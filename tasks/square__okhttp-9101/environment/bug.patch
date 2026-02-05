@@ -1,0 +1,357 @@
+diff --git a/okhttp/src/commonJvmAndroid/kotlin/okhttp3/Cache.kt b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/Cache.kt
+index 71b859245..d102e778b 100644
+--- a/okhttp/src/commonJvmAndroid/kotlin/okhttp3/Cache.kt
++++ b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/Cache.kt
+@@ -229,7 +229,7 @@ class Cache internal constructor(
+     }
+ 
+     if (requestMethod != "GET") {
+-      // Don't cache non-GET responses. We're technically allowed to cache HEAD, QUERY and some
++      // Don't cache non-GET responses. We're technically allowed to cache HEAD requests and some
+       // POST requests, but the complexity of doing so is high and the benefit is low.
+       return null
+     }
+diff --git a/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/cache/CacheInterceptor.kt b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/cache/CacheInterceptor.kt
+index 0e266c987..8e6581bdc 100644
+--- a/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/cache/CacheInterceptor.kt
++++ b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/cache/CacheInterceptor.kt
+@@ -299,8 +299,7 @@ class CacheInterceptor(
+ private fun Request.requestForCache(): Request {
+   val cacheUrlOverride = cacheUrlOverride
+ 
+-  // Allow POST and QUERY caching only when there is a cacheUrlOverride
+-  return if (cacheUrlOverride != null && (HttpMethod.isCacheable(method) || method == "POST")) {
++  return if (cacheUrlOverride != null && (method == "GET" || method == "POST")) {
+     newBuilder()
+       .get()
+       .url(cacheUrlOverride)
+diff --git a/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/http/HttpMethod.kt b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/http/HttpMethod.kt
+index 77d2d9da5..0d3df7510 100644
+--- a/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/http/HttpMethod.kt
++++ b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/http/HttpMethod.kt
+@@ -35,7 +35,6 @@ object HttpMethod {
+         method == "PUT" ||
+         method == "PATCH" ||
+         method == "PROPPATCH" ||
+-        method == "QUERY" ||
+         // WebDAV
+         method == "REPORT"
+     )
+@@ -46,6 +45,4 @@ object HttpMethod {
+   fun redirectsWithBody(method: String): Boolean = method == "PROPFIND"
+ 
+   fun redirectsToGet(method: String): Boolean = method != "PROPFIND"
+-
+-  fun isCacheable(requestMethod: String): Boolean = requestMethod == "GET" || requestMethod == "QUERY"
+ }
+diff --git a/okhttp/src/jvmTest/kotlin/okhttp3/CacheTest.kt b/okhttp/src/jvmTest/kotlin/okhttp3/CacheTest.kt
+index 005a0a422..d5c7d8e3b 100644
+--- a/okhttp/src/jvmTest/kotlin/okhttp3/CacheTest.kt
++++ b/okhttp/src/jvmTest/kotlin/okhttp3/CacheTest.kt
+@@ -35,7 +35,6 @@ import java.util.Locale
+ import java.util.TimeZone
+ import java.util.concurrent.TimeUnit
+ import java.util.concurrent.atomic.AtomicReference
+-import java.util.stream.Stream
+ import javax.net.ssl.HostnameVerifier
+ import kotlin.test.assertFailsWith
+ import mockwebserver3.MockResponse
+@@ -46,7 +45,6 @@ import mockwebserver3.junit5.StartStop
+ import okhttp3.Cache.Companion.key
+ import okhttp3.Headers.Companion.headersOf
+ import okhttp3.MediaType.Companion.toMediaType
+-import okhttp3.MediaType.Companion.toMediaTypeOrNull
+ import okhttp3.RequestBody.Companion.toRequestBody
+ import okhttp3.internal.addHeaderLenient
+ import okhttp3.internal.cacheGet
+@@ -54,7 +52,6 @@ import okhttp3.internal.platform.Platform.Companion.get
+ import okhttp3.java.net.cookiejar.JavaNetCookieJar
+ import okhttp3.testing.PlatformRule
+ import okio.Buffer
+-import okio.BufferedSink
+ import okio.FileSystem
+ import okio.ForwardingFileSystem
+ import okio.GzipSink
+@@ -505,175 +502,23 @@ class CacheTest {
+   }
+ 
+   @Test
+-  fun getAndQueryRedirectToCachedResultIndependently() {
+-    // GET responses
+-    server.enqueue(
+-      MockResponse
+-        .Builder()
+-        .addHeader("Cache-Control: max-age=60")
+-        .body("ABC")
+-        .build(),
+-    )
+-    // QUERY responses
+-    server.enqueue(
+-      MockResponse
+-        .Builder()
+-        .addHeader("Cache-Control: max-age=60")
+-        .body("DEF")
+-        .build(),
++  fun queryWithBodyNotCached() {
++    assertNotCached(
++      MockResponse.Builder().build(),
++      method = "QUERY",
++      requestBody = "foo".toRequestBody(),
+     )
+-
+-    val requestGet1 =
+-      Request
+-        .Builder()
+-        .url(server.url("/foo"))
+-        .get()
+-        .build()
+-    val response1 = client.newCall(requestGet1).execute()
+-    assertThat(response1.body.string()).isEqualTo("ABC")
+-    val recordedRequest1 = server.takeRequest()
+-    assertThat(recordedRequest1.requestLine).isEqualTo("GET /foo HTTP/1.1")
+-
+-    val requestQuery1 =
+-      Request
+-        .Builder()
+-        .url(server.url("/foo"))
+-        .query(RequestBody.EMPTY)
+-        .build()
+-    val response2 = client.newCall(requestQuery1).execute()
+-    assertThat(response2.body.string()).isEqualTo("DEF")
+-    val recordedRequest2 = server.takeRequest()
+-    assertThat(recordedRequest2.requestLine).isEqualTo("QUERY /foo HTTP/1.1")
+   }
+ 
+   @Test
+-  fun queryRequestsCacheTheBodyWithCacheUrlOverride() {
+-    server.enqueue(
+-      MockResponse
+-        .Builder()
+-        .addHeader("Cache-Control: max-age=60")
+-        .body("ABC")
+-        .build(),
+-    )
+-    server.enqueue(
+-      MockResponse
+-        .Builder()
+-        .addHeader("Cache-Control: max-age=60")
+-        .body("DEF")
+-        .build(),
+-    )
+-    server.enqueue(
+-      MockResponse
+-        .Builder()
+-        .addHeader("Cache-Control: max-age=60")
+-        .body("DEFa")
+-        .build(),
+-    )
+-
+-    val url = server.url("/same")
+-
+-    // First QUERY request with body "foo"
+-    val request1 =
+-      Request
+-        .Builder()
+-        .url(url)
+-        .query("foo".toRequestBody())
+-        .cacheUrlOverride(url.newBuilder().addQueryParameter("body", "foo").build())
+-        .build()
+-    val response1 = client.newCall(request1).execute()
+-    assertThat(response1.body.string()).isEqualTo("ABC")
+-
+-    // Second QUERY request with body "bar"
+-    val request2 =
+-      Request
+-        .Builder()
+-        .url(url)
+-        .query("bar".toRequestBody())
+-        .cacheUrlOverride(url.newBuilder().addQueryParameter("body", "bar").build())
+-        .build()
+-    val response2 = client.newCall(request2).execute()
+-    assertThat(response2.body.string()).isEqualTo("DEF")
+-
+-    // Third QUERY request with body "bar" but not cached
+-    val request3 =
+-      Request
+-        .Builder()
+-        .url(url)
+-        .query("bar".toRequestBody())
+-        .build()
+-    val response3 = client.newCall(request3).execute()
+-    assertThat(response3.body.string()).isEqualTo("DEFa")
+-
+-    // Fourth QUERY request with body "foo" again, should be cached and return "ABC"
+-    val response1a = client.newCall(request1).execute()
+-    assertThat(response1a.body.string()).isEqualTo("ABC")
+-
+-    // Fifth QUERY request with body "bar" again, should be cached and return "DEF"
+-    val response2a = client.newCall(request2).execute()
+-    assertThat(response2a.body.string()).isEqualTo("DEF")
+-  }
+-
+-  @Test
+-  fun oneshotBodyIsNotCachedForQueryRequest() {
+-    server.enqueue(
+-      MockResponse
+-        .Builder()
+-        .addHeader("Cache-Control: max-age=60")
+-        .body("ABC1")
+-        .build(),
+-    )
+-    server.enqueue(
+-      MockResponse
+-        .Builder()
+-        .addHeader("Cache-Control: max-age=60")
+-        .body("ABC2")
+-        .build(),
++  fun queryWithoutBodyNotCached() {
++    assertNotCached(
++      MockResponse.Builder().build(),
++      method = "QUERY",
++      requestBody = null,
+     )
+-
+-    val url = server.url("/same")
+-
+-    // QUERY request with body "foo"
+-    val body = "foo"
+-
+-    val request1 =
+-      Request
+-        .Builder()
+-        .url(url)
+-        .query(body.toOneShotRequestBody())
+-        .build()
+-    val response1 = client.newCall(request1).execute()
+-    assertThat(response1.body.string()).isEqualTo("ABC1")
+-
+-    // QUERY request with body "foo" again, should not be cached
+-    val request2 =
+-      Request
+-        .Builder()
+-        .url(url)
+-        .query(body.toOneShotRequestBody())
+-        .build()
+-    val response2 = client.newCall(request2).execute()
+-    assertThat(response2.body.string()).isEqualTo("ABC2")
+-
+-    // Check that the cache did not store the response
+-    assertThat(cache.requestCount()).isEqualTo(2)
+-    assertThat(cache.hitCount()).isEqualTo(0)
+   }
+ 
+-  private fun String.toOneShotRequestBody(): RequestBody =
+-    object : RequestBody() {
+-      val internalBody = Stream.of(this)
+-
+-      override fun isOneShot(): Boolean = true
+-
+-      override fun contentType(): MediaType? = "application/text-plain".toMediaTypeOrNull()
+-
+-      override fun writeTo(sink: BufferedSink) {
+-        internalBody.forEach { item ->
+-          sink.writeUtf8(this@toOneShotRequestBody)
+-        }
+-      }
+-    }
+-
+   @Test
+   fun secureResponseCachingAndRedirects() {
+     server.useHttps(handshakeCertificates.sslSocketFactory())
+@@ -1230,16 +1075,6 @@ class CacheTest {
+     testRequestMethod("GET", true)
+   }
+ 
+-  @Test
+-  fun requestMethodQueryIsCached() {
+-    testRequestMethod("QUERY", false)
+-  }
+-
+-  @Test
+-  fun requestMethodQueryIsCachedWithOverride() {
+-    testRequestMethod("QUERY", true, withOverride = true)
+-  }
+-
+   @Test
+   fun requestMethodHeadIsNotCached() {
+     // We could support this but choose not to for implementation simplicity
+@@ -1312,35 +1147,17 @@ class CacheTest {
+     val response1 = client.newCall(request).execute()
+     response1.body.close()
+     assertThat(response1.header("X-Response-ID")).isEqualTo("1")
+-    val response2 = client.newCall(request).execute()
++    val response2 = get(url)
+     response2.body.close()
+     if (expectCached) {
+       assertThat(response2.header("X-Response-ID")).isEqualTo("1")
+     } else {
+       assertThat(response2.header("X-Response-ID")).isEqualTo("2")
+     }
+-    if (!expectCached) {
+-      server.enqueue(
+-        MockResponse
+-          .Builder()
+-          .addHeader("X-Response-ID: 3")
+-          .build(),
+-      )
+-      val response3 = get(url)
+-      response3.body.close()
+-      assertThat(response3.header("X-Response-ID")).isEqualTo("3")
+-    }
+   }
+ 
+   private fun requestBodyOrNull(requestMethod: String): RequestBody? =
+-    if (requestMethod == "POST" ||
+-      requestMethod == "PUT" ||
+-      requestMethod == "QUERY"
+-    ) {
+-      "foo".toRequestBody("text/plain".toMediaType())
+-    } else {
+-      null
+-    }
++    if (requestMethod == "POST" || requestMethod == "PUT") "foo".toRequestBody("text/plain".toMediaType()) else null
+ 
+   @Test
+   fun postInvalidatesCache() {
+@@ -3809,11 +3626,16 @@ CLEAN $urlKey ${entryMetadata.length} ${entryBody.length}
+     return client.newCall(request).execute()
+   }
+ 
+-  private operator fun get(url: HttpUrl): Response {
++  private operator fun get(
++    url: HttpUrl,
++    method: String = "GET",
++    requestBody: RequestBody? = null,
++  ): Response {
+     val request =
+       Request
+         .Builder()
+         .url(url)
++        .method(method, requestBody)
+         .build()
+     return client.newCall(request).execute()
+   }
+@@ -3843,7 +3665,11 @@ CLEAN $urlKey ${entryMetadata.length} ${entryBody.length}
+     return rfc1123.format(date)
+   }
+ 
+-  private fun assertNotCached(response: MockResponse) {
++  private fun assertNotCached(
++    response: MockResponse,
++    method: String = "GET",
++    requestBody: RequestBody? = null,
++  ) {
+     server.enqueue(
+       response
+         .newBuilder()
+@@ -3857,8 +3683,8 @@ CLEAN $urlKey ${entryMetadata.length} ${entryBody.length}
+         .build(),
+     )
+     val url = server.url("/")
+-    assertThat(get(url).body.string()).isEqualTo("A")
+-    assertThat(get(url).body.string()).isEqualTo("B")
++    assertThat(get(url, method, requestBody).body.string()).isEqualTo("A")
++    assertThat(get(url, method, requestBody).body.string()).isEqualTo("B")
+   }
+ 
+   /** @return the request with the conditional get headers. */

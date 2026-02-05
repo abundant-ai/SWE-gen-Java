@@ -1,0 +1,476 @@
+diff --git a/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/discovery/AbstractOrderingVisitor.java b/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/discovery/AbstractOrderingVisitor.java
+index 0645aa0ab..8f104923b 100644
+--- a/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/discovery/AbstractOrderingVisitor.java
++++ b/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/discovery/AbstractOrderingVisitor.java
+@@ -18,14 +18,16 @@ import java.util.ArrayList;
+ import java.util.HashMap;
+ import java.util.List;
+ import java.util.Map;
++import java.util.Optional;
+ import java.util.function.Consumer;
+ import java.util.function.Function;
+ import java.util.stream.Stream;
+ 
+-import org.junit.platform.commons.logging.Logger;
+-import org.junit.platform.commons.logging.LoggerFactory;
+ import org.junit.platform.commons.util.UnrecoverableExceptions;
++import org.junit.platform.engine.DiscoveryIssue;
++import org.junit.platform.engine.DiscoveryIssue.Severity;
+ import org.junit.platform.engine.TestDescriptor;
++import org.junit.platform.engine.support.discovery.DiscoveryIssueReporter;
+ 
+ /**
+  * Abstract base class for {@linkplain TestDescriptor.Visitor visitors} that
+@@ -35,7 +37,11 @@ import org.junit.platform.engine.TestDescriptor;
+  */
+ abstract class AbstractOrderingVisitor implements TestDescriptor.Visitor {
+ 
+-	private static final Logger logger = LoggerFactory.getLogger(AbstractOrderingVisitor.class);
++	private final DiscoveryIssueReporter issueReporter;
++
++	AbstractOrderingVisitor(DiscoveryIssueReporter issueReporter) {
++		this.issueReporter = issueReporter;
++	}
+ 
+ 	/**
+ 	 * @param <PARENT> the parent container type to search in for matching children
+@@ -51,7 +57,10 @@ abstract class AbstractOrderingVisitor implements TestDescriptor.Visitor {
+ 			}
+ 			catch (Throwable t) {
+ 				UnrecoverableExceptions.rethrowIfUnrecoverable(t);
+-				logger.error(t, () -> errorMessageBuilder.apply(parentTestDescriptor));
++				String message = errorMessageBuilder.apply(parentTestDescriptor);
++				this.issueReporter.reportIssue(DiscoveryIssue.builder(Severity.ERROR, message) //
++						.source(parentTestDescriptor.getSource()) //
++						.cause(t));
+ 			}
+ 		}
+ 	}
+@@ -61,17 +70,24 @@ abstract class AbstractOrderingVisitor implements TestDescriptor.Visitor {
+ 	 */
+ 	protected <CHILD extends TestDescriptor, WRAPPER extends AbstractAnnotatedDescriptorWrapper<?>> void orderChildrenTestDescriptors(
+ 			TestDescriptor parentTestDescriptor, Class<CHILD> matchingChildrenType,
+-			Function<CHILD, WRAPPER> descriptorWrapperFactory,
+-			DescriptorWrapperOrderer<WRAPPER> descriptorWrapperOrderer) {
++			Optional<Consumer<CHILD>> validationAction, Function<CHILD, WRAPPER> descriptorWrapperFactory,
++			DescriptorWrapperOrderer<?, WRAPPER> descriptorWrapperOrderer) {
++
++		Stream<CHILD> matchingChildren = parentTestDescriptor.getChildren()//
++				.stream()//
++				.filter(matchingChildrenType::isInstance)//
++				.map(matchingChildrenType::cast);
+ 
+ 		if (!descriptorWrapperOrderer.canOrderWrappers()) {
++			validationAction.ifPresent(matchingChildren::forEach);
+ 			return;
+ 		}
+ 
+-		List<WRAPPER> matchingDescriptorWrappers = parentTestDescriptor.getChildren()//
+-				.stream()//
+-				.filter(matchingChildrenType::isInstance)//
+-				.map(matchingChildrenType::cast)//
++		if (validationAction.isPresent()) {
++			matchingChildren = matchingChildren.peek(validationAction.get());
++		}
++
++		List<WRAPPER> matchingDescriptorWrappers = matchingChildren//
+ 				.map(descriptorWrapperFactory)//
+ 				.collect(toCollection(ArrayList::new));
+ 
+@@ -84,7 +100,8 @@ abstract class AbstractOrderingVisitor implements TestDescriptor.Visitor {
+ 			Stream<TestDescriptor> nonMatchingTestDescriptors = children.stream()//
+ 					.filter(childTestDescriptor -> !matchingChildrenType.isInstance(childTestDescriptor));
+ 
+-			descriptorWrapperOrderer.orderWrappers(matchingDescriptorWrappers);
++			descriptorWrapperOrderer.orderWrappers(matchingDescriptorWrappers,
++				message -> reportWarning(parentTestDescriptor, message));
+ 
+ 			Stream<TestDescriptor> orderedTestDescriptors = matchingDescriptorWrappers.stream()//
+ 					.map(AbstractAnnotatedDescriptorWrapper::getTestDescriptor);
+@@ -100,39 +117,50 @@ abstract class AbstractOrderingVisitor implements TestDescriptor.Visitor {
+ 		});
+ 	}
+ 
++	private void reportWarning(TestDescriptor parentTestDescriptor, String message) {
++		issueReporter.reportIssue(DiscoveryIssue.builder(Severity.WARNING, message) //
++				.source(parentTestDescriptor.getSource()));
++	}
++
+ 	protected abstract boolean shouldNonMatchingDescriptorsComeBeforeOrderedOnes();
+ 
+ 	/**
+ 	 * @param <WRAPPER> the wrapper type for the children to order
+ 	 */
+-	protected static class DescriptorWrapperOrderer<WRAPPER> {
++	protected static class DescriptorWrapperOrderer<ORDERER, WRAPPER> {
+ 
+-		private static final DescriptorWrapperOrderer<?> NOOP = new DescriptorWrapperOrderer<>(null, __ -> "",
++		private static final DescriptorWrapperOrderer<?, ?> NOOP = new DescriptorWrapperOrderer<>(null, null, __ -> "",
+ 			___ -> "");
+ 
+ 		@SuppressWarnings("unchecked")
+-		protected static <WRAPPER> DescriptorWrapperOrderer<WRAPPER> noop() {
+-			return (DescriptorWrapperOrderer<WRAPPER>) NOOP;
++		protected static <ORDERER, WRAPPER> DescriptorWrapperOrderer<ORDERER, WRAPPER> noop() {
++			return (DescriptorWrapperOrderer<ORDERER, WRAPPER>) NOOP;
+ 		}
+ 
++		private final ORDERER orderer;
+ 		private final Consumer<List<WRAPPER>> orderingAction;
+ 		private final MessageGenerator descriptorsAddedMessageGenerator;
+ 		private final MessageGenerator descriptorsRemovedMessageGenerator;
+ 
+-		DescriptorWrapperOrderer(Consumer<List<WRAPPER>> orderingAction,
++		DescriptorWrapperOrderer(ORDERER orderer, Consumer<List<WRAPPER>> orderingAction,
+ 				MessageGenerator descriptorsAddedMessageGenerator,
+ 				MessageGenerator descriptorsRemovedMessageGenerator) {
+ 
++			this.orderer = orderer;
+ 			this.orderingAction = orderingAction;
+ 			this.descriptorsAddedMessageGenerator = descriptorsAddedMessageGenerator;
+ 			this.descriptorsRemovedMessageGenerator = descriptorsRemovedMessageGenerator;
+ 		}
+ 
++		ORDERER getOrderer() {
++			return orderer;
++		}
++
+ 		private boolean canOrderWrappers() {
+ 			return this.orderingAction != null;
+ 		}
+ 
+-		private void orderWrappers(List<WRAPPER> wrappers) {
++		private void orderWrappers(List<WRAPPER> wrappers, Consumer<String> errorHandler) {
+ 			List<WRAPPER> orderedWrappers = new ArrayList<>(wrappers);
+ 			this.orderingAction.accept(orderedWrappers);
+ 			Map<Object, Integer> distinctWrappersToIndex = distinctWrappersToIndex(orderedWrappers);
+@@ -140,10 +168,10 @@ abstract class AbstractOrderingVisitor implements TestDescriptor.Visitor {
+ 			int difference = orderedWrappers.size() - wrappers.size();
+ 			int distinctDifference = distinctWrappersToIndex.size() - wrappers.size();
+ 			if (difference > 0) { // difference >= distinctDifference
+-				logDescriptorsAddedWarning(difference);
++				reportDescriptorsAddedWarning(difference, errorHandler);
+ 			}
+ 			if (distinctDifference < 0) { // distinctDifference <= difference
+-				logDescriptorsRemovedWarning(distinctDifference);
++				reportDescriptorsRemovedWarning(distinctDifference, errorHandler);
+ 			}
+ 
+ 			wrappers.sort(comparing(wrapper -> distinctWrappersToIndex.getOrDefault(wrapper, -1)));
+@@ -161,12 +189,12 @@ abstract class AbstractOrderingVisitor implements TestDescriptor.Visitor {
+ 			return toIndex;
+ 		}
+ 
+-		private void logDescriptorsAddedWarning(int number) {
+-			logger.warn(() -> this.descriptorsAddedMessageGenerator.generateMessage(number));
++		private void reportDescriptorsAddedWarning(int number, Consumer<String> errorHandler) {
++			errorHandler.accept(this.descriptorsAddedMessageGenerator.generateMessage(number));
+ 		}
+ 
+-		private void logDescriptorsRemovedWarning(int number) {
+-			logger.warn(() -> this.descriptorsRemovedMessageGenerator.generateMessage(Math.abs(number)));
++		private void reportDescriptorsRemovedWarning(int number, Consumer<String> errorHandler) {
++			errorHandler.accept(this.descriptorsRemovedMessageGenerator.generateMessage(Math.abs(number)));
+ 		}
+ 
+ 	}
+diff --git a/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/discovery/ClassOrderingVisitor.java b/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/discovery/ClassOrderingVisitor.java
+index fb8861083..e64063088 100644
+--- a/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/discovery/ClassOrderingVisitor.java
++++ b/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/discovery/ClassOrderingVisitor.java
+@@ -10,10 +10,14 @@
+ 
+ package org.junit.jupiter.engine.discovery;
+ 
++import static org.junit.platform.commons.support.AnnotationSupport.isAnnotated;
++
+ import java.util.List;
++import java.util.Optional;
+ import java.util.function.Consumer;
+ 
+ import org.junit.jupiter.api.ClassOrderer;
++import org.junit.jupiter.api.Order;
+ import org.junit.jupiter.api.TestClassOrder;
+ import org.junit.jupiter.engine.config.JupiterConfiguration;
+ import org.junit.jupiter.engine.descriptor.ClassBasedTestDescriptor;
+@@ -21,21 +25,37 @@ import org.junit.jupiter.engine.descriptor.JupiterEngineDescriptor;
+ import org.junit.platform.commons.support.AnnotationSupport;
+ import org.junit.platform.commons.support.ReflectionSupport;
+ import org.junit.platform.commons.util.LruCache;
++import org.junit.platform.engine.DiscoveryIssue;
++import org.junit.platform.engine.DiscoveryIssue.Severity;
+ import org.junit.platform.engine.TestDescriptor;
++import org.junit.platform.engine.support.descriptor.ClassSource;
++import org.junit.platform.engine.support.discovery.DiscoveryIssueReporter;
++import org.junit.platform.engine.support.discovery.DiscoveryIssueReporter.Condition;
+ 
+ /**
+  * @since 5.8
+  */
+ class ClassOrderingVisitor extends AbstractOrderingVisitor {
+ 
+-	private final LruCache<ClassBasedTestDescriptor, DescriptorWrapperOrderer<DefaultClassDescriptor>> ordererCache = new LruCache<>(
++	private final LruCache<ClassBasedTestDescriptor, DescriptorWrapperOrderer<ClassOrderer, DefaultClassDescriptor>> ordererCache = new LruCache<>(
+ 		10);
+ 	private final JupiterConfiguration configuration;
+-	private final DescriptorWrapperOrderer<DefaultClassDescriptor> globalOrderer;
++	private final DescriptorWrapperOrderer<ClassOrderer, DefaultClassDescriptor> globalOrderer;
++	private final Condition<ClassBasedTestDescriptor> noOrderAnnotation;
+ 
+-	ClassOrderingVisitor(JupiterConfiguration configuration) {
++	ClassOrderingVisitor(JupiterConfiguration configuration, DiscoveryIssueReporter issueReporter) {
++		super(issueReporter);
+ 		this.configuration = configuration;
+ 		this.globalOrderer = createGlobalOrderer(configuration);
++		this.noOrderAnnotation = issueReporter.createReportingCondition(
++			testDescriptor -> !isAnnotated(testDescriptor.getTestClass(), Order.class), testDescriptor -> {
++				String message = String.format(
++					"Ineffective @Order annotation on class '%s'. It will not be applied because ClassOrderer.OrderAnnotation is not in use.",
++					testDescriptor.getTestClass().getName());
++				return DiscoveryIssue.builder(Severity.INFO, message) //
++						.source(ClassSource.from(testDescriptor.getTestClass())) //
++						.build();
++			});
+ 	}
+ 
+ 	@Override
+@@ -59,31 +79,37 @@ class ClassOrderingVisitor extends AbstractOrderingVisitor {
+ 		orderChildrenTestDescriptors(//
+ 			engineDescriptor, //
+ 			ClassBasedTestDescriptor.class, //
++			toValidationAction(globalOrderer), //
+ 			DefaultClassDescriptor::new, //
+ 			globalOrderer);
+ 	}
+ 
+ 	private void orderNestedClasses(ClassBasedTestDescriptor descriptor) {
++		DescriptorWrapperOrderer<ClassOrderer, DefaultClassDescriptor> wrapperOrderer = createAndCacheClassLevelOrderer(
++			descriptor);
+ 		orderChildrenTestDescriptors(//
+ 			descriptor, //
+ 			ClassBasedTestDescriptor.class, //
++			toValidationAction(wrapperOrderer), //
+ 			DefaultClassDescriptor::new, //
+-			createAndCacheClassLevelOrderer(descriptor));
++			wrapperOrderer);
+ 	}
+ 
+-	private DescriptorWrapperOrderer<DefaultClassDescriptor> createGlobalOrderer(JupiterConfiguration configuration) {
++	private DescriptorWrapperOrderer<ClassOrderer, DefaultClassDescriptor> createGlobalOrderer(
++			JupiterConfiguration configuration) {
+ 		ClassOrderer classOrderer = configuration.getDefaultTestClassOrderer().orElse(null);
+ 		return classOrderer == null ? DescriptorWrapperOrderer.noop() : createDescriptorWrapperOrderer(classOrderer);
+ 	}
+ 
+-	private DescriptorWrapperOrderer<DefaultClassDescriptor> createAndCacheClassLevelOrderer(
++	private DescriptorWrapperOrderer<ClassOrderer, DefaultClassDescriptor> createAndCacheClassLevelOrderer(
+ 			ClassBasedTestDescriptor classBasedTestDescriptor) {
+-		DescriptorWrapperOrderer<DefaultClassDescriptor> orderer = createClassLevelOrderer(classBasedTestDescriptor);
++		DescriptorWrapperOrderer<ClassOrderer, DefaultClassDescriptor> orderer = createClassLevelOrderer(
++			classBasedTestDescriptor);
+ 		ordererCache.put(classBasedTestDescriptor, orderer);
+ 		return orderer;
+ 	}
+ 
+-	private DescriptorWrapperOrderer<DefaultClassDescriptor> createClassLevelOrderer(
++	private DescriptorWrapperOrderer<ClassOrderer, DefaultClassDescriptor> createClassLevelOrderer(
+ 			ClassBasedTestDescriptor classBasedTestDescriptor) {
+ 		return AnnotationSupport.findAnnotation(classBasedTestDescriptor.getTestClass(), TestClassOrder.class)//
+ 				.map(TestClassOrder::value)//
+@@ -93,7 +119,7 @@ class ClassOrderingVisitor extends AbstractOrderingVisitor {
+ 					Object parent = classBasedTestDescriptor.getParent().orElse(null);
+ 					if (parent instanceof ClassBasedTestDescriptor) {
+ 						ClassBasedTestDescriptor parentClassTestDescriptor = (ClassBasedTestDescriptor) parent;
+-						DescriptorWrapperOrderer<DefaultClassDescriptor> cacheEntry = ordererCache.get(
++						DescriptorWrapperOrderer<ClassOrderer, DefaultClassDescriptor> cacheEntry = ordererCache.get(
+ 							parentClassTestDescriptor);
+ 						return cacheEntry != null ? cacheEntry : createClassLevelOrderer(parentClassTestDescriptor);
+ 					}
+@@ -101,7 +127,8 @@ class ClassOrderingVisitor extends AbstractOrderingVisitor {
+ 				});
+ 	}
+ 
+-	private DescriptorWrapperOrderer<DefaultClassDescriptor> createDescriptorWrapperOrderer(ClassOrderer classOrderer) {
++	private DescriptorWrapperOrderer<ClassOrderer, DefaultClassDescriptor> createDescriptorWrapperOrderer(
++			ClassOrderer classOrderer) {
+ 		Consumer<List<DefaultClassDescriptor>> orderingAction = classDescriptors -> classOrderer.orderClasses(
+ 			new DefaultClassOrdererContext(classDescriptors, this.configuration));
+ 
+@@ -112,8 +139,17 @@ class ClassOrderingVisitor extends AbstractOrderingVisitor {
+ 			"ClassOrderer [%s] removed %s ClassDescriptor(s) which will be retained with arbitrary ordering.",
+ 			classOrderer.getClass().getName(), number);
+ 
+-		return new DescriptorWrapperOrderer<>(orderingAction, descriptorsAddedMessageGenerator,
++		return new DescriptorWrapperOrderer<>(classOrderer, orderingAction, descriptorsAddedMessageGenerator,
+ 			descriptorsRemovedMessageGenerator);
+ 	}
+ 
++	private Optional<Consumer<ClassBasedTestDescriptor>> toValidationAction(
++			DescriptorWrapperOrderer<ClassOrderer, DefaultClassDescriptor> wrapperOrderer) {
++
++		if (wrapperOrderer.getOrderer() instanceof ClassOrderer.OrderAnnotation) {
++			return Optional.empty();
++		}
++		return Optional.of(noOrderAnnotation::check);
++	}
++
+ }
+diff --git a/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/discovery/DiscoverySelectorResolver.java b/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/discovery/DiscoverySelectorResolver.java
+index 4b25b3d43..6fabb7546 100644
+--- a/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/discovery/DiscoverySelectorResolver.java
++++ b/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/discovery/DiscoverySelectorResolver.java
+@@ -44,8 +44,8 @@ public class DiscoverySelectorResolver {
+ 				ctx.getIssueReporter())) //
+ 			.addSelectorResolver(ctx -> new MethodSelectorResolver(getConfiguration(ctx), ctx.getIssueReporter())) //
+ 			.addTestDescriptorVisitor(ctx -> TestDescriptor.Visitor.composite( //
+-				new ClassOrderingVisitor(getConfiguration(ctx)), //
+-				new MethodOrderingVisitor(getConfiguration(ctx)), //
++				new ClassOrderingVisitor(getConfiguration(ctx), ctx.getIssueReporter()), //
++				new MethodOrderingVisitor(getConfiguration(ctx), ctx.getIssueReporter()), //
+ 				descriptor -> {
+ 					if (descriptor instanceof Validatable) {
+ 						((Validatable) descriptor).validate(ctx.getIssueReporter());
+diff --git a/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/discovery/MethodOrderingVisitor.java b/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/discovery/MethodOrderingVisitor.java
+index bad48c639..471b9ecf8 100644
+--- a/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/discovery/MethodOrderingVisitor.java
++++ b/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/discovery/MethodOrderingVisitor.java
+@@ -11,19 +11,26 @@
+ package org.junit.jupiter.engine.discovery;
+ 
+ import static org.junit.platform.commons.support.AnnotationSupport.findAnnotation;
++import static org.junit.platform.commons.support.AnnotationSupport.isAnnotated;
+ 
+ import java.util.List;
+ import java.util.Optional;
+ import java.util.function.Consumer;
+ 
+ import org.junit.jupiter.api.MethodOrderer;
++import org.junit.jupiter.api.Order;
+ import org.junit.jupiter.api.TestMethodOrder;
+ import org.junit.jupiter.engine.config.JupiterConfiguration;
+ import org.junit.jupiter.engine.descriptor.ClassBasedTestDescriptor;
+ import org.junit.jupiter.engine.descriptor.JupiterTestDescriptor;
+ import org.junit.jupiter.engine.descriptor.MethodBasedTestDescriptor;
+ import org.junit.platform.commons.support.ReflectionSupport;
++import org.junit.platform.engine.DiscoveryIssue;
++import org.junit.platform.engine.DiscoveryIssue.Severity;
+ import org.junit.platform.engine.TestDescriptor;
++import org.junit.platform.engine.support.descriptor.MethodSource;
++import org.junit.platform.engine.support.discovery.DiscoveryIssueReporter;
++import org.junit.platform.engine.support.discovery.DiscoveryIssueReporter.Condition;
+ 
+ /**
+  * @since 5.5
+@@ -31,9 +38,20 @@ import org.junit.platform.engine.TestDescriptor;
+ class MethodOrderingVisitor extends AbstractOrderingVisitor {
+ 
+ 	private final JupiterConfiguration configuration;
++	private final Condition<MethodBasedTestDescriptor> noOrderAnnotation;
+ 
+-	MethodOrderingVisitor(JupiterConfiguration configuration) {
++	MethodOrderingVisitor(JupiterConfiguration configuration, DiscoveryIssueReporter issueReporter) {
++		super(issueReporter);
+ 		this.configuration = configuration;
++		this.noOrderAnnotation = issueReporter.createReportingCondition(
++			testDescriptor -> !isAnnotated(testDescriptor.getTestMethod(), Order.class), testDescriptor -> {
++				String message = String.format(
++					"Ineffective @Order annotation on method '%s'. It will not be applied because MethodOrderer.OrderAnnotation is not in use.",
++					testDescriptor.getTestMethod().toGenericString());
++				return DiscoveryIssue.builder(Severity.INFO, message) //
++						.source(MethodSource.from(testDescriptor.getTestMethod())) //
++						.build();
++			});
+ 	}
+ 
+ 	@Override
+@@ -54,37 +72,62 @@ class MethodOrderingVisitor extends AbstractOrderingVisitor {
+ 	 * @since 5.4
+ 	 */
+ 	private void orderContainedMethods(ClassBasedTestDescriptor classBasedTestDescriptor, Class<?> testClass) {
+-		findAnnotation(testClass, TestMethodOrder.class)//
++		Optional<MethodOrderer> methodOrderer = findAnnotation(testClass, TestMethodOrder.class)//
+ 				.map(TestMethodOrder::value)//
+ 				.<MethodOrderer> map(ReflectionSupport::newInstance)//
+ 				.map(Optional::of)//
+-				.orElseGet(configuration::getDefaultTestMethodOrderer)//
+-				.ifPresent(methodOrderer -> {
+-
+-					Consumer<List<DefaultMethodDescriptor>> orderingAction = methodDescriptors -> methodOrderer.orderMethods(
+-						new DefaultMethodOrdererContext(testClass, methodDescriptors, this.configuration));
+-
+-					MessageGenerator descriptorsAddedMessageGenerator = number -> String.format(
+-						"MethodOrderer [%s] added %s MethodDescriptor(s) for test class [%s] which will be ignored.",
+-						methodOrderer.getClass().getName(), number, testClass.getName());
+-					MessageGenerator descriptorsRemovedMessageGenerator = number -> String.format(
+-						"MethodOrderer [%s] removed %s MethodDescriptor(s) for test class [%s] which will be retained with arbitrary ordering.",
+-						methodOrderer.getClass().getName(), number, testClass.getName());
+-
+-					DescriptorWrapperOrderer<DefaultMethodDescriptor> descriptorWrapperOrderer = new DescriptorWrapperOrderer<>(
+-						orderingAction, descriptorsAddedMessageGenerator, descriptorsRemovedMessageGenerator);
+-
+-					orderChildrenTestDescriptors(classBasedTestDescriptor, //
+-						MethodBasedTestDescriptor.class, //
+-						DefaultMethodDescriptor::new, //
+-						descriptorWrapperOrderer);
+-
+-					// Note: MethodOrderer#getDefaultExecutionMode() is guaranteed
+-					// to be invoked after MethodOrderer#orderMethods().
+-					methodOrderer.getDefaultExecutionMode()//
+-							.map(JupiterTestDescriptor::toExecutionMode)//
+-							.ifPresent(classBasedTestDescriptor::setDefaultChildExecutionMode);
+-				});
++				.orElseGet(configuration::getDefaultTestMethodOrderer);
++		orderContainedMethods(classBasedTestDescriptor, testClass, methodOrderer);
++	}
++
++	private void orderContainedMethods(ClassBasedTestDescriptor classBasedTestDescriptor, Class<?> testClass,
++			Optional<MethodOrderer> methodOrderer) {
++		DescriptorWrapperOrderer<?, DefaultMethodDescriptor> descriptorWrapperOrderer = createDescriptorWrapperOrderer(
++			testClass, methodOrderer);
++
++		orderChildrenTestDescriptors(classBasedTestDescriptor, //
++			MethodBasedTestDescriptor.class, //
++			toValidationAction(methodOrderer), //
++			DefaultMethodDescriptor::new, //
++			descriptorWrapperOrderer);
++
++		// Note: MethodOrderer#getDefaultExecutionMode() is guaranteed
++		// to be invoked after MethodOrderer#orderMethods().
++		methodOrderer //
++				.flatMap(it -> it.getDefaultExecutionMode().map(JupiterTestDescriptor::toExecutionMode)) //
++				.ifPresent(classBasedTestDescriptor::setDefaultChildExecutionMode);
++	}
++
++	private DescriptorWrapperOrderer<?, DefaultMethodDescriptor> createDescriptorWrapperOrderer(Class<?> testClass,
++			Optional<MethodOrderer> methodOrderer) {
++
++		return methodOrderer //
++				.map(it -> createDescriptorWrapperOrderer(testClass, it)) //
++				.orElseGet(DescriptorWrapperOrderer::noop);
++
++	}
++
++	private DescriptorWrapperOrderer<?, DefaultMethodDescriptor> createDescriptorWrapperOrderer(Class<?> testClass,
++			MethodOrderer methodOrderer) {
++		Consumer<List<DefaultMethodDescriptor>> orderingAction = methodDescriptors -> methodOrderer.orderMethods(
++			new DefaultMethodOrdererContext(testClass, methodDescriptors, this.configuration));
++
++		MessageGenerator descriptorsAddedMessageGenerator = number -> String.format(
++			"MethodOrderer [%s] added %s MethodDescriptor(s) for test class [%s] which will be ignored.",
++			methodOrderer.getClass().getName(), number, testClass.getName());
++		MessageGenerator descriptorsRemovedMessageGenerator = number -> String.format(
++			"MethodOrderer [%s] removed %s MethodDescriptor(s) for test class [%s] which will be retained with arbitrary ordering.",
++			methodOrderer.getClass().getName(), number, testClass.getName());
++
++		return new DescriptorWrapperOrderer<>(methodOrderer, orderingAction, descriptorsAddedMessageGenerator,
++			descriptorsRemovedMessageGenerator);
++	}
++
++	private Optional<Consumer<MethodBasedTestDescriptor>> toValidationAction(Optional<MethodOrderer> methodOrderer) {
++		if (methodOrderer.orElse(null) instanceof MethodOrderer.OrderAnnotation) {
++			return Optional.empty();
++		}
++		return Optional.of(noOrderAnnotation::check);
+ 	}
+ 
+ }

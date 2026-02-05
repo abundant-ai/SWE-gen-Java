@@ -1,0 +1,217 @@
+diff --git a/okhttp-tls/src/main/kotlin/okhttp3/tls/internal/der/Adapters.kt b/okhttp-tls/src/main/kotlin/okhttp3/tls/internal/der/Adapters.kt
+index b55ed7735..25389735f 100644
+--- a/okhttp-tls/src/main/kotlin/okhttp3/tls/internal/der/Adapters.kt
++++ b/okhttp-tls/src/main/kotlin/okhttp3/tls/internal/der/Adapters.kt
+@@ -15,8 +15,8 @@
+  */
+ package okhttp3.tls.internal.der
+ 
+-import java.io.IOException
+ import java.math.BigInteger
++import java.net.ProtocolException
+ import java.text.SimpleDateFormat
+ import java.util.Date
+ import java.util.TimeZone
+@@ -202,6 +202,31 @@ internal object Adapters {
+       }
+   )
+ 
++  /** Decodes any value without interpretation as [AnyValue]. */
++  val ANY_VALUE = object : DerAdapter<AnyValue> {
++    override fun matches(header: DerHeader) = true
++
++    override fun fromDer(reader: DerReader): AnyValue {
++      reader.read("ANY") { header ->
++        val bytes = reader.readUnknown()
++        return AnyValue(
++            tagClass = header.tagClass,
++            tag = header.tag,
++            constructed = header.constructed,
++            length = header.length,
++            bytes = bytes
++        )
++      }
++    }
++
++    override fun toDer(writer: DerWriter, value: AnyValue) {
++      writer.write("ANY", value.tagClass, value.tag) {
++        writer.writeOctetString(value.bytes)
++        writer.constructed = value.constructed
++      }
++    }
++  }
++
+   internal fun parseGeneralizedTime(string: String): Long {
+     val utc = TimeZone.getTimeZone("GMT")
+     val dateFormat = SimpleDateFormat("yyyyMMddHHmmssXX").apply {
+@@ -248,7 +273,7 @@ internal object Adapters {
+           }
+ 
+           if (reader.hasNext()) {
+-            throw IOException("unexpected ${reader.peekHeader()} at $reader")
++            throw ProtocolException("unexpected ${reader.peekHeader()} at $reader")
+           }
+ 
+           return@withTypeHint construct(list)
+@@ -281,10 +306,11 @@ internal object Adapters {
+ 
+       override fun fromDer(reader: DerReader): Pair<DerAdapter<*>, Any?> {
+         val peekedHeader = reader.peekHeader()
+-            ?: throw IOException("expected a value at $reader")
++            ?: throw ProtocolException("expected a value at $reader")
+ 
+         val choice = choices.firstOrNull { it.matches(peekedHeader) }
+-            ?: throw IOException("expected a matching choice but was $peekedHeader at $reader")
++            ?: throw ProtocolException(
++                "expected a matching choice but was $peekedHeader at $reader")
+ 
+         return choice to choice.fromDer(reader)
+       }
+@@ -349,7 +375,8 @@ internal object Adapters {
+       String::class to PRINTABLE_STRING,
+       Nothing::class to IA5_STRING,
+       Nothing::class to UTC_TIME,
+-      Long::class to GENERALIZED_TIME
++      Long::class to GENERALIZED_TIME,
++      AnyValue::class to ANY_VALUE
+   )
+ 
+   fun any(
+@@ -366,12 +393,6 @@ internal object Adapters {
+             // Write nothing.
+           }
+ 
+-          value is AnyValue -> {
+-            writer.write("ANY", value.tagClass, value.tag) {
+-              writer.writeOctetString(value.bytes)
+-            }
+-          }
+-
+           else -> {
+             for ((type, adapter) in choices) {
+               if (type.isInstance(value) || (value == null && type == Unit::class)) {
+@@ -386,22 +407,15 @@ internal object Adapters {
+       override fun fromDer(reader: DerReader): Any? {
+         if (isOptional && !reader.hasNext()) return optionalValue
+ 
++        val peekedHeader = reader.peekHeader()
++            ?: throw ProtocolException("expected a value at $reader")
+         for ((_, adapter) in choices) {
+-          if (adapter.matches(reader.peekHeader()!!)) {
++          if (adapter.matches(peekedHeader)) {
+             return adapter.fromDer(reader)
+           }
+         }
+ 
+-        reader.read("ANY") { header ->
+-          val bytes = reader.readUnknown()
+-          return AnyValue(
+-              tagClass = header.tagClass,
+-              tag = header.tag,
+-              constructed = header.constructed,
+-              length = header.length,
+-              bytes = bytes
+-          )
+-        }
++        throw ProtocolException("expected any but was $peekedHeader at $reader")
+       }
+     }
+   }
+diff --git a/okhttp-tls/src/main/kotlin/okhttp3/tls/internal/der/BasicDerAdapter.kt b/okhttp-tls/src/main/kotlin/okhttp3/tls/internal/der/BasicDerAdapter.kt
+index 8a526133d..109cdb6ba 100644
+--- a/okhttp-tls/src/main/kotlin/okhttp3/tls/internal/der/BasicDerAdapter.kt
++++ b/okhttp-tls/src/main/kotlin/okhttp3/tls/internal/der/BasicDerAdapter.kt
+@@ -15,7 +15,7 @@
+  */
+ package okhttp3.tls.internal.der
+ 
+-import okio.IOException
++import java.net.ProtocolException
+ 
+ /**
+  * Handles basic types that always use the same tag. This supports optional types and may set a type
+@@ -56,7 +56,7 @@ internal data class BasicDerAdapter<T>(
+     val peekedHeader = reader.peekHeader()
+     if (peekedHeader == null || peekedHeader.tagClass != tagClass || peekedHeader.tag != tag) {
+       if (isOptional) return defaultValue as T
+-      throw IOException("expected $this but was $peekedHeader at $reader")
++      throw ProtocolException("expected $this but was $peekedHeader at $reader")
+     }
+ 
+     val result = reader.read(name) {
+diff --git a/okhttp-tls/src/main/kotlin/okhttp3/tls/internal/der/CertificateAdapters.kt b/okhttp-tls/src/main/kotlin/okhttp3/tls/internal/der/CertificateAdapters.kt
+index 7805f919a..86c08b948 100644
+--- a/okhttp-tls/src/main/kotlin/okhttp3/tls/internal/der/CertificateAdapters.kt
++++ b/okhttp-tls/src/main/kotlin/okhttp3/tls/internal/der/CertificateAdapters.kt
+@@ -16,8 +16,8 @@
+ package okhttp3.tls.internal.der
+ 
+ import java.math.BigInteger
++import java.net.ProtocolException
+ import okio.ByteString
+-import okio.IOException
+ 
+ /**
+  * ASN.1 adapters adapted from the specifications in [RFC 5280][rfc_5280].
+@@ -47,7 +47,7 @@ internal object CertificateAdapters {
+ 
+     override fun fromDer(reader: DerReader): Long {
+       val peekHeader = reader.peekHeader()
+-          ?: throw IOException("expected time but was exhausted at $reader")
++          ?: throw ProtocolException("expected time but was exhausted at $reader")
+ 
+       return when {
+         peekHeader.tagClass == Adapters.UTC_TIME.tagClass &&
+@@ -58,7 +58,7 @@ internal object CertificateAdapters {
+             peekHeader.tag == Adapters.GENERALIZED_TIME.tag -> {
+           Adapters.GENERALIZED_TIME.fromDer(reader)
+         }
+-        else -> throw IOException("expected time but was $peekHeader at $reader")
++        else -> throw ProtocolException("expected time but was $peekHeader at $reader")
+       }
+     }
+ 
+@@ -185,7 +185,8 @@ internal object CertificateAdapters {
+   internal val generalNameIpAddress = Adapters.OCTET_STRING.withTag(tag = 7L)
+   internal val generalName: DerAdapter<Pair<DerAdapter<*>, Any?>> = Adapters.choice(
+       generalNameDnsName,
+-      generalNameIpAddress
++      generalNameIpAddress,
++      Adapters.ANY_VALUE
+   )
+ 
+   /**
+@@ -262,7 +263,11 @@ internal object CertificateAdapters {
+   private val attributeTypeAndValue: BasicDerAdapter<AttributeTypeAndValue> = Adapters.sequence(
+       "AttributeTypeAndValue",
+       Adapters.OBJECT_IDENTIFIER,
+-      Adapters.any(),
++      Adapters.any(
++          String::class to Adapters.UTF8_STRING,
++          Nothing::class to Adapters.PRINTABLE_STRING,
++          AnyValue::class to Adapters.ANY_VALUE
++      ),
+       decompose = {
+         listOf(
+             it.type,
+diff --git a/okhttp-tls/src/main/kotlin/okhttp3/tls/internal/der/DerReader.kt b/okhttp-tls/src/main/kotlin/okhttp3/tls/internal/der/DerReader.kt
+index 2e14ba189..29a702341 100644
+--- a/okhttp-tls/src/main/kotlin/okhttp3/tls/internal/der/DerReader.kt
++++ b/okhttp-tls/src/main/kotlin/okhttp3/tls/internal/der/DerReader.kt
+@@ -21,7 +21,6 @@ import okio.Buffer
+ import okio.BufferedSource
+ import okio.ByteString
+ import okio.ForwardingSource
+-import okio.IOException
+ import okio.Source
+ import okio.buffer
+ 
+@@ -161,7 +160,7 @@ internal class DerReader(source: Source) {
+    * header. It is an error to not consume a full value in [block].
+    */
+   internal inline fun <T> read(name: String?, block: (DerHeader) -> T): T {
+-    if (!hasNext()) throw IOException("expected a value")
++    if (!hasNext()) throw ProtocolException("expected a value")
+ 
+     val header = peekedHeader!!
+     peekedHeader = null

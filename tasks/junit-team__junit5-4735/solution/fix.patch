@@ -1,0 +1,340 @@
+diff --git a/documentation/src/docs/asciidoc/release-notes/release-notes-6.0.0-M2.adoc b/documentation/src/docs/asciidoc/release-notes/release-notes-6.0.0-M2.adoc
+index 866518e85..91ccc894b 100644
+--- a/documentation/src/docs/asciidoc/release-notes/release-notes-6.0.0-M2.adoc
++++ b/documentation/src/docs/asciidoc/release-notes/release-notes-6.0.0-M2.adoc
+@@ -45,7 +45,7 @@ repository on GitHub.
+   now causes test execution to be cancelled after the first failed test.
+ * Provide cancellation support for implementations of `{HierarchicalTestEngine}` such as
+   JUnit Jupiter, Spock, and Cucumber.
+-* Provide cancellation support for Suite engine
++* Provide cancellation support for the Suite and Vintage test engines
+ * Introduce `TestTask.getTestDescriptor()` method for use in
+   `HierarchicalTestExecutorService` implementations.
+ 
+diff --git a/documentation/src/docs/asciidoc/user-guide/advanced-topics/launcher-api.adoc b/documentation/src/docs/asciidoc/user-guide/advanced-topics/launcher-api.adoc
+index 603a451a3..69ebdacc2 100644
+--- a/documentation/src/docs/asciidoc/user-guide/advanced-topics/launcher-api.adoc
++++ b/documentation/src/docs/asciidoc/user-guide/advanced-topics/launcher-api.adoc
+@@ -387,6 +387,7 @@ are present at runtime.
+ At the time of writing, the following test engines support cancellation:
+ 
+ * `{junit-jupiter-engine}`
++* `{junit-vintage-engine}`
+ * `{junit-platform-suite-engine}`
+ * Any `{TestEngine}` extending `{HierarchicalTestEngine}` such as Spock and Cucumber
+ ====
+diff --git a/junit-vintage-engine/src/main/java/org/junit/vintage/engine/VintageTestEngine.java b/junit-vintage-engine/src/main/java/org/junit/vintage/engine/VintageTestEngine.java
+index 5bd0ee01e..f5b805705 100644
+--- a/junit-vintage-engine/src/main/java/org/junit/vintage/engine/VintageTestEngine.java
++++ b/junit-vintage-engine/src/main/java/org/junit/vintage/engine/VintageTestEngine.java
+@@ -71,7 +71,8 @@ public final class VintageTestEngine implements TestEngine {
+ 		VintageEngineDescriptor engineDescriptor = (VintageEngineDescriptor) request.getRootTestDescriptor();
+ 		// TODO #4725 Provide cancellation support for Vintage engine
+ 		engineExecutionListener.executionStarted(engineDescriptor);
+-		new VintageExecutor(engineDescriptor, engineExecutionListener, request).executeAllChildren();
++		new VintageExecutor(engineDescriptor, engineExecutionListener,
++			request.getConfigurationParameters()).executeAllChildren(request.getCancellationToken());
+ 		engineExecutionListener.executionFinished(engineDescriptor, successful());
+ 	}
+ }
+diff --git a/junit-vintage-engine/src/main/java/org/junit/vintage/engine/descriptor/RunnerTestDescriptor.java b/junit-vintage-engine/src/main/java/org/junit/vintage/engine/descriptor/RunnerTestDescriptor.java
+index 2fa6af237..2ebeb1a3a 100644
+--- a/junit-vintage-engine/src/main/java/org/junit/vintage/engine/descriptor/RunnerTestDescriptor.java
++++ b/junit-vintage-engine/src/main/java/org/junit/vintage/engine/descriptor/RunnerTestDescriptor.java
+@@ -74,6 +74,10 @@ public class RunnerTestDescriptor extends VintageTestDescriptor {
+ 		return new RunnerRequest(this.runner);
+ 	}
+ 
++	public Runner getRunner() {
++		return runner;
++	}
++
+ 	@Override
+ 	protected boolean tryToExcludeFromRunner(Description description) {
+ 		boolean excluded = tryToFilterRunner(description);
+diff --git a/junit-vintage-engine/src/main/java/org/junit/vintage/engine/execution/CancellationTokenAwareRunNotifier.java b/junit-vintage-engine/src/main/java/org/junit/vintage/engine/execution/CancellationTokenAwareRunNotifier.java
+new file mode 100644
+index 000000000..d3d010711
+--- /dev/null
++++ b/junit-vintage-engine/src/main/java/org/junit/vintage/engine/execution/CancellationTokenAwareRunNotifier.java
+@@ -0,0 +1,36 @@
++/*
++ * Copyright 2015-2025 the original author or authors.
++ *
++ * All rights reserved. This program and the accompanying materials are
++ * made available under the terms of the Eclipse Public License v2.0 which
++ * accompanies this distribution and is available at
++ *
++ * https://www.eclipse.org/legal/epl-v20.html
++ */
++
++package org.junit.vintage.engine.execution;
++
++import org.junit.platform.engine.CancellationToken;
++import org.junit.runner.Description;
++import org.junit.runner.notification.RunNotifier;
++import org.junit.runner.notification.StoppedByUserException;
++
++/**
++ * @since 6.0
++ */
++class CancellationTokenAwareRunNotifier extends RunNotifier {
++
++	private final CancellationToken cancellationToken;
++
++	CancellationTokenAwareRunNotifier(CancellationToken cancellationToken) {
++		this.cancellationToken = cancellationToken;
++	}
++
++	@Override
++	public void fireTestStarted(Description description) throws StoppedByUserException {
++		if (cancellationToken.isCancellationRequested()) {
++			pleaseStop();
++		}
++		super.fireTestStarted(description);
++	}
++}
+diff --git a/junit-vintage-engine/src/main/java/org/junit/vintage/engine/execution/RunListenerAdapter.java b/junit-vintage-engine/src/main/java/org/junit/vintage/engine/execution/RunListenerAdapter.java
+index 6a0b4756f..6c48e48e8 100644
+--- a/junit-vintage-engine/src/main/java/org/junit/vintage/engine/execution/RunListenerAdapter.java
++++ b/junit-vintage-engine/src/main/java/org/junit/vintage/engine/execution/RunListenerAdapter.java
+@@ -103,6 +103,10 @@ class RunListenerAdapter extends RunListener {
+ 
+ 	@Override
+ 	public void testRunFinished(Result result) {
++		testRunFinished();
++	}
++
++	void testRunFinished() {
+ 		reportContainerFinished(testRun.getRunnerTestDescriptor());
+ 	}
+ 
+diff --git a/junit-vintage-engine/src/main/java/org/junit/vintage/engine/execution/RunnerExecutor.java b/junit-vintage-engine/src/main/java/org/junit/vintage/engine/execution/RunnerExecutor.java
+index 7e5bf6b13..11bffb6f1 100644
+--- a/junit-vintage-engine/src/main/java/org/junit/vintage/engine/execution/RunnerExecutor.java
++++ b/junit-vintage-engine/src/main/java/org/junit/vintage/engine/execution/RunnerExecutor.java
+@@ -15,9 +15,11 @@ import static org.junit.platform.engine.TestExecutionResult.failed;
+ 
+ import org.apiguardian.api.API;
+ import org.junit.platform.commons.util.UnrecoverableExceptions;
++import org.junit.platform.engine.CancellationToken;
+ import org.junit.platform.engine.EngineExecutionListener;
+ import org.junit.platform.engine.TestExecutionResult;
+-import org.junit.runner.JUnitCore;
++import org.junit.runner.notification.RunNotifier;
++import org.junit.runner.notification.StoppedByUserException;
+ import org.junit.vintage.engine.descriptor.RunnerTestDescriptor;
+ import org.junit.vintage.engine.descriptor.TestSourceProvider;
+ 
+@@ -28,18 +30,30 @@ import org.junit.vintage.engine.descriptor.TestSourceProvider;
+ public class RunnerExecutor {
+ 
+ 	private final EngineExecutionListener engineExecutionListener;
++	private final CancellationToken cancellationToken;
+ 	private final TestSourceProvider testSourceProvider = new TestSourceProvider();
+ 
+-	public RunnerExecutor(EngineExecutionListener engineExecutionListener) {
++	public RunnerExecutor(EngineExecutionListener engineExecutionListener, CancellationToken cancellationToken) {
+ 		this.engineExecutionListener = engineExecutionListener;
++		this.cancellationToken = cancellationToken;
+ 	}
+ 
+ 	public void execute(RunnerTestDescriptor runnerTestDescriptor) {
+-		TestRun testRun = new TestRun(runnerTestDescriptor);
+-		JUnitCore core = new JUnitCore();
+-		core.addListener(new RunListenerAdapter(testRun, engineExecutionListener, testSourceProvider));
++		if (cancellationToken.isCancellationRequested()) {
++			engineExecutionListener.executionSkipped(runnerTestDescriptor, "Execution cancelled");
++			return;
++		}
++		RunNotifier notifier = new CancellationTokenAwareRunNotifier(cancellationToken);
++		var testRun = new TestRun(runnerTestDescriptor);
++		var listener = new RunListenerAdapter(testRun, engineExecutionListener, testSourceProvider);
++		notifier.addListener(listener);
+ 		try {
+-			core.run(runnerTestDescriptor.toRequest());
++			listener.testRunStarted(runnerTestDescriptor.getDescription());
++			runnerTestDescriptor.getRunner().run(notifier);
++			listener.testRunFinished();
++		}
++		catch (StoppedByUserException e) {
++			reportEventsForCancellation(e, testRun);
+ 		}
+ 		catch (Throwable t) {
+ 			UnrecoverableExceptions.rethrowIfUnrecoverable(t);
+@@ -47,6 +61,19 @@ public class RunnerExecutor {
+ 		}
+ 	}
+ 
++	private void reportEventsForCancellation(StoppedByUserException exception, TestRun testRun) {
++		testRun.getInProgressTestDescriptors().forEach(startedDescriptor -> {
++			startedDescriptor.getChildren().forEach(child -> {
++				if (!testRun.isFinishedOrSkipped(child)) {
++					engineExecutionListener.executionSkipped(child, "Execution cancelled");
++					testRun.markSkipped(child);
++				}
++			});
++			engineExecutionListener.executionFinished(startedDescriptor, TestExecutionResult.aborted(exception));
++			testRun.markFinished(startedDescriptor);
++		});
++	}
++
+ 	private void reportUnexpectedFailure(TestRun testRun, RunnerTestDescriptor runnerTestDescriptor,
+ 			TestExecutionResult result) {
+ 		if (testRun.isNotStarted(runnerTestDescriptor)) {
+diff --git a/junit-vintage-engine/src/main/java/org/junit/vintage/engine/execution/TestRun.java b/junit-vintage-engine/src/main/java/org/junit/vintage/engine/execution/TestRun.java
+index 1b7814a8a..c33c0afc7 100644
+--- a/junit-vintage-engine/src/main/java/org/junit/vintage/engine/execution/TestRun.java
++++ b/junit-vintage-engine/src/main/java/org/junit/vintage/engine/execution/TestRun.java
+@@ -87,6 +87,12 @@ class TestRun {
+ 		return result;
+ 	}
+ 
++	Collection<TestDescriptor> getInProgressTestDescriptors() {
++		List<TestDescriptor> result = new ArrayList<>(inProgressDescriptors.keySet());
++		Collections.reverse(result);
++		return result;
++	}
++
+ 	boolean isDescendantOfRunnerTestDescriptor(TestDescriptor testDescriptor) {
+ 		return runnerDescendants.contains(testDescriptor);
+ 	}
+diff --git a/junit-vintage-engine/src/main/java/org/junit/vintage/engine/execution/VintageExecutor.java b/junit-vintage-engine/src/main/java/org/junit/vintage/engine/execution/VintageExecutor.java
+index 450dc4fde..e8c1cfef0 100644
+--- a/junit-vintage-engine/src/main/java/org/junit/vintage/engine/execution/VintageExecutor.java
++++ b/junit-vintage-engine/src/main/java/org/junit/vintage/engine/execution/VintageExecutor.java
+@@ -27,8 +27,9 @@ import org.apiguardian.api.API;
+ import org.junit.platform.commons.logging.Logger;
+ import org.junit.platform.commons.logging.LoggerFactory;
+ import org.junit.platform.commons.util.ExceptionUtils;
++import org.junit.platform.engine.CancellationToken;
++import org.junit.platform.engine.ConfigurationParameters;
+ import org.junit.platform.engine.EngineExecutionListener;
+-import org.junit.platform.engine.ExecutionRequest;
+ import org.junit.platform.engine.TestDescriptor;
+ import org.junit.vintage.engine.Constants;
+ import org.junit.vintage.engine.descriptor.RunnerTestDescriptor;
+@@ -48,56 +49,54 @@ public class VintageExecutor {
+ 
+ 	private final VintageEngineDescriptor engineDescriptor;
+ 	private final EngineExecutionListener engineExecutionListener;
+-	private final ExecutionRequest request;
++	private final ConfigurationParameters configurationParameters;
+ 
+ 	private final boolean parallelExecutionEnabled;
+ 	private final boolean classes;
+ 	private final boolean methods;
+ 
+ 	public VintageExecutor(VintageEngineDescriptor engineDescriptor, EngineExecutionListener engineExecutionListener,
+-			ExecutionRequest request) {
++			ConfigurationParameters configurationParameters) {
+ 		this.engineDescriptor = engineDescriptor;
+ 		this.engineExecutionListener = engineExecutionListener;
+-		this.request = request;
+-		this.parallelExecutionEnabled = request.getConfigurationParameters().getBoolean(
+-			Constants.PARALLEL_EXECUTION_ENABLED).orElse(false);
+-		this.classes = request.getConfigurationParameters().getBoolean(Constants.PARALLEL_CLASS_EXECUTION).orElse(
+-			false);
+-		this.methods = request.getConfigurationParameters().getBoolean(Constants.PARALLEL_METHOD_EXECUTION).orElse(
++		this.configurationParameters = configurationParameters;
++		this.parallelExecutionEnabled = configurationParameters.getBoolean(Constants.PARALLEL_EXECUTION_ENABLED).orElse(
+ 			false);
++		this.classes = configurationParameters.getBoolean(Constants.PARALLEL_CLASS_EXECUTION).orElse(false);
++		this.methods = configurationParameters.getBoolean(Constants.PARALLEL_METHOD_EXECUTION).orElse(false);
+ 	}
+ 
+-	public void executeAllChildren() {
++	public void executeAllChildren(CancellationToken cancellationToken) {
+ 
+ 		if (!parallelExecutionEnabled) {
+-			executeClassesAndMethodsSequentially();
++			executeClassesAndMethodsSequentially(cancellationToken);
+ 			return;
+ 		}
+ 
+ 		if (!classes && !methods) {
+ 			logger.warn(() -> "Parallel execution is enabled but no scope is defined. "
+ 					+ "Falling back to sequential execution.");
+-			executeClassesAndMethodsSequentially();
++			executeClassesAndMethodsSequentially(cancellationToken);
+ 			return;
+ 		}
+ 
+-		boolean wasInterrupted = executeInParallel();
++		boolean wasInterrupted = executeInParallel(cancellationToken);
+ 		if (wasInterrupted) {
+ 			Thread.currentThread().interrupt();
+ 		}
+ 	}
+ 
+-	private void executeClassesAndMethodsSequentially() {
+-		RunnerExecutor runnerExecutor = new RunnerExecutor(engineExecutionListener);
++	private void executeClassesAndMethodsSequentially(CancellationToken cancellationToken) {
++		RunnerExecutor runnerExecutor = new RunnerExecutor(engineExecutionListener, cancellationToken);
+ 		for (Iterator<TestDescriptor> iterator = engineDescriptor.getModifiableChildren().iterator(); iterator.hasNext();) {
+ 			runnerExecutor.execute((RunnerTestDescriptor) iterator.next());
+ 			iterator.remove();
+ 		}
+ 	}
+ 
+-	private boolean executeInParallel() {
++	private boolean executeInParallel(CancellationToken cancellationToken) {
+ 		ExecutorService executorService = Executors.newWorkStealingPool(getThreadPoolSize());
+-		RunnerExecutor runnerExecutor = new RunnerExecutor(engineExecutionListener);
++		RunnerExecutor runnerExecutor = new RunnerExecutor(engineExecutionListener, cancellationToken);
+ 
+ 		List<RunnerTestDescriptor> runnerTestDescriptors = collectRunnerTestDescriptors(executorService);
+ 
+@@ -110,7 +109,7 @@ public class VintageExecutor {
+ 	}
+ 
+ 	private int getThreadPoolSize() {
+-		Optional<String> optionalPoolSize = request.getConfigurationParameters().get(Constants.PARALLEL_POOL_SIZE);
++		Optional<String> optionalPoolSize = configurationParameters.get(Constants.PARALLEL_POOL_SIZE);
+ 		if (optionalPoolSize.isPresent()) {
+ 			try {
+ 				int poolSize = Integer.parseInt(optionalPoolSize.get());
+diff --git a/junit-vintage-engine/src/testFixtures/java/org/junit/vintage/engine/samples/junit4/CancellingTestCase.java b/junit-vintage-engine/src/testFixtures/java/org/junit/vintage/engine/samples/junit4/CancellingTestCase.java
+new file mode 100644
+index 000000000..84ef34424
+--- /dev/null
++++ b/junit-vintage-engine/src/testFixtures/java/org/junit/vintage/engine/samples/junit4/CancellingTestCase.java
+@@ -0,0 +1,38 @@
++/*
++ * Copyright 2015-2025 the original author or authors.
++ *
++ * All rights reserved. This program and the accompanying materials are
++ * made available under the terms of the Eclipse Public License v2.0 which
++ * accompanies this distribution and is available at
++ *
++ * https://www.eclipse.org/legal/epl-v20.html
++ */
++
++package org.junit.vintage.engine.samples.junit4;
++
++import static java.util.Objects.requireNonNull;
++import static org.junit.Assert.fail;
++
++import org.junit.Before;
++import org.junit.Test;
++import org.junit.platform.engine.CancellationToken;
++
++public class CancellingTestCase {
++
++	public static CancellationToken cancellationToken;
++
++	@Before
++	public void cancelExecution() {
++		requireNonNull(cancellationToken).cancel();
++	}
++
++	@Test
++	public void first() {
++		fail();
++	}
++
++	@Test
++	public void second() {
++		fail();
++	}
++}

@@ -1,0 +1,691 @@
+diff --git a/build.gradle.kts b/build.gradle.kts
+index 42c6bdee9..befab1665 100644
+--- a/build.gradle.kts
++++ b/build.gradle.kts
+@@ -42,7 +42,6 @@ apply(plugin = "com.diffplug.spotless")
+ configure<SpotlessExtension> {
+   kotlin {
+     target("**/*.kt")
+-    targetExclude("**/kotlinTemplates/**/*.kt")
+     ktlint()
+   }
+ }
+diff --git a/native-image-tests/src/main/kotlin/okhttp3/PublicSuffixDatabaseTest.kt b/native-image-tests/src/main/kotlin/okhttp3/PublicSuffixDatabaseTest.kt
+index 175de8da3..98a452cd4 100644
+--- a/native-image-tests/src/main/kotlin/okhttp3/PublicSuffixDatabaseTest.kt
++++ b/native-image-tests/src/main/kotlin/okhttp3/PublicSuffixDatabaseTest.kt
+@@ -17,8 +17,11 @@ package okhttp3
+ 
+ import assertk.assertThat
+ import assertk.assertions.isEqualTo
++import assertk.assertions.isGreaterThan
+ import okhttp3.HttpUrl.Companion.toHttpUrl
++import okhttp3.internal.publicsuffix.PublicSuffixDatabase
+ import okhttp3.testing.PlatformRule
++import okio.FileSystem
+ import org.junit.jupiter.api.Test
+ import org.junit.jupiter.api.extension.RegisterExtension
+ 
+@@ -33,4 +36,12 @@ class PublicSuffixDatabaseTest {
+ 
+     assertThat(url.topPrivateDomain()).isEqualTo("twitter.com")
+   }
++
++  @Test
++  fun testPublicSuffixes() {
++    platform.assumeNotGraalVMImage()
++
++    val metadata = FileSystem.RESOURCES.metadata(PublicSuffixDatabase.PUBLIC_SUFFIX_RESOURCE)
++    assertThat(metadata.size!!).isGreaterThan(30000)
++  }
+ }
+diff --git a/okhttp/build.gradle.kts b/okhttp/build.gradle.kts
+index 9c9ea07c7..5c3f2fb4e 100644
+--- a/okhttp/build.gradle.kts
++++ b/okhttp/build.gradle.kts
+@@ -1,9 +1,5 @@
+ import com.vanniktech.maven.publish.JavadocJar
+ import com.vanniktech.maven.publish.KotlinJvm
+-import java.io.DataInputStream
+-import java.io.FileInputStream
+-import java.util.Base64
+-import java.util.zip.GZIPInputStream
+ 
+ plugins {
+   kotlin("jvm")
+@@ -13,27 +9,12 @@ plugins {
+   id("binary-compatibility-validator")
+ }
+ 
+-fun ByteArray.toByteStringExpression(): String {
+-  return "\"${Base64.getEncoder().encodeToString(this@toByteStringExpression)}\".decodeBase64()!!"
+-}
+-
++// Build & use okhttp3/internal/-InternalVersion.kt
+ val copyKotlinTemplates = tasks.register<Copy>("copyKotlinTemplates") {
+   from("src/main/kotlinTemplates")
+   into("$buildDir/generated/sources/kotlinTemplates")
+-
++  expand("projectVersion" to project.version)
+   filteringCharset = Charsets.UTF_8.toString()
+-
+-  // TODO replace with KotlinPoet?
+-  val databaseGz = project.file("src/test/resources/okhttp3/internal/publicsuffix/PublicSuffixDatabase.gz")
+-  val listBytes = databaseGz.readBytes().toByteStringExpression()
+-
+-  expand(
+-    // Build & use okhttp3/internal/-InternalVersion.kt
+-    "projectVersion" to project.version,
+-
+-    // Build okhttp3/internal/publicsuffix/EmbeddedPublicSuffixList.kt
+-    "publicSuffixListBytes" to listBytes
+-  )
+ }
+ 
+ // Build & use okhttp3/internal/idn/IdnaMappingTableInstance.kt
+diff --git a/okhttp/src/main/kotlin/okhttp3/internal/publicsuffix/PublicSuffixDatabase.kt b/okhttp/src/main/kotlin/okhttp3/internal/publicsuffix/PublicSuffixDatabase.kt
+index 88094ad1c..fef4fd01d 100644
+--- a/okhttp/src/main/kotlin/okhttp3/internal/publicsuffix/PublicSuffixDatabase.kt
++++ b/okhttp/src/main/kotlin/okhttp3/internal/publicsuffix/PublicSuffixDatabase.kt
+@@ -15,10 +15,18 @@
+  */
+ package okhttp3.internal.publicsuffix
+ 
++import java.io.IOException
++import java.io.InterruptedIOException
+ import java.net.IDN
++import java.util.concurrent.CountDownLatch
++import java.util.concurrent.atomic.AtomicBoolean
+ import okhttp3.internal.and
+-import okio.ByteString
+-import okio.ByteString.Companion.encodeUtf8
++import okhttp3.internal.platform.Platform
++import okio.FileSystem
++import okio.GzipSource
++import okio.Path
++import okio.Path.Companion.toPath
++import okio.buffer
+ 
+ /**
+  * A database of public suffixes provided by [publicsuffix.org][publicsuffix_org].
+@@ -26,8 +34,22 @@ import okio.ByteString.Companion.encodeUtf8
+  * [publicsuffix_org]: https://publicsuffix.org/
+  */
+ class PublicSuffixDatabase internal constructor(
+-  private val publicSuffixList: PublicSuffixList,
++  val path: Path = PUBLIC_SUFFIX_RESOURCE,
++  val fileSystem: FileSystem = FileSystem.RESOURCES,
+ ) {
++  /** True after we've attempted to read the list for the first time. */
++  private val listRead = AtomicBoolean(false)
++
++  /** Used for concurrent threads reading the list for the first time. */
++  private val readCompleteLatch = CountDownLatch(1)
++
++  // The lists are held as a large array of UTF-8 bytes. This is to avoid allocating lots of strings
++  // that will likely never be used. Each rule is separated by '\n'. Please see the
++  // PublicSuffixListGenerator class for how these lists are generated.
++  // Guarded by this.
++  private lateinit var publicSuffixListBytes: ByteArray
++  private lateinit var publicSuffixExceptionListBytes: ByteArray
++
+   /**
+    * Returns the effective top-level domain plus one (eTLD+1) by referencing the public suffix list.
+    * Returns null if the domain is a public suffix or a private address.
+@@ -79,16 +101,29 @@ class PublicSuffixDatabase internal constructor(
+   }
+ 
+   private fun findMatchingRule(domainLabels: List<String>): List<String> {
+-    publicSuffixList.ensureLoaded()
++    if (!listRead.get() && listRead.compareAndSet(false, true)) {
++      readTheListUninterruptibly()
++    } else {
++      try {
++        readCompleteLatch.await()
++      } catch (_: InterruptedException) {
++        Thread.currentThread().interrupt() // Retain interrupted status.
++      }
++    }
++
++    check(::publicSuffixListBytes.isInitialized) {
++      // May have failed with an IOException
++      "Unable to load $PUBLIC_SUFFIX_RESOURCE resource from the classpath."
++    }
+ 
+     // Break apart the domain into UTF-8 labels, i.e. foo.bar.com turns into [foo, bar, com].
+-    val domainLabelsUtf8Bytes = Array(domainLabels.size) { i -> domainLabels[i].encodeUtf8() }
++    val domainLabelsUtf8Bytes = Array(domainLabels.size) { i -> domainLabels[i].toByteArray() }
+ 
+     // Start by looking for exact matches. We start at the leftmost label. For example, foo.bar.com
+     // will look like: [foo, bar, com], [bar, com], [com]. The longest matching rule wins.
+     var exactMatch: String? = null
+     for (i in domainLabelsUtf8Bytes.indices) {
+-      val rule = publicSuffixList.bytes.binarySearch(domainLabelsUtf8Bytes, i)
++      val rule = publicSuffixListBytes.binarySearch(domainLabelsUtf8Bytes, i)
+       if (rule != null) {
+         exactMatch = rule
+         break
+@@ -105,7 +140,7 @@ class PublicSuffixDatabase internal constructor(
+       val labelsWithWildcard = domainLabelsUtf8Bytes.clone()
+       for (labelIndex in 0 until labelsWithWildcard.size - 1) {
+         labelsWithWildcard[labelIndex] = WILDCARD_LABEL
+-        val rule = publicSuffixList.bytes.binarySearch(labelsWithWildcard, labelIndex)
++        val rule = publicSuffixListBytes.binarySearch(labelsWithWildcard, labelIndex)
+         if (rule != null) {
+           wildcardMatch = rule
+           break
+@@ -118,7 +153,7 @@ class PublicSuffixDatabase internal constructor(
+     if (wildcardMatch != null) {
+       for (labelIndex in 0 until domainLabelsUtf8Bytes.size - 1) {
+         val rule =
+-          publicSuffixList.exceptionBytes.binarySearch(
++          publicSuffixExceptionListBytes.binarySearch(
+             domainLabelsUtf8Bytes,
+             labelIndex,
+           )
+@@ -147,20 +182,84 @@ class PublicSuffixDatabase internal constructor(
+     }
+   }
+ 
++  /**
++   * Reads the public suffix list treating the operation as uninterruptible. We always want to read
++   * the list otherwise we'll be left in a bad state. If the thread was interrupted prior to this
++   * operation, it will be re-interrupted after the list is read.
++   */
++  private fun readTheListUninterruptibly() {
++    var interrupted = false
++    try {
++      while (true) {
++        try {
++          readTheList()
++          return
++        } catch (_: InterruptedIOException) {
++          Thread.interrupted() // Temporarily clear the interrupted state.
++          interrupted = true
++        } catch (e: IOException) {
++          Platform.get().log("Failed to read public suffix list", Platform.WARN, e)
++          return
++        }
++      }
++    } finally {
++      if (interrupted) {
++        Thread.currentThread().interrupt() // Retain interrupted status.
++      }
++    }
++  }
++
++  @Throws(IOException::class)
++  private fun readTheList() {
++    var publicSuffixListBytes: ByteArray?
++    var publicSuffixExceptionListBytes: ByteArray?
++
++    try {
++      GzipSource(fileSystem.source(path)).buffer().use { bufferedSource ->
++        val totalBytes = bufferedSource.readInt()
++        publicSuffixListBytes = bufferedSource.readByteArray(totalBytes.toLong())
++
++        val totalExceptionBytes = bufferedSource.readInt()
++        publicSuffixExceptionListBytes = bufferedSource.readByteArray(totalExceptionBytes.toLong())
++      }
++
++      synchronized(this) {
++        this.publicSuffixListBytes = publicSuffixListBytes!!
++        this.publicSuffixExceptionListBytes = publicSuffixExceptionListBytes!!
++      }
++    } finally {
++      readCompleteLatch.countDown()
++    }
++  }
++
++  /** Visible for testing. */
++  fun setListBytes(
++    publicSuffixListBytes: ByteArray,
++    publicSuffixExceptionListBytes: ByteArray,
++  ) {
++    this.publicSuffixListBytes = publicSuffixListBytes
++    this.publicSuffixExceptionListBytes = publicSuffixExceptionListBytes
++    listRead.set(true)
++    readCompleteLatch.countDown()
++  }
++
+   companion object {
+-    private val WILDCARD_LABEL = ByteString.of('*'.code.toByte())
++    @JvmField
++    val PUBLIC_SUFFIX_RESOURCE = "/okhttp3/internal/publicsuffix/${PublicSuffixDatabase::class.java.simpleName}.gz".toPath()
++
++    private val WILDCARD_LABEL = byteArrayOf('*'.code.toByte())
+     private val PREVAILING_RULE = listOf("*")
+ 
+     private const val EXCEPTION_MARKER = '!'
+ 
+-    private val instance = PublicSuffixDatabase(EmbeddedPublicSuffixList)
++    private val instance = PublicSuffixDatabase()
+ 
+     fun get(): PublicSuffixDatabase {
+       return instance
+     }
+ 
+-    private fun ByteString.binarySearch(
+-      labels: Array<ByteString>,
++    private fun ByteArray.binarySearch(
++      labels: Array<ByteArray>,
+       labelIndex: Int,
+     ): String? {
+       var low = 0
+@@ -239,7 +338,7 @@ class PublicSuffixDatabase internal constructor(
+             low = mid + end + 1
+           } else {
+             // Found a match.
+-            match = this.substring(mid, mid + publicSuffixLength).string(Charsets.UTF_8)
++            match = String(this, mid, publicSuffixLength)
+             break
+           }
+         }
+diff --git a/okhttp/src/main/kotlin/okhttp3/internal/publicsuffix/PublicSuffixList.kt b/okhttp/src/main/kotlin/okhttp3/internal/publicsuffix/PublicSuffixList.kt
+deleted file mode 100644
+index 3fdfaa659..000000000
+--- a/okhttp/src/main/kotlin/okhttp3/internal/publicsuffix/PublicSuffixList.kt
++++ /dev/null
+@@ -1,28 +0,0 @@
+-/*
+- * Copyright (C) 2024 Block, Inc.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-package okhttp3.internal.publicsuffix
+-
+-import okio.ByteString
+-
+-/**
+- * Basic I/O for the PublicSuffixDatabase.gz.
+- */
+-internal interface PublicSuffixList {
+-  fun ensureLoaded()
+-
+-  val bytes: ByteString
+-  val exceptionBytes: ByteString
+-}
+diff --git a/okhttp/src/main/kotlinTemplates/okhttp3/internal/publicsuffix/EmbeddedPublicSuffixList.kt b/okhttp/src/main/kotlinTemplates/okhttp3/internal/publicsuffix/EmbeddedPublicSuffixList.kt
+deleted file mode 100644
+index 93f14cff3..000000000
+--- a/okhttp/src/main/kotlinTemplates/okhttp3/internal/publicsuffix/EmbeddedPublicSuffixList.kt
++++ /dev/null
+@@ -1,54 +0,0 @@
+-/*
+- * Copyright (C) 2024 Block, Inc.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-package okhttp3.internal.publicsuffix
+-
+-//Note that PublicSuffixDatabase.gz is compiled from The Public Suffix List:
+-//https://publicsuffix.org/list/public_suffix_list.dat
+-//
+-//It is subject to the terms of the Mozilla Public License, v. 2.0:
+-//https://mozilla.org/MPL/2.0/
+-
+-import okio.Buffer
+-import okio.ByteString
+-import okio.ByteString.Companion.decodeBase64
+-import okio.GzipSource
+-import okio.buffer
+-
+-/**
+- * A implementation of I/O for PublicSuffixDatabase.gz by directly encoding
+- * the relevant byte arrays in a class file.
+- */
+-internal object EmbeddedPublicSuffixList: PublicSuffixList {
+-  override fun ensureLoaded() {
+-  }
+-
+-  override val bytes: ByteString
+-
+-  override val exceptionBytes: ByteString
+-
+-  init {
+-    Buffer().use { buffer ->
+-      buffer.write($publicSuffixListBytes)
+-      GzipSource(buffer).buffer().use { source ->
+-        val totalBytes = source.readInt()
+-        bytes = source.readByteString(totalBytes.toLong())
+-
+-        val totalExceptionBytes = source.readInt()
+-        exceptionBytes = source.readByteString(totalExceptionBytes.toLong())
+-      }
+-    }
+-  }
+-}
+diff --git a/okhttp/src/main/resources/META-INF/proguard/okhttp3.pro b/okhttp/src/main/resources/META-INF/proguard/okhttp3.pro
+index 280a52749..74fc31680 100644
+--- a/okhttp/src/main/resources/META-INF/proguard/okhttp3.pro
++++ b/okhttp/src/main/resources/META-INF/proguard/okhttp3.pro
+@@ -1,6 +1,10 @@
+ # JSR 305 annotations are for embedding nullability information.
+ -dontwarn javax.annotation.**
+ 
++# A resource is loaded with a relative path so the package of this class must be preserved.
++-keeppackagenames okhttp3.internal.publicsuffix.*
++-adaptresourcefilenames okhttp3/internal/publicsuffix/PublicSuffixDatabase.gz
++
+ # Animal Sniffer compileOnly dependency to ensure APIs are compatible with older versions of Java.
+ -dontwarn org.codehaus.mojo.animal_sniffer.*
+ 
+diff --git a/okhttp/src/test/resources/okhttp3/internal/publicsuffix/NOTICE b/okhttp/src/main/resources/okhttp3/internal/publicsuffix/NOTICE
+similarity index 100%
+rename from okhttp/src/test/resources/okhttp3/internal/publicsuffix/NOTICE
+rename to okhttp/src/main/resources/okhttp3/internal/publicsuffix/NOTICE
+diff --git a/okhttp/src/test/resources/okhttp3/internal/publicsuffix/PublicSuffixDatabase.gz b/okhttp/src/main/resources/okhttp3/internal/publicsuffix/PublicSuffixDatabase.gz
+similarity index 100%
+rename from okhttp/src/test/resources/okhttp3/internal/publicsuffix/PublicSuffixDatabase.gz
+rename to okhttp/src/main/resources/okhttp3/internal/publicsuffix/PublicSuffixDatabase.gz
+diff --git a/okhttp/src/test/java/okhttp3/internal/publicsuffix/PublicSuffixDatabaseTest.kt b/okhttp/src/test/java/okhttp3/internal/publicsuffix/PublicSuffixDatabaseTest.kt
+index 02ef95e94..e264cb34e 100644
+--- a/okhttp/src/test/java/okhttp3/internal/publicsuffix/PublicSuffixDatabaseTest.kt
++++ b/okhttp/src/test/java/okhttp3/internal/publicsuffix/PublicSuffixDatabaseTest.kt
+@@ -23,7 +23,6 @@ import kotlin.test.assertEquals
+ import kotlin.test.assertFailsWith
+ import okhttp3.internal.toCanonicalHost
+ import okio.Buffer
+-import okio.ByteString
+ import okio.FileSystem
+ import okio.GzipSource
+ import okio.Path.Companion.toPath
+@@ -32,8 +31,7 @@ import okio.use
+ import org.junit.jupiter.api.Test
+ 
+ class PublicSuffixDatabaseTest {
+-  private val list = ResourcePublicSuffixList()
+-  private val publicSuffixDatabase = PublicSuffixDatabase(list)
++  private val publicSuffixDatabase = PublicSuffixDatabase()
+ 
+   @Test fun longestMatchWins() {
+     val buffer =
+@@ -41,7 +39,7 @@ class PublicSuffixDatabaseTest {
+         .writeUtf8("com\n")
+         .writeUtf8("my.square.com\n")
+         .writeUtf8("square.com\n")
+-    list.setListBytes(buffer.readByteString(), ByteString.of())
++    publicSuffixDatabase.setListBytes(buffer.readByteArray(), byteArrayOf())
+     assertThat(publicSuffixDatabase.getEffectiveTldPlusOne("example.com"))
+       .isEqualTo("example.com")
+     assertThat(publicSuffixDatabase.getEffectiveTldPlusOne("foo.example.com"))
+@@ -58,7 +56,7 @@ class PublicSuffixDatabaseTest {
+         .writeUtf8("*.square.com\n")
+         .writeUtf8("com\n")
+         .writeUtf8("example.com\n")
+-    list.setListBytes(buffer.readByteString(), ByteString.of())
++    publicSuffixDatabase.setListBytes(buffer.readByteArray(), byteArrayOf())
+     assertThat(publicSuffixDatabase.getEffectiveTldPlusOne("my.square.com")).isNull()
+     assertThat(publicSuffixDatabase.getEffectiveTldPlusOne("foo.my.square.com"))
+       .isEqualTo("foo.my.square.com")
+@@ -72,7 +70,7 @@ class PublicSuffixDatabaseTest {
+         .writeUtf8("bbb\n")
+         .writeUtf8("ddd\n")
+         .writeUtf8("fff\n")
+-    list.setListBytes(buffer.readByteString(), ByteString.of())
++    publicSuffixDatabase.setListBytes(buffer.readByteArray(), byteArrayOf())
+     assertThat(publicSuffixDatabase.getEffectiveTldPlusOne("aaa")).isNull()
+     assertThat(publicSuffixDatabase.getEffectiveTldPlusOne("ggg")).isNull()
+     assertThat(publicSuffixDatabase.getEffectiveTldPlusOne("ccc")).isNull()
+@@ -89,7 +87,7 @@ class PublicSuffixDatabaseTest {
+         .writeUtf8("*.square.jp\n")
+         .writeUtf8("example.com\n")
+         .writeUtf8("square.com\n")
+-    list.setListBytes(buffer.readByteString(), exception.readByteString())
++    publicSuffixDatabase.setListBytes(buffer.readByteArray(), exception.readByteArray())
+     assertThat(publicSuffixDatabase.getEffectiveTldPlusOne("my.square.jp"))
+       .isEqualTo("my.square.jp")
+     assertThat(publicSuffixDatabase.getEffectiveTldPlusOne("foo.my.square.jp"))
+@@ -107,14 +105,14 @@ class PublicSuffixDatabaseTest {
+         .writeUtf8("*.square.jp\n")
+         .writeUtf8("example.com\n")
+         .writeUtf8("square.com\n")
+-    list.setListBytes(buffer.readByteString(), exception.readByteString())
++    publicSuffixDatabase.setListBytes(buffer.readByteArray(), exception.readByteArray())
+     assertThat(publicSuffixDatabase.getEffectiveTldPlusOne("example.com")).isNull()
+     assertThat(publicSuffixDatabase.getEffectiveTldPlusOne("foo.square.jp")).isNull()
+   }
+ 
+   @Test fun allPublicSuffixes() {
+     val buffer = Buffer()
+-    FileSystem.RESOURCES.source(ResourcePublicSuffixList.PUBLIC_SUFFIX_RESOURCE).use { resource ->
++    FileSystem.RESOURCES.source(PublicSuffixDatabase.PUBLIC_SUFFIX_RESOURCE).use { resource ->
+       GzipSource(resource).buffer().use { source ->
+         val length = source.readInt()
+         buffer.write(source, length.toLong())
+@@ -134,7 +132,7 @@ class PublicSuffixDatabaseTest {
+ 
+   @Test fun publicSuffixExceptions() {
+     val buffer = Buffer()
+-    FileSystem.RESOURCES.source(ResourcePublicSuffixList.PUBLIC_SUFFIX_RESOURCE).use { resource ->
++    FileSystem.RESOURCES.source(PublicSuffixDatabase.PUBLIC_SUFFIX_RESOURCE).use { resource ->
+       GzipSource(resource).buffer().use { source ->
+         var length = source.readInt()
+         source.skip(length.toLong())
+@@ -165,9 +163,7 @@ class PublicSuffixDatabaseTest {
+   @Test fun secondReadFailsSameAsFirst() {
+     val badPublicSuffixDatabase =
+       PublicSuffixDatabase(
+-        ResourcePublicSuffixList(
+-          path = "/xxx.gz".toPath(),
+-        ),
++        path = "/xxx.gz".toPath(),
+       )
+     lateinit var firstFailure: Exception
+     assertFailsWith<Exception> {
+@@ -282,13 +278,6 @@ class PublicSuffixDatabaseTest {
+     checkPublicSuffix("xn--fiqs8s", null)
+   }
+ 
+-  @Test fun contentsMatch() {
+-    list.ensureLoaded()
+-
+-    assertEquals(list.bytes, EmbeddedPublicSuffixList.bytes)
+-    assertEquals(list.exceptionBytes, EmbeddedPublicSuffixList.exceptionBytes)
+-  }
+-
+   private fun checkPublicSuffix(
+     domain: String,
+     registrablePart: String?,
+diff --git a/okhttp/src/test/java/okhttp3/internal/publicsuffix/PublicSuffixListGenerator.kt b/okhttp/src/test/java/okhttp3/internal/publicsuffix/PublicSuffixListGenerator.kt
+index 174dc4917..8d77d56d4 100644
+--- a/okhttp/src/test/java/okhttp3/internal/publicsuffix/PublicSuffixListGenerator.kt
++++ b/okhttp/src/test/java/okhttp3/internal/publicsuffix/PublicSuffixListGenerator.kt
+@@ -13,20 +13,17 @@
+  * See the License for the specific language governing permissions and
+  * limitations under the License.
+  */
+-@file:OptIn(ExperimentalCoroutinesApi::class)
+-
+ package okhttp3.internal.publicsuffix
+ 
+ import java.util.SortedSet
+ import java.util.TreeSet
+ import kotlinx.coroutines.Dispatchers
+-import kotlinx.coroutines.ExperimentalCoroutinesApi
+ import kotlinx.coroutines.withContext
+ import okhttp3.HttpUrl.Companion.toHttpUrl
+ import okhttp3.OkHttpClient
+ import okhttp3.Request
+ import okhttp3.coroutines.executeAsync
+-import okhttp3.internal.publicsuffix.ResourcePublicSuffixList.Companion.PUBLIC_SUFFIX_RESOURCE
++import okhttp3.internal.publicsuffix.PublicSuffixDatabase.Companion.PUBLIC_SUFFIX_RESOURCE
+ import okio.BufferedSink
+ import okio.ByteString
+ import okio.ByteString.Companion.encodeUtf8
+@@ -52,13 +49,15 @@ class PublicSuffixListGenerator(
+   val fileSystem: FileSystem = FileSystem.SYSTEM,
+   val client: OkHttpClient = OkHttpClient(),
+ ) {
+-  private val testResources = projectRoot / "okhttp/src/test/resources"
+-  private val publicSuffixListDotDat = testResources / "okhttp3/internal/publicsuffix/public_suffix_list.dat"
+-  private val outputFile = testResources / PUBLIC_SUFFIX_RESOURCE
++  private val resources = projectRoot / "okhttp/src/main/resources/okhttp3/internal/publicsuffix"
++  private val testResources = projectRoot / "okhttp/src/test/resources/okhttp3/internal/publicsuffix"
++  private val publicSuffixListDotDat = testResources / "public_suffix_list.dat"
++  private val outputFile = resources / PUBLIC_SUFFIX_RESOURCE
+ 
+   val request = Request("https://publicsuffix.org/list/public_suffix_list.dat".toHttpUrl())
+ 
+   suspend fun import() {
++    check(fileSystem.metadata(resources).isDirectory)
+     check(fileSystem.metadata(testResources).isDirectory)
+ 
+     updateLocalFile()
+@@ -168,14 +167,5 @@ A wildcard rule was added that wildcards the first level! We'll need to change t
+ }
+ 
+ suspend fun main() {
+-  val publicSuffixListGenerator = PublicSuffixListGenerator()
+-
+-  try {
+-    publicSuffixListGenerator.import()
+-  } finally {
+-    publicSuffixListGenerator.client.run {
+-      connectionPool.evictAll()
+-      dispatcher.executorService.shutdownNow()
+-    }
+-  }
++  PublicSuffixListGenerator().import()
+ }
+diff --git a/okhttp/src/test/java/okhttp3/internal/publicsuffix/ResourcePublicSuffixList.kt b/okhttp/src/test/java/okhttp3/internal/publicsuffix/ResourcePublicSuffixList.kt
+deleted file mode 100644
+index 3efacb9e6..000000000
+--- a/okhttp/src/test/java/okhttp3/internal/publicsuffix/ResourcePublicSuffixList.kt
++++ /dev/null
+@@ -1,115 +0,0 @@
+-package okhttp3.internal.publicsuffix
+-
+-import java.io.IOException
+-import java.io.InterruptedIOException
+-import java.util.concurrent.CountDownLatch
+-import java.util.concurrent.atomic.AtomicBoolean
+-import okhttp3.internal.platform.Platform
+-import okio.ByteString
+-import okio.FileSystem
+-import okio.GzipSource
+-import okio.Path
+-import okio.Path.Companion.toPath
+-import okio.buffer
+-
+-internal class ResourcePublicSuffixList(
+-  val path: Path = PUBLIC_SUFFIX_RESOURCE,
+-  val fileSystem: FileSystem = FileSystem.RESOURCES,
+-) : PublicSuffixList {
+-  /** True after we've attempted to read the list for the first time. */
+-  private val listRead = AtomicBoolean(false)
+-
+-  /** Used for concurrent threads reading the list for the first time. */
+-  private val readCompleteLatch = CountDownLatch(1)
+-
+-  // The lists are held as a large array of UTF-8 bytes. This is to avoid allocating lots of strings
+-  // that will likely never be used. Each rule is separated by '\n'. Please see the
+-  // PublicSuffixListGenerator class for how these lists are generated.
+-  // Guarded by this.
+-  override lateinit var bytes: ByteString
+-  override lateinit var exceptionBytes: ByteString
+-
+-  @Throws(IOException::class)
+-  private fun readTheList() {
+-    var publicSuffixListBytes: ByteString?
+-    var publicSuffixExceptionListBytes: ByteString?
+-
+-    try {
+-      GzipSource(fileSystem.source(path)).buffer().use { bufferedSource ->
+-        val totalBytes = bufferedSource.readInt()
+-        publicSuffixListBytes = bufferedSource.readByteString(totalBytes.toLong())
+-
+-        val totalExceptionBytes = bufferedSource.readInt()
+-        publicSuffixExceptionListBytes = bufferedSource.readByteString(totalExceptionBytes.toLong())
+-      }
+-
+-      synchronized(this) {
+-        this.bytes = publicSuffixListBytes!!
+-        this.exceptionBytes = publicSuffixExceptionListBytes!!
+-      }
+-    } finally {
+-      readCompleteLatch.countDown()
+-    }
+-  }
+-
+-  override fun ensureLoaded() {
+-    if (!listRead.get() && listRead.compareAndSet(false, true)) {
+-      readTheListUninterruptibly()
+-    } else {
+-      try {
+-        readCompleteLatch.await()
+-      } catch (_: InterruptedException) {
+-        Thread.currentThread().interrupt() // Retain interrupted status.
+-      }
+-    }
+-
+-    check(::bytes.isInitialized) {
+-      // May have failed with an IOException
+-      "Unable to load $PUBLIC_SUFFIX_RESOURCE resource from the classpath."
+-    }
+-  }
+-
+-  /**
+-   * Reads the public suffix list treating the operation as uninterruptible. We always want to read
+-   * the list otherwise we'll be left in a bad state. If the thread was interrupted prior to this
+-   * operation, it will be re-interrupted after the list is read.
+-   */
+-  private fun readTheListUninterruptibly() {
+-    var interrupted = false
+-    try {
+-      while (true) {
+-        try {
+-          readTheList()
+-          return
+-        } catch (_: InterruptedIOException) {
+-          Thread.interrupted() // Temporarily clear the interrupted state.
+-          interrupted = true
+-        } catch (e: IOException) {
+-          Platform.get().log("Failed to read public suffix list", Platform.WARN, e)
+-          return
+-        }
+-      }
+-    } finally {
+-      if (interrupted) {
+-        Thread.currentThread().interrupt() // Retain interrupted status.
+-      }
+-    }
+-  }
+-
+-  /** Visible for testing. */
+-  fun setListBytes(
+-    publicSuffixListBytes: ByteString,
+-    publicSuffixExceptionListBytes: ByteString,
+-  ) {
+-    this.bytes = publicSuffixListBytes
+-    this.exceptionBytes = publicSuffixExceptionListBytes
+-    listRead.set(true)
+-    readCompleteLatch.countDown()
+-  }
+-
+-  companion object {
+-    @JvmField
+-    val PUBLIC_SUFFIX_RESOURCE =
+-      "okhttp3/internal/publicsuffix/${PublicSuffixDatabase::class.java.simpleName}.gz".toPath()
+-  }
+-}

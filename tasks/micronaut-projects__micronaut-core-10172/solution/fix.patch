@@ -1,0 +1,264 @@
+diff --git a/http-server/src/main/java/io/micronaut/http/server/cors/CorsFilter.java b/http-server/src/main/java/io/micronaut/http/server/cors/CorsFilter.java
+index 69f3661a7e..644a64e87f 100644
+--- a/http-server/src/main/java/io/micronaut/http/server/cors/CorsFilter.java
++++ b/http-server/src/main/java/io/micronaut/http/server/cors/CorsFilter.java
+@@ -33,6 +33,7 @@ import io.micronaut.http.MutableHttpResponse;
+ import io.micronaut.http.annotation.RequestFilter;
+ import io.micronaut.http.annotation.ResponseFilter;
+ import io.micronaut.http.annotation.ServerFilter;
++import io.micronaut.http.filter.ConditionalFilter;
+ import io.micronaut.http.filter.ServerFilterPhase;
+ import io.micronaut.http.server.HttpServerConfiguration;
+ import io.micronaut.http.server.util.HttpHostResolver;
+@@ -69,7 +70,7 @@ import static io.micronaut.http.annotation.Filter.MATCH_ALL_PATTERN;
+  * @since 1.0
+  */
+ @ServerFilter(MATCH_ALL_PATTERN)
+-public class CorsFilter implements Ordered {
++public class CorsFilter implements Ordered, ConditionalFilter {
+     public static final int CORS_FILTER_ORDER = ServerFilterPhase.METRICS.after();
+ 
+     private static final Logger LOG = LoggerFactory.getLogger(CorsFilter.class);
+@@ -90,6 +91,18 @@ public class CorsFilter implements Ordered {
+         this.httpHostResolver = httpHostResolver;
+     }
+ 
++    @Override
++    public boolean isEnabled(HttpRequest<?> request) {
++        String origin = request.getOrigin().orElse(null);
++        if (origin == null) {
++            if (LOG.isTraceEnabled()) {
++                LOG.trace("Http Header " + HttpHeaders.ORIGIN + " not present. Proceeding with the request.");
++            }
++            return false;
++        }
++        return true;
++    }
++
+     @RequestFilter
+     @Nullable
+     @Internal
+diff --git a/http/src/main/java/io/micronaut/http/filter/AroundLegacyFilter.java b/http/src/main/java/io/micronaut/http/filter/AroundLegacyFilter.java
+index a994f4a268..97a869624c 100644
+--- a/http/src/main/java/io/micronaut/http/filter/AroundLegacyFilter.java
++++ b/http/src/main/java/io/micronaut/http/filter/AroundLegacyFilter.java
+@@ -42,6 +42,14 @@ import java.util.function.Function;
+ @Internal
+ record AroundLegacyFilter(HttpFilter bean, FilterOrder order) implements InternalHttpFilter, Toggleable {
+ 
++    @Override
++    public boolean isEnabled(HttpRequest<?> request) {
++        if (bean instanceof ConditionalFilter conditionalFilter) {
++            return conditionalFilter.isEnabled(request);
++        }
++        return true;
++    }
++
+     @Override
+     public boolean isFiltersRequest() {
+         return true;
+diff --git a/http/src/main/java/io/micronaut/http/filter/AsyncFilter.java b/http/src/main/java/io/micronaut/http/filter/AsyncFilter.java
+index b9075a399d..28031085a3 100644
+--- a/http/src/main/java/io/micronaut/http/filter/AsyncFilter.java
++++ b/http/src/main/java/io/micronaut/http/filter/AsyncFilter.java
+@@ -17,6 +17,7 @@ package io.micronaut.http.filter;
+ 
+ import io.micronaut.core.annotation.Internal;
+ import io.micronaut.core.execution.ExecutionFlow;
++import io.micronaut.http.HttpRequest;
+ 
+ import java.util.concurrent.Executor;
+ import java.util.function.Function;
+@@ -34,6 +35,11 @@ import java.util.function.Function;
+ @Internal
+ record AsyncFilter(InternalHttpFilter actual, Executor executor) implements InternalHttpFilter {
+ 
++    @Override
++    public boolean isEnabled(HttpRequest<?> request) {
++        return actual.isEnabled(request);
++    }
++
+     @Override
+     public boolean isFiltersRequest() {
+         return actual.isFiltersRequest();
+diff --git a/http/src/main/java/io/micronaut/http/filter/ConditionalFilter.java b/http/src/main/java/io/micronaut/http/filter/ConditionalFilter.java
+new file mode 100644
+index 0000000000..ed444259a1
+--- /dev/null
++++ b/http/src/main/java/io/micronaut/http/filter/ConditionalFilter.java
+@@ -0,0 +1,39 @@
++/*
++ * Copyright 2017-2023 original authors
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * https://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package io.micronaut.http.filter;
++
++import io.micronaut.core.annotation.Experimental;
++import io.micronaut.http.HttpRequest;
++
++/**
++ * The condition for instances of {@link io.micronaut.http.annotation.RequestFilter} and {@link io.micronaut.http.annotation.ResponseFilter} filters.
++ * Allowing to skip all the method filters if {@link #isEnabled(HttpRequest)} returns false.
++ *
++ * @author Denis Stepanov
++ * @since 4.3.0
++ */
++@Experimental
++public interface ConditionalFilter {
++
++    /**
++     * The filter condition.
++     *
++     * @param request The request
++     * @return true if the filter is enabled
++     */
++    boolean isEnabled(HttpRequest<?> request);
++
++}
+diff --git a/http/src/main/java/io/micronaut/http/filter/FilterRunner.java b/http/src/main/java/io/micronaut/http/filter/FilterRunner.java
+index a38a442409..249b897cd7 100644
+--- a/http/src/main/java/io/micronaut/http/filter/FilterRunner.java
++++ b/http/src/main/java/io/micronaut/http/filter/FilterRunner.java
+@@ -25,6 +25,7 @@ import io.micronaut.core.propagation.PropagatedContext;
+ import io.micronaut.http.HttpRequest;
+ import io.micronaut.http.HttpResponse;
+ 
++import java.util.ArrayList;
+ import java.util.List;
+ import java.util.ListIterator;
+ import java.util.function.BiFunction;
+@@ -144,7 +145,16 @@ public class FilterRunner {
+      */
+     public final ExecutionFlow<HttpResponse<?>> run(HttpRequest<?> request,
+                                                     PropagatedContext propagatedContext) {
+-        ListIterator<InternalHttpFilter> iterator = filters.listIterator();
++        List<InternalHttpFilter> filtersToRun = new ArrayList<>(filters.size());
++        for (InternalHttpFilter filter : filters) {
++            if (filter.isEnabled(request)) {
++                filtersToRun.add(filter);
++            }
++        }
++        if (filtersToRun.isEmpty()) {
++            return responseProvider.apply(request, propagatedContext);
++        }
++        ListIterator<InternalHttpFilter> iterator = filtersToRun.listIterator();
+         ExecutionFlow<FilterContext> flow = filterRequest(new FilterContext(request, propagatedContext), iterator);
+         FilterContext flowContext = flow.tryCompleteValue();
+         if (flowContext != null) {
+diff --git a/http/src/main/java/io/micronaut/http/filter/InternalHttpFilter.java b/http/src/main/java/io/micronaut/http/filter/InternalHttpFilter.java
+index b653481464..989fae7f9c 100644
+--- a/http/src/main/java/io/micronaut/http/filter/InternalHttpFilter.java
++++ b/http/src/main/java/io/micronaut/http/filter/InternalHttpFilter.java
+@@ -20,6 +20,7 @@ import io.micronaut.core.annotation.NonNull;
+ import io.micronaut.core.annotation.Nullable;
+ import io.micronaut.core.execution.ExecutionFlow;
+ import io.micronaut.core.order.Ordered;
++import io.micronaut.http.HttpRequest;
+ 
+ import java.util.function.Function;
+ 
+@@ -33,6 +34,13 @@ import java.util.function.Function;
+ @Internal
+ sealed interface InternalHttpFilter extends GenericHttpFilter, Ordered permits AroundLegacyFilter, AsyncFilter, MethodFilter {
+ 
++    /**
++     * Checks the filter is implementing {@link ConditionalFilter} and is enabled.
++     * @param request The request
++     * @return true if enabled
++     */
++    boolean isEnabled(HttpRequest<?> request);
++
+     /**
+      * If the filter supports filtering a request.
+      *
+diff --git a/http/src/main/java/io/micronaut/http/filter/MethodFilter.java b/http/src/main/java/io/micronaut/http/filter/MethodFilter.java
+index ef10544767..80e043b733 100644
+--- a/http/src/main/java/io/micronaut/http/filter/MethodFilter.java
++++ b/http/src/main/java/io/micronaut/http/filter/MethodFilter.java
+@@ -59,6 +59,7 @@ import java.util.function.Predicate;
+  * @param order               The order
+  * @param bean                The bean instance
+  * @param method              The method
++ * @param unsafeExecutable    The optional unsafe method executor
+  * @param isResponseFilter    If it's a response filter
+  * @param argBinders          The argument binders
+  * @param filterCondition     The filter condition
+@@ -66,6 +67,7 @@ import java.util.function.Predicate;
+  * @param filtersException    The filter exception
+  * @param waitForBody         Should it wait for the body
+  * @param returnHandler       The return handler
++ * @param isConditional       Is conditional filter
+  * @param <T>                 The bean type
+  * @author Jonas Konrad
+  * @author Denis Stepanov
+@@ -76,6 +78,8 @@ import java.util.function.Predicate;
+ record MethodFilter<T>(FilterOrder order,
+                        T bean,
+                        Executable<T, ?> method,
++                       @Nullable
++                       UnsafeExecutable<T, ?> unsafeExecutable,
+                        boolean isResponseFilter,
+                        FilterArgBinder[] argBinders,
+                        @Nullable
+@@ -84,7 +88,8 @@ record MethodFilter<T>(FilterOrder order,
+                        ContinuationCreator continuationCreator,
+                        boolean filtersException,
+                        boolean waitForBody,
+-                       FilterReturnHandler returnHandler
++                       FilterReturnHandler returnHandler,
++                       boolean isConditional
+ ) implements InternalHttpFilter {
+ 
+     private static final Predicate<FilterMethodContext> FILTER_CONDITION_ALWAYS_TRUE = runner -> true;
+@@ -213,13 +218,15 @@ record MethodFilter<T>(FilterOrder order,
+             order,
+             bean,
+             method,
++            method instanceof UnsafeExecutable unsafeExecutable ? unsafeExecutable : null,
+             isResponseFilter,
+             fulfilled,
+             filterCondition,
+             continuationCreator,
+             filtersException,
+             waitForBody,
+-            returnHandler
++            returnHandler,
++            bean instanceof ConditionalFilter
+         );
+     }
+ 
+@@ -228,6 +235,14 @@ record MethodFilter<T>(FilterOrder order,
+         return continuationReturnType.isReactive() || continuationReturnType.getType() == Publisher.class;
+     }
+ 
++    @Override
++    public boolean isEnabled(HttpRequest<?> request) {
++        if (isConditional) {
++            return ((ConditionalFilter) bean).isEnabled(request);
++        }
++        return true;
++    }
++
+     @Override
+     public boolean isFiltersRequest() {
+         return !isResponseFilter;
+@@ -323,7 +338,7 @@ record MethodFilter<T>(FilterOrder order,
+         try {
+             Object[] args = bindArgs(methodContext);
+             Object returnValue;
+-            if (method instanceof UnsafeExecutable<T, ?> unsafeExecutable) {
++            if (unsafeExecutable != null) {
+                 returnValue = unsafeExecutable.invokeUnsafe(bean, args);
+             } else {
+                 returnValue = method.invoke(bean, args);

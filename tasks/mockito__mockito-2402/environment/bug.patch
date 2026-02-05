@@ -1,0 +1,314 @@
+diff --git a/settings.gradle.kts b/settings.gradle.kts
+index cdaa0e66e..0803799cd 100644
+--- a/settings.gradle.kts
++++ b/settings.gradle.kts
+@@ -9,6 +9,7 @@ include("deprecatedPluginsTest",
+     "kotlinTest",
+     "kotlinReleaseCoroutinesTest",
+     "android",
++    "androidTest",
+     "junit-jupiter",
+     "junitJupiterExtensionTest",
+     "junitJupiterInlineMockMakerExtensionTest",
+@@ -18,12 +19,6 @@ include("deprecatedPluginsTest",
+     "junitJupiterParallelTest",
+     "osgi-test")
+ 
+-if (System.getenv("ANDROID_SDK_ROOT") != null || File(".local.properties").exists()) {
+-    include("androidTest")
+-} else {
+-    logger.info("Not including android test project due to missing SDK configuration")
+-}
+-
+ rootProject.name = "mockito"
+ 
+ val koltinBuildScriptProject = hashSetOf("junitJupiterExtensionTest", "junitJupiterInlineMockMakerExtensionTest")
+diff --git a/src/main/java/org/mockito/internal/creation/bytebuddy/SubclassBytecodeGenerator.java b/src/main/java/org/mockito/internal/creation/bytebuddy/SubclassBytecodeGenerator.java
+index f67fdfc5a..46ecb7868 100644
+--- a/src/main/java/org/mockito/internal/creation/bytebuddy/SubclassBytecodeGenerator.java
++++ b/src/main/java/org/mockito/internal/creation/bytebuddy/SubclassBytecodeGenerator.java
+@@ -44,6 +44,7 @@ import net.bytebuddy.implementation.FieldAccessor;
+ import net.bytebuddy.implementation.Implementation;
+ import net.bytebuddy.implementation.attribute.MethodAttributeAppender;
+ import net.bytebuddy.matcher.ElementMatcher;
++import org.mockito.Answers;
+ import org.mockito.codegen.InjectionBase;
+ import org.mockito.exceptions.base.MockitoException;
+ import org.mockito.internal.creation.bytebuddy.ByteBuddyCrossClassLoaderSerializationSupport.CrossClassLoaderSerializableMock;
+@@ -240,11 +241,21 @@ class SubclassBytecodeGenerator implements BytecodeGenerator {
+                         .serialVersionUid(42L)
+                         .defineField("mockitoInterceptor", MockMethodInterceptor.class, PRIVATE)
+                         .implement(MockAccess.class)
+-                        .intercept(FieldAccessor.ofBeanProperty())
+-                        .method(isHashCode())
+-                        .intercept(hashCode)
+-                        .method(isEquals())
+-                        .intercept(equals);
++                        .intercept(FieldAccessor.ofBeanProperty());
++
++        if (features.defaultAnswer != Answers.CALLS_REAL_METHODS) {
++            builder =
++                    builder.method(isHashCode())
++                            .intercept(hashCode)
++                            .method(isEquals())
++                            .intercept(equals);
++        } else {
++            builder =
++                    builder.method(isHashCode())
++                            .intercept(dispatcher)
++                            .method(isEquals())
++                            .intercept(dispatcher);
++        }
+         if (features.serializableMode == SerializableMode.ACROSS_CLASSLOADERS) {
+             builder =
+                     builder.implement(CrossClassLoaderSerializableMock.class)
+diff --git a/src/main/java/org/mockito/internal/creation/bytebuddy/TypeCachingBytecodeGenerator.java b/src/main/java/org/mockito/internal/creation/bytebuddy/TypeCachingBytecodeGenerator.java
+index 30ed949bf..5ce57b111 100644
+--- a/src/main/java/org/mockito/internal/creation/bytebuddy/TypeCachingBytecodeGenerator.java
++++ b/src/main/java/org/mockito/internal/creation/bytebuddy/TypeCachingBytecodeGenerator.java
+@@ -5,12 +5,14 @@
+ package org.mockito.internal.creation.bytebuddy;
+ 
+ import java.lang.ref.ReferenceQueue;
++import java.util.Objects;
+ import java.util.Set;
+ import java.util.concurrent.locks.ReadWriteLock;
+ import java.util.concurrent.locks.ReentrantReadWriteLock;
+ 
+ import net.bytebuddy.TypeCache;
+ import org.mockito.mock.SerializableMode;
++import org.mockito.stubbing.Answer;
+ 
+ class TypeCachingBytecodeGenerator extends ReferenceQueue<ClassLoader>
+         implements BytecodeGenerator {
+@@ -43,7 +45,8 @@ class TypeCachingBytecodeGenerator extends ReferenceQueue<ClassLoader>
+                                     params.mockedType,
+                                     params.interfaces,
+                                     params.serializableMode,
+-                                    params.stripAnnotations),
++                                    params.stripAnnotations,
++                                    params.defaultAnswer),
+                             () -> bytecodeGenerator.mockClass(params),
+                             BOOTSTRAP_LOCK);
+         } catch (IllegalArgumentException exception) {
+@@ -83,15 +86,18 @@ class TypeCachingBytecodeGenerator extends ReferenceQueue<ClassLoader>
+ 
+         private final SerializableMode serializableMode;
+         private final boolean stripAnnotations;
++        private final Answer defaultAnswer;
+ 
+         private MockitoMockKey(
+                 Class<?> type,
+                 Set<Class<?>> additionalType,
+                 SerializableMode serializableMode,
+-                boolean stripAnnotations) {
++                boolean stripAnnotations,
++                Answer defaultAnswer) {
+             super(type, additionalType);
+             this.serializableMode = serializableMode;
+             this.stripAnnotations = stripAnnotations;
++            this.defaultAnswer = defaultAnswer;
+         }
+ 
+         @Override
+@@ -107,7 +113,8 @@ class TypeCachingBytecodeGenerator extends ReferenceQueue<ClassLoader>
+             }
+             MockitoMockKey that = (MockitoMockKey) object;
+             return stripAnnotations == that.stripAnnotations
+-                    && serializableMode.equals(that.serializableMode);
++                    && serializableMode.equals(that.serializableMode)
++                    && Objects.equals(defaultAnswer, that.defaultAnswer);
+         }
+ 
+         @Override
+@@ -115,6 +122,7 @@ class TypeCachingBytecodeGenerator extends ReferenceQueue<ClassLoader>
+             int result = super.hashCode();
+             result = 31 * result + (stripAnnotations ? 1 : 0);
+             result = 31 * result + serializableMode.hashCode();
++            result = 31 * result + Objects.hashCode(defaultAnswer);
+             return result;
+         }
+     }
+diff --git a/src/test/java/org/mockito/internal/creation/bytebuddy/TypeCachingMockBytecodeGeneratorTest.java b/src/test/java/org/mockito/internal/creation/bytebuddy/TypeCachingMockBytecodeGeneratorTest.java
+index 026fba3bf..e26b36d53 100644
+--- a/src/test/java/org/mockito/internal/creation/bytebuddy/TypeCachingMockBytecodeGeneratorTest.java
++++ b/src/test/java/org/mockito/internal/creation/bytebuddy/TypeCachingMockBytecodeGeneratorTest.java
+@@ -145,7 +145,7 @@ public class TypeCachingMockBytecodeGeneratorTest {
+     }
+ 
+     @Test
+-    public void ensure_cache_returns_same_instance_defaultAnswer() throws Exception {
++    public void ensure_cache_returns_different_instance_defaultAnswer() throws Exception {
+         // given
+         ClassLoader classloader_with_life_shorter_than_cache =
+                 inMemoryClassLoader()
+@@ -174,10 +174,10 @@ public class TypeCachingMockBytecodeGeneratorTest {
+                                     SerializableMode.NONE,
+                                     false,
+                                     answer));
+-            assertThat(classes.add(klass)).isFalse();
++            assertThat(classes.add(klass)).isTrue();
+         }
+ 
+-        assertThat(classes).hasSize(1);
++        assertThat(classes).hasSize(answers.length + 1);
+     }
+ 
+     @Test
+diff --git a/src/test/java/org/mockitousage/spies/MockCreationShouldNotAffectSpyTest.java b/src/test/java/org/mockitousage/spies/MockCreationShouldNotAffectSpyTest.java
+new file mode 100644
+index 000000000..c77e58959
+--- /dev/null
++++ b/src/test/java/org/mockitousage/spies/MockCreationShouldNotAffectSpyTest.java
+@@ -0,0 +1,48 @@
++/*
++ * Copyright (c) 2007 Mockito contributors
++ * This program is made available under the terms of the MIT License.
++ */
++package org.mockitousage.spies;
++
++import org.junit.Test;
++import org.mockitoutil.TestBase;
++
++import static org.junit.Assert.assertEquals;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.spy;
++
++public class MockCreationShouldNotAffectSpyTest extends TestBase {
++
++    @Test
++    public void test() {
++        TestClass instance = new TestClass(42);
++
++        TestClass mock = mock(TestClass.class);
++        assertEquals(mock.hashCode(), mock.hashCode());
++        assertEquals(mock, mock);
++
++        TestClass spy = spy(instance);
++        assertEquals(instance.hashCode(), spy.hashCode());
++        assertEquals(spy, instance);
++        assertEquals(instance, spy);
++    }
++
++    static class TestClass {
++        private final long value;
++
++        TestClass(final long value) {
++            this.value = value;
++        }
++
++        public boolean equals(final Object o) {
++            if (!(o instanceof TestClass)) {
++                return false;
++            }
++            return value == ((TestClass) o).value;
++        }
++
++        public int hashCode() {
++            return Long.hashCode(value);
++        }
++    }
++}
+diff --git a/src/test/java/org/mockitousage/spies/SpyCreationShouldNotAffectMockTest.java b/src/test/java/org/mockitousage/spies/SpyCreationShouldNotAffectMockTest.java
+new file mode 100644
+index 000000000..a57ec082c
+--- /dev/null
++++ b/src/test/java/org/mockitousage/spies/SpyCreationShouldNotAffectMockTest.java
+@@ -0,0 +1,48 @@
++/*
++ * Copyright (c) 2007 Mockito contributors
++ * This program is made available under the terms of the MIT License.
++ */
++package org.mockitousage.spies;
++
++import org.junit.Test;
++import org.mockitoutil.TestBase;
++
++import static org.junit.Assert.assertEquals;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.spy;
++
++public class SpyCreationShouldNotAffectMockTest extends TestBase {
++
++    @Test
++    public void test() {
++        TestClass instance = new TestClass(Long.MIN_VALUE);
++
++        TestClass spy = spy(instance);
++        assertEquals(instance.hashCode(), spy.hashCode());
++        assertEquals(spy, instance);
++        assertEquals(instance, spy);
++
++        TestClass mock = mock(TestClass.class);
++        assertEquals(mock.hashCode(), mock.hashCode());
++        assertEquals(mock, mock);
++    }
++
++    static class TestClass {
++        private final long value;
++
++        TestClass(final long value) {
++            this.value = value;
++        }
++
++        public boolean equals(final Object o) {
++            if (!(o instanceof TestClass)) {
++                return false;
++            }
++            return value == ((TestClass) o).value;
++        }
++
++        public int hashCode() {
++            return Long.hashCode(value);
++        }
++    }
++}
+diff --git a/src/test/java/org/mockitousage/spies/SpyingOnRealObjectsTest.java b/src/test/java/org/mockitousage/spies/SpyingOnRealObjectsTest.java
+index 30d378458..06b4878fa 100644
+--- a/src/test/java/org/mockitousage/spies/SpyingOnRealObjectsTest.java
++++ b/src/test/java/org/mockitousage/spies/SpyingOnRealObjectsTest.java
+@@ -9,6 +9,7 @@ import static org.junit.Assert.*;
+ import static org.junit.Assume.assumeTrue;
+ import static org.mockito.Mockito.*;
+ 
++import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.LinkedList;
+ import java.util.List;
+@@ -59,7 +60,7 @@ public class SpyingOnRealObjectsTest extends TestBase {
+ 
+     @Test
+     public void shouldAllowOverridingStubs() {
+-        when(spy.contains(any())).thenReturn(true);
++        when(spy.contains(anyObject())).thenReturn(true);
+         when(spy.contains("foo")).thenReturn(false);
+ 
+         assertTrue(spy.contains("bar"));
+@@ -192,4 +193,13 @@ public class SpyingOnRealObjectsTest extends TestBase {
+                             "Most likely it is due to mocking a private class that is not visible to Mockito");
+         }
+     }
++
++    @Test
++    public void spysHashCodeEqualsDelegatedToActualMethods() {
++        List<String> real = new ArrayList<>();
++        real.add("one");
++        List<String> spy = spy(real);
++        assertEquals(real.hashCode(), spy.hashCode());
++        assertTrue(spy.equals(real));
++    }
+ }
+diff --git a/subprojects/kotlinReleaseCoroutinesTest/src/test/kotlin/org/mockito/kotlin/SuspendTest.kt b/subprojects/kotlinReleaseCoroutinesTest/src/test/kotlin/org/mockito/kotlin/SuspendTest.kt
+index d42a0c000..85131ac6f 100644
+--- a/subprojects/kotlinReleaseCoroutinesTest/src/test/kotlin/org/mockito/kotlin/SuspendTest.kt
++++ b/subprojects/kotlinReleaseCoroutinesTest/src/test/kotlin/org/mockito/kotlin/SuspendTest.kt
+@@ -5,8 +5,8 @@
+ package org.mockito.kotlin
+ 
+ import kotlinx.coroutines.runBlocking
+-import org.hamcrest.MatcherAssert.assertThat
+ import org.hamcrest.core.IsEqual
++import org.junit.Assert.assertThat
+ import org.junit.Test
+ import org.mockito.Mockito.*
+ 

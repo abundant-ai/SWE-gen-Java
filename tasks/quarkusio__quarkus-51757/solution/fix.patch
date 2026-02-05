@@ -1,0 +1,464 @@
+diff --git a/docs/src/main/asciidoc/websockets-next-reference.adoc b/docs/src/main/asciidoc/websockets-next-reference.adoc
+index e0e53f36f89..9411b98d60b 100644
+--- a/docs/src/main/asciidoc/websockets-next-reference.adoc
++++ b/docs/src/main/asciidoc/websockets-next-reference.adoc
+@@ -874,6 +874,74 @@ quarkus.http.auth.proactive=false <1>
+ ----
+ <1> Start authenticating an opening WebSocket handshake request only when the `io.quarkus.oidc.BearerTokenAuthentication` annotation is detected.
+ 
++==== Secure HTTP upgrade with the `@AuthorizationPolicy` annotation
++
++You can bind custom named `HttpSecurityPolicy` to a WebSocket endpoint with the `@AuthorizationPolicy` security annotation.
++The `@AuthorizationPolicy` security annotation can only be used to secure the HTTP upgrade, thus placing this annotation on WebSocket endpoint methods fails the build during the validation.
++
++.Example WebSocket endpoint with secured HTTP upgrade
++[source, java]
++----
++package io.quarkus.websockets.next.test.security;
++
++import io.quarkus.vertx.http.security.AuthorizationPolicy;
++import io.quarkus.websockets.next.OnTextMessage;
++import io.quarkus.websockets.next.WebSocket;
++
++@AuthorizationPolicy(name = "custom")   <1>
++@WebSocket(path = "/end")
++public class Endpoint {
++
++    @OnTextMessage
++    String echo(String message) {
++        return message;
++    }
++
++}
++----
++<1> Secure the HTTP upgrade with the `HttpSecurityPolicy` named `custom`.
++
++.Example custom `HttpSecurityPolicy`
++[source, java]
++----
++package io.quarkus.websockets.next.test.security;
++
++import io.quarkus.security.identity.SecurityIdentity;
++import io.quarkus.vertx.http.runtime.security.HttpSecurityPolicy;
++import io.smallrye.mutiny.Uni;
++import io.vertx.ext.web.RoutingContext;
++import jakarta.enterprise.context.ApplicationScoped;
++
++@ApplicationScoped
++public class CustomHttpSecurityPolicy implements HttpSecurityPolicy {
++
++    @Override
++    public Uni<CheckResult> checkPermission(RoutingContext routingContext, Uni<SecurityIdentity> identity,
++                                            AuthorizationRequestContext requestContext) {
++        if (customRequestAuthorization(routingContext)) {
++            return CheckResult.permit();
++        }
++        return CheckResult.deny();
++    }
++
++    @Override
++    public String name() {
++        return "custom";    <1>
++    }
++
++    private static boolean customRequestAuthorization(RoutingContext routingContext) {
++        // here comes your custom authorization check
++        // for example, you can check headers:
++        String authorization = routingContext.request().getHeader("Authorization");
++        return verifyAuthorization(authorization);
++    }
++
++}
++----
++<1> The `custom` name must match the name specified with the `io.quarkus.vertx.http.security.AuthorizationPolicy#name` attribute.
++
++See also the xref:security-authorize-web-endpoints-reference.adoc#custom-http-security-policy[Custom HttpSecurityPolicy] section of the Authorization of web endpoints guide for more information about custom policies.
++
+ [[secure-callback-methods]]
+ ==== Secure WebSocket endpoint callback methods
+ 
+diff --git a/extensions/websockets-next/deployment/src/main/java/io/quarkus/websockets/next/deployment/WebSocketProcessor.java b/extensions/websockets-next/deployment/src/main/java/io/quarkus/websockets/next/deployment/WebSocketProcessor.java
+index d601f6e75bc..af36c3eb81a 100644
+--- a/extensions/websockets-next/deployment/src/main/java/io/quarkus/websockets/next/deployment/WebSocketProcessor.java
++++ b/extensions/websockets-next/deployment/src/main/java/io/quarkus/websockets/next/deployment/WebSocketProcessor.java
+@@ -1,11 +1,16 @@
+ package io.quarkus.websockets.next.deployment;
+ 
+ import static io.quarkus.arc.processor.DotNames.EVENT;
++import static io.quarkus.arc.processor.DotNames.OBJECT;
+ import static io.quarkus.deployment.annotations.ExecutionTime.RUNTIME_INIT;
+ import static io.quarkus.deployment.annotations.ExecutionTime.STATIC_INIT;
++import static io.quarkus.security.spi.SecurityTransformer.AuthorizationType.AUTHORIZATION_POLICY;
+ import static io.quarkus.security.spi.SecurityTransformer.AuthorizationType.SECURITY_CHECK;
+ import static io.quarkus.security.spi.SecurityTransformerBuildItem.createSecurityTransformer;
+ import static io.quarkus.vertx.http.deployment.EagerSecurityInterceptorClassesBuildItem.collectInterceptedClasses;
++import static java.util.stream.Collectors.groupingBy;
++import static java.util.stream.Collectors.mapping;
++import static java.util.stream.Collectors.toSet;
+ import static org.jboss.jandex.gizmo2.Jandex2Gizmo.classDescOf;
+ import static org.jboss.jandex.gizmo2.Jandex2Gizmo.methodDescOf;
+ 
+@@ -112,13 +117,16 @@
+ import io.quarkus.security.spi.SecurityTransformerBuildItem;
+ import io.quarkus.security.spi.runtime.AuthorizationFailureEvent;
+ import io.quarkus.security.spi.runtime.AuthorizationSuccessEvent;
++import io.quarkus.security.spi.runtime.BlockingSecurityExecutor;
+ import io.quarkus.security.spi.runtime.SecurityCheck;
+ import io.quarkus.vertx.http.deployment.EagerSecurityInterceptorClassesBuildItem;
+ import io.quarkus.vertx.http.deployment.FilterBuildItem;
+ import io.quarkus.vertx.http.deployment.RouteBuildItem;
+ import io.quarkus.vertx.http.runtime.HandlerType;
+ import io.quarkus.vertx.http.runtime.security.EagerSecurityInterceptorStorage;
++import io.quarkus.vertx.http.runtime.security.HttpSecurityPolicy;
+ import io.quarkus.vertx.http.runtime.security.SecurityHandlerPriorities;
++import io.quarkus.vertx.http.security.AuthorizationPolicy;
+ import io.quarkus.websockets.next.HttpUpgradeCheck;
+ import io.quarkus.websockets.next.InboundProcessingMode;
+ import io.quarkus.websockets.next.WebSocketClientConnection;
+@@ -783,12 +791,29 @@ EndpointSecurityChecksBuildItem collectEndpointSecurityChecks(BeanArchiveIndexBu
+         return new EndpointSecurityChecksBuildItem(endpointIdToSecurityCheck);
+     }
+ 
++    @BuildStep
++    AuthorizationPolicyToEndpointsBuildItem collectEndpointAuthorizationPolicies(BeanArchiveIndexBuildItem indexItem,
++            Capabilities capabilities, List<WebSocketEndpointBuildItem> endpoints,
++            Optional<SecurityTransformerBuildItem> securityTransformerBuildItem) {
++        final Map<String, Set<String>> policyNameToEndpoints;
++        if (capabilities.isMissing(Capability.SECURITY)) {
++            policyNameToEndpoints = Map.of();
++        } else {
++            SecurityTransformer securityTransformer = createSecurityTransformer(indexItem.getIndex(),
++                    securityTransformerBuildItem);
++            policyNameToEndpoints = collectEndpointAuthorizationPolicies(securityTransformer, endpoints, indexItem.getIndex());
++        }
++        return new AuthorizationPolicyToEndpointsBuildItem(policyNameToEndpoints);
++    }
++
+     @Record(RUNTIME_INIT) // needs runtime config
+     @BuildStep
+     void createSecurityHttpUpgradeCheck(BuildProducer<SyntheticBeanBuildItem> producer,
+-            EndpointSecurityChecksBuildItem endpointSecurityChecks, WebSocketServerRecorder recorder) {
++            EndpointSecurityChecksBuildItem endpointSecurityChecks, WebSocketServerRecorder recorder,
++            AuthorizationPolicyToEndpointsBuildItem authorizationPolicyToEndpoints) {
+         var endpointIdToSecurityCheck = endpointSecurityChecks.endpointIdToSecurityCheck;
+-        if (!endpointIdToSecurityCheck.isEmpty()) {
++        var policyNameToEndpoints = authorizationPolicyToEndpoints.policyNameToEndpoints;
++        if (!endpointIdToSecurityCheck.isEmpty() || !policyNameToEndpoints.isEmpty()) {
+             producer.produce(SyntheticBeanBuildItem
+                     .configure(SecurityHttpUpgradeCheck.class)
+                     .types(HttpUpgradeCheck.class)
+@@ -799,7 +824,9 @@ void createSecurityHttpUpgradeCheck(BuildProducer<SyntheticBeanBuildItem> produc
+                     .addInjectionPoint(ParameterizedType.create(EVENT, ClassType.create(AuthorizationFailureEvent.class)))
+                     .addInjectionPoint(ParameterizedType.create(EVENT, ClassType.create(AuthorizationSuccessEvent.class)))
+                     .addInjectionPoint(ClassType.create(WebSocketsServerRuntimeConfig.class))
+-                    .createWith(recorder.createSecurityHttpUpgradeCheck(endpointIdToSecurityCheck))
++                    .addInjectionPoint(ClassType.create(BlockingSecurityExecutor.class))
++                    .addInjectionPoint(ParameterizedType.create(Instance.class, ClassType.create(HttpSecurityPolicy.class)))
++                    .createWith(recorder.createSecurityHttpUpgradeCheck(endpointIdToSecurityCheck, policyNameToEndpoints))
+                     .done());
+         }
+     }
+@@ -918,6 +945,56 @@ private static Map<String, SecurityCheck> collectEndpointSecurityChecks(List<Web
+                 .collect(Collectors.toUnmodifiableMap(Map.Entry::getKey, Map.Entry::getValue));
+     }
+ 
++    private static Map<String, Set<String>> collectEndpointAuthorizationPolicies(SecurityTransformer securityTransformer,
++            List<WebSocketEndpointBuildItem> endpoints, IndexView index) {
++        long authorizationPoliciesCount = securityTransformer.getSecurityAnnotationNames(AUTHORIZATION_POLICY)
++                .stream().mapToLong(n -> securityTransformer.getAnnotations(n).size()).sum();
++        if (authorizationPoliciesCount == 0) {
++            return Map.of();
++        }
++
++        record PolicyToEndpoint(String policyName, String endpointId) {
++        }
++        return endpoints.stream()
++                .<PolicyToEndpoint> mapMulti((endpoint, consumer) -> {
++                    var beanName = endpoint.beanClassName();
++                    var beanClassInfo = index.getClassByName(beanName);
++                    if (securityTransformer.hasSecurityAnnotation(beanClassInfo, AUTHORIZATION_POLICY)) {
++                        var authorizationPolicyAnnotation = securityTransformer
++                                .findFirstSecurityAnnotation(beanClassInfo, AUTHORIZATION_POLICY).get();
++                        String policyName = authorizationPolicyAnnotation.value("name").asString();
++                        consumer.accept(new PolicyToEndpoint(policyName, endpoint.id));
++                    } else {
++                        // we document that security annotations that secure the HTTP upgrade must be on the endpoint class
++                        var superName = beanClassInfo.superName();
++                        while (superName != null && !OBJECT.equals(superName)) {
++                            var superClass = index.getClassByName(superName);
++                            if (superClass != null
++                                    && securityTransformer.hasSecurityAnnotation(superClass, AUTHORIZATION_POLICY)) {
++                                throw new IllegalStateException("""
++                                        WebSocket endpoint '%s' superclass '%s' is secured with the '%s' security annotation.
++                                        Only the HTTP upgrade can be secured with this annotation.
++                                        Please place the annotation on the endpoint class '%s' instead.
++                                        """.formatted(endpoint.id, superClass.name(), AuthorizationPolicy.class.getName(),
++                                        beanName));
++                            } else {
++                                superName = superClass == null ? null : superClass.superName();
++                            }
++                        }
++                    }
++                    beanClassInfo.methods().forEach(mi -> {
++                        if (securityTransformer.hasSecurityAnnotation(mi, AUTHORIZATION_POLICY)) {
++                            throw new IllegalStateException("""
++                                    WebSocket endpoint '%s' has method '%s' secured with the '%s' security annotation.
++                                    Only the HTTP upgrade can be secured with this annotation.
++                                    Please place the annotation on the endpoint class instead.
++                                    """.formatted(beanName, mi.name(), AuthorizationPolicy.class.getName()));
++                        }
++                    });
++                })
++                .collect(groupingBy(PolicyToEndpoint::policyName, mapping(PolicyToEndpoint::endpointId, toSet())));
++    }
++
+     static String mergePath(String prefix, String path) {
+         if (prefix.endsWith("/")) {
+             prefix = prefix.substring(0, prefix.length() - 1);
+@@ -1914,4 +1991,12 @@ private EndpointSecurityChecksBuildItem(Map<String, SecurityCheck> endpointIdToS
+             this.endpointIdToSecurityCheck = endpointIdToSecurityCheck;
+         }
+     }
++
++    private static final class AuthorizationPolicyToEndpointsBuildItem extends SimpleBuildItem {
++        private final Map<String, Set<String>> policyNameToEndpoints;
++
++        private AuthorizationPolicyToEndpointsBuildItem(Map<String, Set<String>> policyNameToEndpoints) {
++            this.policyNameToEndpoints = Map.copyOf(policyNameToEndpoints);
++        }
++    }
+ }
+diff --git a/extensions/websockets-next/runtime/src/main/java/io/quarkus/websockets/next/runtime/SecurityHttpUpgradeCheck.java b/extensions/websockets-next/runtime/src/main/java/io/quarkus/websockets/next/runtime/SecurityHttpUpgradeCheck.java
+index af56449d3fa..1c30717c5ef 100644
+--- a/extensions/websockets-next/runtime/src/main/java/io/quarkus/websockets/next/runtime/SecurityHttpUpgradeCheck.java
++++ b/extensions/websockets-next/runtime/src/main/java/io/quarkus/websockets/next/runtime/SecurityHttpUpgradeCheck.java
+@@ -6,6 +6,7 @@
+ import java.util.List;
+ import java.util.Map;
+ 
++import io.quarkus.arc.ClientProxy;
+ import io.quarkus.security.ForbiddenException;
+ import io.quarkus.security.identity.SecurityIdentity;
+ import io.quarkus.security.spi.runtime.AuthorizationFailureEvent;
+@@ -13,6 +14,8 @@
+ import io.quarkus.security.spi.runtime.MethodDescription;
+ import io.quarkus.security.spi.runtime.SecurityCheck;
+ import io.quarkus.security.spi.runtime.SecurityEventHelper;
++import io.quarkus.vertx.http.runtime.security.HttpSecurityPolicy;
++import io.quarkus.vertx.http.runtime.security.QuarkusHttpUser;
+ import io.quarkus.websockets.next.HttpUpgradeCheck;
+ import io.smallrye.mutiny.Uni;
+ 
+@@ -24,33 +27,81 @@ public final class SecurityHttpUpgradeCheck implements HttpUpgradeCheck {
+ 
+     private final String redirectUrl;
+     private final Map<String, SecurityCheck> endpointToCheck;
++    private final Map<String, HttpSecurityPolicy> endpointToPolicy;
+     private final SecurityEventHelper<AuthorizationSuccessEvent, AuthorizationFailureEvent> securityEventHelper;
++    private final HttpSecurityPolicy.AuthorizationRequestContext authorizationRequestContext;
+ 
+     SecurityHttpUpgradeCheck(String redirectUrl, Map<String, SecurityCheck> endpointToCheck,
+-            SecurityEventHelper<AuthorizationSuccessEvent, AuthorizationFailureEvent> securityEventHelper) {
++            SecurityEventHelper<AuthorizationSuccessEvent, AuthorizationFailureEvent> securityEventHelper,
++            Map<String, HttpSecurityPolicy> endpointToPolicy,
++            HttpSecurityPolicy.AuthorizationRequestContext authorizationRequestContext) {
+         this.redirectUrl = redirectUrl;
+         this.endpointToCheck = Map.copyOf(endpointToCheck);
+         this.securityEventHelper = securityEventHelper;
++        this.authorizationRequestContext = authorizationRequestContext;
++        this.endpointToPolicy = Map.copyOf(endpointToPolicy);
+     }
+ 
+     @Override
+     public Uni<CheckResult> perform(HttpUpgradeContext context) {
+         final SecurityCheck securityCheck = endpointToCheck.get(context.endpointId());
+-        return context.securityIdentity().chain(identity -> securityCheck
+-                .nonBlockingApply(identity, (MethodDescription) null, null)
+-                .replaceWith(() -> permitUpgrade(identity, securityCheck, context))
+-                .onFailure(SecurityException.class)
+-                .recoverWithItem(t -> rejectUpgrade(t, identity, securityCheck, context)));
++        final HttpSecurityPolicy httpSecurityPolicy = endpointToPolicy.get(context.endpointId());
++
++        if (httpSecurityPolicy != null) {
++            if (securityCheck != null) {
++                // ATM this must be a validation failure during the build time, hence we should never get here
++                // because for now, security annotations cannot be combined anywhere in Quarkus
++                return CheckResult.rejectUpgrade(403);
++            } else if (context instanceof HttpUpgradeContextImpl impl) {
++                return httpSecurityPolicy
++                        .checkPermission(impl.routingContext(), context.securityIdentity(), authorizationRequestContext)
++                        .onItemOrFailure().transform((checkResult, throwable) -> {
++                            if (checkResult == null) {
++                                return rejectUpgrade(throwable, getSecurityIdentity(impl),
++                                        getHttpSecurityPolicyClass(httpSecurityPolicy), context);
++                            }
++
++                            final SecurityIdentity securityIdentity;
++                            if (checkResult.getAugmentedIdentity() != null) {
++                                securityIdentity = checkResult.getAugmentedIdentity();
++                                QuarkusHttpUser.setIdentity(securityIdentity, impl.routingContext());
++                            } else {
++                                securityIdentity = getSecurityIdentity(impl);
++                            }
++
++                            if (checkResult.isPermitted()) {
++                                return permitUpgrade(securityIdentity, getHttpSecurityPolicyClass(httpSecurityPolicy), context);
++                            } else {
++                                return rejectUpgrade(throwable, securityIdentity,
++                                        getHttpSecurityPolicyClass(httpSecurityPolicy), context);
++                            }
++                        });
++            } else {
++                // there must be only one implementation of the upgrade contexts, otherwise tests will fail
++                return CheckResult.rejectUpgrade(403);
++            }
++        } else {
++            if (securityCheck == null) {
++                // illegal state - this check must be applied on secured endpoints only
++                return CheckResult.rejectUpgrade(403);
++            } else {
++                return context.securityIdentity().chain(identity -> securityCheck
++                        .nonBlockingApply(identity, (MethodDescription) null, null)
++                        .replaceWith(() -> permitUpgrade(identity, securityCheck, context))
++                        .onFailure(SecurityException.class)
++                        .recoverWithItem(t -> rejectUpgrade(t, identity, securityCheck, context)));
++            }
++        }
+     }
+ 
+     @Override
+     public boolean appliesTo(String endpointId) {
+-        return endpointToCheck.containsKey(endpointId);
++        return endpointToCheck.containsKey(endpointId) || endpointToPolicy.containsKey(endpointId);
+     }
+ 
+-    private CheckResult permitUpgrade(SecurityIdentity identity, SecurityCheck securityCheck, HttpUpgradeContext context) {
++    private CheckResult permitUpgrade(SecurityIdentity identity, Object authorizationCheck, HttpUpgradeContext context) {
+         if (securityEventHelper.fireEventOnSuccess()) {
+-            String authorizationContext = securityCheck.getClass().getName();
++            String authorizationContext = authorizationCheck.getClass().getName();
+             AuthorizationSuccessEvent successEvent = new AuthorizationSuccessEvent(identity, authorizationContext,
+                     Map.of(SECURED_ENDPOINT_ID_KEY, context.endpointId(), HTTP_REQUEST_KEY, context.httpRequest()));
+             securityEventHelper.fireSuccessEvent(successEvent);
+@@ -58,10 +109,10 @@ private CheckResult permitUpgrade(SecurityIdentity identity, SecurityCheck secur
+         return CheckResult.permitUpgradeSync();
+     }
+ 
+-    private CheckResult rejectUpgrade(Throwable throwable, SecurityIdentity identity, SecurityCheck securityCheck,
++    private CheckResult rejectUpgrade(Throwable throwable, SecurityIdentity identity, Object authorizationCheck,
+             HttpUpgradeContext context) {
+         if (securityEventHelper.fireEventOnFailure()) {
+-            String authorizationContext = securityCheck.getClass().getName();
++            String authorizationContext = authorizationCheck.getClass().getName();
+             AuthorizationFailureEvent failureEvent = new AuthorizationFailureEvent(identity, throwable, authorizationContext,
+                     Map.of(SECURED_ENDPOINT_ID_KEY, context.endpointId(), HTTP_REQUEST_KEY, context.httpRequest()));
+             securityEventHelper.fireFailureEvent(failureEvent);
+@@ -70,11 +121,21 @@ private CheckResult rejectUpgrade(Throwable throwable, SecurityIdentity identity
+             return CheckResult.rejectUpgradeSync(302,
+                     Map.of(LOCATION.toString(), List.of(redirectUrl),
+                             CACHE_CONTROL.toString(), List.of("no-store")));
+-        } else if (throwable instanceof ForbiddenException) {
++        } else if (throwable instanceof ForbiddenException || (identity != null && !identity.isAnonymous())) {
+             return CheckResult.rejectUpgradeSync(403);
+         } else {
+             return CheckResult.rejectUpgradeSync(401);
+         }
+     }
+ 
++    private static SecurityIdentity getSecurityIdentity(HttpUpgradeContextImpl impl) {
++        if (impl.routingContext().user() instanceof QuarkusHttpUser user) {
++            return user.getSecurityIdentity();
++        }
++        return null;
++    }
++
++    private static String getHttpSecurityPolicyClass(HttpSecurityPolicy httpSecurityPolicy) {
++        return ClientProxy.unwrap(httpSecurityPolicy).getClass().getName();
++    }
+ }
+diff --git a/extensions/websockets-next/runtime/src/main/java/io/quarkus/websockets/next/runtime/WebSocketServerRecorder.java b/extensions/websockets-next/runtime/src/main/java/io/quarkus/websockets/next/runtime/WebSocketServerRecorder.java
+index aadfbff21e6..cbe4cfc8ba5 100644
+--- a/extensions/websockets-next/runtime/src/main/java/io/quarkus/websockets/next/runtime/WebSocketServerRecorder.java
++++ b/extensions/websockets-next/runtime/src/main/java/io/quarkus/websockets/next/runtime/WebSocketServerRecorder.java
+@@ -8,10 +8,12 @@
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Objects;
++import java.util.Set;
+ import java.util.concurrent.CompletionStage;
+ import java.util.function.Consumer;
+ import java.util.function.Function;
+ import java.util.function.Supplier;
++import java.util.stream.Collectors;
+ 
+ import jakarta.enterprise.inject.Instance;
+ import jakarta.enterprise.inject.spi.BeanManager;
+@@ -29,11 +31,14 @@
+ import io.quarkus.security.identity.IdentityProvider;
+ import io.quarkus.security.identity.IdentityProviderManager;
+ import io.quarkus.security.identity.SecurityIdentity;
++import io.quarkus.security.spi.runtime.BlockingSecurityExecutor;
+ import io.quarkus.security.spi.runtime.SecurityCheck;
+ import io.quarkus.security.spi.runtime.SecurityEventHelper;
+ import io.quarkus.vertx.core.runtime.VertxCoreRecorder;
+ import io.quarkus.vertx.http.runtime.security.EagerSecurityInterceptorStorage;
++import io.quarkus.vertx.http.runtime.security.HttpSecurityPolicy;
+ import io.quarkus.vertx.http.runtime.security.QuarkusHttpUser;
++import io.quarkus.vertx.http.security.AuthorizationPolicy;
+ import io.quarkus.websockets.next.HandshakeRequest;
+ import io.quarkus.websockets.next.HttpUpgradeCheck;
+ import io.quarkus.websockets.next.HttpUpgradeCheck.CheckResult;
+@@ -210,7 +215,7 @@ private static Function<WebSocketConnectionImpl, SecuritySupport> getSecuritySup
+     }
+ 
+     public Function<SyntheticCreationalContext<SecurityHttpUpgradeCheck>, SecurityHttpUpgradeCheck> createSecurityHttpUpgradeCheck(
+-            Map<String, SecurityCheck> endpointToCheck) {
++            Map<String, SecurityCheck> endpointToCheck, Map<String, Set<String>> policyNameToEndpoints) {
+         return new Function<SyntheticCreationalContext<SecurityHttpUpgradeCheck>, SecurityHttpUpgradeCheck>() {
+             @Override
+             public SecurityHttpUpgradeCheck apply(SyntheticCreationalContext<SecurityHttpUpgradeCheck> ctx) {
+@@ -221,8 +226,43 @@ public SecurityHttpUpgradeCheck apply(SyntheticCreationalContext<SecurityHttpUpg
+                 }), AUTHORIZATION_SUCCESS,
+                         AUTHORIZATION_FAILURE, ctx.getInjectedReference(BeanManager.class), securityEventsEnabled);
+                 WebSocketsServerRuntimeConfig config = ctx.getInjectedReference(WebSocketsServerRuntimeConfig.class);
++
++                final HttpSecurityPolicy.AuthorizationRequestContext authorizationRequestContext;
++                final Map<String, HttpSecurityPolicy> endpointToPolicy;
++                if (policyNameToEndpoints.isEmpty()) {
++                    endpointToPolicy = Map.of();
++                    authorizationRequestContext = null;
++                } else {
++                    BlockingSecurityExecutor blockingSecurityExecutor = ctx
++                            .getInjectedReference(BlockingSecurityExecutor.class);
++                    authorizationRequestContext = (routingContext, identityUni, function) -> identityUni
++                            .flatMap(identity -> blockingSecurityExecutor
++                                    .executeBlocking(() -> function.apply(routingContext, identity)));
++
++                    endpointToPolicy = new HashMap<>();
++                    Instance<HttpSecurityPolicy> policies = ctx.getInjectedReference(new TypeLiteral<>() {
++                    });
++                    var policyNameToEndpointsRemainder = new HashMap<>(policyNameToEndpoints);
++                    for (HttpSecurityPolicy policy : policies) {
++                        String policyName = policy.name();
++                        if (policyName != null && policyNameToEndpoints.containsKey(policyName)) {
++                            for (String endpoint : policyNameToEndpoints.get(policyName)) {
++                                endpointToPolicy.put(endpoint, policy);
++                            }
++                            policyNameToEndpointsRemainder.remove(policyName);
++                        }
++                    }
++                    if (!policyNameToEndpointsRemainder.isEmpty()) {
++                        String missingPolicies = policyNameToEndpointsRemainder.entrySet().stream()
++                                .map(e -> "policy '%s' is required by endpoints '%s'".formatted(e.getKey(), e.getValue()))
++                                .collect(Collectors.joining(System.lineSeparator()));
++                        throw new RuntimeException("The '%s' policies required by the '%s' annotation instances are missing: %s"
++                                .formatted(HttpSecurityPolicy.class.getName(), AuthorizationPolicy.class.getName(),
++                                        missingPolicies));
++                    }
++                }
+                 return new SecurityHttpUpgradeCheck(config.security().authFailureRedirectUrl().orElse(null), endpointToCheck,
+-                        securityEventHelper);
++                        securityEventHelper, endpointToPolicy, authorizationRequestContext);
+             }
+         };
+     }

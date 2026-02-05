@@ -1,0 +1,347 @@
+diff --git a/http/src/main/java/io/micronaut/http/filter/AsyncFilter.java b/http/src/main/java/io/micronaut/http/filter/AsyncFilter.java
+new file mode 100644
+index 0000000000..28031085a3
+--- /dev/null
++++ b/http/src/main/java/io/micronaut/http/filter/AsyncFilter.java
+@@ -0,0 +1,87 @@
++/*
++ * Copyright 2017-2023 original authors
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * https://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package io.micronaut.http.filter;
++
++import io.micronaut.core.annotation.Internal;
++import io.micronaut.core.execution.ExecutionFlow;
++import io.micronaut.http.HttpRequest;
++
++import java.util.concurrent.Executor;
++import java.util.function.Function;
++
++/**
++ * Wrapper around a filter that signifies the filter should be run asynchronously on the given
++ * executor. Usually from an {@link io.micronaut.scheduling.annotation.ExecuteOn} annotation.
++ *
++ * @param actual   Actual filter
++ * @param executor Executor to run the filter on
++ * @author Jonas Konrad
++ * @author Denis Stepanov
++ * @since 4.2.0
++ */
++@Internal
++record AsyncFilter(InternalHttpFilter actual, Executor executor) implements InternalHttpFilter {
++
++    @Override
++    public boolean isEnabled(HttpRequest<?> request) {
++        return actual.isEnabled(request);
++    }
++
++    @Override
++    public boolean isFiltersRequest() {
++        return actual.isFiltersRequest();
++    }
++
++    @Override
++    public boolean isFiltersResponse() {
++        return actual.isFiltersResponse();
++    }
++
++    @Override
++    public boolean hasContinuation() {
++        return actual.hasContinuation();
++    }
++
++    @Override
++    public ExecutionFlow<FilterContext> processRequestFilter(FilterContext context) {
++        if (isFiltersRequest()) {
++            return ExecutionFlow.async(executor, () -> actual.processRequestFilter(context));
++        }
++        return InternalHttpFilter.super.processRequestFilter(context);
++    }
++
++    @Override
++    public ExecutionFlow<FilterContext> processRequestFilter(FilterContext context,
++                                                             Function<FilterContext, ExecutionFlow<FilterContext>> downstream) {
++        if (isFiltersRequest()) {
++            return ExecutionFlow.async(executor, () -> actual.processRequestFilter(context, downstream));
++        }
++        return InternalHttpFilter.super.processRequestFilter(context, downstream);
++    }
++
++    @Override
++    public ExecutionFlow<FilterContext> processResponseFilter(FilterContext context, Throwable exceptionToFilter) {
++        if (isFiltersResponse()) {
++            return ExecutionFlow.async(executor, () -> actual.processResponseFilter(context, exceptionToFilter));
++        }
++        return InternalHttpFilter.super.processResponseFilter(context, exceptionToFilter);
++    }
++
++    @Override
++    public int getOrder() {
++        return actual.getOrder();
++    }
++}
+diff --git a/http/src/main/java/io/micronaut/http/filter/BaseFilterProcessor.java b/http/src/main/java/io/micronaut/http/filter/BaseFilterProcessor.java
+index b0c11c2560..ebe21f7e42 100644
+--- a/http/src/main/java/io/micronaut/http/filter/BaseFilterProcessor.java
++++ b/http/src/main/java/io/micronaut/http/filter/BaseFilterProcessor.java
+@@ -123,21 +123,21 @@ public abstract class BaseFilterProcessor<A extends Annotation> implements Execu
+             if (method.isAnnotationPresent(RequestFilter.class)) {
+                 FilterMetadata methodLevel = metadata(method, RequestFilter.class);
+                 FilterMetadata combined = combineMetadata(beanLevel, methodLevel);
+-                addFilter(() -> MethodFilter.prepareFilterMethod(beanContext.getConversionService(), beanContext.getBean(beanDefinition), method, false, combined.order, argumentBinderRegistry, getExecutor(combined)), method, combined);
++                addFilter(() -> withAsync(combined, MethodFilter.prepareFilterMethod(beanContext.getConversionService(), beanContext.getBean(beanDefinition), method, false, combined.order, argumentBinderRegistry)), method, combined);
+             }
+             if (method.isAnnotationPresent(ResponseFilter.class)) {
+                 FilterMetadata methodLevel = metadata(method, ResponseFilter.class);
+                 FilterMetadata combined = combineMetadata(beanLevel, methodLevel);
+-                addFilter(() -> MethodFilter.prepareFilterMethod(beanContext.getConversionService(), beanContext.getBean(beanDefinition), method, true, combined.order, argumentBinderRegistry, getExecutor(combined)), method, combined);
++                addFilter(() -> withAsync(combined, MethodFilter.prepareFilterMethod(beanContext.getConversionService(), beanContext.getBean(beanDefinition), method, true, combined.order, argumentBinderRegistry)), method, combined);
+             }
+         }
+     }
+ 
+-    private Executor getExecutor(FilterMetadata metadata) {
++    private GenericHttpFilter withAsync(FilterMetadata metadata, GenericHttpFilter filter) {
+         if (metadata.executeOn != null) {
+-            return beanContext.getBean(Executor.class, Qualifiers.byName(metadata.executeOn));
++            return new AsyncFilter((InternalHttpFilter) filter, beanContext.getBean(Executor.class, Qualifiers.byName(metadata.executeOn)));
+         } else {
+-            return null;
++            return filter;
+         }
+     }
+ 
+diff --git a/http/src/main/java/io/micronaut/http/filter/InternalHttpFilter.java b/http/src/main/java/io/micronaut/http/filter/InternalHttpFilter.java
+index e66b03eefc..b8e5ba5545 100644
+--- a/http/src/main/java/io/micronaut/http/filter/InternalHttpFilter.java
++++ b/http/src/main/java/io/micronaut/http/filter/InternalHttpFilter.java
+@@ -32,7 +32,7 @@ import java.util.function.Function;
+  * @since 4.2.0
+  */
+ @Internal
+-sealed interface InternalHttpFilter extends GenericHttpFilter, Ordered permits AroundLegacyFilter, FilterRunner.RouteMatchResolverHttpFilter, MethodFilter {
++sealed interface InternalHttpFilter extends GenericHttpFilter, Ordered permits AroundLegacyFilter, AsyncFilter, FilterRunner.RouteMatchResolverHttpFilter, MethodFilter {
+ 
+     /**
+      * Checks the filter is implementing {@link ConditionalFilter} and is enabled.
+diff --git a/http/src/main/java/io/micronaut/http/filter/MethodFilter.java b/http/src/main/java/io/micronaut/http/filter/MethodFilter.java
+index b88ebcbd25..b19fd10b13 100644
+--- a/http/src/main/java/io/micronaut/http/filter/MethodFilter.java
++++ b/http/src/main/java/io/micronaut/http/filter/MethodFilter.java
+@@ -50,14 +50,12 @@ import java.util.Objects;
+ import java.util.Optional;
+ import java.util.concurrent.CompletionStage;
+ import java.util.concurrent.ExecutionException;
+-import java.util.concurrent.Executor;
+ import java.util.function.Function;
+ import java.util.function.Predicate;
+ 
+ /**
+  * Internal implementation of {@link io.micronaut.http.annotation.ServerFilter}.
+  *
+- * @param <T>                 The bean type
+  * @param order               The order
+  * @param bean                The bean instance
+  * @param method              The method
+@@ -70,7 +68,7 @@ import java.util.function.Predicate;
+  * @param filtersException    The filter exception
+  * @param returnHandler       The return handler
+  * @param isConditional       Is conditional filter
+- * @param executor            The executor to run this filter on
++ * @param <T>                 The bean type
+  * @author Jonas Konrad
+  * @author Denis Stepanov
+  * @since 4.2.0
+@@ -91,8 +89,8 @@ record MethodFilter<T>(FilterOrder order,
+                        ContinuationCreator continuationCreator,
+                        boolean filtersException,
+                        FilterReturnHandler returnHandler,
+-                       boolean isConditional,
+-                       Executor executor) implements InternalHttpFilter {
++                       boolean isConditional
++) implements InternalHttpFilter {
+ 
+     private static final Predicate<FilterMethodContext> FILTER_CONDITION_ALWAYS_TRUE = runner -> true;
+ 
+@@ -101,9 +99,8 @@ record MethodFilter<T>(FilterOrder order,
+                                                    ExecutableMethod<T, ?> method,
+                                                    boolean isResponseFilter,
+                                                    FilterOrder order,
+-                                                   RequestBinderRegistry argumentBinderRegistry,
+-                                                   @Nullable Executor executor) throws IllegalArgumentException {
+-        return prepareFilterMethod(conversionService, bean, method, method.getArguments(), method.getReturnType().asArgument(), isResponseFilter, order, argumentBinderRegistry, executor);
++                                                   RequestBinderRegistry argumentBinderRegistry) throws IllegalArgumentException {
++        return prepareFilterMethod(conversionService, bean, method, method.getArguments(), method.getReturnType().asArgument(), isResponseFilter, order, argumentBinderRegistry);
+     }
+ 
+     static <T> MethodFilter<T> prepareFilterMethod(ConversionService conversionService,
+@@ -113,8 +110,7 @@ record MethodFilter<T>(FilterOrder order,
+                                                    Argument<?> returnType,
+                                                    boolean isResponseFilter,
+                                                    FilterOrder order,
+-                                                   RequestBinderRegistry argumentBinderRegistry,
+-                                                   @Nullable Executor executor) throws IllegalArgumentException {
++                                                   RequestBinderRegistry argumentBinderRegistry) throws IllegalArgumentException {
+ 
+         FilterArgBinder[] fulfilled = new FilterArgBinder[arguments.length];
+         AsyncFilterArgBinder[] asyncArgBinders = null;
+@@ -232,8 +228,7 @@ record MethodFilter<T>(FilterOrder order,
+             continuationCreator,
+             filtersException,
+             returnHandler,
+-            bean instanceof ConditionalFilter,
+-            executor
++            bean instanceof ConditionalFilter
+         );
+     }
+ 
+@@ -289,7 +284,7 @@ record MethodFilter<T>(FilterOrder order,
+             context.response(),
+             null,
+             null);
+-        return filter(context, filterMethodContext, null, false);
++        return filter(context, filterMethodContext);
+     }
+ 
+     @Override
+@@ -305,7 +300,7 @@ record MethodFilter<T>(FilterOrder order,
+             context.response(),
+             null,
+             createContinuation(downstream, context, mutablePropagatedContext));
+-        return filter(context, filterMethodContext, null, false);
++        return filter(context, filterMethodContext);
+     }
+ 
+     @Override
+@@ -322,7 +317,7 @@ record MethodFilter<T>(FilterOrder order,
+             context.response(),
+             exceptionToFilter,
+             null);
+-        return filter(context, filterMethodContext, null, false);
++        return filter(context, filterMethodContext);
+     }
+ 
+     @Override
+@@ -336,35 +331,30 @@ record MethodFilter<T>(FilterOrder order,
+         return continuationCreator.create(downstream, filterContext, mutablePropagatedContext);
+     }
+ 
+-    private ExecutionFlow<FilterContext> filter(
+-        FilterContext filterContext,
+-        FilterMethodContext methodContext,
+-        Object[] args,
+-        boolean onExecutor
+-    ) {
+-        // this is intentionally one method instead of three nested ones to reduce stacktrace depth
+-        // and avoid unnecessary propagate calls
+-
++    private ExecutionFlow<FilterContext> filter(FilterContext filterContext,
++                                                FilterMethodContext methodContext) {
+         try (PropagatedContext.Scope ignore = filterContext.propagatedContext().propagate()) {
+-            if (args == null) {
+-                if (filterCondition != null && !filterCondition.test(methodContext)) {
+-                    return ExecutionFlow.just(filterContext);
+-                }
+-                if (asyncArgBinders != null) {
+-                    return bindArgsAsync(methodContext).flatMap(a -> filter(filterContext, methodContext, a, onExecutor));
+-                } else {
+-                    try {
+-                        args = bindArgsSync(methodContext);
+-                    } catch (Throwable e) {
+-                        return ExecutionFlow.error(e);
+-                    }
+-                }
++            if (filterCondition != null && !filterCondition.test(methodContext)) {
++                return ExecutionFlow.just(filterContext);
+             }
+-            if (!onExecutor && executor != null) {
+-                Object[] finalArgs = args;
+-                return ExecutionFlow.async(executor, () -> filter(filterContext, methodContext, finalArgs, true));
++            if (asyncArgBinders != null) {
++                return bindArgsAsync(methodContext).flatMap(args -> filter0(filterContext, methodContext, args));
++            } else {
++                Object[] args;
++                try {
++                    args = bindArgsSync(methodContext);
++                } catch (Throwable e) {
++                    return ExecutionFlow.error(e);
++                }
++                return filter0(filterContext, methodContext, args);
+             }
++        } catch (Throwable e) {
++            return ExecutionFlow.error(e);
++        }
++    }
+ 
++    private ExecutionFlow<FilterContext> filter0(FilterContext filterContext, FilterMethodContext methodContext, Object[] args) {
++        try {
+             Object returnValue;
+             if (unsafeExecutable != null) {
+                 returnValue = unsafeExecutable.invokeUnsafe(bean, args);
+diff --git a/inject/custom-config/bootstrap.yml b/inject/custom-config/bootstrap.yml
+new file mode 100644
+index 0000000000..b4d95d8c98
+--- /dev/null
++++ b/inject/custom-config/bootstrap.yml
+@@ -0,0 +1,17 @@
++#
++# Copyright 2017-2025 original authors
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++# https://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++#
++
++custom-bootstrap-value: test
+diff --git a/inject/src/main/java/io/micronaut/context/DefaultApplicationContext.java b/inject/src/main/java/io/micronaut/context/DefaultApplicationContext.java
+index bbd5b5f0fb..3648cc7706 100644
+--- a/inject/src/main/java/io/micronaut/context/DefaultApplicationContext.java
++++ b/inject/src/main/java/io/micronaut/context/DefaultApplicationContext.java
+@@ -832,6 +832,12 @@ public class DefaultApplicationContext extends DefaultBeanContext implements Con
+                 public ClassPathResourceLoader getResourceLoader() {
+                     return resourceLoader;
+                 }
++
++                @Nullable
++                @Override
++                public List<String> getOverrideConfigLocations() {
++                    return configuration.getOverrideConfigLocations();
++                }
+             });
+         }
+ 
+diff --git a/inject/src/main/java/io/micronaut/context/env/DefaultEnvironment.java b/inject/src/main/java/io/micronaut/context/env/DefaultEnvironment.java
+index 741c3f7e6d..ad7b72af14 100644
+--- a/inject/src/main/java/io/micronaut/context/env/DefaultEnvironment.java
++++ b/inject/src/main/java/io/micronaut/context/env/DefaultEnvironment.java
+@@ -169,8 +169,9 @@ public class DefaultEnvironment extends PropertySourcePropertyResolver implement
+         if (!environments.isEmpty()) {
+             log.info("Established active environments: {}", environments);
+         }
+-        List<String> configLocations = configuration.getOverrideConfigLocations() == null ?
+-                new ArrayList<>(DEFAULT_CONFIG_LOCATIONS) : configuration.getOverrideConfigLocations();
++        List<String> configLocations = configuration.getOverrideConfigLocations() == null
++            ? new ArrayList<>(DEFAULT_CONFIG_LOCATIONS)
++            : new ArrayList<>(configuration.getOverrideConfigLocations());
+         // Search config locations in reverse order
+         Collections.reverse(configLocations);
+         this.configLocations = configLocations;

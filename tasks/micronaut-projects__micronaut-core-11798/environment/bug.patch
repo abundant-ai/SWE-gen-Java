@@ -1,0 +1,165 @@
+diff --git a/context/src/main/java/io/micronaut/runtime/context/scope/refresh/RefreshScope.java b/context/src/main/java/io/micronaut/runtime/context/scope/refresh/RefreshScope.java
+index 926fce3533..81bd851c11 100644
+--- a/context/src/main/java/io/micronaut/runtime/context/scope/refresh/RefreshScope.java
++++ b/context/src/main/java/io/micronaut/runtime/context/scope/refresh/RefreshScope.java
+@@ -171,19 +171,13 @@ public class RefreshScope implements CustomScope<Refreshable>, LifeCycle<Refresh
+ 
+     private void refreshSubsetOfConfigurationProperties(Set<String> keySet) {
+         Collection<BeanRegistration<?>> registrations =
+-            beanContext.getActiveBeanRegistrations(Qualifiers.byStereotype(ConfigurationReader.class));
++            beanContext.getActiveBeanRegistrations(Qualifiers.byStereotype(ConfigurationProperties.class));
+         for (BeanRegistration<?> registration : registrations) {
+             BeanDefinition<?> definition = registration.getBeanDefinition();
+             Optional<String> value = definition.stringValue(ConfigurationReader.class, "prefix");
+             if (value.isPresent()) {
+                 String configPrefix = value.get();
+-                if (configPrefix.endsWith(".*")) {
+-                    configPrefix = configPrefix.substring(0, configPrefix.length() - 2);
+-                } else if (configPrefix.endsWith("[*]")) {
+-                    configPrefix = configPrefix.substring(0, configPrefix.length() - 3);
+-                }
+-                String finalConfigPrefix = configPrefix;
+-                if (keySet.stream().anyMatch(key -> key.startsWith(finalConfigPrefix))) {
++                if (keySet.stream().anyMatch(key -> key.startsWith(configPrefix))) {
+                     beanContext.refreshBean(registration);
+                 }
+             }
+@@ -192,7 +186,7 @@ public class RefreshScope implements CustomScope<Refreshable>, LifeCycle<Refresh
+ 
+     private void refreshAllConfigurationProperties() {
+         Collection<BeanRegistration<?>> registrations =
+-            beanContext.getActiveBeanRegistrations(Qualifiers.byStereotype(ConfigurationReader.class));
++            beanContext.getActiveBeanRegistrations(Qualifiers.byStereotype(ConfigurationProperties.class));
+         for (BeanRegistration<?> registration : registrations) {
+             beanContext.refreshBean(registration);
+         }
+diff --git a/inject/src/main/java/io/micronaut/context/BeanDefinitionDelegate.java b/inject/src/main/java/io/micronaut/context/BeanDefinitionDelegate.java
+index 6ee0978c94..a2ac2138e4 100644
+--- a/inject/src/main/java/io/micronaut/context/BeanDefinitionDelegate.java
++++ b/inject/src/main/java/io/micronaut/context/BeanDefinitionDelegate.java
+@@ -139,29 +139,16 @@ sealed class BeanDefinitionDelegate<T> extends AbstractBeanContextConditional
+ 
+     @Override
+     public T inject(BeanContext context, T bean) {
+-        if (definition instanceof InjectableBeanDefinition<T>) {
+-            try (DefaultBeanResolutionContext resolutionContext = new DefaultBeanResolutionContext(context, this)) {
+-                return inject(resolutionContext, context, bean);
+-            }
++        if (definition instanceof InjectableBeanDefinition<T> injectableBeanDefinition) {
++            return injectableBeanDefinition.inject(context, bean);
+         }
+         return bean;
+     }
+ 
+     @Override
+     public T inject(BeanResolutionContext resolutionContext, BeanContext context, T bean) {
+-        ConfigurationPath oldPath = null;
+-        if (configurationPath != null && resolutionContext != null) {
+-            oldPath = resolutionContext.getConfigurationPath();
+-            resolutionContext.setConfigurationPath(configurationPath);
+-        }
+         if (definition instanceof InjectableBeanDefinition<T> injectableBeanDefinition) {
+-            try {
+-                return injectableBeanDefinition.inject(resolutionContext, context, bean);
+-            } finally {
+-                if (resolutionContext != null) {
+-                    resolutionContext.setConfigurationPath(oldPath);
+-                }
+-            }
++            return injectableBeanDefinition.inject(resolutionContext, context, bean);
+         }
+         return bean;
+     }
+diff --git a/runtime/src/test/groovy/io/micronaut/runtime/context/scope/RefreshScopeSpec.groovy b/runtime/src/test/groovy/io/micronaut/runtime/context/scope/RefreshScopeSpec.groovy
+index e3b0b48996..b76055b780 100644
+--- a/runtime/src/test/groovy/io/micronaut/runtime/context/scope/RefreshScopeSpec.groovy
++++ b/runtime/src/test/groovy/io/micronaut/runtime/context/scope/RefreshScopeSpec.groovy
+@@ -2,7 +2,6 @@ package io.micronaut.runtime.context.scope
+ 
+ import io.micronaut.context.ApplicationContext
+ import io.micronaut.context.annotation.ConfigurationProperties
+-import io.micronaut.context.annotation.EachProperty
+ import io.micronaut.context.annotation.Value
+ import io.micronaut.context.env.Environment
+ import io.micronaut.core.util.StringUtils
+@@ -119,8 +118,6 @@ class RefreshScopeSpec extends Specification {
+     void "test fire refresh event that refreshes environment diff"() {
+         given:
+         System.setProperty("foo.bar", "test")
+-        System.setProperty("foos.test.bar", "test")
+-        System.setProperty("foo-list[0].bar", "test")
+         ApplicationContext beanContext = ApplicationContext.builder().start()
+ 
+         // override IO executor with synchronous impl
+@@ -138,14 +135,9 @@ class RefreshScopeSpec extends Specification {
+         bean.hashCode() == bean.hashCode()
+         bean.testValue() == 'test'
+         bean.testConfigProps() == 'test'
+-        bean.testEachProps() == 'test'
+-        bean.testListEachProps() == 'test'
+-
+ 
+         when:
+         System.setProperty("foo.bar", "bar")
+-        System.setProperty("foos.test.bar", "bar")
+-        System.setProperty("foo-list[0].bar", "bar")
+         Environment environment = beanContext.getEnvironment()
+         Map<String, Object> previousValues = environment.refreshAndDiff()
+         beanContext.publishEvent(new RefreshEvent(previousValues))
+@@ -153,8 +145,6 @@ class RefreshScopeSpec extends Specification {
+         then:
+         bean.testValue() == 'bar'
+         bean.testConfigProps() == 'bar'
+-        bean.testEachProps() == 'bar'
+-        bean.testListEachProps() == 'bar'
+ 
+         cleanup:
+         beanContext?.stop()
+@@ -239,16 +229,12 @@ class RefreshScopeSpec extends Specification {
+     static class RefreshBean {
+ 
+         final MyConfig config
+-        final List<EachConfig> configs
+-        final List<EachConfig> moreConfigs
+ 
+         @Value('${foo.bar}')
+         String foo
+ 
+-        RefreshBean(MyConfig config, List<EachConfig> configs, List<EachListConfig> moreConfigs) {
++        RefreshBean(MyConfig config) {
+             this.config = config
+-            this.configs = configs
+-            this.moreConfigs = moreConfigs
+         }
+ 
+         String testValue() {
+@@ -258,14 +244,6 @@ class RefreshScopeSpec extends Specification {
+         String testConfigProps() {
+             return config.bar
+         }
+-
+-        String testEachProps() {
+-            return configs[0].bar
+-        }
+-
+-        String testListEachProps() {
+-            return moreConfigs[0].bar
+-        }
+     }
+ 
+     @Refreshable("foo")
+@@ -308,14 +286,4 @@ class RefreshScopeSpec extends Specification {
+     static class SecondConfig {
+         String bar = "default"
+     }
+-
+-    @EachProperty('foos')
+-    static class EachConfig {
+-        String bar
+-    }
+-
+-    @EachProperty(value = 'foo-list', list = true)
+-    static class EachListConfig {
+-        String bar
+-    }
+ }

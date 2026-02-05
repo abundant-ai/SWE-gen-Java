@@ -1,0 +1,172 @@
+diff --git a/documentation/modules/ROOT/pages/writing-tests/parameterized-classes-and-tests.adoc b/documentation/modules/ROOT/pages/writing-tests/parameterized-classes-and-tests.adoc
+index 8f3844fcc..42e967d4c 100644
+--- a/documentation/modules/ROOT/pages/writing-tests/parameterized-classes-and-tests.adoc
++++ b/documentation/modules/ROOT/pages/writing-tests/parameterized-classes-and-tests.adoc
+@@ -913,8 +913,8 @@ integral types: `byte`, `short`, `int`, `long`, and their boxed counterparts.
+ 
+ In addition to implicit conversion from strings to the target types listed in the above
+ table, JUnit Jupiter also provides a fallback mechanism for automatic conversion from a
+-`String` to a given target type if the target type declares exactly one suitable _factory
+-method_ or a _factory constructor_ as defined below.
++`String` to a given target type if the target type declares a suitable _factory method_
++or _factory constructor_ as defined below.
+ 
+ - __factory method__: a non-private, `static` method declared in the target type that
+   accepts either a single `String` argument or a single `CharSequence` argument and
+@@ -924,9 +924,17 @@ method_ or a _factory constructor_ as defined below.
+   either a single `String` argument or a single `CharSequence` argument. Note that the
+   target type must be declared as either a top-level class or as a `static` nested class.
+ 
+-NOTE: If multiple _factory methods_ are discovered, they will be ignored. If a _factory
+-method_ and a _factory constructor_ are discovered, the factory method will be used
+-instead of the constructor.
++If there are multiple _factory methods_ or _factory constructors_, matching proceeds in the
++following order:
++
++1. A single _factory method_ accepting a `String` argument.
++2. A single _factory constructor_ accepting a `String` argument.
++3. A single _factory method_ accepting a `CharSequence` argument.
++4. A single _factory constructor_ accepting a `CharSequence` argument.
++5. A single _factory method_ accepting a `String` argument once all `@Deprecated` factory
++methods have been removed from the set of methods being considered.
++6. A single _factory method_ accepting a `CharSequence` argument once all `@Deprecated` factory
++methods have been removed from the set of methods being considered.
+ 
+ For example, in the following `@ParameterizedTest` method, the `Book` argument will be
+ created by invoking the `Book.fromTitle(String)` factory method and passing `"42 Cats"`
+diff --git a/documentation/modules/ROOT/partials/release-notes/release-notes-6.1.0-M2.adoc b/documentation/modules/ROOT/partials/release-notes/release-notes-6.1.0-M2.adoc
+index ba9b0fb0f..3ab82eda2 100644
+--- a/documentation/modules/ROOT/partials/release-notes/release-notes-6.1.0-M2.adoc
++++ b/documentation/modules/ROOT/partials/release-notes/release-notes-6.1.0-M2.adoc
+@@ -48,6 +48,9 @@ repository on GitHub.
+ * https://www.junit-pioneer.org/[JUnit Pioneer]'s `DefaultLocaleExtension` and
+   `DefaultTimeZoneExtension` are now part of the JUnit Jupiter. Find examples in the
+   xref:writing-tests/built-in-extensions.adoc#DefaultLocaleAndTimeZone[User Guide].
++* Exclude competing `@Deprecated` factory methods in
++  xref:writing-tests/parameterized-classes-and-tests.adoc#tests-argument-conversion-implicit-fallback[fallback String-to-Object]
++  converter.
+ * Trim internal stack frames from `AssertionFailedError` stack traces.
+ * Introduce new `trimStacktrace(Class<?>)` and `retainStackTraceElements(int)`
+   methods for `AssertionFailureBuilder`. These allow user defined assertions to
+diff --git a/junit-platform-commons/src/main/java/org/junit/platform/commons/support/conversion/FallbackStringToObjectConverter.java b/junit-platform-commons/src/main/java/org/junit/platform/commons/support/conversion/FallbackStringToObjectConverter.java
+index 80be72128..b5960eaed 100644
+--- a/junit-platform-commons/src/main/java/org/junit/platform/commons/support/conversion/FallbackStringToObjectConverter.java
++++ b/junit-platform-commons/src/main/java/org/junit/platform/commons/support/conversion/FallbackStringToObjectConverter.java
+@@ -15,6 +15,8 @@ import static org.junit.platform.commons.support.ModifierSupport.isNotPrivate;
+ import static org.junit.platform.commons.support.ModifierSupport.isNotStatic;
+ import static org.junit.platform.commons.support.ReflectionSupport.findMethods;
+ import static org.junit.platform.commons.support.ReflectionSupport.invokeMethod;
++import static org.junit.platform.commons.support.conversion.FallbackStringToObjectConverter.DeprecationStatus.EXCLUDE_DEPRECATED;
++import static org.junit.platform.commons.support.conversion.FallbackStringToObjectConverter.DeprecationStatus.INCLUDE_DEPRECATED;
+ import static org.junit.platform.commons.util.ReflectionUtils.findConstructors;
+ import static org.junit.platform.commons.util.ReflectionUtils.newInstance;
+ 
+@@ -32,8 +34,8 @@ import org.junit.platform.commons.util.Preconditions;
+ /**
+  * {@code FallbackStringToObjectConverter} is a {@link StringToObjectConverter}
+  * that provides a fallback conversion strategy for converting from a
+- * {@link String} to a given target type by invoking a static factory method
+- * or factory constructor defined in the target type.
++ * {@link String} or {@link CharSequence} to a given target type by invoking a
++ * static factory method or factory constructor defined in the target type.
+  *
+  * <h2>Search Algorithm</h2>
+  *
+@@ -92,12 +94,29 @@ class FallbackStringToObjectConverter implements StringToObjectConverter {
+ 	private static Function<String, @Nullable Object> findFactoryExecutable(Class<?> targetType) {
+ 		return factoryExecutableCache.computeIfAbsent(targetType, type -> {
+ 			// First, search for exact String argument matches.
+-			Function<String, @Nullable Object> factory = findFactoryExecutable(type, String.class);
++			var factory = findFactoryMethodExecutable(type, String.class, INCLUDE_DEPRECATED);
++			if (factory != null) {
++				return factory;
++			}
++			factory = findFactoryConstructorExecutable(type, String.class);
+ 			if (factory != null) {
+ 				return factory;
+ 			}
+ 			// Second, fall back to CharSequence argument matches.
+-			factory = findFactoryExecutable(type, CharSequence.class);
++			factory = findFactoryMethodExecutable(type, CharSequence.class, INCLUDE_DEPRECATED);
++			if (factory != null) {
++				return factory;
++			}
++			factory = findFactoryConstructorExecutable(type, CharSequence.class);
++			if (factory != null) {
++				return factory;
++			}
++			// Third, try factory methods again, but exclude deprecated methods
++			factory = findFactoryMethodExecutable(type, String.class, EXCLUDE_DEPRECATED);
++			if (factory != null) {
++				return factory;
++			}
++			factory = findFactoryMethodExecutable(type, CharSequence.class, EXCLUDE_DEPRECATED);
+ 			if (factory != null) {
+ 				return factory;
+ 			}
+@@ -106,13 +125,17 @@ class FallbackStringToObjectConverter implements StringToObjectConverter {
+ 		});
+ 	}
+ 
+-	private static @Nullable Function<String, @Nullable Object> findFactoryExecutable(Class<?> targetType,
+-			Class<?> parameterType) {
+-
+-		Method factoryMethod = findFactoryMethod(targetType, parameterType);
++	private static @Nullable Function<String, @Nullable Object> findFactoryMethodExecutable(Class<?> targetType,
++			Class<?> parameterType, DeprecationStatus deprecationStatus) {
++		Method factoryMethod = findFactoryMethod(targetType, parameterType, deprecationStatus);
+ 		if (factoryMethod != null) {
+ 			return source -> invokeMethod(factoryMethod, null, source);
+ 		}
++		return null;
++	}
++
++	private static @Nullable Function<String, @Nullable Object> findFactoryConstructorExecutable(Class<?> targetType,
++			Class<?> parameterType) {
+ 		Constructor<?> constructor = findFactoryConstructor(targetType, parameterType);
+ 		if (constructor != null) {
+ 			return source -> newInstance(constructor, source);
+@@ -120,9 +143,10 @@ class FallbackStringToObjectConverter implements StringToObjectConverter {
+ 		return null;
+ 	}
+ 
+-	private static @Nullable Method findFactoryMethod(Class<?> targetType, Class<?> parameterType) {
+-		List<Method> factoryMethods = findMethods(targetType, new IsFactoryMethod(targetType, parameterType),
+-			BOTTOM_UP);
++	private static @Nullable Method findFactoryMethod(Class<?> targetType, Class<?> parameterType,
++			DeprecationStatus deprecationStatus) {
++		var isFactoryMethod = new IsFactoryMethod(targetType, parameterType, deprecationStatus);
++		List<Method> factoryMethods = findMethods(targetType, isFactoryMethod, BOTTOM_UP);
+ 		if (factoryMethods.size() == 1) {
+ 			return factoryMethods.get(0);
+ 		}
+@@ -138,12 +162,17 @@ class FallbackStringToObjectConverter implements StringToObjectConverter {
+ 		return null;
+ 	}
+ 
++	enum DeprecationStatus {
++		INCLUDE_DEPRECATED, EXCLUDE_DEPRECATED
++	}
++
+ 	/**
+ 	 * {@link Predicate} that determines if the {@link Method} supplied to
+ 	 * {@link #test(Method)} is a non-private static factory method for the
+ 	 * supplied {@link #targetType} and {@link #parameterType}.
+ 	 */
+-	record IsFactoryMethod(Class<?> targetType, Class<?> parameterType) implements Predicate<Method> {
++	record IsFactoryMethod(Class<?> targetType, Class<?> parameterType, DeprecationStatus deprecationStatus)
++			implements Predicate<Method> {
+ 
+ 		@Override
+ 		public boolean test(Method method) {
+@@ -154,6 +183,10 @@ class FallbackStringToObjectConverter implements StringToObjectConverter {
+ 			if (isNotStatic(method)) {
+ 				return false;
+ 			}
++			if (deprecationStatus == DeprecationStatus.EXCLUDE_DEPRECATED
++					&& method.getAnnotation(Deprecated.class) != null) {
++				return false;
++			}
+ 			return isFactoryCandidate(method, this.parameterType);
+ 		}
+ 	}

@@ -1,0 +1,315 @@
+diff --git a/retrofit/src/main/java/retrofit2/Call.java b/retrofit/src/main/java/retrofit2/Call.java
+index 873bb0c6..ca57759f 100644
+--- a/retrofit/src/main/java/retrofit2/Call.java
++++ b/retrofit/src/main/java/retrofit2/Call.java
+@@ -15,6 +15,7 @@
+  */
+ package retrofit2;
+ 
++import com.squareup.okhttp.ResponseBody;
+ import java.io.IOException;
+ 
+ /**
+@@ -66,4 +67,13 @@ public interface Call<T> extends Cloneable {
+    * has already been.
+    */
+   Call<T> clone();
++
++  /** Creates {@link Call} instances. */
++  interface Factory {
++    /**
++     * Returns a {@link Call} which will send {@code request} when executed or enqueue and use
++     * {@code converter} to parse the response. May not return null.
++     */
++    <T> Call<T> create(DeferredRequest request, Converter<ResponseBody, T> converter);
++  }
+ }
+diff --git a/retrofit/src/main/java/retrofit2/DeferredRequest.java b/retrofit/src/main/java/retrofit2/DeferredRequest.java
+new file mode 100644
+index 00000000..37d83711
+--- /dev/null
++++ b/retrofit/src/main/java/retrofit2/DeferredRequest.java
+@@ -0,0 +1,28 @@
++/*
++ * Copyright (C) 2015 Square, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package retrofit2;
++
++import com.squareup.okhttp.Request;
++import java.io.IOException;
++
++/**
++ * An un-built HTTP request. This class defers any work necessary to create an HTTP request until
++ * {@link #get()} is called.
++ */
++public interface DeferredRequest {
++  /** Perform the work necessary to create and then return the {@link Request}. */
++  Request get() throws IOException;
++}
+diff --git a/retrofit/src/main/java/retrofit2/MethodHandler.java b/retrofit/src/main/java/retrofit2/MethodHandler.java
+index 8e4fe720..440e78ef 100644
+--- a/retrofit/src/main/java/retrofit2/MethodHandler.java
++++ b/retrofit/src/main/java/retrofit2/MethodHandler.java
+@@ -15,7 +15,6 @@
+  */
+ package retrofit2;
+ 
+-import com.squareup.okhttp.OkHttpClient;
+ import com.squareup.okhttp.ResponseBody;
+ import java.lang.annotation.Annotation;
+ import java.lang.reflect.Method;
+@@ -29,7 +28,8 @@ final class MethodHandler {
+     Converter<ResponseBody, ?> responseConverter =
+         createResponseConverter(method, retrofit, responseType);
+     RequestFactory requestFactory = RequestFactoryParser.parse(method, responseType, retrofit);
+-    return new MethodHandler(retrofit.client(), requestFactory, callAdapter, responseConverter);
++    return new MethodHandler(retrofit.callFactory(), requestFactory, callAdapter,
++        responseConverter);
+   }
+ 
+   private static CallAdapter<?> createCallAdapter(Method method, Retrofit retrofit) {
+@@ -59,20 +59,25 @@ final class MethodHandler {
+     }
+   }
+ 
+-  private final OkHttpClient client;
++  private final Call.Factory callFactory;
+   private final RequestFactory requestFactory;
+   private final CallAdapter<?> callAdapter;
+   private final Converter<ResponseBody, ?> responseConverter;
+ 
+-  private MethodHandler(OkHttpClient client, RequestFactory requestFactory,
++  private MethodHandler(Call.Factory callFactory, RequestFactory requestFactory,
+       CallAdapter<?> callAdapter, Converter<ResponseBody, ?> responseConverter) {
+-    this.client = client;
++    this.callFactory = callFactory;
+     this.requestFactory = requestFactory;
+     this.callAdapter = callAdapter;
+     this.responseConverter = responseConverter;
+   }
+ 
+   Object invoke(Object... args) {
+-    return callAdapter.adapt(new OkHttpCall<>(client, requestFactory, responseConverter, args));
++    DeferredRequest request = requestFactory.defer(args);
++    Call<?> call = callFactory.create(request, responseConverter);
++    if (call == null) {
++      throw new NullPointerException("Call.Factory returned null.");
++    }
++    return callAdapter.adapt(call);
+   }
+ }
+diff --git a/retrofit/src/main/java/retrofit2/OkHttpCall.java b/retrofit/src/main/java/retrofit2/OkHttpCall.java
+index fc2d70b6..3972ffed 100644
+--- a/retrofit/src/main/java/retrofit2/OkHttpCall.java
++++ b/retrofit/src/main/java/retrofit2/OkHttpCall.java
+@@ -29,25 +29,23 @@ import static retrofit2.Utils.closeQuietly;
+ 
+ final class OkHttpCall<T> implements Call<T> {
+   private final OkHttpClient client;
+-  private final RequestFactory requestFactory;
++  private final DeferredRequest request;
+   private final Converter<ResponseBody, T> responseConverter;
+-  private final Object[] args;
+ 
+   private volatile com.squareup.okhttp.Call rawCall;
+   private boolean executed; // Guarded by this.
+   private volatile boolean canceled;
+ 
+-  OkHttpCall(OkHttpClient client, RequestFactory requestFactory,
+-      Converter<ResponseBody, T> responseConverter, Object[] args) {
++  OkHttpCall(OkHttpClient client, DeferredRequest request,
++      Converter<ResponseBody, T> responseConverter) {
+     this.client = client;
+-    this.requestFactory = requestFactory;
++    this.request = request;
+     this.responseConverter = responseConverter;
+-    this.args = args;
+   }
+ 
+   @SuppressWarnings("CloneDoesntCallSuperClone") // We are a final type & this saves clearing state.
+   @Override public OkHttpCall<T> clone() {
+-    return new OkHttpCall<>(client, requestFactory, responseConverter, args);
++    return new OkHttpCall<>(client, request, responseConverter);
+   }
+ 
+   @Override public void enqueue(final Callback<T> callback) {
+@@ -122,7 +120,7 @@ final class OkHttpCall<T> implements Call<T> {
+   }
+ 
+   private com.squareup.okhttp.Call createRawCall() throws IOException {
+-    return client.newCall(requestFactory.create(args));
++    return client.newCall(request.get());
+   }
+ 
+   private Response<T> parseResponse(com.squareup.okhttp.Response rawResponse) throws IOException {
+diff --git a/retrofit/src/main/java/retrofit2/OkHttpCallFactory.java b/retrofit/src/main/java/retrofit2/OkHttpCallFactory.java
+new file mode 100644
+index 00000000..7c9e666b
+--- /dev/null
++++ b/retrofit/src/main/java/retrofit2/OkHttpCallFactory.java
+@@ -0,0 +1,32 @@
++/*
++ * Copyright (C) 2015 Square, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package retrofit2;
++
++import com.squareup.okhttp.OkHttpClient;
++import com.squareup.okhttp.ResponseBody;
++
++final class OkHttpCallFactory implements Call.Factory {
++  final OkHttpClient client;
++
++  OkHttpCallFactory(OkHttpClient client) {
++    this.client = client;
++  }
++
++  @Override
++  public <T> Call<T> create(DeferredRequest request, Converter<ResponseBody, T> converter) {
++    return new OkHttpCall<>(client, request, converter);
++  }
++}
+diff --git a/retrofit/src/main/java/retrofit2/RequestFactory.java b/retrofit/src/main/java/retrofit2/RequestFactory.java
+index 7a266483..23063def 100644
+--- a/retrofit/src/main/java/retrofit2/RequestFactory.java
++++ b/retrofit/src/main/java/retrofit2/RequestFactory.java
+@@ -45,6 +45,14 @@ final class RequestFactory {
+     this.requestActions = requestActions;
+   }
+ 
++  DeferredRequest defer(final Object... args) {
++    return new DeferredRequest() {
++      @Override public Request get() throws IOException {
++        return create(args);
++      }
++    };
++  }
++
+   Request create(Object... args) throws IOException {
+     RequestBuilder requestBuilder =
+         new RequestBuilder(method, baseUrl.url(), relativeUrl, headers, contentType, hasBody,
+diff --git a/retrofit/src/main/java/retrofit2/Retrofit.java b/retrofit/src/main/java/retrofit2/Retrofit.java
+index 606295a6..5427ad33 100644
+--- a/retrofit/src/main/java/retrofit2/Retrofit.java
++++ b/retrofit/src/main/java/retrofit2/Retrofit.java
+@@ -92,17 +92,17 @@ import static retrofit2.Utils.checkNotNull;
+ public final class Retrofit {
+   private final Map<Method, MethodHandler> methodHandlerCache = new LinkedHashMap<>();
+ 
+-  private final OkHttpClient client;
++  private final Call.Factory callFactory;
+   private final BaseUrl baseUrl;
+   private final List<Converter.Factory> converterFactories;
+   private final List<CallAdapter.Factory> adapterFactories;
+   private final Executor callbackExecutor;
+   private final boolean validateEagerly;
+ 
+-  private Retrofit(OkHttpClient client, BaseUrl baseUrl, List<Converter.Factory> converterFactories,
+-      List<CallAdapter.Factory> adapterFactories, Executor callbackExecutor,
+-      boolean validateEagerly) {
+-    this.client = client;
++  private Retrofit(Call.Factory callFactory, BaseUrl baseUrl,
++      List<Converter.Factory> converterFactories, List<CallAdapter.Factory> adapterFactories,
++      Executor callbackExecutor, boolean validateEagerly) {
++    this.callFactory = callFactory;
+     this.baseUrl = baseUrl;
+     this.converterFactories = converterFactories;
+     this.adapterFactories = adapterFactories;
+@@ -156,8 +156,11 @@ public final class Retrofit {
+     return handler;
+   }
+ 
+-  public OkHttpClient client() {
+-    return client;
++  /**
++   * TODO
++   */
++  public Call.Factory callFactory() {
++    return callFactory;
+   }
+ 
+   public BaseUrl baseUrl() {
+@@ -344,7 +347,7 @@ public final class Retrofit {
+    * are optional.
+    */
+   public static final class Builder {
+-    private OkHttpClient client;
++    private Call.Factory callFactory;
+     private BaseUrl baseUrl;
+     private List<Converter.Factory> converterFactories = new ArrayList<>();
+     private List<CallAdapter.Factory> adapterFactories = new ArrayList<>();
+@@ -357,9 +360,25 @@ public final class Retrofit {
+       converterFactories.add(new BuiltInConverters());
+     }
+ 
+-    /** The HTTP client used for requests. */
++    /**
++     * The HTTP client used for requests.
++     * <p>
++     * This is a convenience method for calling {@link #callFactory} with an instance that uses
++     * {@code client} for execution.
++     * <p>
++     * Note: This method <b>does not</b> make a defensive copy of {@code client}. Changes to its
++     * settings will affect subsequent requests. Pass in a {@linkplain OkHttpClient#clone() cloned}
++     * instance to prevent this if desired.
++     */
+     public Builder client(OkHttpClient client) {
+-      this.client = checkNotNull(client, "client == null");
++      return callFactory(new OkHttpCallFactory(checkNotNull(client, "client == null")));
++    }
++
++    /**
++     * TODO
++     */
++    public Builder callFactory(Call.Factory factory) {
++      this.callFactory = checkNotNull(factory, "factory == null");
+       return this;
+     }
+ 
+@@ -488,9 +507,9 @@ public final class Retrofit {
+         throw new IllegalStateException("Base URL required.");
+       }
+ 
+-      OkHttpClient client = this.client;
+-      if (client == null) {
+-        client = new OkHttpClient();
++      Call.Factory callFactory = this.callFactory;
++      if (callFactory == null) {
++        callFactory = new OkHttpCallFactory(new OkHttpClient());
+       }
+ 
+       // Make a defensive copy of the adapters and add the default Call adapter.
+@@ -500,8 +519,8 @@ public final class Retrofit {
+       // Make a defensive copy of the converters.
+       List<Converter.Factory> converterFactories = new ArrayList<>(this.converterFactories);
+ 
+-      return new Retrofit(client, baseUrl, converterFactories, adapterFactories, callbackExecutor,
+-          validateEagerly);
++      return new Retrofit(callFactory, baseUrl, converterFactories, adapterFactories,
++          callbackExecutor, validateEagerly);
+     }
+   }
+ }

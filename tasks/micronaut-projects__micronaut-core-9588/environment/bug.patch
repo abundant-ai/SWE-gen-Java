@@ -1,0 +1,408 @@
+diff --git a/gradle/libs.versions.toml b/gradle/libs.versions.toml
+index b35a6ec7c1..5f778af51e 100644
+--- a/gradle/libs.versions.toml
++++ b/gradle/libs.versions.toml
+@@ -32,14 +32,14 @@ junit-platform="1.9.3"
+ logback = "1.4.8"
+ logbook-netty = "2.16.0"
+ log4j = "2.20.0"
+-micronaut-aws = "4.0.0-M11"
+-micronaut-groovy = "4.0.0-M4"
++micronaut-aws = "4.0.1"
++micronaut-groovy = "4.0.1"
+ micronaut-session = "4.0.0-M3"
+ micronaut-sql = "5.0.0-M7"
+ micronaut-test = "4.0.0-M4"
+ micronaut-validation = "4.0.0-M9"
+-micronaut-rxjava2 = "2.0.0-M6"
+-micronaut-rxjava3 = "3.0.0-M6"
++micronaut-rxjava2 = "2.0.1"
++micronaut-rxjava3 = "3.0.1"
+ micronaut-reactor = "3.0.0-M7"
+ neo4j-java-driver = "1.4.5"
+ selenium = "4.9.1"
+diff --git a/http-netty/src/main/java/io/micronaut/http/netty/NettyHttpResponseBuilder.java b/http-netty/src/main/java/io/micronaut/http/netty/NettyHttpResponseBuilder.java
+index 808df35b38..33a41f8dd5 100644
+--- a/http-netty/src/main/java/io/micronaut/http/netty/NettyHttpResponseBuilder.java
++++ b/http-netty/src/main/java/io/micronaut/http/netty/NettyHttpResponseBuilder.java
+@@ -25,6 +25,8 @@ import io.netty.handler.codec.http.DefaultFullHttpResponse;
+ import io.netty.handler.codec.http.DefaultHttpResponse;
+ import io.netty.handler.codec.http.DefaultLastHttpContent;
+ import io.netty.handler.codec.http.FullHttpResponse;
++import io.netty.handler.codec.http.HttpHeaderNames;
++import io.netty.handler.codec.http.HttpHeaderValues;
+ import io.netty.handler.codec.http.HttpResponse;
+ import io.netty.handler.codec.http.HttpResponseStatus;
+ import io.netty.handler.codec.http.HttpVersion;
+@@ -111,6 +113,15 @@ public interface NettyHttpResponseBuilder {
+             response.getHeaders()
+                 .forEach((s, strings) -> fullHttpResponse.headers().add(s, strings));
+         }
++
++        // does the response have a body
++        if (response instanceof FullHttpResponse || response instanceof StreamedHttpResponse) {
++            io.netty.handler.codec.http.HttpHeaders nettyHeaders = fullHttpResponse.headers();
++            // default to Transfer-Encoding: chunked if Content-Length not set or not already set
++            if (!nettyHeaders.contains(HttpHeaderNames.CONTENT_LENGTH) && !nettyHeaders.contains(HttpHeaderNames.TRANSFER_ENCODING)) {
++                nettyHeaders.set(HttpHeaderNames.TRANSFER_ENCODING, HttpHeaderValues.CHUNKED);
++            }
++        }
+         return fullHttpResponse;
+     }
+ 
+diff --git a/http-netty/src/main/java/io/micronaut/http/netty/body/NettyWriteContext.java b/http-netty/src/main/java/io/micronaut/http/netty/body/NettyWriteContext.java
+index 1493a52878..f8f651eee9 100644
+--- a/http-netty/src/main/java/io/micronaut/http/netty/body/NettyWriteContext.java
++++ b/http-netty/src/main/java/io/micronaut/http/netty/body/NettyWriteContext.java
+@@ -46,18 +46,7 @@ public interface NettyWriteContext {
+      *
+      * @param response The response to write
+      */
+-    default void writeFull(@NonNull FullHttpResponse response) {
+-        writeFull(response, false);
+-    }
+-
+-    /**
+-     * Write a full response.
+-     *
+-     * @param response The response to write
+-     * @param headResponse If {@code true}, this is a response to a {@code HEAD} request, so the
+-     * {@code Content-Length} header should not be overwritten.
+-     */
+-    void writeFull(@NonNull FullHttpResponse response, boolean headResponse);
++    void writeFull(@NonNull FullHttpResponse response);
+ 
+     /**
+      * Write a streamed response.
+diff --git a/http-server-netty/src/main/java/io/micronaut/http/server/netty/RoutingInBoundHandler.java b/http-server-netty/src/main/java/io/micronaut/http/server/netty/RoutingInBoundHandler.java
+index 0f2bb91f13..e0e4d96305 100644
+--- a/http-server-netty/src/main/java/io/micronaut/http/server/netty/RoutingInBoundHandler.java
++++ b/http-server-netty/src/main/java/io/micronaut/http/server/netty/RoutingInBoundHandler.java
+@@ -32,6 +32,7 @@ import io.micronaut.http.HttpMethod;
+ import io.micronaut.http.HttpRequest;
+ import io.micronaut.http.HttpResponse;
+ import io.micronaut.http.MediaType;
++import io.micronaut.http.MutableHttpHeaders;
+ import io.micronaut.http.MutableHttpResponse;
+ import io.micronaut.http.body.DynamicMessageBodyWriter;
+ import io.micronaut.http.body.MediaTypeProvider;
+@@ -67,6 +68,8 @@ import io.netty.handler.codec.http.DefaultHttpHeaders;
+ import io.netty.handler.codec.http.FullHttpRequest;
+ import io.netty.handler.codec.http.FullHttpResponse;
+ import io.netty.handler.codec.http.HttpContent;
++import io.netty.handler.codec.http.HttpHeaderNames;
++import io.netty.handler.codec.http.HttpHeaderValues;
+ import io.netty.handler.codec.http.HttpResponseStatus;
+ import io.netty.handler.codec.http.HttpVersion;
+ import org.reactivestreams.Processor;
+@@ -330,7 +333,7 @@ public final class RoutingInBoundHandler implements RequestHandler {
+                 actualResponseType = responseBodyType;
+             }
+             NettyBodyWriter<Object> closure = wrap(messageBodyWriter);
+-            closeConnectionIfError(response, nettyRequest, outboundAccess);
++            handleMissingConnectionHeader(response, nettyRequest, outboundAccess);
+             if (closure.isBlocking()) {
+                 MediaType finalResponseMediaType = responseMediaType;
+                 getIoExecutor().execute(() -> writeNettyMessageBody(nettyRequest, (MutableHttpResponse<Object>) response, actualResponseType, finalResponseMediaType, body, closure, outboundAccess));
+@@ -423,7 +426,7 @@ public final class RoutingInBoundHandler implements RequestHandler {
+ 
+     private void writeFinalNettyResponse(MutableHttpResponse<?> message, NettyHttpRequest<?> request, PipeliningServerHandler.OutboundAccess outboundAccess) {
+         // default Connection header if not set explicitly
+-        closeConnectionIfError(message, request, outboundAccess);
++        handleMissingConnectionHeader(message, request, outboundAccess);
+         io.netty.handler.codec.http.HttpResponse nettyResponse = NettyHttpResponseBuilder.toHttpResponse(message);
+         // close handled by HttpServerKeepAliveHandler
+         if (request.getNativeRequest() instanceof StreamedHttpRequest streamed && !streamed.isConsumed()) {
+@@ -431,10 +434,14 @@ public final class RoutingInBoundHandler implements RequestHandler {
+             Flux.from(streamed).subscribe(HttpContent::release);
+         }
+         if (nettyResponse instanceof StreamedHttpResponse streamed) {
++            nettyResponse.headers().set(HttpHeaderNames.TRANSFER_ENCODING, HttpHeaderValues.CHUNKED);
+             writeStreamedWithErrorHandling(request, outboundAccess, streamed);
+         } else {
+             FullHttpResponse fullResponse = (FullHttpResponse) nettyResponse;
+-            outboundAccess.writeFull(fullResponse, request.getMethod() == HttpMethod.HEAD);
++            if (PipeliningServerHandler.canHaveBody(fullResponse.status()) && request.getMethod() != HttpMethod.HEAD) {
++                nettyResponse.headers().set(HttpHeaderNames.CONTENT_LENGTH, fullResponse.content().readableBytes());
++            }
++            outboundAccess.writeFull(fullResponse);
+         }
+ 
+         if (LOG.isDebugEnabled()) {
+@@ -450,7 +457,7 @@ public final class RoutingInBoundHandler implements RequestHandler {
+         streamed.subscribe(sub);
+     }
+ 
+-    private void closeConnectionIfError(MutableHttpResponse<?> message, HttpRequest<?> request, PipeliningServerHandler.OutboundAccess outboundAccess) {
++    private void handleMissingConnectionHeader(MutableHttpResponse<?> message, HttpRequest<?> request, PipeliningServerHandler.OutboundAccess outboundAccess) {
+         boolean decodeError = request instanceof NettyHttpRequest<?> nettyRequest &&
+             nettyRequest.getNativeRequest().decoderResult().isFailure();
+ 
+@@ -481,6 +488,13 @@ public final class RoutingInBoundHandler implements RequestHandler {
+         );
+     }
+ 
++    private static void setResponseBody(MutableHttpResponse<?> response, ByteBuf byteBuf) {
++        int len = byteBuf.readableBytes();
++        MutableHttpHeaders headers = response.getHeaders();
++        headers.set(HttpHeaderNames.CONTENT_LENGTH, String.valueOf(len));
++        response.body((Object) byteBuf);
++    }
++
+     /**
+      * Is the exception ignorable by Micronaut.
+      *
+@@ -534,7 +548,7 @@ public final class RoutingInBoundHandler implements RequestHandler {
+                 mediaType,
+                 object,
+                 outgoingResponse.getHeaders(), bufferFactory);
+-            outgoingResponse.body((Object) byteBuffer.asNativeBuffer());
++            setResponseBody(outgoingResponse, (ByteBuf) byteBuffer.asNativeBuffer());
+             writeFinalNettyResponse(outgoingResponse, (NettyHttpRequest<?>) request, (PipeliningServerHandler.OutboundAccess) nettyContext);
+         }
+ 
+diff --git a/http-server-netty/src/main/java/io/micronaut/http/server/netty/handler/PipeliningServerHandler.java b/http-server-netty/src/main/java/io/micronaut/http/server/netty/handler/PipeliningServerHandler.java
+index 68496e4995..f0bfcaaee7 100644
+--- a/http-server-netty/src/main/java/io/micronaut/http/server/netty/handler/PipeliningServerHandler.java
++++ b/http-server-netty/src/main/java/io/micronaut/http/server/netty/handler/PipeliningServerHandler.java
+@@ -634,28 +634,19 @@ public final class PipeliningServerHandler extends ChannelInboundHandlerAdapter
+             }
+         }
+ 
++        /**
++         * Write a full response.
++         *
++         * @param response The response to write
++         */
+         @Override
+-        public void writeFull(FullHttpResponse response, boolean headResponse) {
+-            response.headers().remove(HttpHeaderNames.TRANSFER_ENCODING);
+-            if (canHaveBody(response.status())) {
+-                if (!headResponse) {
+-                    response.headers().set(HttpHeaderNames.CONTENT_LENGTH, response.content().readableBytes());
+-                }
+-            } else {
+-                response.headers().remove(HttpHeaderNames.CONTENT_LENGTH);
+-            }
++        public void writeFull(FullHttpResponse response) {
+             preprocess(response);
+             write(new FullOutboundHandler(this, response));
+         }
+ 
+         @Override
+         public void writeStreamed(HttpResponse response, Publisher<HttpContent> content) {
+-            response.headers().remove(HttpHeaderNames.CONTENT_LENGTH);
+-            if (canHaveBody(response.status())) {
+-                response.headers().set(HttpHeaderNames.TRANSFER_ENCODING, HttpHeaderValues.CHUNKED);
+-            } else {
+-                response.headers().remove(HttpHeaderNames.TRANSFER_ENCODING);
+-            }
+             preprocess(response);
+             content.subscribe(new StreamingOutboundHandler(this, response));
+         }
+diff --git a/http-server-netty/src/test/groovy/io/micronaut/http/server/netty/TransferSpec.groovy b/http-server-netty/src/test/groovy/io/micronaut/http/server/netty/TransferSpec.groovy
+deleted file mode 100644
+index 04ab85f546..0000000000
+--- a/http-server-netty/src/test/groovy/io/micronaut/http/server/netty/TransferSpec.groovy
++++ /dev/null
+@@ -1,124 +0,0 @@
+-package io.micronaut.http.server.netty
+-
+-import io.micronaut.context.ApplicationContext
+-import io.micronaut.context.BeanProvider
+-import io.micronaut.context.annotation.Requires
+-import io.micronaut.http.HttpRequest
+-import io.micronaut.http.HttpResponse
+-import io.micronaut.http.MediaType
+-import io.micronaut.http.annotation.Controller
+-import io.micronaut.http.annotation.Get
+-import io.micronaut.http.annotation.Produces
+-import io.micronaut.http.client.ProxyHttpClient
+-import io.micronaut.runtime.server.EmbeddedServer
+-import jakarta.inject.Inject
+-import org.reactivestreams.Publisher
+-import reactor.core.publisher.Flux
+-import spock.lang.Specification
+-
+-class TransferSpec extends Specification {
+-    def 'transfer headers'() {
+-        given:
+-        def ctx = ApplicationContext.run(['spec.name': 'TransferSpec'])
+-        def server = ctx.getBean(EmbeddedServer)
+-        server.start()
+-        // use java http client because the micronaut one strips some of these headers
+-        def client = java.net.http.HttpClient.newHttpClient()
+-
+-        when:
+-        def clResponse = client.send(
+-                java.net.http.HttpRequest.newBuilder(new URI(server.URI.toString() + "/explicit-content-length")).GET().build(),
+-                java.net.http.HttpResponse.BodyHandlers.ofString())
+-        then:
+-        clResponse.body() == "foo"
+-        clResponse.headers().firstValue("content-length").isEmpty()
+-        clResponse.headers().firstValue("transfer-encoding").get() == "chunked"
+-
+-        when:
+-        def teResponse = client.send(
+-                java.net.http.HttpRequest.newBuilder(new URI(server.URI.toString() + "/explicit-transfer")).GET().build(),
+-                java.net.http.HttpResponse.BodyHandlers.ofString())
+-        then:
+-        teResponse.body() == "foo"
+-        teResponse.headers().firstValue("content-length").get() == "3"
+-        teResponse.headers().firstValue("transfer-encoding").isEmpty()
+-
+-        when:
+-        def proxyClResponse = client.send(
+-                java.net.http.HttpRequest.newBuilder(new URI(server.URI.toString() + "/proxied/explicit-content-length")).GET().build(),
+-                java.net.http.HttpResponse.BodyHandlers.ofString())
+-        then:
+-        proxyClResponse.body() == "foo"
+-        proxyClResponse.headers().firstValue("content-length").isEmpty()
+-        proxyClResponse.headers().firstValue("transfer-encoding").get() == "chunked"
+-
+-        when:
+-        def proxyTeResponse = client.send(
+-                java.net.http.HttpRequest.newBuilder(new URI(server.URI.toString() + "/proxied/explicit-transfer")).GET().build(),
+-                java.net.http.HttpResponse.BodyHandlers.ofString())
+-        then:
+-        proxyTeResponse.body() == "foo"
+-        proxyTeResponse.headers().firstValue("content-length").isEmpty()
+-        proxyTeResponse.headers().firstValue("transfer-encoding").get() == "chunked"
+-
+-        when:
+-        def proxySimpleResponse = client.send(
+-                java.net.http.HttpRequest.newBuilder(new URI(server.URI.toString() + "/proxied/simple")).GET().build(),
+-                java.net.http.HttpResponse.BodyHandlers.ofString())
+-        then:
+-        proxySimpleResponse.body() == "foo"
+-        proxySimpleResponse.headers().firstValue("content-length").isEmpty()
+-        proxySimpleResponse.headers().firstValue("transfer-encoding").get() == "chunked"
+-
+-        cleanup:
+-        server.close()
+-        ctx.close()
+-    }
+-
+-    @Controller
+-    @Requires(property = "spec.name", value = "TransferSpec")
+-    static class MyController {
+-        @Inject
+-        BeanProvider<EmbeddedServer> embeddedServer
+-        @Inject
+-        ProxyHttpClient proxyHttpClient
+-
+-        @Get("/explicit-content-length")
+-        @Produces(MediaType.TEXT_PLAIN)
+-        HttpResponse<Publisher<String>> explicitContentLength() {
+-            return HttpResponse.ok(Flux.just("f", "oo"))
+-                    .header("content-length", "3")
+-        }
+-
+-        @Get("/explicit-transfer")
+-        @Produces(MediaType.TEXT_PLAIN)
+-        HttpResponse<String> explicitTransfer() {
+-            return HttpResponse.ok("foo")
+-                    .header("transfer-encoding", "chunked")
+-        }
+-
+-        @Get("/simple")
+-        @Produces(MediaType.TEXT_PLAIN)
+-        HttpResponse<String> simple() {
+-            return HttpResponse.ok("foo")
+-        }
+-
+-        @Get("/proxied/explicit-content-length")
+-        @Produces(MediaType.TEXT_PLAIN)
+-        Publisher<HttpResponse<?>> proxiedExplicitContentLength() {
+-            return proxyHttpClient.proxy(HttpRequest.GET(embeddedServer.get().URI.toString() + "/explicit-content-length"))
+-        }
+-
+-        @Get("/proxied/explicit-transfer")
+-        @Produces(MediaType.TEXT_PLAIN)
+-        Publisher<HttpResponse<?>> proxiedExplicitTransfer() {
+-            return proxyHttpClient.proxy(HttpRequest.GET(embeddedServer.get().URI.toString() + "/explicit-transfer"))
+-        }
+-
+-        @Get("/proxied/simple")
+-        @Produces(MediaType.TEXT_PLAIN)
+-        Publisher<HttpResponse<?>> proxiedSimple() {
+-            return proxyHttpClient.proxy(HttpRequest.GET(embeddedServer.get().URI.toString() + "/simple"))
+-        }
+-    }
+-}
+diff --git a/src/main/docs/guide/httpServer/filters/filterPatterns.adoc b/src/main/docs/guide/httpServer/filters/filterPatterns.adoc
+index eb0cf62c13..d3aaa285bf 100644
+--- a/src/main/docs/guide/httpServer/filters/filterPatterns.adoc
++++ b/src/main/docs/guide/httpServer/filters/filterPatterns.adoc
+@@ -17,7 +17,7 @@ You can use different styles of pattern for path matching by setting `patternSty
+ |customer/joy, customer/jay
+ 
+ |`customer/*/id`
+-|customer/adam/id, com/amy/id
++|customer/adam/id, customer/amy/id
+ 
+ |`customer/**`
+ |customer/adam, customer/adam/id, customer/adam/name
+diff --git a/src/main/docs/guide/languageSupport/kotlin/coroutines.adoc b/src/main/docs/guide/languageSupport/kotlin/coroutines.adoc
+index b05b81f018..49089efc7c 100644
+--- a/src/main/docs/guide/languageSupport/kotlin/coroutines.adoc
++++ b/src/main/docs/guide/languageSupport/kotlin/coroutines.adoc
+@@ -1,23 +1,39 @@
+ Kotlin coroutines allow you to create asynchronous applications with imperative style code. A Micronaut controller action can be a `suspend` function:
+ 
+-snippet::io.micronaut.docs.server.suspend.SuspendController[tags="suspend", indent=0, title="Controller suspend function example"]
++.Controller suspend function example
++[source, kotlin]
++----
++include::{testsuitekotlin}/server/suspend/SuspendController.kt[tags="suspend", indent=0]
++----
+ 
+ <1> The function is marked as `suspend`, though in reality it won't be suspended.
+ 
+-snippet::io.micronaut.docs.server.suspend.SuspendController[tags="suspendDelayed", indent=0, title="Controller suspend function example"]
++snippet::io.micronaut.docs.server.suspend.SuspendController.kt[tags="suspendDelayed", indent=0, title="Controller suspend function example"]
+ 
+ <1> The function is marked as `suspend`.
+ <2> The `delay` is called to make sure that a function is suspended and the response is returned from a different thread.
+ 
+-snippet::io.micronaut.docs.server.suspend.SuspendController[tags="suspendStatus", indent=0, title="Controller suspend function example"]
++.Controller suspend function example
++[source, kotlin]
++----
++include::{testsuitekotlin}/server/suspend/SuspendController.kt[tags="suspendStatus", indent=0]
++----
+ 
+ <1> `suspend` function also works when all we want is to return a status.
+ 
+-snippet::io.micronaut.docs.server.suspend.SuspendController[tags="suspendStatusDelayed", indent=0, title="Controller suspend function example"]
++.Controller suspend function example
++[source, kotlin]
++----
++include::{testsuitekotlin}/server/suspend/SuspendController.kt[tags="suspendStatusDelayed", indent=0]
++----
+ 
+ You can also use `Flow` type for streaming server and client. A streaming controller can return `Flow`, for example:
+ 
+-snippet::io.micronaut.docs.streaming.HeadlineFlowController[tags="streamingWithFlow", indent=0, title="Streaming JSON on the Server with Flow"]
++.Streaming JSON on the Server with Flow
++[source, kotlin]
++----
++include::{testsuitekotlin}/streaming/HeadlineFlowController.kt[tags="streamingWithFlow", indent=0]
++----
+ 
+ <1> A method `streamHeadlinesWithFlow` is defined that produces `application/x-json-stream`
+ <2> A `Flow` is created using `flow`
+@@ -27,7 +43,12 @@ snippet::io.micronaut.docs.streaming.HeadlineFlowController[tags="streamingWithF
+ 
+ A streaming client can simply return a `Flow`, for example:
+ 
+-snippet::io.micronaut.docs.streaming.HeadlineFlowClient[tags="imports, class, streamingWithFlow", indent=0, title="Streaming client with Flow"]
++
++.Streaming client with Flow
++[source, kotlin]
++----
++include::{testsuitekotlin}/streaming/HeadlineFlowClient.kt[tags="imports,class, streamingWithFlow", indent=0]
++----
+ 
+ <1> The `@Get` method is defined as processing responses of type `APPLICATION_JSON_STREAM`
+ <2> The return type is `Flow`

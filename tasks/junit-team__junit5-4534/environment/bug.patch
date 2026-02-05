@@ -1,0 +1,798 @@
+diff --git a/.github/actions/run-gradle/action.yml b/.github/actions/run-gradle/action.yml
+index 7506f777a..16a121155 100644
+--- a/.github/actions/run-gradle/action.yml
++++ b/.github/actions/run-gradle/action.yml
+@@ -26,8 +26,6 @@ runs:
+       run: |
+         ./gradlew \
+         -Porg.gradle.java.installations.auto-download=false \
+-        -Pjunit.develocity.predictiveTestSelection.enabled=true \
+-        -Pjunit.develocity.predictiveTestSelection.selectRemainingTests=${{ github.event_name != 'pull_request' }} \
+         "-Dscan.value.GitHub job=${{ github.job }}" \
+         javaToolchains \
+         ${{ inputs.arguments }}
+diff --git a/gradle/plugins/build-parameters/build.gradle.kts b/gradle/plugins/build-parameters/build.gradle.kts
+index 8a1276886..bed7fe291 100644
+--- a/gradle/plugins/build-parameters/build.gradle.kts
++++ b/gradle/plugins/build-parameters/build.gradle.kts
+@@ -39,7 +39,7 @@ buildParameters {
+ 			group("predictiveTestSelection") {
+ 				bool("enabled") {
+ 					description = "Whether or not to use Predictive Test Selection for selecting tests to execute"
+-					defaultValue = true
++					defaultValue = false
+ 				}
+ 				bool("selectRemainingTests") {
+ 					// see https://docs.gradle.com/develocity/predictive-test-selection/#gradle-selection-mode
+diff --git a/junit-platform-launcher/src/main/java/org/junit/platform/launcher/LauncherConstants.java b/junit-platform-launcher/src/main/java/org/junit/platform/launcher/LauncherConstants.java
+index a18a71b45..b356e376b 100644
+--- a/junit-platform-launcher/src/main/java/org/junit/platform/launcher/LauncherConstants.java
++++ b/junit-platform-launcher/src/main/java/org/junit/platform/launcher/LauncherConstants.java
+@@ -225,10 +225,9 @@ public class LauncherConstants {
+ 	 *
+ 	 * <p>If an engine reports an issue with a severity equal to or higher than
+ 	 * the configured critical severity, its tests will not be executed.
+-	 * Depending on {@link #DISCOVERY_ISSUE_FAILURE_PHASE_PROPERTY_NAME}, a
++	 * Instead, the engine will be reported as failed during execution with a
+ 	 * {@link org.junit.platform.launcher.core.DiscoveryIssueException} listing
+-	 * all critical issues will be thrown during discovery or be reported as
+-	 * engine-level failure during execution.
++	 * all critical issues.
+ 	 *
+ 	 * <h4>Supported Values</h4>
+ 	 *
+@@ -245,27 +244,6 @@ public class LauncherConstants {
+ 	@API(status = EXPERIMENTAL, since = "1.13")
+ 	public static final String CRITICAL_DISCOVERY_ISSUE_SEVERITY_PROPERTY_NAME = "junit.platform.discovery.issue.severity.critical";
+ 
+-	/**
+-	 * Property name used to configure the phase that critical discovery issues
+-	 * should cause a failure
+-	 *
+-	 * <h4>Supported Values</h4>
+-	 *
+-	 * <p>Supported values are "discovery" or "execution".
+-	 *
+-	 * <p>If not specified, the {@code Launcher} will report discovery issues
+-	 * during the discovery phase if
+-	 * {@link Launcher#discover(LauncherDiscoveryRequest)} is called, and during
+-	 * the execution phase if
+-	 * {@link Launcher#execute(LauncherDiscoveryRequest, TestExecutionListener...)}
+-	 * is called.
+-	 *
+-	 * @since 1.13
+-	 * @see #CRITICAL_DISCOVERY_ISSUE_SEVERITY_PROPERTY_NAME
+-	 */
+-	@API(status = EXPERIMENTAL, since = "1.13")
+-	public static final String DISCOVERY_ISSUE_FAILURE_PHASE_PROPERTY_NAME = "junit.platform.discovery.issue.failure.phase";
+-
+ 	private LauncherConstants() {
+ 		/* no-op */
+ 	}
+diff --git a/junit-platform-launcher/src/main/java/org/junit/platform/launcher/core/DefaultLauncher.java b/junit-platform-launcher/src/main/java/org/junit/platform/launcher/core/DefaultLauncher.java
+index c4691503b..2a9fa3bf1 100644
+--- a/junit-platform-launcher/src/main/java/org/junit/platform/launcher/core/DefaultLauncher.java
++++ b/junit-platform-launcher/src/main/java/org/junit/platform/launcher/core/DefaultLauncher.java
+@@ -12,8 +12,8 @@ package org.junit.platform.launcher.core;
+ 
+ import static java.util.Collections.unmodifiableCollection;
+ import static org.junit.platform.engine.support.store.NamespacedHierarchicalStore.CloseAction.closeAutoCloseables;
+-import static org.junit.platform.launcher.core.LauncherPhase.DISCOVERY;
+-import static org.junit.platform.launcher.core.LauncherPhase.EXECUTION;
++import static org.junit.platform.launcher.core.EngineDiscoveryOrchestrator.Phase.DISCOVERY;
++import static org.junit.platform.launcher.core.EngineDiscoveryOrchestrator.Phase.EXECUTION;
+ 
+ import java.util.Collection;
+ 
+@@ -100,7 +100,8 @@ class DefaultLauncher implements Launcher {
+ 		execute((InternalTestPlan) testPlan, listeners);
+ 	}
+ 
+-	private LauncherDiscoveryResult discover(LauncherDiscoveryRequest discoveryRequest, LauncherPhase phase) {
++	private LauncherDiscoveryResult discover(LauncherDiscoveryRequest discoveryRequest,
++			EngineDiscoveryOrchestrator.Phase phase) {
+ 		return discoveryOrchestrator.discover(discoveryRequest, phase);
+ 	}
+ 
+diff --git a/junit-platform-launcher/src/main/java/org/junit/platform/launcher/core/EngineDiscoveryOrchestrator.java b/junit-platform-launcher/src/main/java/org/junit/platform/launcher/core/EngineDiscoveryOrchestrator.java
+index 5c989b32d..00bcdae9a 100644
+--- a/junit-platform-launcher/src/main/java/org/junit/platform/launcher/core/EngineDiscoveryOrchestrator.java
++++ b/junit-platform-launcher/src/main/java/org/junit/platform/launcher/core/EngineDiscoveryOrchestrator.java
+@@ -13,12 +13,12 @@ package org.junit.platform.launcher.core;
+ import static java.util.stream.Collectors.joining;
+ import static org.apiguardian.api.API.Status.INTERNAL;
+ import static org.junit.platform.engine.Filter.composeFilters;
+-import static org.junit.platform.launcher.core.LauncherPhase.getDiscoveryIssueFailurePhase;
+ 
+ import java.util.Collection;
+ import java.util.LinkedHashMap;
+ import java.util.LinkedList;
+ import java.util.List;
++import java.util.Locale;
+ import java.util.Map;
+ import java.util.Optional;
+ import java.util.function.Function;
+@@ -28,7 +28,6 @@ import org.junit.platform.commons.JUnitException;
+ import org.junit.platform.commons.logging.Logger;
+ import org.junit.platform.commons.logging.LoggerFactory;
+ import org.junit.platform.commons.util.UnrecoverableExceptions;
+-import org.junit.platform.engine.ConfigurationParameters;
+ import org.junit.platform.engine.Filter;
+ import org.junit.platform.engine.FilterResult;
+ import org.junit.platform.engine.TestDescriptor;
+@@ -69,19 +68,15 @@ public class EngineDiscoveryOrchestrator {
+ 	}
+ 
+ 	/**
+-	 * Discovers tests for the supplied request using the configured test
+-	 * engines.
++	 * Discovers tests for the supplied request in the supplied phase using the
++	 * configured test engines.
+ 	 *
+ 	 * <p>Applies {@linkplain org.junit.platform.launcher.EngineFilter engine
+ 	 * filters} and {@linkplain PostDiscoveryFilter post-discovery filters} and
+ 	 * {@linkplain TestDescriptor#prune() prunes} the resulting test tree.
+ 	 */
+-	public LauncherDiscoveryResult discover(LauncherDiscoveryRequest request) {
+-		return discover(request, Optional.empty(), UniqueId::forEngine);
+-	}
+-
+-	LauncherDiscoveryResult discover(LauncherDiscoveryRequest request, LauncherPhase phase) {
+-		return discover(request, Optional.of(phase), UniqueId::forEngine);
++	public LauncherDiscoveryResult discover(LauncherDiscoveryRequest request, Phase phase) {
++		return discover(request, phase, UniqueId::forEngine);
+ 	}
+ 
+ 	/**
+@@ -98,12 +93,12 @@ public class EngineDiscoveryOrchestrator {
+ 	 * {@link EngineExecutionOrchestrator} will not emit start or emit events
+ 	 * for engines without tests.
+ 	 */
+-	public LauncherDiscoveryResult discover(LauncherDiscoveryRequest request, UniqueId parentId) {
+-		LauncherDiscoveryResult result = discover(request, Optional.empty(), parentId::appendEngine);
++	public LauncherDiscoveryResult discover(LauncherDiscoveryRequest request, Phase phase, UniqueId parentId) {
++		LauncherDiscoveryResult result = discover(request, phase, parentId::appendEngine);
+ 		return result.withRetainedEngines(TestDescriptor::containsTests);
+ 	}
+ 
+-	private LauncherDiscoveryResult discover(LauncherDiscoveryRequest request, Optional<LauncherPhase> phase,
++	private LauncherDiscoveryResult discover(LauncherDiscoveryRequest request, Phase phase,
+ 			Function<String, UniqueId> uniqueIdCreator) {
+ 		DiscoveryIssueCollector issueCollector = new DiscoveryIssueCollector(request.getConfigurationParameters());
+ 		LauncherDiscoveryListener listener = getLauncherDiscoveryListener(request, issueCollector);
+@@ -114,48 +109,19 @@ public class EngineDiscoveryOrchestrator {
+ 			}
+ 		};
+ 		listener.launcherDiscoveryStarted(request);
+-		LauncherDiscoveryResult discoveryResult;
+ 		try {
+ 			Map<TestEngine, EngineResultInfo> testEngineResults = discoverSafely(delegatingRequest, phase,
+ 				issueCollector, uniqueIdCreator);
+-			discoveryResult = new LauncherDiscoveryResult(testEngineResults, request.getConfigurationParameters(),
++			return new LauncherDiscoveryResult(testEngineResults, request.getConfigurationParameters(),
+ 				request.getOutputDirectoryProvider());
+ 		}
+ 		finally {
+ 			listener.launcherDiscoveryFinished(request);
+ 		}
+-		if (shouldReportDiscoveryIssues(request, phase)) {
+-			reportDiscoveryIssues(discoveryResult);
+-		}
+-		return discoveryResult;
+ 	}
+ 
+-	private static boolean shouldReportDiscoveryIssues(LauncherDiscoveryRequest request,
+-			Optional<LauncherPhase> phase) {
+-		ConfigurationParameters configurationParameters = request.getConfigurationParameters();
+-		return getDiscoveryIssueFailurePhase(configurationParameters).orElse(
+-			phase.orElse(null)) == LauncherPhase.DISCOVERY;
+-	}
+-
+-	private static void reportDiscoveryIssues(LauncherDiscoveryResult discoveryResult) {
+-		DiscoveryIssueException exception = null;
+-		for (TestEngine testEngine : discoveryResult.getTestEngines()) {
+-			EngineResultInfo engineResult = discoveryResult.getEngineResult(testEngine);
+-			DiscoveryIssueNotifier discoveryIssueNotifier = engineResult.getDiscoveryIssueNotifier();
+-			discoveryIssueNotifier.logCriticalIssues(testEngine);
+-			discoveryIssueNotifier.logNonCriticalIssues(testEngine);
+-			if (exception == null) {
+-				exception = discoveryIssueNotifier.createExceptionForCriticalIssues(testEngine);
+-			}
+-		}
+-		if (exception != null) {
+-			throw exception;
+-		}
+-	}
+-
+-	private Map<TestEngine, EngineResultInfo> discoverSafely(LauncherDiscoveryRequest request,
+-			Optional<LauncherPhase> phase, DiscoveryIssueCollector issueCollector,
+-			Function<String, UniqueId> uniqueIdCreator) {
++	private Map<TestEngine, EngineResultInfo> discoverSafely(LauncherDiscoveryRequest request, Phase phase,
++			DiscoveryIssueCollector issueCollector, Function<String, UniqueId> uniqueIdCreator) {
+ 		Map<TestEngine, EngineResultInfo> testEngineDescriptors = new LinkedHashMap<>();
+ 		EngineFilterer engineFilterer = new EngineFilterer(request.getEngineFilters());
+ 
+@@ -163,13 +129,14 @@ public class EngineDiscoveryOrchestrator {
+ 			boolean engineIsExcluded = engineFilterer.isExcluded(testEngine);
+ 
+ 			if (engineIsExcluded) {
+-				logger.debug(() -> String.format("Test discovery for engine '%s' was skipped due to an EngineFilter%s.",
+-					testEngine.getId(), phase.map(it -> String.format(" in %s phase", it)).orElse("")));
++				logger.debug(() -> String.format(
++					"Test discovery for engine '%s' was skipped due to an EngineFilter in %s phase.",
++					testEngine.getId(), phase));
+ 				continue;
+ 			}
+ 
+-			logger.debug(() -> String.format("Discovering tests%s in engine '%s'.",
+-				phase.map(it -> String.format(" during Launcher %s phase", it)).orElse(""), testEngine.getId()));
++			logger.debug(() -> String.format("Discovering tests during Launcher %s phase in engine '%s'.", phase,
++				testEngine.getId()));
+ 
+ 			EngineResultInfo engineResult = discoverEngineRoot(testEngine, request, issueCollector, uniqueIdCreator);
+ 			testEngineDescriptors.put(testEngine, engineResult);
+@@ -274,4 +241,13 @@ public class EngineDiscoveryOrchestrator {
+ 		testEngineResults.values().forEach(result -> result.getRootDescriptor().accept(visitor));
+ 	}
+ 
++	public enum Phase {
++		DISCOVERY, EXECUTION;
++
++		@Override
++		public String toString() {
++			return name().toLowerCase(Locale.ENGLISH);
++		}
++	}
++
+ }
+diff --git a/junit-platform-launcher/src/main/java/org/junit/platform/launcher/core/EngineExecutionOrchestrator.java b/junit-platform-launcher/src/main/java/org/junit/platform/launcher/core/EngineExecutionOrchestrator.java
+index 1cf63758f..eccb29fd8 100644
+--- a/junit-platform-launcher/src/main/java/org/junit/platform/launcher/core/EngineExecutionOrchestrator.java
++++ b/junit-platform-launcher/src/main/java/org/junit/platform/launcher/core/EngineExecutionOrchestrator.java
+@@ -13,7 +13,6 @@ package org.junit.platform.launcher.core;
+ import static org.apiguardian.api.API.Status.INTERNAL;
+ import static org.junit.platform.launcher.LauncherConstants.DRY_RUN_PROPERTY_NAME;
+ import static org.junit.platform.launcher.LauncherConstants.STACKTRACE_PRUNING_ENABLED_PROPERTY_NAME;
+-import static org.junit.platform.launcher.core.LauncherPhase.getDiscoveryIssueFailurePhase;
+ import static org.junit.platform.launcher.core.ListenerRegistry.forEngineExecutionListeners;
+ 
+ import java.util.Optional;
+@@ -186,9 +185,7 @@ public class EngineExecutionOrchestrator {
+ 	private void failOrExecuteEngine(LauncherDiscoveryResult discoveryResult, EngineExecutionListener listener,
+ 			TestEngine testEngine, NamespacedHierarchicalStore<Namespace> requestLevelStore) {
+ 		EngineResultInfo engineDiscoveryResult = discoveryResult.getEngineResult(testEngine);
+-		DiscoveryIssueNotifier discoveryIssueNotifier = shouldReportDiscoveryIssues(discoveryResult) //
+-				? engineDiscoveryResult.getDiscoveryIssueNotifier() //
+-				: DiscoveryIssueNotifier.NO_ISSUES;
++		DiscoveryIssueNotifier discoveryIssueNotifier = engineDiscoveryResult.getDiscoveryIssueNotifier();
+ 		TestDescriptor engineDescriptor = engineDiscoveryResult.getRootDescriptor();
+ 		Throwable failure = engineDiscoveryResult.getCause() //
+ 				.orElseGet(() -> discoveryIssueNotifier.createExceptionForCriticalIssues(testEngine));
+@@ -206,12 +203,6 @@ public class EngineExecutionOrchestrator {
+ 		}
+ 	}
+ 
+-	private static boolean shouldReportDiscoveryIssues(LauncherDiscoveryResult discoveryResult) {
+-		ConfigurationParameters configurationParameters = discoveryResult.getConfigurationParameters();
+-		return getDiscoveryIssueFailurePhase(configurationParameters).orElse(
+-			LauncherPhase.EXECUTION) == LauncherPhase.EXECUTION;
+-	}
+-
+ 	private ListenerRegistry<TestExecutionListener> buildListenerRegistryForExecution(
+ 			TestExecutionListener... listeners) {
+ 		if (listeners.length == 0) {
+diff --git a/junit-platform-launcher/src/main/java/org/junit/platform/launcher/core/LauncherPhase.java b/junit-platform-launcher/src/main/java/org/junit/platform/launcher/core/LauncherPhase.java
+deleted file mode 100644
+index 107bcf971..000000000
+--- a/junit-platform-launcher/src/main/java/org/junit/platform/launcher/core/LauncherPhase.java
++++ /dev/null
+@@ -1,51 +0,0 @@
+-/*
+- * Copyright 2015-2025 the original author or authors.
+- *
+- * All rights reserved. This program and the accompanying materials are
+- * made available under the terms of the Eclipse Public License v2.0 which
+- * accompanies this distribution and is available at
+- *
+- * https://www.eclipse.org/legal/epl-v20.html
+- */
+-
+-package org.junit.platform.launcher.core;
+-
+-import static org.junit.platform.launcher.LauncherConstants.DISCOVERY_ISSUE_FAILURE_PHASE_PROPERTY_NAME;
+-
+-import java.util.Locale;
+-import java.util.Optional;
+-
+-import org.junit.platform.commons.logging.Logger;
+-import org.junit.platform.commons.logging.LoggerFactory;
+-import org.junit.platform.engine.ConfigurationParameters;
+-
+-/**
+- * The phase the {@link org.junit.platform.launcher.Launcher} is in.
+- *
+- * @since 1.13
+- */
+-enum LauncherPhase {
+-
+-	DISCOVERY, EXECUTION;
+-
+-	private static final Logger logger = LoggerFactory.getLogger(LauncherPhase.class);
+-
+-	static Optional<LauncherPhase> getDiscoveryIssueFailurePhase(ConfigurationParameters configurationParameters) {
+-		return configurationParameters.get(DISCOVERY_ISSUE_FAILURE_PHASE_PROPERTY_NAME, value -> {
+-			try {
+-				return LauncherPhase.valueOf(value.toUpperCase(Locale.ROOT));
+-			}
+-			catch (Exception e) {
+-				logger.warn(
+-					() -> String.format("Ignoring invalid LauncherPhase '%s' set via the '%s' configuration parameter.",
+-						value, DISCOVERY_ISSUE_FAILURE_PHASE_PROPERTY_NAME));
+-				return null;
+-			}
+-		});
+-	}
+-
+-	@Override
+-	public String toString() {
+-		return name().toLowerCase(Locale.ENGLISH);
+-	}
+-}
+diff --git a/junit-platform-suite-engine/src/main/java/org/junit/platform/suite/engine/SuiteLauncher.java b/junit-platform-suite-engine/src/main/java/org/junit/platform/suite/engine/SuiteLauncher.java
+index 640d90f98..6e3bf311c 100644
+--- a/junit-platform-suite-engine/src/main/java/org/junit/platform/suite/engine/SuiteLauncher.java
++++ b/junit-platform-suite-engine/src/main/java/org/junit/platform/suite/engine/SuiteLauncher.java
+@@ -23,6 +23,7 @@ import org.junit.platform.engine.support.store.Namespace;
+ import org.junit.platform.engine.support.store.NamespacedHierarchicalStore;
+ import org.junit.platform.launcher.LauncherDiscoveryRequest;
+ import org.junit.platform.launcher.core.EngineDiscoveryOrchestrator;
++import org.junit.platform.launcher.core.EngineDiscoveryOrchestrator.Phase;
+ import org.junit.platform.launcher.core.EngineExecutionOrchestrator;
+ import org.junit.platform.launcher.core.LauncherDiscoveryResult;
+ import org.junit.platform.launcher.core.ServiceLoaderTestEngineRegistry;
+@@ -55,7 +56,7 @@ class SuiteLauncher {
+ 	}
+ 
+ 	LauncherDiscoveryResult discover(LauncherDiscoveryRequest discoveryRequest, UniqueId parentId) {
+-		return discoveryOrchestrator.discover(discoveryRequest, parentId);
++		return discoveryOrchestrator.discover(discoveryRequest, Phase.DISCOVERY, parentId);
+ 	}
+ 
+ 	TestExecutionSummary execute(LauncherDiscoveryResult discoveryResult,
+diff --git a/junit-platform-testkit/src/main/java/org/junit/platform/testkit/engine/EngineTestKit.java b/junit-platform-testkit/src/main/java/org/junit/platform/testkit/engine/EngineTestKit.java
+index 37398b4ef..9f7f3e185 100644
+--- a/junit-platform-testkit/src/main/java/org/junit/platform/testkit/engine/EngineTestKit.java
++++ b/junit-platform-testkit/src/main/java/org/junit/platform/testkit/engine/EngineTestKit.java
+@@ -17,6 +17,8 @@ import static org.apiguardian.api.API.Status.EXPERIMENTAL;
+ import static org.apiguardian.api.API.Status.MAINTAINED;
+ import static org.apiguardian.api.API.Status.STABLE;
+ import static org.junit.platform.engine.support.store.NamespacedHierarchicalStore.CloseAction.closeAutoCloseables;
++import static org.junit.platform.launcher.core.EngineDiscoveryOrchestrator.Phase.DISCOVERY;
++import static org.junit.platform.launcher.core.EngineDiscoveryOrchestrator.Phase.EXECUTION;
+ 
+ import java.nio.file.Path;
+ import java.util.List;
+@@ -188,7 +190,7 @@ public final class EngineTestKit {
+ 	public static EngineDiscoveryResults discover(TestEngine testEngine, LauncherDiscoveryRequest discoveryRequest) {
+ 		Preconditions.notNull(testEngine, "TestEngine must not be null");
+ 		Preconditions.notNull(discoveryRequest, "EngineDiscoveryRequest must not be null");
+-		LauncherDiscoveryResult discoveryResult = discoverUsingOrchestrator(testEngine, discoveryRequest);
++		LauncherDiscoveryResult discoveryResult = discover(testEngine, discoveryRequest, DISCOVERY);
+ 		TestDescriptor engineDescriptor = discoveryResult.getEngineTestDescriptor(testEngine);
+ 		List<DiscoveryIssue> discoveryIssues = discoveryResult.getDiscoveryIssues(testEngine);
+ 		return new EngineDiscoveryResults(engineDescriptor, discoveryIssues);
+@@ -335,7 +337,7 @@ public final class EngineTestKit {
+ 
+ 	private static void executeUsingLauncherOrchestration(TestEngine testEngine,
+ 			LauncherDiscoveryRequest discoveryRequest, EngineExecutionListener listener) {
+-		LauncherDiscoveryResult discoveryResult = discoverUsingOrchestrator(testEngine, discoveryRequest);
++		LauncherDiscoveryResult discoveryResult = discover(testEngine, discoveryRequest, EXECUTION);
+ 		TestDescriptor engineTestDescriptor = discoveryResult.getEngineTestDescriptor(testEngine);
+ 		Preconditions.notNull(engineTestDescriptor, "TestEngine did not yield a TestDescriptor");
+ 		withRequestLevelStore(store -> new EngineExecutionOrchestrator().execute(discoveryResult, listener, store));
+@@ -352,10 +354,10 @@ public final class EngineTestKit {
+ 		return new NamespacedHierarchicalStore<>(parentStore, closeAutoCloseables());
+ 	}
+ 
+-	private static LauncherDiscoveryResult discoverUsingOrchestrator(TestEngine testEngine,
+-			LauncherDiscoveryRequest discoveryRequest) {
++	private static LauncherDiscoveryResult discover(TestEngine testEngine, LauncherDiscoveryRequest discoveryRequest,
++			EngineDiscoveryOrchestrator.Phase phase) {
+ 		return new EngineDiscoveryOrchestrator(singleton(testEngine), emptySet()) //
+-				.discover(discoveryRequest);
++				.discover(discoveryRequest, phase);
+ 	}
+ 
+ 	@SuppressWarnings("unchecked")
+diff --git a/jupiter-tests/src/test/java/org/junit/jupiter/engine/AbstractJupiterTestEngineTests.java b/jupiter-tests/src/test/java/org/junit/jupiter/engine/AbstractJupiterTestEngineTests.java
+index 0dcd074d7..35a2e8941 100644
+--- a/jupiter-tests/src/test/java/org/junit/jupiter/engine/AbstractJupiterTestEngineTests.java
++++ b/jupiter-tests/src/test/java/org/junit/jupiter/engine/AbstractJupiterTestEngineTests.java
+@@ -82,7 +82,7 @@ public abstract class AbstractJupiterTestEngineTests {
+ 		return EngineTestKit.discover(this.engine, request);
+ 	}
+ 
+-	protected static LauncherDiscoveryRequestBuilder defaultRequest() {
++	private static LauncherDiscoveryRequestBuilder defaultRequest() {
+ 		return request() //
+ 				.outputDirectoryProvider(dummyOutputDirectoryProvider()) //
+ 				.configurationParameter(STACKTRACE_PRUNING_ENABLED_PROPERTY_NAME, String.valueOf(false)) //
+diff --git a/jupiter-tests/src/test/java/org/junit/jupiter/engine/TestInstanceLifecycleConfigurationTests.java b/jupiter-tests/src/test/java/org/junit/jupiter/engine/TestInstanceLifecycleConfigurationTests.java
+index e121fbd68..8090690f3 100644
+--- a/jupiter-tests/src/test/java/org/junit/jupiter/engine/TestInstanceLifecycleConfigurationTests.java
++++ b/jupiter-tests/src/test/java/org/junit/jupiter/engine/TestInstanceLifecycleConfigurationTests.java
+@@ -16,7 +16,6 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
+ import static org.junit.jupiter.api.TestInstance.Lifecycle.PER_CLASS;
+ import static org.junit.jupiter.api.TestInstance.Lifecycle.PER_METHOD;
+ import static org.junit.platform.engine.discovery.DiscoverySelectors.selectClass;
+-import static org.junit.platform.launcher.LauncherConstants.DISCOVERY_ISSUE_FAILURE_PHASE_PROPERTY_NAME;
+ import static org.junit.platform.launcher.core.LauncherDiscoveryRequestBuilder.request;
+ 
+ import java.util.ArrayList;
+@@ -130,7 +129,6 @@ class TestInstanceLifecycleConfigurationTests extends AbstractJupiterTestEngineT
+ 			request()
+ 				.selectors(selectClass(testClass))
+ 				.configurationParameters(configParams)
+-				.configurationParameter(DISCOVERY_ISSUE_FAILURE_PHASE_PROPERTY_NAME, "execution")
+ 				.build()
+ 		);
+ 		// @formatter:on
+diff --git a/jupiter-tests/src/test/java/org/junit/jupiter/engine/discovery/DiscoverySelectorResolverTests.java b/jupiter-tests/src/test/java/org/junit/jupiter/engine/discovery/DiscoverySelectorResolverTests.java
+index f607f28e1..697efda83 100644
+--- a/jupiter-tests/src/test/java/org/junit/jupiter/engine/discovery/DiscoverySelectorResolverTests.java
++++ b/jupiter-tests/src/test/java/org/junit/jupiter/engine/discovery/DiscoverySelectorResolverTests.java
+@@ -819,7 +819,7 @@ class DiscoverySelectorResolverTests extends AbstractJupiterTestEngineTests {
+ 	}
+ 
+ 	private LauncherDiscoveryRequestBuilder request() {
+-		return defaultRequest() //
++		return LauncherDiscoveryRequestBuilder.request() //
+ 				.configurationParameter(DEFAULT_DISCOVERY_LISTENER_CONFIGURATION_PROPERTY_NAME, "logging") //
+ 				.listeners(discoveryListener);
+ 	}
+diff --git a/jupiter-tests/src/test/java/org/junit/jupiter/engine/discovery/DiscoveryTests.java b/jupiter-tests/src/test/java/org/junit/jupiter/engine/discovery/DiscoveryTests.java
+index 26db9306a..ab2d904f3 100644
+--- a/jupiter-tests/src/test/java/org/junit/jupiter/engine/discovery/DiscoveryTests.java
++++ b/jupiter-tests/src/test/java/org/junit/jupiter/engine/discovery/DiscoveryTests.java
+@@ -25,6 +25,7 @@ import static org.junit.platform.engine.discovery.DiscoverySelectors.selectNeste
+ import static org.junit.platform.engine.discovery.DiscoverySelectors.selectNestedMethod;
+ import static org.junit.platform.engine.discovery.DiscoverySelectors.selectPackage;
+ import static org.junit.platform.engine.discovery.DiscoverySelectors.selectUniqueId;
++import static org.junit.platform.launcher.core.LauncherDiscoveryRequestBuilder.request;
+ 
+ import java.lang.annotation.Retention;
+ import java.lang.annotation.RetentionPolicy;
+@@ -61,21 +62,21 @@ class DiscoveryTests extends AbstractJupiterTestEngineTests {
+ 
+ 	@Test
+ 	void discoverTestClass() {
+-		LauncherDiscoveryRequest request = defaultRequest().selectors(selectClass(LocalTestCase.class)).build();
++		LauncherDiscoveryRequest request = request().selectors(selectClass(LocalTestCase.class)).build();
+ 		TestDescriptor engineDescriptor = discoverTests(request).getEngineDescriptor();
+ 		assertEquals(7, engineDescriptor.getDescendants().size(), "# resolved test descriptors");
+ 	}
+ 
+ 	@Test
+ 	void doNotDiscoverAbstractTestClass() {
+-		LauncherDiscoveryRequest request = defaultRequest().selectors(selectClass(AbstractTestCase.class)).build();
++		LauncherDiscoveryRequest request = request().selectors(selectClass(AbstractTestCase.class)).build();
+ 		TestDescriptor engineDescriptor = discoverTests(request).getEngineDescriptor();
+ 		assertEquals(0, engineDescriptor.getDescendants().size(), "# resolved test descriptors");
+ 	}
+ 
+ 	@Test
+ 	void discoverMethodByUniqueId() {
+-		LauncherDiscoveryRequest request = defaultRequest().selectors(
++		LauncherDiscoveryRequest request = request().selectors(
+ 			selectUniqueId(JupiterUniqueIdBuilder.uniqueIdForMethod(LocalTestCase.class, "test1()"))).build();
+ 		TestDescriptor engineDescriptor = discoverTests(request).getEngineDescriptor();
+ 		assertEquals(2, engineDescriptor.getDescendants().size(), "# resolved test descriptors");
+@@ -83,7 +84,7 @@ class DiscoveryTests extends AbstractJupiterTestEngineTests {
+ 
+ 	@Test
+ 	void discoverMethodByUniqueIdForOverloadedMethod() {
+-		LauncherDiscoveryRequest request = defaultRequest().selectors(
++		LauncherDiscoveryRequest request = request().selectors(
+ 			selectUniqueId(JupiterUniqueIdBuilder.uniqueIdForMethod(LocalTestCase.class, "test4()"))).build();
+ 		TestDescriptor engineDescriptor = discoverTests(request).getEngineDescriptor();
+ 		assertEquals(2, engineDescriptor.getDescendants().size(), "# resolved test descriptors");
+@@ -91,9 +92,8 @@ class DiscoveryTests extends AbstractJupiterTestEngineTests {
+ 
+ 	@Test
+ 	void discoverMethodByUniqueIdForOverloadedMethodVariantThatAcceptsArguments() {
+-		LauncherDiscoveryRequest request = defaultRequest().selectors(
+-			selectUniqueId(JupiterUniqueIdBuilder.uniqueIdForMethod(LocalTestCase.class,
+-				"test4(" + TestInfo.class.getName() + ")"))).build();
++		LauncherDiscoveryRequest request = request().selectors(selectUniqueId(JupiterUniqueIdBuilder.uniqueIdForMethod(
++			LocalTestCase.class, "test4(" + TestInfo.class.getName() + ")"))).build();
+ 		TestDescriptor engineDescriptor = discoverTests(request).getEngineDescriptor();
+ 		assertEquals(2, engineDescriptor.getDescendants().size(), "# resolved test descriptors");
+ 	}
+@@ -102,15 +102,14 @@ class DiscoveryTests extends AbstractJupiterTestEngineTests {
+ 	void discoverMethodByMethodReference() throws NoSuchMethodException {
+ 		Method testMethod = LocalTestCase.class.getDeclaredMethod("test3");
+ 
+-		LauncherDiscoveryRequest request = defaultRequest().selectors(
+-			selectMethod(LocalTestCase.class, testMethod)).build();
++		LauncherDiscoveryRequest request = request().selectors(selectMethod(LocalTestCase.class, testMethod)).build();
+ 		TestDescriptor engineDescriptor = discoverTests(request).getEngineDescriptor();
+ 		assertEquals(2, engineDescriptor.getDescendants().size(), "# resolved test descriptors");
+ 	}
+ 
+ 	@Test
+ 	void discoverMultipleMethodsOfSameClass() {
+-		LauncherDiscoveryRequest request = defaultRequest().selectors(selectMethod(LocalTestCase.class, "test1"),
++		LauncherDiscoveryRequest request = request().selectors(selectMethod(LocalTestCase.class, "test1"),
+ 			selectMethod(LocalTestCase.class, "test2")).build();
+ 
+ 		TestDescriptor engineDescriptor = discoverTests(request).getEngineDescriptor();
+@@ -122,7 +121,7 @@ class DiscoveryTests extends AbstractJupiterTestEngineTests {
+ 
+ 	@Test
+ 	void discoverCompositeSpec() {
+-		LauncherDiscoveryRequest spec = defaultRequest().selectors(
++		LauncherDiscoveryRequest spec = request().selectors(
+ 			selectUniqueId(JupiterUniqueIdBuilder.uniqueIdForMethod(LocalTestCase.class, "test2()")),
+ 			selectClass(LocalTestCase.class)).build();
+ 
+@@ -132,7 +131,7 @@ class DiscoveryTests extends AbstractJupiterTestEngineTests {
+ 
+ 	@Test
+ 	void discoverTestTemplateMethodByUniqueId() {
+-		LauncherDiscoveryRequest spec = defaultRequest().selectors(
++		LauncherDiscoveryRequest spec = request().selectors(
+ 			selectUniqueId(uniqueIdForTestTemplateMethod(TestTemplateClass.class, "testTemplate()"))).build();
+ 
+ 		TestDescriptor engineDescriptor = discoverTests(spec).getEngineDescriptor();
+@@ -141,7 +140,7 @@ class DiscoveryTests extends AbstractJupiterTestEngineTests {
+ 
+ 	@Test
+ 	void discoverTestTemplateMethodByMethodSelector() {
+-		LauncherDiscoveryRequest spec = defaultRequest().selectors(
++		LauncherDiscoveryRequest spec = request().selectors(
+ 			selectMethod(TestTemplateClass.class, "testTemplate")).build();
+ 
+ 		TestDescriptor engineDescriptor = discoverTests(spec).getEngineDescriptor();
+@@ -154,7 +153,7 @@ class DiscoveryTests extends AbstractJupiterTestEngineTests {
+ 			List.of(TestCaseWithExtendedNested.class, TestCaseWithExtendedNested.ConcreteInner1.class),
+ 			AbstractSuperClass.NestedInAbstractClass.class,
+ 			AbstractSuperClass.NestedInAbstractClass.class.getDeclaredMethod("test"));
+-		LauncherDiscoveryRequest spec = defaultRequest().selectors(selector).build();
++		LauncherDiscoveryRequest spec = request().selectors(selector).build();
+ 
+ 		TestDescriptor engineDescriptor = discoverTests(spec).getEngineDescriptor();
+ 
+@@ -199,12 +198,12 @@ class DiscoveryTests extends AbstractJupiterTestEngineTests {
+ 	static List<Named<LauncherDiscoveryRequest>> requestsForTestClassWithInvalidTestMethod() {
+ 		return List.of( //
+ 			named("directly selected",
+-				defaultRequest().selectors(selectClass(InvalidTestCases.InvalidTestMethodTestCase.class)).build()), //
+-			named("indirectly selected", defaultRequest() //
++				request().selectors(selectClass(InvalidTestCases.InvalidTestMethodTestCase.class)).build()), //
++			named("indirectly selected", request() //
+ 					.selectors(selectPackage(InvalidTestCases.InvalidTestMethodTestCase.class.getPackageName())) //
+ 					.filters(includeClassNamePatterns(
+ 						Pattern.quote(InvalidTestCases.InvalidTestMethodTestCase.class.getName()))).build()), //
+-			named("subclasses", defaultRequest() //
++			named("subclasses", request() //
+ 					.selectors(selectClass(InvalidTestCases.InvalidTestMethodSubclass1TestCase.class),
+ 						selectClass(InvalidTestCases.InvalidTestMethodSubclass2TestCase.class)) //
+ 					.build()) //
+@@ -230,14 +229,14 @@ class DiscoveryTests extends AbstractJupiterTestEngineTests {
+ 	static List<Arguments> requestsForTestClassWithInvalidStandaloneTestClass() {
+ 		return List.of( //
+ 			argumentSet("directly selected",
+-				defaultRequest().selectors(selectClass(InvalidTestCases.InvalidTestClassTestCase.class)).build(),
++				request().selectors(selectClass(InvalidTestCases.InvalidTestClassTestCase.class)).build(),
+ 				InvalidTestCases.InvalidTestClassTestCase.class), //
+-			argumentSet("indirectly selected", defaultRequest() //
++			argumentSet("indirectly selected", request() //
+ 					.selectors(selectPackage(InvalidTestCases.InvalidTestClassTestCase.class.getPackageName())) //
+ 					.filters(includeClassNamePatterns(
+ 						Pattern.quote(InvalidTestCases.InvalidTestClassTestCase.class.getName()))).build(), //
+ 				InvalidTestCases.InvalidTestClassTestCase.class), //
+-			argumentSet("subclass", defaultRequest() //
++			argumentSet("subclass", request() //
+ 					.selectors(selectClass(InvalidTestCases.InvalidTestClassSubclassTestCase.class)) //
+ 					.build(), //
+ 				InvalidTestCases.InvalidTestClassSubclassTestCase.class) //
+@@ -263,8 +262,8 @@ class DiscoveryTests extends AbstractJupiterTestEngineTests {
+ 	static List<Named<LauncherDiscoveryRequest>> requestsForTestClassWithInvalidNestedTestClass() {
+ 		return List.of( //
+ 			named("directly selected",
+-				defaultRequest().selectors(selectClass(InvalidTestCases.InvalidTestClassTestCase.Inner.class)).build()), //
+-			named("subclass", defaultRequest() //
++				request().selectors(selectClass(InvalidTestCases.InvalidTestClassTestCase.Inner.class)).build()), //
++			named("subclass", request() //
+ 					.selectors(selectNestedClass(List.of(InvalidTestCases.InvalidTestClassSubclassTestCase.class),
+ 						InvalidTestCases.InvalidTestClassTestCase.Inner.class)) //
+ 					.build()) //
+diff --git a/platform-tests/src/test/java/org/junit/platform/jfr/FlightRecordingDiscoveryListenerIntegrationTests.java b/platform-tests/src/test/java/org/junit/platform/jfr/FlightRecordingDiscoveryListenerIntegrationTests.java
+index c734d70e0..e893428d0 100644
+--- a/platform-tests/src/test/java/org/junit/platform/jfr/FlightRecordingDiscoveryListenerIntegrationTests.java
++++ b/platform-tests/src/test/java/org/junit/platform/jfr/FlightRecordingDiscoveryListenerIntegrationTests.java
+@@ -57,7 +57,6 @@ public class FlightRecordingDiscoveryListenerIntegrationTests {
+ 		EngineTestKit.discover(testEngine, request() //
+ 				.selectors(selectClass(FlightRecordingDiscoveryListenerIntegrationTests.class)) //
+ 				.listeners(new FlightRecordingDiscoveryListener()) //
+-				.enableImplicitConfigurationParameters(false) //
+ 				.build());
+ 
+ 		jfrEvents.awaitEvents();
+diff --git a/platform-tests/src/test/java/org/junit/platform/launcher/core/DefaultLauncherTests.java b/platform-tests/src/test/java/org/junit/platform/launcher/core/DefaultLauncherTests.java
+index d03bc43c3..1722bd9bf 100644
+--- a/platform-tests/src/test/java/org/junit/platform/launcher/core/DefaultLauncherTests.java
++++ b/platform-tests/src/test/java/org/junit/platform/launcher/core/DefaultLauncherTests.java
+@@ -25,7 +25,6 @@ import static org.junit.platform.engine.discovery.DiscoverySelectors.selectPacka
+ import static org.junit.platform.engine.discovery.DiscoverySelectors.selectUniqueId;
+ import static org.junit.platform.fakes.FaultyTestEngines.createEngineThatCannotResolveAnything;
+ import static org.junit.platform.fakes.FaultyTestEngines.createEngineThatFailsToResolveAnything;
+-import static org.junit.platform.launcher.LauncherConstants.DISCOVERY_ISSUE_FAILURE_PHASE_PROPERTY_NAME;
+ import static org.junit.platform.launcher.LauncherConstants.DRY_RUN_PROPERTY_NAME;
+ import static org.junit.platform.launcher.core.LauncherDiscoveryRequestBuilder.DEFAULT_DISCOVERY_LISTENER_CONFIGURATION_PROPERTY_NAME;
+ import static org.junit.platform.launcher.core.LauncherDiscoveryRequestBuilder.request;
+@@ -949,55 +948,6 @@ class DefaultLauncherTests {
+ 					LauncherConstants.CRITICAL_DISCOVERY_ISSUE_SEVERITY_PROPERTY_NAME);
+ 	}
+ 
+-	@Test
+-	void failsDuringDiscoveryIfConfigurationParameterIsSetAccordingly() {
+-
+-		var engine = new TestEngineStub("engine-id") {
+-			@Override
+-			public TestDescriptor discover(EngineDiscoveryRequest discoveryRequest, UniqueId uniqueId) {
+-				var listener = discoveryRequest.getDiscoveryListener();
+-				listener.issueEncountered(uniqueId, DiscoveryIssue.create(Severity.ERROR, "error"));
+-				return new EngineDescriptor(uniqueId, "Engine");
+-			}
+-		};
+-
+-		var exception = assertThrows(DiscoveryIssueException.class, () -> execute(engine, request -> request //
+-				.configurationParameter(LauncherConstants.DISCOVERY_ISSUE_FAILURE_PHASE_PROPERTY_NAME, "discovery")));
+-
+-		assertThat(exception) //
+-				.isInstanceOf(DiscoveryIssueException.class) //
+-				.hasMessageStartingWith(
+-					"TestEngine with ID 'engine-id' encountered a critical issue during test discovery") //
+-				.hasMessageContaining("(1) [ERROR] error");
+-	}
+-
+-	@ParameterizedTest
+-	@ValueSource(strings = { "discovery", "execution" })
+-	void logsNonCriticalIssuesOnlyOnce(String phase, @TrackLogRecords LogRecordListener listener) {
+-
+-		var engine = new TestEngineStub("engine-id") {
+-			@Override
+-			public TestDescriptor discover(EngineDiscoveryRequest discoveryRequest, UniqueId uniqueId) {
+-				var listener = discoveryRequest.getDiscoveryListener();
+-				listener.issueEncountered(uniqueId, DiscoveryIssue.create(Severity.WARNING, "warning"));
+-				return new EngineDescriptor(uniqueId, "Engine");
+-			}
+-
+-			@Override
+-			public void execute(ExecutionRequest request) {
+-				var executionListener = request.getEngineExecutionListener();
+-				var engineDescriptor = request.getRootTestDescriptor();
+-				executionListener.executionStarted(engineDescriptor);
+-				executionListener.executionFinished(engineDescriptor, successful());
+-			}
+-		};
+-
+-		execute(engine, request -> request //
+-				.configurationParameter(LauncherConstants.DISCOVERY_ISSUE_FAILURE_PHASE_PROPERTY_NAME, phase));
+-
+-		assertThat(listener.stream(DiscoveryIssueNotifier.class, Level.WARNING)).hasSize(1);
+-	}
+-
+ 	private static ReportedData execute(TestEngine engine) {
+ 		return execute(engine, identity());
+ 	}
+@@ -1019,7 +969,6 @@ class DefaultLauncherTests {
+ 
+ 		var builder = request() //
+ 				.enableImplicitConfigurationParameters(false) //
+-				.configurationParameter(DISCOVERY_ISSUE_FAILURE_PHASE_PROPERTY_NAME, "execution") //
+ 				.configurationParameter(DEFAULT_DISCOVERY_LISTENER_CONFIGURATION_PROPERTY_NAME, "logging");
+ 		var request = configurer.apply(builder).build();
+ 		var launcher = createLauncher(engine);
+diff --git a/platform-tests/src/test/java/org/junit/platform/launcher/listeners/discovery/LoggingLauncherDiscoveryListenerTests.java b/platform-tests/src/test/java/org/junit/platform/launcher/listeners/discovery/LoggingLauncherDiscoveryListenerTests.java
+index ca0eb6983..400f4b43d 100644
+--- a/platform-tests/src/test/java/org/junit/platform/launcher/listeners/discovery/LoggingLauncherDiscoveryListenerTests.java
++++ b/platform-tests/src/test/java/org/junit/platform/launcher/listeners/discovery/LoggingLauncherDiscoveryListenerTests.java
+@@ -15,7 +15,6 @@ import static org.junit.platform.engine.discovery.DiscoverySelectors.selectClass
+ import static org.junit.platform.engine.discovery.DiscoverySelectors.selectUniqueId;
+ import static org.junit.platform.fakes.FaultyTestEngines.createEngineThatCannotResolveAnything;
+ import static org.junit.platform.fakes.FaultyTestEngines.createEngineThatFailsToResolveAnything;
+-import static org.junit.platform.launcher.LauncherConstants.DISCOVERY_ISSUE_FAILURE_PHASE_PROPERTY_NAME;
+ import static org.junit.platform.launcher.core.LauncherDiscoveryRequestBuilder.DEFAULT_DISCOVERY_LISTENER_CONFIGURATION_PROPERTY_NAME;
+ import static org.junit.platform.launcher.core.LauncherDiscoveryRequestBuilder.request;
+ import static org.junit.platform.launcher.core.LauncherFactoryForTestingPurposesOnly.createLauncher;
+@@ -38,10 +37,8 @@ public class LoggingLauncherDiscoveryListenerTests {
+ 	void logsWarningOnUnresolvedUniqueIdSelectorWithEnginePrefix(LogRecordListener log) {
+ 		var engine = createEngineThatCannotResolveAnything("some-engine");
+ 		var request = request() //
+-				.configurationParameter(DISCOVERY_ISSUE_FAILURE_PHASE_PROPERTY_NAME, "execution") //
+ 				.configurationParameter(DEFAULT_DISCOVERY_LISTENER_CONFIGURATION_PROPERTY_NAME, "logging") //
+ 				.selectors(selectUniqueId(UniqueId.forEngine(engine.getId()))) //
+-				.enableImplicitConfigurationParameters(false) //
+ 				.build();
+ 		var launcher = createLauncher(engine);
+ 
+@@ -59,7 +56,6 @@ public class LoggingLauncherDiscoveryListenerTests {
+ 		var request = request() //
+ 				.configurationParameter(DEFAULT_DISCOVERY_LISTENER_CONFIGURATION_PROPERTY_NAME, "logging") //
+ 				.selectors(selectUniqueId(UniqueId.forEngine("some-other-engine"))) //
+-				.enableImplicitConfigurationParameters(false) //
+ 				.build();
+ 		var launcher = createLauncher(engine);
+ 
+@@ -76,10 +72,8 @@ public class LoggingLauncherDiscoveryListenerTests {
+ 		var rootCause = new RuntimeException();
+ 		var engine = createEngineThatFailsToResolveAnything("some-engine", rootCause);
+ 		var request = request() //
+-				.configurationParameter(DISCOVERY_ISSUE_FAILURE_PHASE_PROPERTY_NAME, "execution") //
+ 				.configurationParameter(DEFAULT_DISCOVERY_LISTENER_CONFIGURATION_PROPERTY_NAME, "logging") //
+ 				.selectors(selectClass(Object.class)) //
+-				.enableImplicitConfigurationParameters(false) //
+ 				.build();
+ 		var launcher = createLauncher(engine);
+ 
+@@ -103,7 +97,6 @@ public class LoggingLauncherDiscoveryListenerTests {
+ 		var request = request() //
+ 				.configurationParameter(DEFAULT_DISCOVERY_LISTENER_CONFIGURATION_PROPERTY_NAME, "logging") //
+ 				.selectors(selectUniqueId(UniqueId.forEngine(engine.getId()))) //
+-				.enableImplicitConfigurationParameters(false) //
+ 				.build();
+ 		var launcher = createLauncher(engine);
+ 
+@@ -120,7 +113,6 @@ public class LoggingLauncherDiscoveryListenerTests {
+ 		var request = request() //
+ 				.configurationParameter(DEFAULT_DISCOVERY_LISTENER_CONFIGURATION_PROPERTY_NAME, "logging") //
+ 				.selectors(selectUniqueId(UniqueId.forEngine(engine.getId()))) //
+-				.enableImplicitConfigurationParameters(false) //
+ 				.build();
+ 		var launcher = createLauncher(engine);
+ 
+diff --git a/platform-tests/src/test/java/org/junit/platform/testkit/engine/EngineDiscoveryResultsIntegrationTests.java b/platform-tests/src/test/java/org/junit/platform/testkit/engine/EngineDiscoveryResultsIntegrationTests.java
+index 24cb2cc5a..29945442f 100644
+--- a/platform-tests/src/test/java/org/junit/platform/testkit/engine/EngineDiscoveryResultsIntegrationTests.java
++++ b/platform-tests/src/test/java/org/junit/platform/testkit/engine/EngineDiscoveryResultsIntegrationTests.java
+@@ -27,7 +27,6 @@ import org.junit.platform.engine.TestEngine;
+ import org.junit.platform.engine.UniqueId;
+ import org.junit.platform.engine.support.descriptor.ClassSource;
+ import org.junit.platform.fakes.TestEngineStub;
+-import org.junit.platform.launcher.core.LauncherDiscoveryRequestBuilder;
+ 
+ @ParameterizedClass
+ @EnumSource
+@@ -71,16 +70,12 @@ record EngineDiscoveryResultsIntegrationTests(TestKitApi testKit) {
+ 		STATIC_METHOD {
+ 			@Override
+ 			EngineDiscoveryResults discover(String engineId, DiscoverySelector selector) {
+-				return EngineTestKit.discover(engineId, newRequest().selectors(selector).build());
++				return EngineTestKit.discover(engineId, request().selectors(selector).build());
+ 			}
+ 
+ 			@Override
+ 			EngineDiscoveryResults discover(TestEngine testEngine) {
+-				return EngineTestKit.discover(testEngine, newRequest().build());
+-			}
+-
+-			private static LauncherDiscoveryRequestBuilder newRequest() {
+-				return request().enableImplicitConfigurationParameters(false);
++				return EngineTestKit.discover(testEngine, request().build());
+ 			}
+ 		},
+ 
+diff --git a/platform-tests/src/test/java/org/junit/platform/testkit/engine/EngineTestKitTests.java b/platform-tests/src/test/java/org/junit/platform/testkit/engine/EngineTestKitTests.java
+index dffb0255f..60776a7b6 100644
+--- a/platform-tests/src/test/java/org/junit/platform/testkit/engine/EngineTestKitTests.java
++++ b/platform-tests/src/test/java/org/junit/platform/testkit/engine/EngineTestKitTests.java
+@@ -68,7 +68,6 @@ class EngineTestKitTests {
+ 		when(testEngine.getId()).thenReturn("test-engine");
+ 
+ 		LauncherDiscoveryRequest request = mock(LauncherDiscoveryRequest.class);
+-		when(request.getConfigurationParameters()).thenReturn(mock());
+ 		when(request.getDiscoveryListener()).thenReturn(LauncherDiscoveryListener.NOOP);
+ 
+ 		try (MockedConstruction<EngineExecutionOrchestrator> mockedConstruction = mockConstruction(

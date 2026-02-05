@@ -1,0 +1,455 @@
+diff --git a/http-netty/src/main/java/io/micronaut/http/netty/websocket/AbstractNettyWebSocketHandler.java b/http-netty/src/main/java/io/micronaut/http/netty/websocket/AbstractNettyWebSocketHandler.java
+index 909cd038b1..825f33ef08 100644
+--- a/http-netty/src/main/java/io/micronaut/http/netty/websocket/AbstractNettyWebSocketHandler.java
++++ b/http-netty/src/main/java/io/micronaut/http/netty/websocket/AbstractNettyWebSocketHandler.java
+@@ -220,7 +220,7 @@ public abstract class AbstractNettyWebSocketHandler extends SimpleChannelInbound
+                 Object target = errorMethod.getTarget();
+                 Object result;
+                 try {
+-                    result = invokeExecutable(boundExecutable, errorMethod);
++                    result = boundExecutable.invoke(target);
+                 } catch (Exception e) {
+ 
+                     if (LOG.isErrorEnabled()) {
+@@ -230,8 +230,8 @@ public abstract class AbstractNettyWebSocketHandler extends SimpleChannelInbound
+                     return;
+                 }
+                 if (Publishers.isConvertibleToPublisher(result)) {
+-                    Mono<?> unhandled = Mono.from(instrumentPublisher(ctx, result));
+-                    unhandled.subscribe(unhandledResult -> fallback.accept(cause), throwable -> {
++                    Flux<?> flowable = Flux.from(instrumentPublisher(ctx, result));
++                    flowable.collectList().subscribe(objects -> fallback.accept(cause), throwable -> {
+                         if (throwable != null && LOG.isErrorEnabled()) {
+                             LOG.error("Error subscribing to @OnError handler {}.{}: {}", target.getClass().getSimpleName(), errorMethod.getExecutableMethod(), throwable.getMessage(), throwable);
+                         }
+diff --git a/http-server-netty/src/main/java/io/micronaut/http/server/netty/websocket/NettyServerWebSocketHandler.java b/http-server-netty/src/main/java/io/micronaut/http/server/netty/websocket/NettyServerWebSocketHandler.java
+index 1555436120..6234e95fb3 100644
+--- a/http-server-netty/src/main/java/io/micronaut/http/server/netty/websocket/NettyServerWebSocketHandler.java
++++ b/http-server-netty/src/main/java/io/micronaut/http/server/netty/websocket/NettyServerWebSocketHandler.java
+@@ -26,7 +26,6 @@ import io.micronaut.core.convert.value.ConvertibleValues;
+ import io.micronaut.core.propagation.PropagatedContext;
+ import io.micronaut.core.type.Argument;
+ import io.micronaut.core.type.Executable;
+-import io.micronaut.core.type.ReturnType;
+ import io.micronaut.core.util.KotlinUtils;
+ import io.micronaut.http.HttpAttributes;
+ import io.micronaut.http.HttpRequest;
+@@ -39,8 +38,6 @@ import io.micronaut.http.server.CoroutineHelper;
+ import io.micronaut.http.server.netty.NettyEmbeddedServices;
+ import io.micronaut.inject.ExecutableMethod;
+ import io.micronaut.inject.MethodExecutionHandle;
+-import io.micronaut.scheduling.executor.ExecutorSelector;
+-import io.micronaut.scheduling.executor.ThreadSelection;
+ import io.micronaut.web.router.UriRouteMatch;
+ import io.micronaut.websocket.CloseReason;
+ import io.micronaut.websocket.WebSocketPongMessage;
+@@ -68,7 +65,6 @@ import java.security.Principal;
+ import java.util.List;
+ import java.util.Optional;
+ import java.util.Set;
+-import java.util.concurrent.CompletableFuture;
+ import java.util.function.Function;
+ import java.util.function.Supplier;
+ import java.util.stream.Collectors;
+@@ -95,8 +91,6 @@ public class NettyServerWebSocketHandler extends AbstractNettyWebSocketHandler {
+ 
+     private final Argument<?> bodyArgument;
+     private final Argument<?> pongArgument;
+-    private final ThreadSelection threadSelection;
+-    private final ExecutorSelector executorSelector;
+ 
+     /**
+      * Default constructor.
+@@ -108,20 +102,17 @@ public class NettyServerWebSocketHandler extends AbstractNettyWebSocketHandler {
+      * @param request                    The request used to create the websocket
+      * @param routeMatch                 The route match
+      * @param ctx                        The channel handler context
+-     * @param executorSelector
+      * @param coroutineHelper            Helper for kotlin coroutines
+      */
+     NettyServerWebSocketHandler(
+-        NettyEmbeddedServices nettyEmbeddedServices,
+-        WebSocketSessionRepository webSocketSessionRepository,
+-        WebSocketServerHandshaker handshaker,
+-        WebSocketBean<?> webSocketBean,
+-        HttpRequest<?> request,
+-        UriRouteMatch<Object, Object> routeMatch,
+-        ChannelHandlerContext ctx,
+-        ThreadSelection threadSelection,
+-        ExecutorSelector executorSelector,
+-        @Nullable CoroutineHelper coroutineHelper) {
++            NettyEmbeddedServices nettyEmbeddedServices,
++            WebSocketSessionRepository webSocketSessionRepository,
++            WebSocketServerHandshaker handshaker,
++            WebSocketBean<?> webSocketBean,
++            HttpRequest<?> request,
++            UriRouteMatch<Object, Object> routeMatch,
++            ChannelHandlerContext ctx,
++            @Nullable CoroutineHelper coroutineHelper) {
+         super(
+                 ctx,
+                 nettyEmbeddedServices.getRequestArgumentSatisfier().getBinderRegistry(),
+@@ -134,9 +125,6 @@ public class NettyServerWebSocketHandler extends AbstractNettyWebSocketHandler {
+                 webSocketSessionRepository,
+                 nettyEmbeddedServices.getApplicationContext().getConversionService());
+ 
+-        this.threadSelection = threadSelection;
+-        this.executorSelector = executorSelector;
+-
+         this.serverSession = createWebSocketSession(ctx);
+ 
+         ExecutableBinder<WebSocketState> binder = new DefaultExecutableBinder<>();
+@@ -357,27 +345,8 @@ public class NettyServerWebSocketHandler extends AbstractNettyWebSocketHandler {
+     }
+ 
+     private Object invokeExecutable0(BoundExecutable boundExecutable, MethodExecutionHandle<?, ?> messageHandler) {
+-        return this.executorSelector.select(messageHandler.getExecutableMethod(), threadSelection)
+-            .map(
+-                executorService -> {
+-                    ReturnType<?> returnType = messageHandler.getExecutableMethod().getReturnType();
+-                    Mono<?> result;
+-                    if (returnType.isReactive()) {
+-                        result = Mono.from((Publisher<?>) boundExecutable.invoke(messageHandler.getTarget()))
+-                                     .contextWrite(reactorContext -> reactorContext.put(ServerRequestContext.KEY, originatingRequest));;
+-                    } else if (returnType.isAsync()) {
+-                        result = Mono.fromFuture((Supplier<CompletableFuture<?>>) invokeWithContext(boundExecutable, messageHandler));
+-                    } else {
+-                        result = Mono.fromSupplier(invokeWithContext(boundExecutable, messageHandler));
+-                    }
+-                    return (Object) result.subscribeOn(Schedulers.fromExecutor(executorService));
+-                }
+-            ).orElseGet(invokeWithContext(boundExecutable, messageHandler));
+-    }
+-
+-    private Supplier<?> invokeWithContext(BoundExecutable boundExecutable, MethodExecutionHandle<?, ?> messageHandler) {
+-        return () -> ServerRequestContext.with(originatingRequest,
+-            (Supplier<Object>) () -> boundExecutable.invoke(messageHandler.getTarget()));
++        return ServerRequestContext.with(originatingRequest,
++                (Supplier<Object>) () -> boundExecutable.invoke(messageHandler.getTarget()));
+     }
+ 
+     @Override
+diff --git a/http-server-netty/src/main/java/io/micronaut/http/server/netty/websocket/NettyServerWebSocketUpgradeHandler.java b/http-server-netty/src/main/java/io/micronaut/http/server/netty/websocket/NettyServerWebSocketUpgradeHandler.java
+index e488cf6294..977bc406ac 100644
+--- a/http-server-netty/src/main/java/io/micronaut/http/server/netty/websocket/NettyServerWebSocketUpgradeHandler.java
++++ b/http-server-netty/src/main/java/io/micronaut/http/server/netty/websocket/NettyServerWebSocketUpgradeHandler.java
+@@ -199,8 +199,6 @@ public final class NettyServerWebSocketUpgradeHandler implements RequestHandler
+                     msg,
+                     routeMatch,
+                     ctx,
+-                    serverConfiguration.getThreadSelection(),
+-                    routeExecutor.getExecutorSelector(),
+                     routeExecutor.getCoroutineHelper().orElse(null));
+                 pipeline.addBefore(ctx.name(), NettyServerWebSocketHandler.ID, webSocketHandler);
+ 
+diff --git a/http-server-netty/src/test/groovy/io/micronaut/websocket/WebsocketExecuteOnSpec.groovy b/http-server-netty/src/test/groovy/io/micronaut/websocket/WebsocketExecuteOnSpec.groovy
+deleted file mode 100644
+index 4085a32010..0000000000
+--- a/http-server-netty/src/test/groovy/io/micronaut/websocket/WebsocketExecuteOnSpec.groovy
++++ /dev/null
+@@ -1,290 +0,0 @@
+-package io.micronaut.websocket
+-
+-import io.micronaut.context.annotation.Property
+-import io.micronaut.context.annotation.Requires
+-import io.micronaut.http.context.ServerRequestContext
+-import io.micronaut.runtime.server.EmbeddedServer
+-import io.micronaut.scheduling.LoomSupport
+-import io.micronaut.scheduling.TaskExecutors
+-import io.micronaut.scheduling.annotation.ExecuteOn
+-import io.micronaut.test.extensions.spock.annotation.MicronautTest
+-import io.micronaut.websocket.annotation.*
+-import jakarta.inject.Inject
+-import org.reactivestreams.Publisher
+-import org.slf4j.Logger
+-import org.slf4j.LoggerFactory
+-import reactor.core.publisher.Flux
+-import reactor.core.publisher.Mono
+-import spock.lang.Specification
+-import spock.lang.Unroll
+-import spock.util.concurrent.PollingConditions
+-
+-import java.util.concurrent.CompletableFuture
+-import java.util.concurrent.Future
+-import java.util.function.Predicate
+-import java.util.function.Supplier
+-import java.util.stream.Collectors
+-
+-@Property(name = "spec.name", value = "WebsocketExecuteOnSpec")
+-@MicronautTest
+-class WebsocketExecuteOnSpec extends Specification {
+-
+-    static final Logger LOG = LoggerFactory.getLogger(WebsocketExecuteOnSpec.class)
+-
+-    static final String ERROR_MESSAGE = "error"
+-    static final String JOINED = "joined on thread %s"
+-    static final String DISCONNECTED = "disconnected on thread %s"
+-    static final String ECHO = " from thread %s"
+-    static final String ERROR_RESPONSE = "error handled on thread %s"
+-
+-    @Inject
+-    EmbeddedServer embeddedServer
+-
+-    @Unroll
+-    void "#type websocket server methods can run outside of the event loop with ExecuteOn"() {
+-        given:
+-        WebSocketClient wsClient = embeddedServer.applicationContext.createBean(WebSocketClient.class, embeddedServer.getURL())
+-        String threadName = (LoomSupport.isSupported() ? "virtual" : TaskExecutors.IO) + "-executor"
+-        String expectedJoined = "joined on thread " + threadName
+-        String expectedEcho = "Hello from thread " + threadName
+-
+-        expect:
+-        wsClient
+-
+-        when:
+-        EchoClientWebSocket echoClientWebSocket = Flux.from(wsClient.connect(EchoClientWebSocket, "/echo/${type}")).blockFirst()
+-
+-        then:
+-        noExceptionThrown()
+-        new PollingConditions().eventually {
+-            echoClientWebSocket.receivedMessages() == [expectedJoined]
+-        }
+-
+-        when:
+-        echoClientWebSocket.send('Hello')
+-
+-        then:
+-        new PollingConditions().eventually {
+-            echoClientWebSocket.receivedMessages() == [expectedJoined, expectedEcho]
+-        }
+-
+-        cleanup:
+-        echoClientWebSocket.close()
+-
+-        where:
+-        type        | _
+-        "sync"      | _
+-        "reactive"  | _
+-        "async"     | _
+-    }
+-
+-    @Unroll
+-    void "#type websocket server handler can handle errors with ExecuteOn"() {
+-        given:
+-        WebSocketClient wsClient = embeddedServer.applicationContext.createBean(WebSocketClient.class, embeddedServer.getURL())
+-        String threadName = (LoomSupport.isSupported() ? "virtual" : TaskExecutors.IO) + "-executor"
+-        String expectedJoined = "joined on thread " + threadName
+-        String expectedError = "error handled on thread " + threadName
+-        String expectedEcho = "Hello from thread " + threadName
+-
+-        expect:
+-        wsClient
+-
+-        when:
+-        EchoClientWebSocket echoClientWebSocket = Flux.from(wsClient.connect(EchoClientWebSocket, "/echo/${type}")).blockFirst()
+-
+-        then:
+-        noExceptionThrown()
+-        new PollingConditions().eventually {
+-            echoClientWebSocket.receivedMessages() == [expectedJoined]
+-        }
+-
+-        when:
+-        echoClientWebSocket.send(ERROR_MESSAGE)
+-
+-        then:
+-        new PollingConditions().eventually {
+-            echoClientWebSocket.receivedMessages() == [expectedJoined, expectedError]
+-        }
+-
+-        when:
+-        echoClientWebSocket.send('Hello')
+-
+-        then:
+-        new PollingConditions().eventually {
+-            echoClientWebSocket.receivedMessages() == [expectedJoined, expectedError, expectedEcho]
+-        }
+-
+-        cleanup:
+-        echoClientWebSocket.close()
+-
+-        where:
+-        type        | _
+-        "sync"      | _
+-        "reactive"  | _
+-        "async"     | _
+-    }
+-
+-    @Requires(property = "spec.name", value = "WebsocketExecuteOnSpec")
+-    @ServerWebSocket("/echo/sync")
+-    @ExecuteOn(TaskExecutors.BLOCKING)
+-    static class SynchronousEchoServerWebSocket {
+-
+-        @Inject
+-        WebSocketBroadcaster broadcaster
+-
+-        @OnOpen
+-        void onOpen(WebSocketSession session) {
+-            broadcaster.broadcastSync(JOINED.formatted(Thread.currentThread().getName()), isValid(session))
+-        }
+-
+-        @OnMessage
+-        void onMessage(String message, WebSocketSession session) {
+-            if (message == ERROR_MESSAGE) {
+-                throw new IllegalStateException("this should be handled")
+-            }
+-            broadcaster.broadcastSync((message + ECHO).formatted(Thread.currentThread().getName()), isValid(session))
+-        }
+-
+-        @OnClose
+-        void onClose(WebSocketSession session) {
+-            broadcaster.broadcastSync(DISCONNECTED.formatted(Thread.currentThread().getName()), isValid(session))
+-        }
+-
+-        @OnError
+-        void handleError(IllegalStateException ex) {
+-            LOG.info("Handling error from error handler")
+-            broadcaster.broadcastSync(ERROR_RESPONSE.formatted(Thread.currentThread().getName()))
+-        }
+-
+-        private static Predicate<WebSocketSession> isValid(WebSocketSession session) {
+-            return { s -> s == session }
+-        }
+-    }
+-
+-    @Requires(property = "spec.name", value = "WebsocketExecuteOnSpec")
+-    @ServerWebSocket("/echo/reactive")
+-    @ExecuteOn(TaskExecutors.BLOCKING)
+-    static class ReactiveEchoServerWebSocket {
+-
+-        @Inject
+-        WebSocketBroadcaster broadcaster
+-
+-        Supplier<String> formatMessage(String message) {
+-            () -> message.formatted(Thread.currentThread().getName())
+-        }
+-
+-        @OnOpen
+-        Publisher<String> onOpen(WebSocketSession session) {
+-            Mono.fromSupplier(formatMessage(JOINED))
+-                    .flatMap(message -> Mono.from(broadcaster.broadcast(message)))
+-        }
+-
+-        @OnMessage
+-        Publisher<String> onMessage(String message, WebSocketSession session) {
+-            if (message == ERROR_MESSAGE) {
+-                return Mono.error(new IllegalStateException("this should be handled"))
+-            }
+-            Mono.fromSupplier(formatMessage(message + ECHO))
+-                    .flatMap(m -> Mono.from(broadcaster.broadcast(m)))
+-        }
+-
+-        @OnClose
+-        Publisher<String> onClose(WebSocketSession session) {
+-            Mono.just(session)
+-                    .flatMap(s -> {
+-                        LOG.info(DISCONNECTED.formatted(Thread.currentThread().getName()))
+-                        return Mono.just("closed")
+-                    })
+-        }
+-
+-        @OnError
+-        Publisher<?> handleError(IllegalStateException ex) {
+-            LOG.info("Handling error from error handler")
+-            Mono.fromSupplier(() -> ERROR_RESPONSE.formatted(Thread.currentThread().getName()))
+-                    .flatMap(m -> Mono.from(broadcaster.broadcast(m))).then(Mono.empty())
+-        }
+-    }
+-
+-    @Requires(property = "spec.name", value = "WebsocketExecuteOnSpec")
+-    @ServerWebSocket("/echo/async")
+-    @ExecuteOn(TaskExecutors.BLOCKING)
+-    static class AsyncEchoServerWebSocket {
+-
+-        @Inject
+-        WebSocketBroadcaster broadcaster
+-
+-        Supplier<String> formatMessage(String message) {
+-            () -> message.formatted(Thread.currentThread().getName())
+-        }
+-
+-        @OnOpen
+-        CompletableFuture<String> onOpen(WebSocketSession session) {
+-            Mono.fromSupplier(formatMessage(JOINED))
+-                    .flatMap(message -> Mono.from(broadcaster.broadcast(message))).toFuture();
+-        }
+-
+-        @OnMessage
+-        CompletableFuture<String> onMessage(String message, WebSocketSession session) {
+-            if (message == ERROR_MESSAGE) {
+-                return Mono.error(new IllegalStateException("this should be handled")).toFuture()
+-            }
+-            Mono.fromSupplier(formatMessage(message + ECHO))
+-                    .flatMap(m -> Mono.from(broadcaster.broadcast(m))).toFuture()
+-        }
+-
+-        @OnClose
+-        CompletableFuture<String> onClose(WebSocketSession session) {
+-            Mono.just(session)
+-                    .flatMap(s -> {
+-                        LOG.info(DISCONNECTED.formatted(Thread.currentThread().getName()))
+-                        return Mono.just("closed")
+-                    }).toFuture()
+-        }
+-
+-        @OnError
+-        CompletableFuture<?> handleError(IllegalStateException ex) {
+-            LOG.info("Handling error from error handler")
+-            Mono.fromSupplier(() -> ERROR_RESPONSE.formatted(Thread.currentThread().getName()))
+-                    .flatMap(m -> Mono.from(broadcaster.broadcast(m))).then(Mono.empty()).toFuture()
+-        }
+-
+-    }
+-
+-    @Requires(property = "spec.name", value = "WebsocketExecuteOnSpec")
+-    @ClientWebSocket
+-    static abstract class EchoClientWebSocket implements AutoCloseable {
+-
+-        static final String RECEIVED = "RECEIVED:"
+-
+-        private WebSocketSession session
+-        private List<String> replies = new ArrayList<>()
+-
+-        @OnOpen
+-        void onOpen(WebSocketSession session) {
+-            this.session = session
+-        }
+-        List<String> getReplies() {
+-            return replies
+-        }
+-
+-        @OnMessage
+-        void onMessage(String message) {
+-            replies.add(RECEIVED + message)
+-        }
+-
+-        abstract void send(String message)
+-
+-        List<String> receivedMessages() {
+-            return filterMessagesByType(RECEIVED)
+-        }
+-
+-        List<String> filterMessagesByType(String type) {
+-            replies.stream()
+-                    .filter(str -> str.contains(type))
+-                    .map(str -> str.replaceAll(type, ""))
+-                    .map(str -> str.replaceAll("\\d", "").replace("-thread-", ""))
+-                    .collect(Collectors.toList())
+-        }
+-    }
+-}
+diff --git a/src/main/docs/guide/httpServer/websocket/websocketServer.adoc b/src/main/docs/guide/httpServer/websocket/websocketServer.adoc
+index d310ccc41b..91c37c57a8 100644
+--- a/src/main/docs/guide/httpServer/websocket/websocketServer.adoc
++++ b/src/main/docs/guide/httpServer/websocket/websocketServer.adoc
+@@ -33,10 +33,6 @@ The ann:websocket.annotation.OnMessage[] method can define a parameter for the m
+ 
+ A method annotated with ann:websocket.annotation.OnError[] can be added to implement custom error handling. The `@OnError` method can define a parameter that receives the exception type to be handled. If no `@OnError` handling is present and an unrecoverable exception occurs, the WebSocket is automatically closed.
+ 
+-=== Using @ExecuteOn For Blocking Methods
+-
+-The callback methods of a ann:websocket.annotation.ServerWebSocket[] are invoked on the main Netty server event loop by default. If you do any blocking I/O operations in your WebSocket handler methods, then you must offload those tasks to a separate thread pool in the same manner as with HTTP. As with a ann:http.annotation.Controller[] or ann:http.annotation.Filter[], the ann:scheduling.annotation.ExecuteOn[] annotation can be applied to a ann:websocket.annotation.ServerWebSocket[] handler at either the type or method level.
+-
+ === Non-Blocking Message Handling
+ 
+ The previous example uses the `broadcastSync` method of the api:websocket.WebSocketBroadcaster[] interface which blocks until the broadcast is complete. A similar `sendSync` method exists in api:websocket.WebSocketSession[] to send a message to a single receiver in a blocking manner. You can however implement non-blocking WebSocket servers by instead returning a rs:Publisher[] or a link:{jdkapi}/java.base/java/util/concurrent/Future.html[Future] from each WebSocket handler method. For example:

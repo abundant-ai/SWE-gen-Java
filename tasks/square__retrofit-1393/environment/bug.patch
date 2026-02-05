@@ -1,0 +1,775 @@
+diff --git a/retrofit-mock/src/main/java/retrofit2/mock/BehaviorDelegate.java b/retrofit-mock/src/main/java/retrofit2/mock/BehaviorDelegate.java
+index 3ba4c8dd..b1b875dc 100644
+--- a/retrofit-mock/src/main/java/retrofit2/mock/BehaviorDelegate.java
++++ b/retrofit-mock/src/main/java/retrofit2/mock/BehaviorDelegate.java
+@@ -20,7 +20,6 @@ import java.lang.reflect.InvocationHandler;
+ import java.lang.reflect.Method;
+ import java.lang.reflect.Proxy;
+ import java.lang.reflect.Type;
+-import java.util.concurrent.ExecutorService;
+ import retrofit2.Call;
+ import retrofit2.CallAdapter;
+ import retrofit2.Retrofit;
+@@ -35,14 +34,11 @@ import retrofit2.Retrofit;
+ public final class BehaviorDelegate<T> {
+   private final Retrofit retrofit;
+   private final NetworkBehavior behavior;
+-  private final ExecutorService executor;
+   private final Class<T> service;
+ 
+-  BehaviorDelegate(Retrofit retrofit, NetworkBehavior behavior, ExecutorService executor,
+-      Class<T> service) {
++  BehaviorDelegate(Retrofit retrofit, NetworkBehavior behavior, Class<T> service) {
+     this.retrofit = retrofit;
+     this.behavior = behavior;
+-    this.executor = executor;
+     this.service = service;
+   }
+ 
+@@ -52,7 +48,8 @@ public final class BehaviorDelegate<T> {
+ 
+   @SuppressWarnings("unchecked") // Single-interface proxy creation guarded by parameter safety.
+   public T returning(Call<?> call) {
+-    final Call<?> behaviorCall = new BehaviorCall<>(behavior, executor, call);
++    final Call<?> behaviorCall =
++        new BehaviorCall<>(behavior, retrofit.client().getDispatcher().getExecutorService(), call);
+     return (T) Proxy.newProxyInstance(service.getClassLoader(), new Class[] { service },
+         new InvocationHandler() {
+           @Override
+diff --git a/retrofit-mock/src/main/java/retrofit2/mock/MockRetrofit.java b/retrofit-mock/src/main/java/retrofit2/mock/MockRetrofit.java
+index 3c75b47a..b7562f8f 100644
+--- a/retrofit-mock/src/main/java/retrofit2/mock/MockRetrofit.java
++++ b/retrofit-mock/src/main/java/retrofit2/mock/MockRetrofit.java
+@@ -15,20 +15,23 @@
+  */
+ package retrofit2.mock;
+ 
+-import java.util.concurrent.Executor;
+-import java.util.concurrent.ExecutorService;
+-import java.util.concurrent.Executors;
+ import retrofit2.Retrofit;
+ 
+ public final class MockRetrofit {
++  public static MockRetrofit create(Retrofit retrofit) {
++    return create(retrofit, NetworkBehavior.create());
++  }
++
++  public static MockRetrofit create(Retrofit retrofit, NetworkBehavior behavior) {
++    return new MockRetrofit(retrofit, behavior);
++  }
++
+   private final Retrofit retrofit;
+   private final NetworkBehavior behavior;
+-  private final ExecutorService executor;
+ 
+-  MockRetrofit(Retrofit retrofit, NetworkBehavior behavior, ExecutorService executor) {
++  public MockRetrofit(Retrofit retrofit, NetworkBehavior behavior) {
+     this.retrofit = retrofit;
+     this.behavior = behavior;
+-    this.executor = executor;
+   }
+ 
+   public Retrofit retrofit() {
+@@ -39,41 +42,8 @@ public final class MockRetrofit {
+     return behavior;
+   }
+ 
+-  public Executor backgroundExecutor() {
+-    return executor;
+-  }
+-
+   @SuppressWarnings("unchecked") // Single-interface proxy creation guarded by parameter safety.
+   public <T> BehaviorDelegate<T> create(Class<T> service) {
+-    return new BehaviorDelegate<>(retrofit, behavior, executor, service);
+-  }
+-
+-  public static final class Builder {
+-    private final Retrofit retrofit;
+-    private NetworkBehavior behavior;
+-    private ExecutorService executor;
+-
+-    public Builder(Retrofit retrofit) {
+-      if (retrofit == null) throw new NullPointerException("retrofit == null");
+-      this.retrofit = retrofit;
+-    }
+-
+-    public Builder networkBehavior(NetworkBehavior behavior) {
+-      if (behavior == null) throw new NullPointerException("behavior == null");
+-      this.behavior = behavior;
+-      return this;
+-    }
+-
+-    public Builder backgroundExecutor(ExecutorService executor) {
+-      if (executor == null) throw new NullPointerException("executor == null");
+-      this.executor = executor;
+-      return this;
+-    }
+-
+-    public MockRetrofit build() {
+-      if (behavior == null) behavior = NetworkBehavior.create();
+-      if (executor == null) executor = Executors.newCachedThreadPool();
+-      return new MockRetrofit(retrofit, behavior, executor);
+-    }
++    return new BehaviorDelegate<>(retrofit, behavior, service);
+   }
+ }
+diff --git a/retrofit-mock/src/test/java/retrofit2/mock/BehaviorDelegateTest.java b/retrofit-mock/src/test/java/retrofit2/mock/BehaviorDelegateTest.java
+deleted file mode 100644
+index 40d38f15..00000000
+--- a/retrofit-mock/src/test/java/retrofit2/mock/BehaviorDelegateTest.java
++++ /dev/null
+@@ -1,298 +0,0 @@
+-/*
+- * Copyright (C) 2013 Square, Inc.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-package retrofit2.mock;
+-
+-import java.io.IOException;
+-import java.util.Random;
+-import java.util.concurrent.CountDownLatch;
+-import java.util.concurrent.TimeUnit;
+-import java.util.concurrent.atomic.AtomicLong;
+-import java.util.concurrent.atomic.AtomicReference;
+-import org.junit.Before;
+-import org.junit.Test;
+-import retrofit2.Call;
+-import retrofit2.Callback;
+-import retrofit2.Response;
+-import retrofit2.Retrofit;
+-
+-import static java.util.concurrent.TimeUnit.MILLISECONDS;
+-import static java.util.concurrent.TimeUnit.SECONDS;
+-import static org.assertj.core.api.Assertions.assertThat;
+-import static org.junit.Assert.assertTrue;
+-import static org.junit.Assert.fail;
+-
+-public final class BehaviorDelegateTest {
+-  interface DoWorkService {
+-    Call<String> response();
+-    Call<String> failure();
+-  }
+-
+-  private final IOException mockFailure = new IOException("Timeout!");
+-  private final NetworkBehavior behavior = NetworkBehavior.create(new Random(2847));
+-  private DoWorkService service;
+-
+-  @Before public void setUp() {
+-    Retrofit retrofit = new Retrofit.Builder()
+-        .baseUrl("http://example.com")
+-        .build();
+-    MockRetrofit mockRetrofit = new MockRetrofit.Builder(retrofit)
+-        .networkBehavior(behavior)
+-        .build();
+-    final BehaviorDelegate<DoWorkService> delegate = mockRetrofit.create(DoWorkService.class);
+-
+-    service = new DoWorkService() {
+-      @Override public Call<String> response() {
+-        Call<String> response = Calls.response("Response!");
+-        return delegate.returning(response).response();
+-      }
+-
+-      @Override public Call<String> failure() {
+-        Call<String> failure = Calls.failure(mockFailure);
+-        return delegate.returning(failure).failure();
+-      }
+-    };
+-  }
+-
+-  @Test public void syncFailureThrowsAfterDelay() {
+-    behavior.setDelay(100, MILLISECONDS);
+-    behavior.setVariancePercent(0);
+-    behavior.setFailurePercent(100);
+-
+-    Call<String> call = service.response();
+-
+-    long startNanos = System.nanoTime();
+-    try {
+-      call.execute();
+-      fail();
+-    } catch (IOException e) {
+-      long tookMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos);
+-      assertThat(e).isSameAs(behavior.failureException());
+-      assertThat(tookMs).isGreaterThanOrEqualTo(100);
+-    }
+-  }
+-
+-  @Test public void asyncFailureTriggersFailureAfterDelay() throws InterruptedException {
+-    behavior.setDelay(100, MILLISECONDS);
+-    behavior.setVariancePercent(0);
+-    behavior.setFailurePercent(100);
+-
+-    Call<String> call = service.response();
+-
+-    final long startNanos = System.nanoTime();
+-    final AtomicLong tookMs = new AtomicLong();
+-    final AtomicReference<Throwable> failureRef = new AtomicReference<>();
+-    final CountDownLatch latch = new CountDownLatch(1);
+-    call.enqueue(new Callback<String>() {
+-      @Override public void onResponse(Response<String> response) {
+-        throw new AssertionError();
+-      }
+-
+-      @Override public void onFailure(Throwable t) {
+-        tookMs.set(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos));
+-        failureRef.set(t);
+-        latch.countDown();
+-      }
+-    });
+-    assertTrue(latch.await(1, SECONDS));
+-
+-    assertThat(failureRef.get()).isSameAs(behavior.failureException());
+-    assertThat(tookMs.get()).isGreaterThanOrEqualTo(100);
+-  }
+-
+-  @Test public void syncSuccessReturnsAfterDelay() throws IOException {
+-    behavior.setDelay(100, MILLISECONDS);
+-    behavior.setVariancePercent(0);
+-    behavior.setFailurePercent(0);
+-
+-    Call<String> call = service.response();
+-
+-    long startNanos = System.nanoTime();
+-    Response<String> response = call.execute();
+-    long tookMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos);
+-
+-    assertThat(response.body()).isEqualTo("Response!");
+-    assertThat(tookMs).isGreaterThanOrEqualTo(100);
+-  }
+-
+-  @Test public void asyncSuccessCalledAfterDelay() throws InterruptedException, IOException {
+-    behavior.setDelay(100, MILLISECONDS);
+-    behavior.setVariancePercent(0);
+-    behavior.setFailurePercent(0);
+-
+-    Call<String> call = service.response();
+-
+-    final long startNanos = System.nanoTime();
+-    final AtomicLong tookMs = new AtomicLong();
+-    final AtomicReference<String> actual = new AtomicReference<>();
+-    final CountDownLatch latch = new CountDownLatch(1);
+-    call.enqueue(new Callback<String>() {
+-      @Override public void onResponse(Response<String> response) {
+-        tookMs.set(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos));
+-        actual.set(response.body());
+-        latch.countDown();
+-      }
+-
+-      @Override public void onFailure(Throwable t) {
+-        throw new AssertionError();
+-      }
+-    });
+-    assertTrue(latch.await(1, SECONDS));
+-
+-    assertThat(actual.get()).isEqualTo("Response!");
+-    assertThat(tookMs.get()).isGreaterThanOrEqualTo(100);
+-  }
+-
+-  @Test public void syncFailureThrownAfterDelay() {
+-    behavior.setDelay(100, MILLISECONDS);
+-    behavior.setVariancePercent(0);
+-    behavior.setFailurePercent(0);
+-
+-    Call<String> call = service.failure();
+-
+-    long startNanos = System.nanoTime();
+-    try {
+-      call.execute();
+-      fail();
+-    } catch (IOException e) {
+-      long tookMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos);
+-      assertThat(tookMs).isGreaterThanOrEqualTo(100);
+-      assertThat(e).isSameAs(mockFailure);
+-    }
+-  }
+-
+-  @Test public void asyncFailureCalledAfterDelay() throws InterruptedException {
+-    behavior.setDelay(100, MILLISECONDS);
+-    behavior.setVariancePercent(0);
+-    behavior.setFailurePercent(0);
+-
+-    Call<String> call = service.failure();
+-
+-    final AtomicLong tookMs = new AtomicLong();
+-    final AtomicReference<Throwable> failureRef = new AtomicReference<>();
+-    final CountDownLatch latch = new CountDownLatch(1);
+-    final long startNanos = System.nanoTime();
+-    call.enqueue(new Callback<String>() {
+-      @Override public void onResponse(Response<String> response) {
+-        throw new AssertionError();
+-      }
+-
+-      @Override public void onFailure(Throwable t) {
+-        tookMs.set(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos));
+-        failureRef.set(t);
+-        latch.countDown();
+-      }
+-    });
+-    assertTrue(latch.await(1, SECONDS));
+-
+-    assertThat(tookMs.get()).isGreaterThanOrEqualTo(100);
+-    assertThat(failureRef.get()).isSameAs(mockFailure);
+-  }
+-
+-  @Test public void syncCanBeCanceled() throws IOException {
+-    behavior.setDelay(10, SECONDS);
+-    behavior.setVariancePercent(0);
+-    behavior.setFailurePercent(0);
+-
+-    final Call<String> call = service.response();
+-
+-    new Thread(new Runnable() {
+-      @Override public void run() {
+-        try {
+-          Thread.sleep(100);
+-          call.cancel();
+-        } catch (InterruptedException ignored) {
+-        }
+-      }
+-    }).start();
+-
+-    try {
+-      call.execute();
+-      fail();
+-    } catch (IOException e) {
+-      assertThat(e).isExactlyInstanceOf(IOException.class).hasMessage("canceled");
+-    }
+-  }
+-
+-  @Test public void asyncCanBeCanceled() throws InterruptedException {
+-    behavior.setDelay(10, SECONDS);
+-    behavior.setVariancePercent(0);
+-    behavior.setFailurePercent(0);
+-
+-    final Call<String> call = service.response();
+-
+-    final AtomicReference<Throwable> failureRef = new AtomicReference<>();
+-    final CountDownLatch latch = new CountDownLatch(1);
+-    call.enqueue(new Callback<String>() {
+-      @Override public void onResponse(Response<String> response) {
+-        latch.countDown();
+-      }
+-
+-      @Override public void onFailure(Throwable t) {
+-        failureRef.set(t);
+-        latch.countDown();
+-      }
+-    });
+-
+-    // TODO we shouldn't need to sleep
+-    Thread.sleep(100); // Ensure the task has started.
+-    call.cancel();
+-
+-    assertTrue(latch.await(1, SECONDS));
+-    assertThat(failureRef.get()).isExactlyInstanceOf(IOException.class).hasMessage("canceled");
+-  }
+-
+-  @Test public void syncCanceledBeforeStart() throws IOException {
+-    behavior.setDelay(100, MILLISECONDS);
+-    behavior.setVariancePercent(0);
+-    behavior.setFailurePercent(0);
+-
+-    final Call<String> call = service.response();
+-
+-    call.cancel();
+-    try {
+-      call.execute();
+-      fail();
+-    } catch (IOException e) {
+-      assertThat(e).isExactlyInstanceOf(IOException.class).hasMessage("canceled");
+-    }
+-  }
+-
+-  @Test public void asyncCanBeCanceledBeforeStart() throws InterruptedException {
+-    behavior.setDelay(10, SECONDS);
+-    behavior.setVariancePercent(0);
+-    behavior.setFailurePercent(0);
+-
+-    final Call<String> call = service.response();
+-    call.cancel();
+-
+-    final AtomicReference<Throwable> failureRef = new AtomicReference<>();
+-    final CountDownLatch latch = new CountDownLatch(1);
+-    call.enqueue(new Callback<String>() {
+-      @Override public void onResponse(Response<String> response) {
+-        latch.countDown();
+-      }
+-
+-      @Override public void onFailure(Throwable t) {
+-        failureRef.set(t);
+-        latch.countDown();
+-      }
+-    });
+-
+-    assertTrue(latch.await(1, SECONDS));
+-    assertThat(failureRef.get()).isExactlyInstanceOf(IOException.class).hasMessage("canceled");
+-  }
+-}
+diff --git a/retrofit-mock/src/test/java/retrofit2/mock/MockRetrofitTest.java b/retrofit-mock/src/test/java/retrofit2/mock/MockRetrofitTest.java
+index 3599cc97..3e091483 100644
+--- a/retrofit-mock/src/test/java/retrofit2/mock/MockRetrofitTest.java
++++ b/retrofit-mock/src/test/java/retrofit2/mock/MockRetrofitTest.java
+@@ -1,73 +1,297 @@
++/*
++ * Copyright (C) 2013 Square, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
+ package retrofit2.mock;
+ 
+-import java.util.concurrent.ExecutorService;
+-import java.util.concurrent.Executors;
++import java.io.IOException;
++import java.util.Random;
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.atomic.AtomicLong;
++import java.util.concurrent.atomic.AtomicReference;
++import org.junit.Before;
+ import org.junit.Test;
++import retrofit2.Call;
++import retrofit2.Callback;
++import retrofit2.Response;
+ import retrofit2.Retrofit;
+ 
++import static java.util.concurrent.TimeUnit.MILLISECONDS;
++import static java.util.concurrent.TimeUnit.SECONDS;
+ import static org.assertj.core.api.Assertions.assertThat;
++import static org.junit.Assert.assertTrue;
+ import static org.junit.Assert.fail;
+ 
+ public final class MockRetrofitTest {
+-  private final Retrofit retrofit = new Retrofit.Builder().baseUrl("http://example.com").build();
+-  private final NetworkBehavior behavior = NetworkBehavior.create();
+-  private final ExecutorService executor = Executors.newSingleThreadExecutor();
++  interface DoWorkService {
++    Call<String> response();
++    Call<String> failure();
++  }
++
++  private final IOException mockFailure = new IOException("Timeout!");
++  private final NetworkBehavior behavior = NetworkBehavior.create(new Random(2847));
++  private DoWorkService service;
++
++  @Before public void setUp() {
++    Retrofit retrofit = new Retrofit.Builder()
++        .baseUrl("http://example.com")
++        .build();
++
++    MockRetrofit mockRetrofit = MockRetrofit.create(retrofit, behavior);
++    final BehaviorDelegate<DoWorkService> delegate = mockRetrofit.create(DoWorkService.class);
++
++    service = new DoWorkService() {
++      @Override public Call<String> response() {
++        Call<String> response = Calls.response("Response!");
++        return delegate.returning(response).response();
++      }
+ 
+-  @Test public void retrofitNullThrows() {
++      @Override public Call<String> failure() {
++        Call<String> failure = Calls.failure(mockFailure);
++        return delegate.returning(failure).failure();
++      }
++    };
++  }
++
++  @Test public void syncFailureThrowsAfterDelay() {
++    behavior.setDelay(100, MILLISECONDS);
++    behavior.setVariancePercent(0);
++    behavior.setFailurePercent(100);
++
++    Call<String> call = service.response();
++
++    long startNanos = System.nanoTime();
+     try {
+-      new MockRetrofit.Builder(null);
++      call.execute();
+       fail();
+-    } catch (NullPointerException e) {
+-      assertThat(e).hasMessage("retrofit == null");
++    } catch (IOException e) {
++      long tookMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos);
++      assertThat(e).isSameAs(behavior.failureException());
++      assertThat(tookMs).isGreaterThanOrEqualTo(100);
+     }
+   }
+ 
+-  @Test public void retrofitPropagated() {
+-    MockRetrofit mockRetrofit = new MockRetrofit.Builder(retrofit).build();
+-    assertThat(mockRetrofit.retrofit()).isSameAs(retrofit);
++  @Test public void asyncFailureTriggersFailureAfterDelay() throws InterruptedException {
++    behavior.setDelay(100, MILLISECONDS);
++    behavior.setVariancePercent(0);
++    behavior.setFailurePercent(100);
++
++    Call<String> call = service.response();
++
++    final long startNanos = System.nanoTime();
++    final AtomicLong tookMs = new AtomicLong();
++    final AtomicReference<Throwable> failureRef = new AtomicReference<>();
++    final CountDownLatch latch = new CountDownLatch(1);
++    call.enqueue(new Callback<String>() {
++      @Override public void onResponse(Response<String> response) {
++        throw new AssertionError();
++      }
++
++      @Override public void onFailure(Throwable t) {
++        tookMs.set(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos));
++        failureRef.set(t);
++        latch.countDown();
++      }
++    });
++    assertTrue(latch.await(1, SECONDS));
++
++    assertThat(failureRef.get()).isSameAs(behavior.failureException());
++    assertThat(tookMs.get()).isGreaterThanOrEqualTo(100);
+   }
+ 
+-  @Test public void networkBehaviorNullThrows() {
+-    MockRetrofit.Builder builder = new MockRetrofit.Builder(retrofit);
++  @Test public void syncSuccessReturnsAfterDelay() throws IOException {
++    behavior.setDelay(100, MILLISECONDS);
++    behavior.setVariancePercent(0);
++    behavior.setFailurePercent(0);
++
++    Call<String> call = service.response();
++
++    long startNanos = System.nanoTime();
++    Response<String> response = call.execute();
++    long tookMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos);
++
++    assertThat(response.body()).isEqualTo("Response!");
++    assertThat(tookMs).isGreaterThanOrEqualTo(100);
++  }
++
++  @Test public void asyncSuccessCalledAfterDelay() throws InterruptedException, IOException {
++    behavior.setDelay(100, MILLISECONDS);
++    behavior.setVariancePercent(0);
++    behavior.setFailurePercent(0);
++
++    Call<String> call = service.response();
++
++    final long startNanos = System.nanoTime();
++    final AtomicLong tookMs = new AtomicLong();
++    final AtomicReference<String> actual = new AtomicReference<>();
++    final CountDownLatch latch = new CountDownLatch(1);
++    call.enqueue(new Callback<String>() {
++      @Override public void onResponse(Response<String> response) {
++        tookMs.set(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos));
++        actual.set(response.body());
++        latch.countDown();
++      }
++
++      @Override public void onFailure(Throwable t) {
++        throw new AssertionError();
++      }
++    });
++    assertTrue(latch.await(1, SECONDS));
++
++    assertThat(actual.get()).isEqualTo("Response!");
++    assertThat(tookMs.get()).isGreaterThanOrEqualTo(100);
++  }
++
++  @Test public void syncFailureThrownAfterDelay() {
++    behavior.setDelay(100, MILLISECONDS);
++    behavior.setVariancePercent(0);
++    behavior.setFailurePercent(0);
++
++    Call<String> call = service.failure();
++
++    long startNanos = System.nanoTime();
+     try {
+-      builder.networkBehavior(null);
++      call.execute();
+       fail();
+-    } catch (NullPointerException e) {
+-      assertThat(e).hasMessage("behavior == null");
++    } catch (IOException e) {
++      long tookMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos);
++      assertThat(tookMs).isGreaterThanOrEqualTo(100);
++      assertThat(e).isSameAs(mockFailure);
+     }
+   }
+ 
+-  @Test public void networkBehaviorDefault() {
+-    MockRetrofit mockRetrofit = new MockRetrofit.Builder(retrofit).build();
+-    assertThat(mockRetrofit.networkBehavior()).isNotNull();
+-  }
++  @Test public void asyncFailureCalledAfterDelay() throws InterruptedException {
++    behavior.setDelay(100, MILLISECONDS);
++    behavior.setVariancePercent(0);
++    behavior.setFailurePercent(0);
+ 
+-  @Test public void networkBehaviorPropagated() {
+-    MockRetrofit mockRetrofit = new MockRetrofit.Builder(retrofit)
+-        .networkBehavior(behavior)
+-        .build();
+-    assertThat(mockRetrofit.networkBehavior()).isSameAs(behavior);
++    Call<String> call = service.failure();
++
++    final AtomicLong tookMs = new AtomicLong();
++    final AtomicReference<Throwable> failureRef = new AtomicReference<>();
++    final CountDownLatch latch = new CountDownLatch(1);
++    final long startNanos = System.nanoTime();
++    call.enqueue(new Callback<String>() {
++      @Override public void onResponse(Response<String> response) {
++        throw new AssertionError();
++      }
++
++      @Override public void onFailure(Throwable t) {
++        tookMs.set(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos));
++        failureRef.set(t);
++        latch.countDown();
++      }
++    });
++    assertTrue(latch.await(1, SECONDS));
++
++    assertThat(tookMs.get()).isGreaterThanOrEqualTo(100);
++    assertThat(failureRef.get()).isSameAs(mockFailure);
+   }
+ 
+-  @Test public void backgroundExecutorNullThrows() {
+-    MockRetrofit.Builder builder = new MockRetrofit.Builder(retrofit);
++  @Test public void syncCanBeCanceled() throws IOException {
++    behavior.setDelay(10, SECONDS);
++    behavior.setVariancePercent(0);
++    behavior.setFailurePercent(0);
++
++    final Call<String> call = service.response();
++
++    new Thread(new Runnable() {
++      @Override public void run() {
++        try {
++          Thread.sleep(100);
++          call.cancel();
++        } catch (InterruptedException ignored) {
++        }
++      }
++    }).start();
++
+     try {
+-      builder.backgroundExecutor(null);
++      call.execute();
+       fail();
+-    } catch (NullPointerException e) {
+-      assertThat(e).hasMessage("executor == null");
++    } catch (IOException e) {
++      assertThat(e).isExactlyInstanceOf(IOException.class).hasMessage("canceled");
+     }
+   }
+ 
+-  @Test public void backgroundExecutorDefault() {
+-    MockRetrofit mockRetrofit = new MockRetrofit.Builder(retrofit).build();
+-    assertThat(mockRetrofit.backgroundExecutor()).isNotNull();
++  @Test public void asyncCanBeCanceled() throws InterruptedException {
++    behavior.setDelay(10, SECONDS);
++    behavior.setVariancePercent(0);
++    behavior.setFailurePercent(0);
++
++    final Call<String> call = service.response();
++
++    final AtomicReference<Throwable> failureRef = new AtomicReference<>();
++    final CountDownLatch latch = new CountDownLatch(1);
++    call.enqueue(new Callback<String>() {
++      @Override public void onResponse(Response<String> response) {
++        latch.countDown();
++      }
++
++      @Override public void onFailure(Throwable t) {
++        failureRef.set(t);
++        latch.countDown();
++      }
++    });
++
++    // TODO we shouldn't need to sleep
++    Thread.sleep(100); // Ensure the task has started.
++    call.cancel();
++
++    assertTrue(latch.await(1, SECONDS));
++    assertThat(failureRef.get()).isExactlyInstanceOf(IOException.class).hasMessage("canceled");
++  }
++
++  @Test public void syncCanceledBeforeStart() throws IOException {
++    behavior.setDelay(100, MILLISECONDS);
++    behavior.setVariancePercent(0);
++    behavior.setFailurePercent(0);
++
++    final Call<String> call = service.response();
++
++    call.cancel();
++    try {
++      call.execute();
++      fail();
++    } catch (IOException e) {
++      assertThat(e).isExactlyInstanceOf(IOException.class).hasMessage("canceled");
++    }
+   }
+ 
+-  @Test public void backgroundExecutorPropagated() {
+-    MockRetrofit mockRetrofit = new MockRetrofit.Builder(retrofit)
+-        .backgroundExecutor(executor)
+-        .build();
+-    assertThat(mockRetrofit.backgroundExecutor()).isSameAs(executor);
++  @Test public void asyncCanBeCanceledBeforeStart() throws InterruptedException {
++    behavior.setDelay(10, SECONDS);
++    behavior.setVariancePercent(0);
++    behavior.setFailurePercent(0);
++
++    final Call<String> call = service.response();
++    call.cancel();
++
++    final AtomicReference<Throwable> failureRef = new AtomicReference<>();
++    final CountDownLatch latch = new CountDownLatch(1);
++    call.enqueue(new Callback<String>() {
++      @Override public void onResponse(Response<String> response) {
++        latch.countDown();
++      }
++
++      @Override public void onFailure(Throwable t) {
++        failureRef.set(t);
++        latch.countDown();
++      }
++    });
++
++    assertTrue(latch.await(1, SECONDS));
++    assertThat(failureRef.get()).isExactlyInstanceOf(IOException.class).hasMessage("canceled");
+   }
+ }
+diff --git a/samples/src/main/java/com/example/retrofit/SimpleMockService.java b/samples/src/main/java/com/example/retrofit/SimpleMockService.java
+index 347c911a..6b98ff88 100644
+--- a/samples/src/main/java/com/example/retrofit/SimpleMockService.java
++++ b/samples/src/main/java/com/example/retrofit/SimpleMockService.java
+@@ -73,9 +73,7 @@ public final class SimpleMockService {
+ 
+     // Create a MockRetrofit object with a NetworkBehavior which manages the fake behavior of calls.
+     NetworkBehavior behavior = NetworkBehavior.create();
+-    MockRetrofit mockRetrofit = new MockRetrofit.Builder(retrofit)
+-        .networkBehavior(behavior)
+-        .build();
++    MockRetrofit mockRetrofit = MockRetrofit.create(retrofit, behavior);
+ 
+     BehaviorDelegate<GitHub> delegate = mockRetrofit.create(GitHub.class);
+     MockGitHub gitHub = new MockGitHub(delegate);

@@ -1,0 +1,2562 @@
+diff --git a/bom/application/pom.xml b/bom/application/pom.xml
+index c5a3c66bfee..9ee70e0d542 100644
+--- a/bom/application/pom.xml
++++ b/bom/application/pom.xml
+@@ -56,7 +56,7 @@
+         <smallrye-reactive-streams-operators.version>1.0.13</smallrye-reactive-streams-operators.version>
+         <smallrye-reactive-types-converter.version>3.0.3</smallrye-reactive-types-converter.version>
+         <smallrye-mutiny-vertx-binding.version>3.21.3</smallrye-mutiny-vertx-binding.version>
+-        <smallrye-reactive-messaging.version>4.31.0</smallrye-reactive-messaging.version>
++        <smallrye-reactive-messaging.version>4.32.0</smallrye-reactive-messaging.version>
+         <smallrye-stork.version>2.7.3</smallrye-stork.version>
+         <jakarta.activation.version>2.1.4</jakarta.activation.version>
+         <jakarta.annotation-api.version>3.0.0</jakarta.annotation-api.version>
+@@ -166,7 +166,7 @@
+         <osgi.version>6.0.0</osgi.version>
+         <mongo-client.version>5.6.2</mongo-client.version>
+         <proton-j.version>0.34.1</proton-j.version>
+-        <javaparser.version>3.27.1</javaparser.version>
++        <javaparser.version>3.28.0</javaparser.version>
+         <hibernate-quarkus-local-cache.version>0.5.0</hibernate-quarkus-local-cache.version>
+         <flapdoodle.mongo.version>4.22.0</flapdoodle.mongo.version>
+         <quarkus-spring-api.version>6.2.SP3</quarkus-spring-api.version>
+diff --git a/build-parent/pom.xml b/build-parent/pom.xml
+index 55633b9e9a6..d0bf987f368 100644
+--- a/build-parent/pom.xml
++++ b/build-parent/pom.xml
+@@ -35,7 +35,7 @@
+ 
+         <asciidoctorj.version>3.0.0</asciidoctorj.version>
+         <htmlunit.version>4.21.0</htmlunit.version>
+-        <javaparser-core.version>3.27.1</javaparser-core.version>
++        <javaparser-core.version>3.28.0</javaparser-core.version>
+         <jdeparser.version>2.0.3.Final</jdeparser.version>
+         <subethasmtp.version>6.0.1</subethasmtp.version>
+ 
+@@ -57,8 +57,8 @@
+         <!--
+         Supported Maven versions, interpreted as a version range (Also defined in quarkus-enforcer-rules)
+          -->
+-        <!-- TODO: once we can upgrade the minimum Maven version to use for Quarkus projects, let's use ${maven.min.version} again -->
+-        <supported-maven-versions>[3.8.6,)</supported-maven-versions>
++        <!-- This version is more permissive than ${maven.min.version} as we usually have more requirements for the Quarkus build itself than for Quarkus projects -->
++        <supported-maven-versions>[3.9.0,)</supported-maven-versions>
+ 
+         <!-- These 2 properties are used by CreateProjectMojo to add the Maven Wrapper -->
+         <proposed-maven-version>3.9.12</proposed-maven-version>
+diff --git a/core/deployment/src/main/java/io/quarkus/deployment/builditem/DevServicesRegistryBuildItem.java b/core/deployment/src/main/java/io/quarkus/deployment/builditem/DevServicesRegistryBuildItem.java
+index c01c2953e16..656d0d38ead 100644
+--- a/core/deployment/src/main/java/io/quarkus/deployment/builditem/DevServicesRegistryBuildItem.java
++++ b/core/deployment/src/main/java/io/quarkus/deployment/builditem/DevServicesRegistryBuildItem.java
+@@ -7,7 +7,10 @@
+ import java.util.Set;
+ import java.util.UUID;
+ import java.util.concurrent.CompletableFuture;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.function.BiConsumer;
+ import java.util.function.Consumer;
++import java.util.function.Predicate;
+ import java.util.function.Supplier;
+ import java.util.stream.Collectors;
+ 
+@@ -83,8 +86,25 @@ public void startAll(Collection<DevServicesResultBuildItem> services,
+             List<DevServicesCustomizerBuildItem> customizers,
+             ClassLoader augmentClassLoader) {
+         closeRemainingRunningServices(services);
++        Map<String, String> config = new ConcurrentHashMap<>();
++        startSelectedServices(services, customizers, augmentClassLoader, dr -> !dr.hasDependencies(), config);
++
++        // Now start everything with a dependency
++        // This won't handle the case where the dependencies also have dependencies, but that can be a follow-on work item if people ask for it
++        // I think we could implement it by getting the actual dependencies and seeing if any of them are also in the list of things we're starting, and then recursing
++        startSelectedServices(services, customizers, augmentClassLoader,
++                DevServicesResultBuildItem::hasDependencies, config);
++
++    }
++
++    private void startSelectedServices(Collection<DevServicesResultBuildItem> services,
++            List<DevServicesCustomizerBuildItem> customizers, ClassLoader augmentClassLoader,
++            Predicate<? super DevServicesResultBuildItem> filter, Map<String, String> config) {
++        // TODO Note that this does not handle chained dependencies; dependencies can only be one level deep for now
++        // It would be easy to fix that, but let's wait until we need to
+         CompletableFuture.allOf(services.stream()
+                 .filter(DevServicesResultBuildItem::isStartable)
++                .filter(filter)
+                 .map(serv -> CompletableFuture.runAsync(() -> {
+                     // We need to set the context classloader to the augment classloader, so that the dev services can be started with the right classloader
+                     if (augmentClassLoader != null) {
+@@ -92,25 +112,28 @@ public void startAll(Collection<DevServicesResultBuildItem> services,
+                     } else {
+                         Thread.currentThread().setContextClassLoader(serv.getClass().getClassLoader());
+                     }
+-                    this.start(serv, customizers);
++                    this.start(serv, customizers, config);
+                 }))
+                 .toArray(CompletableFuture[]::new)).join();
+     }
+ 
+-    public void start(DevServicesResultBuildItem request, List<DevServicesCustomizerBuildItem> customizers) {
++    public void start(DevServicesResultBuildItem request, List<DevServicesCustomizerBuildItem> customizers,
++            Map<String, String> config) {
+         // RunningService class is loaded on parent classloader
+         RunningService matchedDevService = this.getRunningServices(request.getName(), request.getServiceName(),
+                 request.getServiceConfig());
++
+         if (matchedDevService == null) {
+             // There isn't a running container that has the right config, we need to do work
+             // Let's get all the running dev services associated with this feature (+ launch mode plus named section), so we can close them
+             closeAllRunningServices(request.getName(), request.getServiceName());
+ 
+-            reallyStart(request, customizers);
++            reallyStart(request, customizers, config);
+         }
+     }
+ 
+-    private void reallyStart(DevServicesResultBuildItem request, List<DevServicesCustomizerBuildItem> customizers) {
++    private void reallyStart(DevServicesResultBuildItem request, List<DevServicesCustomizerBuildItem> customizers,
++            Map<String, String> configs) {
+         StartupLogCompressor compressor = new StartupLogCompressor("Dev Services Startup", null, null);
+         try {
+             Supplier<Startable> startableSupplier = request.getStartableSupplier();
+@@ -122,25 +145,64 @@ private void reallyStart(DevServicesResultBuildItem request, List<DevServicesCus
+             for (DevServicesCustomizerBuildItem customizer : customizers) {
+                 startable = customizer.apply(request, startable);
+             }
+-            startable.start();
+ 
+-            RunningService service = new RunningService(request.getName(), request.getDescription(),
+-                    request.getConfig(startable), request.getOverrideConfig(startable), startable.getContainerId(), startable);
+-            this.addRunningService(request.getName(), request.getServiceName(), request.getServiceConfig(), service);
++            String missingDependency = null;
++
++            // The config from the new sources isn't easily available via ConfigProvider.getConfig(), so directly inject it into services which depend on it
++            var dependencies = request.getDependencies();
++            if (dependencies != null && !dependencies.isEmpty()) {
++                for (DevServicesResultBuildItem.DevServiceConfigDependency<? extends Startable> dependency : dependencies) {
++
++                    var value = configs.get(dependency.requiredConfigKey());
++                    if (value != null) {
++                        ((BiConsumer<Startable, String>) dependency.valueInjector()).accept(startable, value);
++                    } else {
++                        missingDependency = dependency.requiredConfigKey();
++                    }
++                }
++            }
++
++            var optionalDependencies = request.getOptionalDependencies();
++            if (optionalDependencies != null && !optionalDependencies.isEmpty()) {
++                for (DevServicesResultBuildItem.DevServiceConfigDependency<? extends Startable> dependency : optionalDependencies) {
++                    var value = configs.get(dependency.requiredConfigKey());
++                    if (value != null) {
++                        ((BiConsumer<Startable, String>) dependency.valueInjector()).accept(startable, value);
++                    }
++                }
++            }
++
++            if (missingDependency == null) {
++
++                startable.start();
++
++                Map<String, String> config = request.getConfig(startable);
++                Map<String, String> overrideConfig = request.getOverrideConfig(startable);
++                configs.putAll(config);
++                configs.putAll(overrideConfig);
+ 
+-            compressor.close();
++                RunningService service = new RunningService(request.getName(), request.getDescription(),
++                        config, overrideConfig, startable.getContainerId(), startable);
++                this.addRunningService(request.getName(), request.getServiceName(), request.getServiceConfig(), service);
+ 
+-            Consumer<Startable> postStartAction = request.getPostStartAction();
+-            if (postStartAction != null) {
+-                try {
+-                    postStartAction.accept(startable);
+-                } catch (Throwable t) {
+-                    log.errorf(t, "An error occurred while executing the post-start action for %s dev service: %s",
+-                            request.getName(), t.getMessage());
++                compressor.close();
++
++                Consumer<Startable> postStartAction = request.getPostStartAction();
++                if (postStartAction != null) {
++                    try {
++                        postStartAction.accept(startable);
++                    } catch (Throwable t) {
++                        log.errorf(t, "An error occurred while executing the post-start action for %s dev service: %s",
++                                request.getName(), t.getMessage());
++                    }
++                } else {
++                    log.infof("The %s dev service is ready to accept connections on %s", request.getName(),
++                            startable.getConnectionInfo());
+                 }
+             } else {
+-                log.infof("The %s dev service is ready to accept connections on %s", request.getName(),
+-                        startable.getConnectionInfo());
++                log.infof("The %s dev service did not start because the configuration with key %s did not become available",
++                        request.getName(),
++                        missingDependency);
+             }
+         } catch (Throwable t) {
+             compressor.closeAndDumpCaptured();
+diff --git a/core/deployment/src/main/java/io/quarkus/deployment/builditem/DevServicesResultBuildItem.java b/core/deployment/src/main/java/io/quarkus/deployment/builditem/DevServicesResultBuildItem.java
+index 25bfe02f71d..d215c57ea62 100644
+--- a/core/deployment/src/main/java/io/quarkus/deployment/builditem/DevServicesResultBuildItem.java
++++ b/core/deployment/src/main/java/io/quarkus/deployment/builditem/DevServicesResultBuildItem.java
+@@ -4,9 +4,11 @@
+ import java.io.IOException;
+ import java.util.Collections;
+ import java.util.HashMap;
++import java.util.HashSet;
+ import java.util.Map;
+ import java.util.Objects;
+ import java.util.Set;
++import java.util.function.BiConsumer;
+ import java.util.function.Consumer;
+ import java.util.function.Function;
+ import java.util.function.Supplier;
+@@ -79,6 +81,27 @@ public final class DevServicesResultBuildItem extends MultiBuildItem {
+      */
+     private final Map<String, Function<Startable, String>> applicationConfigProvider;
+     private final Set<String> highPriorityConfig;
++    private final Set<DevServiceConfigDependency<? extends Startable>> dependencies;
++    private final Set<DevServiceConfigDependency<? extends Startable>> optionalDependencies;
++
++    private DevServicesResultBuildItem(String name, String description, String serviceName, Object serviceConfig,
++            Map<String, String> config, Supplier<Startable> startableSupplier, Consumer<Startable> postStartAction,
++            Map<String, Function<Startable, String>> applicationConfigProvider, Set<String> highPriorityConfig,
++            Set<DevServiceConfigDependency<? extends Startable>> dependencies,
++            Set<DevServiceConfigDependency<? extends Startable>> optionalDependencies) {
++        this.name = name;
++        this.description = description;
++        this.containerId = null;
++        this.config = config == null ? Collections.emptyMap() : Collections.unmodifiableMap(config);
++        this.serviceName = serviceName;
++        this.serviceConfig = serviceConfig;
++        this.startableSupplier = startableSupplier;
++        this.postStartAction = postStartAction;
++        this.applicationConfigProvider = applicationConfigProvider;
++        this.highPriorityConfig = highPriorityConfig;
++        this.dependencies = dependencies;
++        this.optionalDependencies = optionalDependencies;
++    }
+ 
+     public static DiscoveredServiceBuilder discovered() {
+         return new DiscoveredServiceBuilder();
+@@ -111,6 +134,8 @@ public DevServicesResultBuildItem(String name, String description, String contai
+         this.highPriorityConfig = null;
+         this.startableSupplier = null;
+         this.postStartAction = null;
++        this.dependencies = null;
++        this.optionalDependencies = null;
+     }
+ 
+     /**
+@@ -135,6 +160,9 @@ public DevServicesResultBuildItem(String name,
+         this.postStartAction = postStartAction;
+         this.applicationConfigProvider = applicationConfigProvider;
+         this.highPriorityConfig = highPriorityConfig;
++        this.dependencies = null;
++        this.optionalDependencies = null;
++
+     }
+ 
+     public String getName() {
+@@ -212,6 +240,19 @@ public Map<String, String> getOverrideConfig(Startable startable) {
+         return map;
+     }
+ 
++    public boolean hasDependencies() {
++        return (dependencies != null && !dependencies.isEmpty())
++                || (optionalDependencies != null && !optionalDependencies.isEmpty());
++    }
++
++    public Set<DevServiceConfigDependency<? extends Startable>> getDependencies() {
++        return dependencies;
++    }
++
++    public Set<DevServiceConfigDependency<? extends Startable>> getOptionalDependencies() {
++        return optionalDependencies;
++    }
++
+     public static class DiscoveredServiceBuilder {
+         private String name;
+         private String containerId;
+@@ -264,6 +305,8 @@ public DevServicesResultBuildItem build() {
+         private Consumer<? extends Startable> postStartAction;
+         private Map<String, Function<Startable, String>> applicationConfigProvider;
+         private Set<String> highPriorityConfig;
++        private final Set<DevServiceConfigDependency<? extends Startable>> dependencies = new HashSet<>();
++        private final Set<DevServiceConfigDependency<? extends Startable>> optionalDependencies = new HashSet<>();
+ 
+         /**
+          * Use {@link #feature(String)} instead
+@@ -367,6 +410,49 @@ public OwnedServiceBuilder<T> serviceConfig(Object serviceConfig) {
+             return this;
+         }
+ 
++        /**
++         * Declares that this dev service should not be started until config from a dependency dev service is available.
++         * Before service start, the `DevServiceConfigDependency`` will be given an opportunity to inject the required config
++         * into the `Startable`.
++         * <p>
++         * If the config key never becomes available, the service will not be started.
++         * </p>
++         * <p>
++         * This method can be called multiple times, and all of the config values will be injected.
++         *
++         * @param key the config key which should be waited for; will never be null
++         * @param function a function which should be invoked on the startable to pass in the config
++         * @return a builder, for chaining
++         */
++        public OwnedServiceBuilder<T> dependsOnConfig(String key, BiConsumer<T, String> function) {
++            this.dependencies.add(new DevServiceConfigDependency<>(key, function));
++            return this;
++        }
++
++        /**
++         * Declares that this dev service should not be started until config from a dependency dev service has a chance to
++         * become available.
++         * Before service start, the `DevServiceConfigDependency`` will be given an opportunity to inject the required config
++         * into the `Startable`.
++         * <p>
++         * This method can be called multiple times, and all of the config values will be injected.
++         *
++         * @param key the config key which should be waited for
++         * @param function a function which should be invoked on the startable to pass in the config; will not be called if the
++         *        config never becomes available
++         * @param optional whether to start the service if the config never becomes availbale
++         *
++         * @return a builder, for chaining
++         */
++        public OwnedServiceBuilder<T> dependsOnConfig(String key, BiConsumer<T, String> function, boolean optional) {
++            if (optional) {
++                this.optionalDependencies.add(new DevServiceConfigDependency<>(key, function));
++                return this;
++            } else {
++                return dependsOnConfig(key, function);
++            }
++        }
++
+         @SuppressWarnings("unchecked")
+         public <S extends Startable> OwnedServiceBuilder<S> startable(Supplier<S> startableSupplier) {
+             this.startableSupplier = startableSupplier;
+@@ -416,7 +502,7 @@ public DevServicesResultBuildItem build() {
+             return new DevServicesResultBuildItem(name, description, serviceName, serviceConfig, config,
+                     (Supplier<Startable>) startableSupplier,
+                     (Consumer<Startable>) postStartAction,
+-                    applicationConfigProvider, highPriorityConfig);
++                    applicationConfigProvider, highPriorityConfig, dependencies, optionalDependencies);
+         }
+ 
+         private static boolean isClassAvailable(String className) {
+@@ -427,6 +513,7 @@ private static boolean isClassAvailable(String className) {
+                 return false;
+             }
+         }
++
+     }
+ 
+     /**
+@@ -517,4 +604,8 @@ public DevServicesResultBuildItem toBuildItem() {
+         }
+     }
+ 
++    record DevServiceConfigDependency<T extends Startable>(String requiredConfigKey,
++            BiConsumer<T, String> valueInjector) {
++    }
++
+ }
+diff --git a/core/deployment/src/main/java/io/quarkus/deployment/builditem/nativeimage/ReflectiveHierarchyBuildItem.java b/core/deployment/src/main/java/io/quarkus/deployment/builditem/nativeimage/ReflectiveHierarchyBuildItem.java
+index d168d9cefcd..6f4dc9611ac 100644
+--- a/core/deployment/src/main/java/io/quarkus/deployment/builditem/nativeimage/ReflectiveHierarchyBuildItem.java
++++ b/core/deployment/src/main/java/io/quarkus/deployment/builditem/nativeimage/ReflectiveHierarchyBuildItem.java
+@@ -25,6 +25,7 @@
+  *
+  * <ul>
+  * <li>Superclasses</li>
++ * <li>Interfaces</li>
+  * <li>Component types of collections</li>
+  * <li>Types used in bean properties (if method reflection is enabled)</li>
+  * <li>Field types (if field reflection is enabled)</li>
+diff --git a/core/deployment/src/main/java/io/quarkus/deployment/steps/ReflectiveHierarchyStep.java b/core/deployment/src/main/java/io/quarkus/deployment/steps/ReflectiveHierarchyStep.java
+index c2d97fde595..9cd356ea98e 100644
+--- a/core/deployment/src/main/java/io/quarkus/deployment/steps/ReflectiveHierarchyStep.java
++++ b/core/deployment/src/main/java/io/quarkus/deployment/steps/ReflectiveHierarchyStep.java
+@@ -125,41 +125,57 @@ private void addReflectiveHierarchy(NativeConfig nativeConfig, CombinedIndexBuil
+             Set<DotName> processedReflectiveHierarchies, Map<DotName, Set<String>> unindexedClasses,
+             BuildProducer<ReflectiveClassBuildItem> reflectiveClass,
+             Deque<ReflectiveHierarchyVisitor> visits) {
+-        final String newSource = source + " > " + type.name().toString();
+-        if (type instanceof VoidType ||
+-                type instanceof PrimitiveType ||
+-                type instanceof UnresolvedTypeVariable ||
+-                type instanceof TypeVariableReference) {
+-            return;
+-        } else if (type instanceof ClassType) {
++        if (type instanceof ClassType) {
+             if (reflectiveHierarchyBuildItem.getIgnoreTypePredicate().test(type.name())) {
+                 return;
+             }
+-
+-            addClassTypeHierarchy(nativeConfig, combinedIndexBuildItem, capabilities, reflectiveHierarchyBuildItem, newSource,
+-                    type.name(),
+-                    type.name(),
+-                    processedReflectiveHierarchies, unindexedClasses,
+-                    reflectiveClass, visits);
+-
++            // If the registered entity is a class make sure to register all its subclasses.
+             for (ClassInfo subclass : combinedIndexBuildItem.getIndex().getAllKnownSubclasses(type.name())) {
+                 addClassTypeHierarchy(nativeConfig, combinedIndexBuildItem, capabilities, reflectiveHierarchyBuildItem,
+-                        newSource,
++                        source + " > " + subclass.name().toString(),
+                         subclass.name(),
+                         subclass.name(),
+                         processedReflectiveHierarchies,
+                         unindexedClasses, reflectiveClass, visits);
+             }
++            // If the registered entity is an interface make sure to register all its implementors.
+             for (ClassInfo subclass : combinedIndexBuildItem.getIndex().getAllKnownImplementors(type.name())) {
+                 addClassTypeHierarchy(nativeConfig, combinedIndexBuildItem, capabilities, reflectiveHierarchyBuildItem,
+-                        newSource,
++                        source + " > " + subclass.name().toString(),
+                         subclass.name(),
+                         subclass.name(),
+                         processedReflectiveHierarchies,
+                         unindexedClasses, reflectiveClass, visits);
+             }
++        }
++        // Recursively register reachable types (excluding their subclasses and implementors)
++        addReflectiveHierarchyRecursively(nativeConfig, combinedIndexBuildItem, capabilities, reflectiveHierarchyBuildItem,
++                source, type, processedReflectiveHierarchies, unindexedClasses, reflectiveClass, visits);
++    }
++
++    private void addReflectiveHierarchyRecursively(NativeConfig nativeConfig, CombinedIndexBuildItem combinedIndexBuildItem,
++            Capabilities capabilities, ReflectiveHierarchyBuildItem reflectiveHierarchyBuildItem, String source, Type type,
++            Set<DotName> processedReflectiveHierarchies, Map<DotName, Set<String>> unindexedClasses,
++            BuildProducer<ReflectiveClassBuildItem> reflectiveClass,
++            Deque<ReflectiveHierarchyVisitor> visits) {
++        final String newSource = source + " > " + type.name().toString();
++        if (type instanceof VoidType ||
++                type instanceof PrimitiveType ||
++                type instanceof UnresolvedTypeVariable ||
++                type instanceof TypeVariableReference) {
++            return;
++        } else if (type instanceof ClassType) {
++            if (reflectiveHierarchyBuildItem.getIgnoreTypePredicate().test(type.name())) {
++                return;
++            }
++
++            addClassTypeHierarchy(nativeConfig, combinedIndexBuildItem, capabilities, reflectiveHierarchyBuildItem, newSource,
++                    type.name(),
++                    type.name(),
++                    processedReflectiveHierarchies, unindexedClasses,
++                    reflectiveClass, visits);
+         } else if (type instanceof ArrayType) {
+-            visits.addLast(() -> addReflectiveHierarchy(nativeConfig, combinedIndexBuildItem, capabilities,
++            visits.addLast(() -> addReflectiveHierarchyRecursively(nativeConfig, combinedIndexBuildItem, capabilities,
+                     reflectiveHierarchyBuildItem, newSource,
+                     type.asArrayType().constituent(),
+                     processedReflectiveHierarchies,
+@@ -175,7 +191,7 @@ private void addReflectiveHierarchy(NativeConfig nativeConfig, CombinedIndexBuil
+             }
+             for (Type typeArgument : parameterizedType.arguments()) {
+                 visits.addLast(
+-                        () -> addReflectiveHierarchy(nativeConfig, combinedIndexBuildItem, capabilities,
++                        () -> addReflectiveHierarchyRecursively(nativeConfig, combinedIndexBuildItem, capabilities,
+                                 reflectiveHierarchyBuildItem,
+                                 newSource,
+                                 typeArgument,
+@@ -238,7 +254,7 @@ private void addClassTypeHierarchy(NativeConfig nativeConfig, CombinedIndexBuild
+                 processedReflectiveHierarchies,
+                 unindexedClasses, reflectiveClass, visits));
+         for (Type interfaceType : info.interfaceTypes()) {
+-            visits.addLast(() -> addReflectiveHierarchy(nativeConfig, combinedIndexBuildItem, capabilities,
++            visits.addLast(() -> addReflectiveHierarchyRecursively(nativeConfig, combinedIndexBuildItem, capabilities,
+                     reflectiveHierarchyBuildItem,
+                     source, interfaceType, processedReflectiveHierarchies, unindexedClasses,
+                     reflectiveClass, visits));
+@@ -253,7 +269,7 @@ private void addClassTypeHierarchy(NativeConfig nativeConfig, CombinedIndexBuild
+             }
+             final Type fieldType = getFieldType(combinedIndexBuildItem, initialName, info, field);
+             visits.addLast(
+-                    () -> addReflectiveHierarchy(nativeConfig, combinedIndexBuildItem, capabilities,
++                    () -> addReflectiveHierarchyRecursively(nativeConfig, combinedIndexBuildItem, capabilities,
+                             reflectiveHierarchyBuildItem, source,
+                             fieldType,
+                             processedReflectiveHierarchies,
+@@ -267,7 +283,7 @@ private void addClassTypeHierarchy(NativeConfig nativeConfig, CombinedIndexBuild
+                     method.returnType().kind() == Kind.VOID) {
+                 continue;
+             }
+-            visits.addLast(() -> addReflectiveHierarchy(nativeConfig, combinedIndexBuildItem, capabilities,
++            visits.addLast(() -> addReflectiveHierarchyRecursively(nativeConfig, combinedIndexBuildItem, capabilities,
+                     reflectiveHierarchyBuildItem, source,
+                     method.returnType(),
+                     processedReflectiveHierarchies,
+diff --git a/core/processor/src/main/java/io/quarkus/annotation/processor/documentation/config/formatter/JavadocToAsciidocTransformer.java b/core/processor/src/main/java/io/quarkus/annotation/processor/documentation/config/formatter/JavadocToAsciidocTransformer.java
+index 68767e47c9c..5ef1f9f09d4 100644
+--- a/core/processor/src/main/java/io/quarkus/annotation/processor/documentation/config/formatter/JavadocToAsciidocTransformer.java
++++ b/core/processor/src/main/java/io/quarkus/annotation/processor/documentation/config/formatter/JavadocToAsciidocTransformer.java
+@@ -96,7 +96,7 @@ public static String toAsciidoc(String javadoc, JavadocFormat format, boolean in
+ 
+         // the parser expects all the lines to start with "* "
+         // we add it as it has been previously removed
+-        Javadoc parsedJavadoc = StaticJavaParser.parseJavadoc(START_OF_LINE.matcher(javadoc).replaceAll("* "));
++        Javadoc parsedJavadoc = StaticJavaParser.parseJavadoc(START_OF_LINE.matcher(javadoc).replaceAll("* "), false);
+ 
+         StringBuilder htmlJavadoc = new StringBuilder(javadoc.length());
+ 
+diff --git a/core/processor/src/main/java/io/quarkus/annotation/processor/documentation/config/formatter/JavadocToMarkdownTransformer.java b/core/processor/src/main/java/io/quarkus/annotation/processor/documentation/config/formatter/JavadocToMarkdownTransformer.java
+index 6bbbdcfae74..8cde81b4d75 100644
+--- a/core/processor/src/main/java/io/quarkus/annotation/processor/documentation/config/formatter/JavadocToMarkdownTransformer.java
++++ b/core/processor/src/main/java/io/quarkus/annotation/processor/documentation/config/formatter/JavadocToMarkdownTransformer.java
+@@ -24,7 +24,7 @@ public static String toMarkdown(String javadoc, JavadocFormat format) {
+         } else if (format == JavadocFormat.JAVADOC) {
+             // the parser expects all the lines to start with "* "
+             // we add it as it has been previously removed
+-            Javadoc parsedJavadoc = StaticJavaParser.parseJavadoc(START_OF_LINE.matcher(javadoc).replaceAll("* "));
++            Javadoc parsedJavadoc = StaticJavaParser.parseJavadoc(START_OF_LINE.matcher(javadoc).replaceAll("* "), false);
+ 
+             // HTML is valid Javadoc but we need to drop the Javadoc tags e.g. {@link ...}
+             return simplifyJavadoc(parsedJavadoc.getDescription());
+diff --git a/core/processor/src/main/java/io/quarkus/annotation/processor/documentation/config/util/JavadocUtil.java b/core/processor/src/main/java/io/quarkus/annotation/processor/documentation/config/util/JavadocUtil.java
+index 2bed8914e4c..d00d75b3c7a 100644
+--- a/core/processor/src/main/java/io/quarkus/annotation/processor/documentation/config/util/JavadocUtil.java
++++ b/core/processor/src/main/java/io/quarkus/annotation/processor/documentation/config/util/JavadocUtil.java
+@@ -51,7 +51,7 @@ public static ParsedJavadoc parseConfigItemJavadoc(String rawJavadoc) {
+ 
+         // the parser expects all the lines to start with "* "
+         // we add it as it has been previously removed
+-        Javadoc javadoc = StaticJavaParser.parseJavadoc(START_OF_LINE.matcher(rawJavadoc).replaceAll("* "));
++        Javadoc javadoc = StaticJavaParser.parseJavadoc(START_OF_LINE.matcher(rawJavadoc).replaceAll("* "), false);
+ 
+         String description;
+         JavadocFormat format;
+@@ -96,7 +96,7 @@ public static ParsedJavadocSection parseConfigSectionJavadoc(String javadocComme
+         // the parser expects all the lines to start with "* "
+         // we add it as it has been previously removed
+         javadocComment = START_OF_LINE.matcher(javadocComment).replaceAll("* ");
+-        Javadoc javadoc = StaticJavaParser.parseJavadoc(javadocComment);
++        Javadoc javadoc = StaticJavaParser.parseJavadoc(javadocComment, false);
+ 
+         Optional<String> deprecated = javadoc.getBlockTags().stream()
+                 .filter(t -> t.getType() == Type.DEPRECATED)
+diff --git a/extensions/hibernate-orm/deployment/src/main/java/io/quarkus/hibernate/orm/deployment/dev/HibernateOrmDevUIProcessor.java b/extensions/hibernate-orm/deployment/src/main/java/io/quarkus/hibernate/orm/deployment/dev/HibernateOrmDevUIProcessor.java
+index cf04d74a7b3..cd0893516d9 100644
+--- a/extensions/hibernate-orm/deployment/src/main/java/io/quarkus/hibernate/orm/deployment/dev/HibernateOrmDevUIProcessor.java
++++ b/extensions/hibernate-orm/deployment/src/main/java/io/quarkus/hibernate/orm/deployment/dev/HibernateOrmDevUIProcessor.java
+@@ -26,7 +26,7 @@ public class HibernateOrmDevUIProcessor {
+     public CardPageBuildItem create(HibernateOrmConfig config) {
+         CardPageBuildItem card = new CardPageBuildItem();
+         card.setLogo("hibernate_icon_dark.svg", "hibernate_icon_light.svg");
+-        card.addLibraryVersion("org.hibernate.orm", "hibernate-core", "Hibernate", "https://hibernate.org/orm/");
++        card.addLibraryVersion("org.hibernate.orm", "hibernate-core", "Hibernate ORM", "https://hibernate.org/orm/");
+         card.addLibraryVersion("jakarta.persistence", "jakarta.persistence-api", "Jakarta Persistence",
+                 "https://jakarta.ee/specifications/persistence/");
+ 
+diff --git a/extensions/kafka-client/deployment/src/main/java/io/quarkus/kafka/client/deployment/DevServicesKafkaProcessor.java b/extensions/kafka-client/deployment/src/main/java/io/quarkus/kafka/client/deployment/DevServicesKafkaProcessor.java
+index 39f2f5e694c..bea41eb8a0f 100644
+--- a/extensions/kafka-client/deployment/src/main/java/io/quarkus/kafka/client/deployment/DevServicesKafkaProcessor.java
++++ b/extensions/kafka-client/deployment/src/main/java/io/quarkus/kafka/client/deployment/DevServicesKafkaProcessor.java
+@@ -121,6 +121,7 @@ private Startable createContainer(DevServicesComposeProjectBuildItem composeProj
+                     strimzi.withPort(config.port().get());
+                 }
+                 strimzi.withEnv(config.containerEnv());
++                strimzi.withKafkaConfigurationMap(config.strimzi().serverConfigs());
+                 configureSharedServiceLabel(strimzi, launchMode.getLaunchMode(), DEV_SERVICE_LABEL, config.serviceName());
+                 yield new StartableContainer<>(strimzi, StrimziKafkaContainer::getBootstrapServers);
+             }
+diff --git a/extensions/kafka-client/deployment/src/main/java/io/quarkus/kafka/client/deployment/KafkaDevServicesBuildTimeConfig.java b/extensions/kafka-client/deployment/src/main/java/io/quarkus/kafka/client/deployment/KafkaDevServicesBuildTimeConfig.java
+index 1f7d8b7b7d5..9a111580bb8 100644
+--- a/extensions/kafka-client/deployment/src/main/java/io/quarkus/kafka/client/deployment/KafkaDevServicesBuildTimeConfig.java
++++ b/extensions/kafka-client/deployment/src/main/java/io/quarkus/kafka/client/deployment/KafkaDevServicesBuildTimeConfig.java
+@@ -123,6 +123,11 @@ public String getDefaultImageName() {
+      */
+     RedpandaBuildTimeConfig redpanda();
+ 
++    /**
++     * Allows configuring the Strimzi broker.
++     */
++    StrimziBuildTimeConfig strimzi();
++
+     /**
+      * @return the image name if set, otherwise the default image name for the provider.
+      */
+diff --git a/extensions/kafka-client/deployment/src/main/java/io/quarkus/kafka/client/deployment/StrimziBuildTimeConfig.java b/extensions/kafka-client/deployment/src/main/java/io/quarkus/kafka/client/deployment/StrimziBuildTimeConfig.java
+new file mode 100644
+index 00000000000..96221a326e0
+--- /dev/null
++++ b/extensions/kafka-client/deployment/src/main/java/io/quarkus/kafka/client/deployment/StrimziBuildTimeConfig.java
+@@ -0,0 +1,15 @@
++package io.quarkus.kafka.client.deployment;
++
++import java.util.Map;
++
++/**
++ * Allows configuring the Strimzi dev services broker.
++ */
++public interface StrimziBuildTimeConfig {
++
++    /**
++     * Configuration properties that will be added to the server properties
++     * file provided to the Kafka broker by the Strimzi provider.
++     */
++    Map<String, String> serverConfigs();
++}
+diff --git a/extensions/observability-devservices/testlibs/devresource-lgtm/src/main/java/io/quarkus/observability/devresource/lgtm/LgtmResource.java b/extensions/observability-devservices/testlibs/devresource-lgtm/src/main/java/io/quarkus/observability/devresource/lgtm/LgtmResource.java
+index b41947d4791..9d22b59c38b 100644
+--- a/extensions/observability-devservices/testlibs/devresource-lgtm/src/main/java/io/quarkus/observability/devresource/lgtm/LgtmResource.java
++++ b/extensions/observability-devservices/testlibs/devresource-lgtm/src/main/java/io/quarkus/observability/devresource/lgtm/LgtmResource.java
+@@ -67,7 +67,7 @@ private boolean isScrapingRequired(Function<String, Boolean> checker) {
+         }
+ 
+         if (result && (catalog != null && catalog.hasMicrometerOtlp())) {
+-            log.warnf("Multiple Micrometer registries found - OTLP and %s, no Prometheus scrapping required.", foundRegistry);
++            log.warnf("Multiple Micrometer registries found - OTLP and %s, no Prometheus scraping required.", foundRegistry);
+             return false;
+         }
+ 
+diff --git a/extensions/opentelemetry/deployment/src/test/java/io/quarkus/opentelemetry/deployment/OpenTelemetryMDCTest.java b/extensions/opentelemetry/deployment/src/test/java/io/quarkus/opentelemetry/deployment/OpenTelemetryMDCTest.java
+index 7c9e039acd0..3c1b287d0ec 100644
+--- a/extensions/opentelemetry/deployment/src/test/java/io/quarkus/opentelemetry/deployment/OpenTelemetryMDCTest.java
++++ b/extensions/opentelemetry/deployment/src/test/java/io/quarkus/opentelemetry/deployment/OpenTelemetryMDCTest.java
+@@ -9,26 +9,17 @@
+ 
+ import java.util.ArrayList;
+ import java.util.Collections;
+-import java.util.HashMap;
+ import java.util.List;
+-import java.util.Map;
+ import java.util.Objects;
+ import java.util.Random;
+ import java.util.stream.Collectors;
+ 
+-import jakarta.annotation.Priority;
+ import jakarta.enterprise.context.ApplicationScoped;
+ import jakarta.inject.Inject;
+ import jakarta.ws.rs.GET;
+ import jakarta.ws.rs.Path;
+ import jakarta.ws.rs.Produces;
+-import jakarta.ws.rs.container.ContainerRequestContext;
+-import jakarta.ws.rs.container.ContainerRequestFilter;
+-import jakarta.ws.rs.container.ContainerResponseContext;
+-import jakarta.ws.rs.container.ContainerResponseFilter;
+-import jakarta.ws.rs.container.PreMatching;
+ import jakarta.ws.rs.core.MediaType;
+-import jakarta.ws.rs.ext.Provider;
+ 
+ import org.eclipse.microprofile.context.ManagedExecutor;
+ import org.jboss.logging.MDC;
+@@ -47,7 +38,6 @@
+ import io.quarkus.opentelemetry.deployment.common.exporter.TestSpanExporter;
+ import io.quarkus.opentelemetry.deployment.common.exporter.TestSpanExporterProvider;
+ import io.quarkus.test.QuarkusUnitTest;
+-import io.quarkus.vertx.core.runtime.VertxMDC;
+ import io.restassured.RestAssured;
+ 
+ public class OpenTelemetryMDCTest {
+@@ -55,11 +45,10 @@ public class OpenTelemetryMDCTest {
+     static final QuarkusUnitTest unitTest = new QuarkusUnitTest()
+             .withApplicationRoot((jar) -> jar
+                     .addPackage(TestSpanExporter.class.getPackage())
+-                    .addClass(MdcTracingEntry.class)
++                    .addClass(MdcEntry.class)
+                     .addClass(TestMdcCapturer.class)
+                     .addClass(TestResource.class)
+                     .addClass(GreetingResource.class)
+-                    .addClass(ReqRespFilter.class)
+                     .addAsResource(new StringAsset(TestSpanExporterProvider.class.getCanonicalName()),
+                             "META-INF/services/io.opentelemetry.sdk.autoconfigure.spi.traces.ConfigurableSpanExporterProvider")
+                     .addAsResource(new StringAsset(InMemoryMetricExporterProvider.class.getCanonicalName()),
+@@ -89,8 +78,8 @@ void vertx() {
+                 .body(is("hello"));
+ 
+         List<SpanData> spans = spanExporter.getFinishedSpanItems(2);
+-        List<MdcTracingEntry> mdcEntries = testMdcCapturer.getCapturedMdcTracingEntries();
+-        List<MdcTracingEntry> fromSpans = getExpectedMDCEntries(spans);
++        List<MdcEntry> mdcEntries = testMdcCapturer.getCapturedMdcEntries();
++        List<MdcEntry> expectedMdcEntries = getExpectedMDCEntries(spans);
+ 
+         final SpanData server = getSpanByKindAndParentId(spans, SERVER, "0000000000000000");
+         assertEquals("GET /hello", server.getName());
+@@ -98,16 +87,7 @@ void vertx() {
+         final SpanData programmatic = getSpanByKindAndParentId(spans, INTERNAL, server.getSpanId());
+         assertEquals("something", programmatic.getName());
+ 
+-        assertEquals(fromSpans, mdcEntries);
+-
+-        // ReqRespFilter MDC entries are carried.
+-        testMdcCapturer.getFullMDCEntries().stream()
+-                .forEach(map -> {
+-                    assertThat(map).isNotEmpty();
+-                    assertThat(map.get(ReqRespFilter.REQUEST_METHOD_FIELD))
+-                            .withFailMessage(() -> "Failing map: " + map)
+-                            .isEqualTo(ReqRespFilter.REQUEST_METHOD_FIELD_VALUE);
+-                });
++        assertEquals(expectedMdcEntries, mdcEntries);
+     }
+ 
+     @Test
+@@ -122,33 +102,24 @@ void vertxAsync() {
+         final SpanData server = getSpanByKindAndParentId(spans, SERVER, "0000000000000000");
+         assertEquals("GET /async", server.getName());
+ 
+-        List<MdcTracingEntry> expectedMdcEntriesFromSpans = getExpectedMDCEntries(spans);
+-        assertThat(testMdcCapturer.getCapturedMdcTracingEntries().size()).isEqualTo(6);
++        List<MdcEntry> expectedMdcEntriesFromSpans = getExpectedMDCEntries(spans);
++        assertThat(testMdcCapturer.getCapturedMdcEntries().size()).isEqualTo(6);
+ 
+-        List<MdcTracingEntry> mdcEntries = testMdcCapturer.getCapturedMdcTracingEntries();
++        List<MdcEntry> mdcEntries = testMdcCapturer.getCapturedMdcEntries();
+         // 2 mdcEntries are repeated.
+         assertThat(expectedMdcEntriesFromSpans).containsAll(mdcEntries.stream().distinct().toList());
+ 
+-        assertThat(testMdcCapturer.getCapturedMdcTracingEntries().stream()
+-                .filter(mdcTracingEntry -> mdcTracingEntry.parentId.equals("null"))
++        assertThat(testMdcCapturer.getCapturedMdcEntries().stream()
++                .filter(mdcEntry -> mdcEntry.parentId.equals("null"))
+                 .count())
+                 .withFailMessage("There must be 2 MDC entries for the parent span")
+                 .isEqualTo(2);
+ 
+-        assertThat(testMdcCapturer.getCapturedMdcTracingEntries().stream()
+-                .filter(mdcTracingEntry -> mdcTracingEntry.parentId.equals(server.getSpanId()))
++        assertThat(testMdcCapturer.getCapturedMdcEntries().stream()
++                .filter(mdcEntry -> mdcEntry.parentId.equals(server.getSpanId()))
+                 .count())
+                 .withFailMessage("There must be 4 MDC entries in child spans")
+                 .isEqualTo(4);
+-
+-        // ReqRespFilter MDC entries are carried.
+-        testMdcCapturer.getFullMDCEntries().stream()
+-                .forEach(map -> {
+-                    assertThat(map).isNotEmpty();
+-                    assertThat(map.get(ReqRespFilter.REQUEST_METHOD_FIELD))
+-                            .withFailMessage(() -> "Failing map: " + map)
+-                            .isEqualTo(ReqRespFilter.REQUEST_METHOD_FIELD_VALUE);
+-                });
+     }
+ 
+     @Test
+@@ -167,8 +138,8 @@ void nonVertx() {
+         }
+ 
+         List<SpanData> spans = spanExporter.getFinishedSpanItems(2);
+-        List<MdcTracingEntry> mdcEntries = testMdcCapturer.getCapturedMdcTracingEntries();
+-        List<MdcTracingEntry> fromSpans = getExpectedMDCEntries(spans);
++        List<MdcEntry> mdcEntries = testMdcCapturer.getCapturedMdcEntries();
++        List<MdcEntry> expectedMdcEntries = getExpectedMDCEntries(spans);
+ 
+         final SpanData parent = getSpanByKindAndParentId(spans, INTERNAL, "0000000000000000");
+         assertEquals("parent", parent.getName());
+@@ -176,12 +147,12 @@ void nonVertx() {
+         final SpanData child = getSpanByKindAndParentId(spans, INTERNAL, parent.getSpanId());
+         assertEquals("child", child.getName());
+ 
+-        assertEquals(fromSpans, mdcEntries);
++        assertEquals(expectedMdcEntries, mdcEntries);
+     }
+ 
+-    private List<MdcTracingEntry> getExpectedMDCEntries(List<SpanData> spans) {
++    private List<MdcEntry> getExpectedMDCEntries(List<SpanData> spans) {
+         return spans.stream()
+-                .map(spanData -> new MdcTracingEntry(spanData.getSpanContext().isSampled(),
++                .map(spanData -> new MdcEntry(spanData.getSpanContext().isSampled(),
+                         spanData.getParentSpanContext().isValid() ? spanData.getParentSpanId() : "null",
+                         spanData.getSpanId(),
+                         spanData.getTraceId()))
+@@ -271,61 +242,35 @@ private void executeWorkOnWorkerThread() {
+         }
+     }
+ 
+-    @PreMatching
+-    @ApplicationScoped
+-    @Provider
+-    @Priority(Integer.MAX_VALUE)
+-    public static class ReqRespFilter implements ContainerResponseFilter, ContainerRequestFilter {
+-        public static final String REQUEST_METHOD_FIELD = "request.filter.field";
+-        public static final String REQUEST_METHOD_FIELD_VALUE = "from the request filter";
+-
+-        @Override
+-        public void filter(ContainerRequestContext requestContext) {
+-            VertxMDC.INSTANCE.put(REQUEST_METHOD_FIELD, REQUEST_METHOD_FIELD_VALUE);
+-        }
+-
+-        @Override
+-        public void filter(ContainerRequestContext requestContext, ContainerResponseContext responseContext) {
+-        }
+-    }
+-
+     @Unremovable
+     @ApplicationScoped
+     public static class TestMdcCapturer {
+-        private final List<MdcTracingEntry> mdcTracingEntries = Collections.synchronizedList(new ArrayList<>());
+-        private final List<Map<String, Object>> fullMDCEntries = Collections.synchronizedList(new ArrayList<>());
++        private final List<MdcEntry> mdcEntries = Collections.synchronizedList(new ArrayList<>());
+ 
+         public void reset() {
+-            mdcTracingEntries.clear();
+-            fullMDCEntries.clear();
++            mdcEntries.clear();
+         }
+ 
+         public void captureMdc() {
+-            Map<String, Object> map = new HashMap<>(MDC.getMap());
+-            fullMDCEntries.add(map);
+-            mdcTracingEntries.add(new MdcTracingEntry(
+-                    Boolean.parseBoolean(String.valueOf(map.get("sampled"))),
+-                    String.valueOf(map.get("parentId")),
+-                    String.valueOf(map.get("spanId")),
+-                    String.valueOf(map.get("traceId"))));
+-        }
+-
+-        public List<MdcTracingEntry> getCapturedMdcTracingEntries() {
+-            return List.copyOf(mdcTracingEntries);
++            mdcEntries.add(new MdcEntry(
++                    Boolean.parseBoolean(String.valueOf(MDC.get("sampled"))),
++                    String.valueOf(MDC.get("parentId")),
++                    String.valueOf(MDC.get("spanId")),
++                    String.valueOf(MDC.get("traceId"))));
+         }
+ 
+-        public List<Map> getFullMDCEntries() {
+-            return List.copyOf(fullMDCEntries);
++        public List<MdcEntry> getCapturedMdcEntries() {
++            return List.copyOf(mdcEntries);
+         }
+     }
+ 
+-    public static class MdcTracingEntry {
++    public static class MdcEntry {
+         public final boolean isSampled;
+         public final String parentId;
+         public final String spanId;
+         public final String traceId;
+ 
+-        public MdcTracingEntry(boolean isSampled, String parentId, String spanId, String traceId) {
++        public MdcEntry(boolean isSampled, String parentId, String spanId, String traceId) {
+             this.isSampled = isSampled;
+             this.parentId = parentId;
+             this.spanId = spanId;
+@@ -337,14 +282,14 @@ public boolean equals(Object o) {
+             if (this == o) {
+                 return true;
+             }
+-            if (!(o instanceof MdcTracingEntry)) {
++            if (!(o instanceof MdcEntry)) {
+                 return false;
+             }
+-            MdcTracingEntry mdcTracingEntry = (MdcTracingEntry) o;
+-            return isSampled == mdcTracingEntry.isSampled &&
+-                    Objects.equals(parentId, mdcTracingEntry.parentId) &&
+-                    Objects.equals(spanId, mdcTracingEntry.spanId) &&
+-                    Objects.equals(traceId, mdcTracingEntry.traceId);
++            MdcEntry mdcEntry = (MdcEntry) o;
++            return isSampled == mdcEntry.isSampled &&
++                    Objects.equals(parentId, mdcEntry.parentId) &&
++                    Objects.equals(spanId, mdcEntry.spanId) &&
++                    Objects.equals(traceId, mdcEntry.traceId);
+         }
+ 
+         @Override
+diff --git a/extensions/opentelemetry/runtime/src/main/java/io/quarkus/opentelemetry/runtime/OpenTelemetryUtil.java b/extensions/opentelemetry/runtime/src/main/java/io/quarkus/opentelemetry/runtime/OpenTelemetryUtil.java
+index f74f6689fdd..aa8d4f7a12e 100644
+--- a/extensions/opentelemetry/runtime/src/main/java/io/quarkus/opentelemetry/runtime/OpenTelemetryUtil.java
++++ b/extensions/opentelemetry/runtime/src/main/java/io/quarkus/opentelemetry/runtime/OpenTelemetryUtil.java
+@@ -5,10 +5,8 @@
+ import java.util.LinkedHashMap;
+ import java.util.List;
+ import java.util.Map;
+-import java.util.Set;
+ 
+ import org.jboss.logging.Logger;
+-import org.slf4j.MDC;
+ 
+ import io.opentelemetry.api.trace.Span;
+ import io.opentelemetry.api.trace.SpanContext;
+@@ -24,7 +22,6 @@ public final class OpenTelemetryUtil {
+     public static final String SPAN_ID = "spanId";
+     public static final String SAMPLED = "sampled";
+     public static final String PARENT_ID = "parentId";
+-    private static final Set<String> TRACING_MDC_KEYS = Set.of(TRACE_ID, SPAN_ID, SAMPLED, PARENT_ID);
+ 
+     private OpenTelemetryUtil() {
+     }
+@@ -77,7 +74,7 @@ public static void setMDCData(Context otelContext, io.vertx.core.Context vertxCo
+                         getSpanData(QuarkusContextStorage.getOtelContext(vertxContext)));
+             }
+             // clear the object ref to force a new one and prevent crosstalk
+-            VertxMDC.INSTANCE.reinitializeVertxMdc(vertxContext, TRACING_MDC_KEYS);
++            VertxMDC.INSTANCE.clearVertxMdcFromContext(vertxContext);
+             SpanContext spanContext = span.getSpanContext();
+             VertxMDC.INSTANCE.put(SPAN_ID, spanContext.getSpanId(), vertxContext);
+             VertxMDC.INSTANCE.put(TRACE_ID, spanContext.getTraceId(), vertxContext);
+diff --git a/extensions/opentelemetry/runtime/src/main/java/io/quarkus/opentelemetry/runtime/QuarkusContextStorage.java b/extensions/opentelemetry/runtime/src/main/java/io/quarkus/opentelemetry/runtime/QuarkusContextStorage.java
+index 273a95f1592..f007a88467a 100644
+--- a/extensions/opentelemetry/runtime/src/main/java/io/quarkus/opentelemetry/runtime/QuarkusContextStorage.java
++++ b/extensions/opentelemetry/runtime/src/main/java/io/quarkus/opentelemetry/runtime/QuarkusContextStorage.java
+@@ -3,8 +3,6 @@
+ import static io.quarkus.vertx.core.runtime.context.VertxContextSafetyToggle.setContextSafe;
+ import static io.smallrye.common.vertx.VertxContext.isDuplicatedContext;
+ 
+-import java.util.Map;
+-
+ import org.jboss.logging.Logger;
+ 
+ import io.opentelemetry.api.trace.Span;
+@@ -85,18 +83,10 @@ public void close() {
+                     log.debugv("Closing Otel context: {0}", OpenTelemetryUtil.getSpanData(otelToAttach));
+                 }
+ 
+-                if (otelBefore != otelToAttach && log.isDebugEnabled()) {
+-                    // Different references can contain the same span data.
+-                    // Duplicated contexts can be duplicated.
+-                    Map<String, String> spanDataBefore = OpenTelemetryUtil.getSpanData(otelBefore);
+-                    if (spanDataBefore != null && !spanDataBefore.isEmpty()) {
+-                        log.debug(
+-                                "Context in storage not the expected context, Scope.close was not called correctly. Details:" +
+-                                        " OTel context otelBefore: ref: " + System.identityHashCode(otelBefore) +
+-                                        " Content: " + spanDataBefore +
+-                                        ". OTel context otelToAttach: ref: " + System.identityHashCode(otelToAttach) +
+-                                        " Content: " + OpenTelemetryUtil.getSpanData(otelToAttach));
+-                    }
++                if (otelBefore != otelToAttach) {
++                    log.info("Context in storage not the expected context, Scope.close was not called correctly. Details:" +
++                            " OTel context otelBefore: " + OpenTelemetryUtil.getSpanData(otelBefore) +
++                            ". OTel context otelToAttach: " + OpenTelemetryUtil.getSpanData(otelToAttach));
+                 }
+ 
+                 if (otelBeforeAttach == null) {
+diff --git a/extensions/resteasy-reactive/rest-client-jaxrs/deployment/src/main/java/io/quarkus/jaxrs/client/reactive/deployment/JaxrsClientReactiveProcessor.java b/extensions/resteasy-reactive/rest-client-jaxrs/deployment/src/main/java/io/quarkus/jaxrs/client/reactive/deployment/JaxrsClientReactiveProcessor.java
+index 33cc4739842..354e3f94505 100644
+--- a/extensions/resteasy-reactive/rest-client-jaxrs/deployment/src/main/java/io/quarkus/jaxrs/client/reactive/deployment/JaxrsClientReactiveProcessor.java
++++ b/extensions/resteasy-reactive/rest-client-jaxrs/deployment/src/main/java/io/quarkus/jaxrs/client/reactive/deployment/JaxrsClientReactiveProcessor.java
+@@ -34,6 +34,7 @@
+ import java.nio.file.Path;
+ import java.util.AbstractMap;
+ import java.util.ArrayList;
++import java.util.Arrays;
+ import java.util.Collection;
+ import java.util.Collections;
+ import java.util.Comparator;
+@@ -46,6 +47,7 @@
+ import java.util.Map;
+ import java.util.Optional;
+ import java.util.Set;
++import java.util.TreeSet;
+ import java.util.concurrent.CompletionStage;
+ import java.util.function.BiFunction;
+ import java.util.function.Consumer;
+@@ -2652,7 +2654,7 @@ private void handleReturn(ClassInfo restClientInterface, String defaultMediaType
+             if (consumes != null && consumes.length > 0) {
+ 
+                 if (consumes.length > 1) {
+-                    Set<String> uniqueConsumes = Set.of(consumes);
++                    Set<String> uniqueConsumes = new TreeSet<>(Arrays.asList(consumes));
+                     mediaTypeValue = uniqueConsumes.iterator().next();
+                     if (uniqueConsumes.size() > 1) {
+                         log.debugf("MicroProfile Rest Client `%s`'s method `%s` has multiple `@Consumes` values `%s`,"
+diff --git a/extensions/security-webauthn/deployment/src/main/java/io/quarkus/security/webauthn/deployment/QuarkusSecurityWebAuthnProcessor.java b/extensions/security-webauthn/deployment/src/main/java/io/quarkus/security/webauthn/deployment/QuarkusSecurityWebAuthnProcessor.java
+index a624fdf8727..812e53064e5 100644
+--- a/extensions/security-webauthn/deployment/src/main/java/io/quarkus/security/webauthn/deployment/QuarkusSecurityWebAuthnProcessor.java
++++ b/extensions/security-webauthn/deployment/src/main/java/io/quarkus/security/webauthn/deployment/QuarkusSecurityWebAuthnProcessor.java
+@@ -8,17 +8,18 @@
+ import org.jboss.jandex.DotName;
+ 
+ import com.webauthn4j.data.AuthenticationRequest;
+-import com.webauthn4j.data.AuthenticatorAssertionResponse;
+-import com.webauthn4j.data.AuthenticatorAttestationResponse;
++import com.webauthn4j.data.AuthenticatorResponse;
+ import com.webauthn4j.data.PublicKeyCredential;
+ import com.webauthn4j.data.PublicKeyCredentialCreationOptions;
++import com.webauthn4j.data.PublicKeyCredentialEntity;
+ import com.webauthn4j.data.PublicKeyCredentialParameters;
+ import com.webauthn4j.data.PublicKeyCredentialRequestOptions;
+-import com.webauthn4j.data.PublicKeyCredentialRpEntity;
+ import com.webauthn4j.data.PublicKeyCredentialType;
+-import com.webauthn4j.data.PublicKeyCredentialUserEntity;
+ import com.webauthn4j.data.RegistrationRequest;
+ import com.webauthn4j.data.attestation.AttestationObject;
++import com.webauthn4j.data.attestation.authenticator.COSEKey;
++import com.webauthn4j.data.attestation.authenticator.Curve;
++import com.webauthn4j.data.attestation.statement.AttestationStatement;
+ import com.webauthn4j.data.client.CollectedClientData;
+ 
+ import io.quarkus.arc.deployment.AdditionalBeanBuildItem;
+@@ -54,30 +55,33 @@ public IndexDependencyBuildItem addTypesToJandex() {
+ 
+     @BuildStep
+     public void registerJacksonTypes(BuildProducer<ReflectiveHierarchyBuildItem> reflection) {
++        String source = QuarkusSecurityWebAuthnProcessor.class.getSimpleName();
+         reflection.produce(
+-                ReflectiveHierarchyBuildItem.builder(AuthenticatorAssertionResponse.class).build());
++                ReflectiveHierarchyBuildItem.builder(AuthenticatorResponse.class).source(source).build());
++        reflection.produce(ReflectiveHierarchyBuildItem.builder(AuthenticationRequest.class).source(source).build());
++        reflection.produce(ReflectiveHierarchyBuildItem.builder(RegistrationRequest.class).source(source).build());
+         reflection.produce(
+-                ReflectiveHierarchyBuildItem.builder(AuthenticatorAttestationResponse.class).build());
+-        reflection.produce(ReflectiveHierarchyBuildItem.builder(AuthenticationRequest.class).build());
+-        reflection.produce(ReflectiveHierarchyBuildItem.builder(RegistrationRequest.class).build());
++                ReflectiveHierarchyBuildItem.builder(PublicKeyCredentialCreationOptions.class).source(source).build());
+         reflection.produce(
+-                ReflectiveHierarchyBuildItem.builder(PublicKeyCredentialCreationOptions.class).build());
++                ReflectiveHierarchyBuildItem.builder(PublicKeyCredentialRequestOptions.class).source(source).build());
+         reflection.produce(
+-                ReflectiveHierarchyBuildItem.builder(PublicKeyCredentialRequestOptions.class).build());
++                ReflectiveHierarchyBuildItem.builder(PublicKeyCredentialEntity.class).source(source).build());
+         reflection.produce(
+-                ReflectiveHierarchyBuildItem.builder(PublicKeyCredentialRpEntity.class).build());
++                ReflectiveHierarchyBuildItem.builder(PublicKeyCredentialParameters.class).source(source).build());
+         reflection.produce(
+-                ReflectiveHierarchyBuildItem.builder(PublicKeyCredentialUserEntity.class).build());
++                ReflectiveHierarchyBuildItem.builder(PublicKeyCredentialType.class).source(source).build());
+         reflection.produce(
+-                ReflectiveHierarchyBuildItem.builder(PublicKeyCredentialParameters.class).build());
++                ReflectiveHierarchyBuildItem.builder(PublicKeyCredential.class).source(source).build());
+         reflection.produce(
+-                ReflectiveHierarchyBuildItem.builder(PublicKeyCredentialType.class).build());
++                ReflectiveHierarchyBuildItem.builder(AttestationObject.class).source(source).build());
+         reflection.produce(
+-                ReflectiveHierarchyBuildItem.builder(PublicKeyCredential.class).build());
++                ReflectiveHierarchyBuildItem.builder(CollectedClientData.class).source(source).build());
+         reflection.produce(
+-                ReflectiveHierarchyBuildItem.builder(AttestationObject.class).build());
++                ReflectiveHierarchyBuildItem.builder(Curve.class).source(source).build());
+         reflection.produce(
+-                ReflectiveHierarchyBuildItem.builder(CollectedClientData.class).build());
++                ReflectiveHierarchyBuildItem.builder(AttestationStatement.class).source(source).build());
++        reflection.produce(
++                ReflectiveHierarchyBuildItem.builder(COSEKey.class).source(source).build());
+     }
+ 
+     @BuildStep
+diff --git a/extensions/vertx/deployment/src/test/java/io/quarkus/vertx/mdc/AnotherVertxMdcTest.java b/extensions/vertx/deployment/src/test/java/io/quarkus/vertx/mdc/AnotherVertxMdcTest.java
+deleted file mode 100644
+index 8b3945305cc..00000000000
+--- a/extensions/vertx/deployment/src/test/java/io/quarkus/vertx/mdc/AnotherVertxMdcTest.java
++++ /dev/null
+@@ -1,135 +0,0 @@
+-package io.quarkus.vertx.mdc;
+-
+-import static java.util.Collections.emptySet;
+-import static org.junit.jupiter.api.Assertions.assertEquals;
+-import static org.junit.jupiter.api.Assertions.assertNotEquals;
+-import static org.junit.jupiter.api.Assertions.assertNotNull;
+-import static org.junit.jupiter.api.Assertions.assertNull;
+-
+-import java.util.HashMap;
+-import java.util.Map;
+-import java.util.Set;
+-import java.util.concurrent.ExecutionException;
+-import java.util.concurrent.TimeUnit;
+-import java.util.concurrent.TimeoutException;
+-
+-import jakarta.enterprise.context.ApplicationScoped;
+-import jakarta.inject.Inject;
+-
+-import org.jboss.shrinkwrap.api.ShrinkWrap;
+-import org.jboss.shrinkwrap.api.spec.JavaArchive;
+-import org.junit.jupiter.api.BeforeEach;
+-import org.junit.jupiter.api.Test;
+-import org.junit.jupiter.api.extension.RegisterExtension;
+-
+-import io.quarkus.test.QuarkusUnitTest;
+-import io.quarkus.vertx.VertxContextSupport;
+-import io.quarkus.vertx.core.runtime.VertxMDC;
+-import io.vertx.core.Vertx;
+-
+-public class AnotherVertxMdcTest {
+-
+-    @RegisterExtension
+-    static final QuarkusUnitTest TEST = new QuarkusUnitTest()
+-            .setArchiveProducer(
+-                    () -> ShrinkWrap.create(JavaArchive.class)
+-                            .addClass(HelloBean.class))
+-            .overrideConfigKey("quarkus.log.console.format", "%d{HH:mm:ss} %-5p requestId=%X{requestId} [%c{2.}] (%t) %s%e%n");
+-
+-    static final String VALUE_TO_PRESERVE = "value to preserve";
+-    static final String PROBE = "probe";
+-
+-    @Inject
+-    HelloBean bean;
+-
+-    @BeforeEach
+-    void setUp() {
+-        bean.reset();
+-    }
+-
+-    @Test
+-    void reinitializationTest_nullKeysDiscarded() throws ExecutionException, InterruptedException, TimeoutException {
+-        bean.addEntriesMDC(PROBE, VALUE_TO_PRESERVE);
+-        Map<String, Object> report = bean.hello(null);
+-
+-        assertNotNull(report.get("MDC with probe"));
+-        assertEquals(VALUE_TO_PRESERVE, unwrapMdcValue("MDC with probe", PROBE, report));
+-        assertEquals(VALUE_TO_PRESERVE, unwrapMdcValue("MDC after reinit", PROBE, report));
+-
+-        assertNotEquals(report.get("MDC before object"), report.get("MDC after reinit object"));
+-    }
+-
+-    @Test
+-    void reinitializationTest_noKeysToStore() throws ExecutionException, InterruptedException, TimeoutException {
+-        Map<String, Object> report = bean.hello(null);
+-        // nothing will be done.
+-        assertNull(report.get("MDC with probe"));
+-        assertNull(report.get("MDC after reinit"));
+-    }
+-
+-    @Test
+-    void reinitializationTest_emptyKeysDiscarded() throws ExecutionException, InterruptedException, TimeoutException {
+-        bean.addEntriesMDC(PROBE, VALUE_TO_PRESERVE);
+-        Map<String, Object> report = bean.hello(emptySet());
+-
+-        assertNotNull(report.get("MDC with probe"));
+-        assertEquals(VALUE_TO_PRESERVE, unwrapMdcValue("MDC with probe", PROBE, report));
+-        assertEquals(VALUE_TO_PRESERVE, unwrapMdcValue("MDC after reinit", PROBE, report));
+-
+-        assertNotEquals(report.get("MDC before object"), report.get("MDC after reinit object"));
+-    }
+-
+-    @Test
+-    void reinitializationTest_keysDiscarded() throws ExecutionException, InterruptedException, TimeoutException {
+-        bean.addEntriesMDC(PROBE, VALUE_TO_PRESERVE);
+-        bean.addEntriesMDC("keyToDiscard", "valueToDiscard");
+-        Map<String, Object> report = bean.hello(Set.of("keyToDiscard"));
+-
+-        assertNotNull(report.get("MDC with probe"));
+-        assertEquals(VALUE_TO_PRESERVE, unwrapMdcValue("MDC with probe", PROBE, report));
+-        assertEquals("valueToDiscard", unwrapMdcValue("MDC with probe", "keyToDiscard", report));
+-
+-        assertEquals(VALUE_TO_PRESERVE, unwrapMdcValue("MDC after reinit", PROBE, report));
+-        assertNull(unwrapMdcValue("MDC after reinit", "keyToDiscard", report));
+-
+-        assertNotEquals(report.get("MDC before object"), report.get("MDC after reinit object"));
+-    }
+-
+-    private String unwrapMdcValue(String reportEntry, String key, Object map) {
+-        Map<String, Object> mdc = (Map<String, Object>) ((Map<String, Object>) map).get(reportEntry);
+-        return (String) mdc.get(key);
+-    }
+-
+-    @ApplicationScoped
+-    public static class HelloBean {
+-        private Map<String, String> map = new HashMap<>();
+-
+-        public void addEntriesMDC(String key, String value) {
+-            map.put(key, value);
+-        }
+-
+-        public void reset() {
+-            map.clear();
+-        }
+-
+-        public Map<String, Object> hello(Set<String> keysToDiscard)
+-                throws ExecutionException, InterruptedException, TimeoutException {
+-            return VertxContextSupport.executeBlocking(() -> {
+-                Map<String, Object> report = new HashMap<>();
+-
+-                for (Map.Entry entry : map.entrySet()) {
+-                    VertxMDC.INSTANCE.put((String) entry.getKey(), (String) entry.getValue());
+-                }
+-                report.put("MDC with probe", Vertx.currentContext().getLocal(VertxMDC.class.getName()));
+-                report.put("MDC before object",
+-                        "" + System.identityHashCode(Vertx.currentContext().getLocal(VertxMDC.class.getName())));
+-
+-                VertxMDC.INSTANCE.reinitializeVertxMdc(Vertx.currentContext(), keysToDiscard);
+-                report.put("MDC after reinit", Vertx.currentContext().getLocal(VertxMDC.class.getName()));
+-                report.put("MDC after reinit object",
+-                        "" + System.identityHashCode(Vertx.currentContext().getLocal(VertxMDC.class.getName())));
+-                return report;
+-            }).subscribe().asCompletionStage().toCompletableFuture().get(1, TimeUnit.SECONDS);
+-        }
+-    }
+-}
+diff --git a/extensions/vertx/runtime/src/main/java/io/quarkus/vertx/core/runtime/VertxMDC.java b/extensions/vertx/runtime/src/main/java/io/quarkus/vertx/core/runtime/VertxMDC.java
+index f83e645c72f..1641eec2de1 100644
+--- a/extensions/vertx/runtime/src/main/java/io/quarkus/vertx/core/runtime/VertxMDC.java
++++ b/extensions/vertx/runtime/src/main/java/io/quarkus/vertx/core/runtime/VertxMDC.java
+@@ -4,10 +4,8 @@
+ import static io.smallrye.common.vertx.VertxContext.getOrCreateDuplicatedContext;
+ 
+ import java.util.HashMap;
+-import java.util.HashSet;
+ import java.util.Map;
+ import java.util.Objects;
+-import java.util.Set;
+ import java.util.concurrent.ConcurrentHashMap;
+ import java.util.concurrent.ConcurrentMap;
+ 
+@@ -150,23 +148,6 @@ public Object putObject(String key, Object value, Context vertxContext) {
+         return contextualDataMap(vertxContext).put(key, value);
+     }
+ 
+-    /**
+-     * Sets several entries.
+-     * <p>
+-     * Tries to use the current Vert.x Context, if the context is non-existent
+-     * meaning that it was called out of a Vert.x thread it will fall back to
+-     * the thread local context map.
+-     *
+-     * Will look up the contextual data map just once.
+-     *
+-     * @param map contents to add
+-     * @param vertxContext
+-     */
+-    public void putAll(Map<String, String> map, Context vertxContext) {
+-        Objects.requireNonNull(map);
+-        contextualDataMap(vertxContext).putAll(map);
+-    }
+-
+     /**
+      * Removes a key.
+      *
+@@ -258,20 +239,6 @@ public boolean isEmpty() {
+         return contextualDataMap(getContext()).isEmpty();
+     }
+ 
+-    /**
+-     * Determine whether the current MDC map is empty on the provided context
+-     *
+-     * @param vertxContext
+-     * @return
+-     */
+-    public boolean isEmpty(Context vertxContext) {
+-        return contextualDataMap(vertxContext).isEmpty();
+-    }
+-
+-    public Set<String> getKeys() {
+-        return new HashSet<>(contextualDataMap(getContext()).keySet());
+-    }
+-
+     /**
+      * Get a copy of the MDC map. This is a relatively expensive operation.
+      * If the informed context is null it falls back to the thread local context map.
+@@ -322,45 +289,12 @@ public void clear(Context vertxContext) {
+      *
+      * @param vertxContext
+      */
+-    void clearVertxMdcFromContext(Context vertxContext) {
++    public void clearVertxMdcFromContext(Context vertxContext) {
+         if (vertxContext != null) {
+             vertxContext.removeLocal(VertxMDC.class.getName());
+         }
+     }
+ 
+-    /**
+-     * Clears out the object ref from the context to force a new one to be created and prevent thread crosstalk.
+-     * Also copies to the new reference any previous data not in the set of MDC keys to discard.
+-     *
+-     * @param vertxContext
+-     * @param discardMdcKeys Entries not to be copied over to the new MDC
+-     */
+-    public void reinitializeVertxMdc(Context vertxContext, Set<String> discardMdcKeys) {
+-        if (vertxContext == null || vertxContext.getLocal(VertxMDC.class.getName()) == null) {
+-            // nothing to do
+-            return;
+-        }
+-
+-        if (VertxMDC.INSTANCE.isEmpty(vertxContext)) {
+-            // clear the object ref to force a new one and prevent crosstalk
+-            VertxMDC.INSTANCE.clearVertxMdcFromContext(vertxContext);
+-            return;
+-        }
+-
+-        final Map<String, String> carryover = new HashMap<>();
+-        final boolean hasDiscardKeys = discardMdcKeys == null || discardMdcKeys.isEmpty();
+-        for (String key : VertxMDC.INSTANCE.getKeys()) {
+-            if (hasDiscardKeys || !discardMdcKeys.contains(key)) {
+-                carryover.put(key, VertxMDC.INSTANCE.get(key));
+-            }
+-        }
+-
+-        // clear the object ref to force a new one and prevent crosstalk
+-        VertxMDC.INSTANCE.clearVertxMdcFromContext(vertxContext);
+-        // Preserving relevant data
+-        VertxMDC.INSTANCE.putAll(carryover, vertxContext);
+-    }
+-
+     /**
+      * Gets the current duplicated context or a new duplicated context if a Vert.x Context exists. Multiple invocations
+      * of this method may return the same or different context. If the current context is a duplicate one, multiple
+diff --git a/independent-projects/enforcer-rules/pom.xml b/independent-projects/enforcer-rules/pom.xml
+index f67d412d068..fcacadb7630 100644
+--- a/independent-projects/enforcer-rules/pom.xml
++++ b/independent-projects/enforcer-rules/pom.xml
+@@ -40,7 +40,7 @@
+         <!--
+            Supported Maven versions, interpreted as a version range (Also defined in build-parent)
+         -->
+-        <supported-maven-versions>[3.6.2,)</supported-maven-versions>
++        <supported-maven-versions>[3.9.0,)</supported-maven-versions>
+     </properties>
+ 
+     <dependencies>
+diff --git a/independent-projects/tools/base-codestarts/src/main/resources/codestarts/quarkus-extension/code/extension-base/java/pom.tpl.qute.xml b/independent-projects/tools/base-codestarts/src/main/resources/codestarts/quarkus-extension/code/extension-base/java/pom.tpl.qute.xml
+index b5fd509491d..b8da17b31a2 100644
+--- a/independent-projects/tools/base-codestarts/src/main/resources/codestarts/quarkus-extension/code/extension-base/java/pom.tpl.qute.xml
++++ b/independent-projects/tools/base-codestarts/src/main/resources/codestarts/quarkus-extension/code/extension-base/java/pom.tpl.qute.xml
+@@ -84,7 +84,6 @@
+                     <artifactId>maven-surefire-plugin</artifactId>
+                     <version>$\{surefire-plugin.version}</version>
+                     <configuration>
+-                        <argLine>@\{argLine}</argLine>
+                         <systemPropertyVariables>
+                             <java.util.logging.manager>org.jboss.logmanager.LogManager</java.util.logging.manager>
+                             <maven.home>$\{maven.home}</maven.home>
+@@ -97,7 +96,6 @@
+                     <artifactId>maven-failsafe-plugin</artifactId>
+                     <version>$\{failsafe-plugin.version}</version>
+                     <configuration>
+-                        <argLine>@\{argLine}</argLine>
+                         <systemPropertyVariables>
+                             <java.util.logging.manager>org.jboss.logmanager.LogManager</java.util.logging.manager>
+                             <maven.home>$\{maven.home}</maven.home>
+diff --git a/independent-projects/tools/base-codestarts/src/main/resources/codestarts/quarkus/buildtool/maven/base/pom.tpl.qute.xml b/independent-projects/tools/base-codestarts/src/main/resources/codestarts/quarkus/buildtool/maven/base/pom.tpl.qute.xml
+index d622551385a..a58fa4aa54d 100644
+--- a/independent-projects/tools/base-codestarts/src/main/resources/codestarts/quarkus/buildtool/maven/base/pom.tpl.qute.xml
++++ b/independent-projects/tools/base-codestarts/src/main/resources/codestarts/quarkus/buildtool/maven/base/pom.tpl.qute.xml
+@@ -170,7 +170,9 @@
+                 <artifactId>maven-surefire-plugin</artifactId>
+                 <version>$\{surefire-plugin.version}</version>
+                 <configuration>
++                    {#if quarkus.platform.version.compareVersionTo("3.30.999") > 0}
+                     <argLine>@\{argLine}</argLine>
++                    {/if}
+                     <systemPropertyVariables>
+                         <java.util.logging.manager>org.jboss.logmanager.LogManager</java.util.logging.manager>
+                         <maven.home>$\{maven.home}</maven.home>
+@@ -191,7 +193,9 @@
+                     </execution>
+                 </executions>
+                 <configuration>
++                    {#if quarkus.platform.version.compareVersionTo("3.30.999") > 0}
+                     <argLine>@\{argLine}</argLine>
++                    {/if}
+                     <systemPropertyVariables>
+                         {#if generate-native}
+                         <native.image.path>$\{project.build.directory}/$\{project.build.finalName}-runner</native.image.path>
+diff --git a/integration-tests/devservices/dependent-extension/deployment/pom.xml b/integration-tests/devservices/dependent-extension/deployment/pom.xml
+new file mode 100644
+index 00000000000..59dcbe3dbfe
+--- /dev/null
++++ b/integration-tests/devservices/dependent-extension/deployment/pom.xml
+@@ -0,0 +1,74 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<project xmlns="http://maven.apache.org/POM/4.0.0"
++         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
++         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
++    <parent>
++        <artifactId>quarkus-integration-test-devservices-dependent-extension-parent</artifactId>
++        <groupId>io.quarkus</groupId>
++        <version>999-SNAPSHOT</version>
++    </parent>
++    <modelVersion>4.0.0</modelVersion>
++
++    <artifactId>quarkus-integration-test-devservices-dependent-extension-deployment</artifactId>
++
++    <dependencies>
++        <dependency>
++            <groupId>io.quarkus</groupId>
++            <artifactId>quarkus-integration-test-devservices-dependent-extension</artifactId>
++            <version>${project.version}</version>
++        </dependency>
++        <dependency>
++            <groupId>io.quarkus</groupId>
++            <artifactId>quarkus-devservices-deployment</artifactId>
++        </dependency>
++
++        <!-- test dependencies -->
++        <dependency>
++            <groupId>io.quarkus</groupId>
++            <artifactId>quarkus-junit</artifactId>
++            <scope>test</scope>
++        </dependency>
++        <dependency>
++            <groupId>org.assertj</groupId>
++            <artifactId>assertj-core</artifactId>
++            <scope>test</scope>
++        </dependency>
++        <dependency>
++            <groupId>io.rest-assured</groupId>
++            <artifactId>rest-assured</artifactId>
++            <scope>test</scope>
++            <exclusions>
++                <exclusion>
++                    <groupId>org.apache.commons</groupId>
++                    <artifactId>commons-lang3</artifactId>
++                </exclusion>
++            </exclusions>
++        </dependency>
++    </dependencies>
++
++    <build>
++        <plugins>
++            <plugin>
++                <artifactId>maven-compiler-plugin</artifactId>
++                <executions>
++                    <execution>
++                        <id>default-compile</id>
++                        <configuration>
++                            <annotationProcessorPaths>
++                                <path>
++                                    <groupId>io.quarkus</groupId>
++                                    <artifactId>quarkus-extension-processor</artifactId>
++                                    <version>${project.version}</version>
++                                </path>
++                            </annotationProcessorPaths>
++                            <compilerArgs>
++                                <arg>-AgenerateDoc=false</arg>
++                            </compilerArgs>
++                        </configuration>
++                    </execution>
++                </executions>
++            </plugin>
++        </plugins>
++    </build>
++
++</project>
+diff --git a/integration-tests/devservices/dependent-extension/deployment/src/main/java/io/quarkus/tests/dependentextension/deployment/DependentContainer.java b/integration-tests/devservices/dependent-extension/deployment/src/main/java/io/quarkus/tests/dependentextension/deployment/DependentContainer.java
+new file mode 100644
+index 00000000000..d202f901e56
+--- /dev/null
++++ b/integration-tests/devservices/dependent-extension/deployment/src/main/java/io/quarkus/tests/dependentextension/deployment/DependentContainer.java
+@@ -0,0 +1,48 @@
++package io.quarkus.tests.dependentextension.deployment;
++
++import org.testcontainers.containers.GenericContainer;
++import org.testcontainers.utility.DockerImageName;
++
++import io.quarkus.deployment.builditem.Startable;
++
++public class DependentContainer extends GenericContainer<io.quarkus.tests.dependentextension.deployment.DependentContainer>
++        implements Startable {
++
++    private static final DockerImageName dockerImageName = DockerImageName.parse("httpd");
++    public static final int HTTPD_PORT = 80;
++    private String otherConfig;
++
++    public DependentContainer() {
++        super(dockerImageName);
++        this //.waitingFor(Wait.forLogMessage(".*" + "resuming normal operations" + ".*", 1))
++                .withReuse(true)
++                .withExposedPorts(HTTPD_PORT);
++    }
++
++    @Override
++    public void start() {
++        if (otherConfig != null) {
++            super.start();
++        } else {
++            throw new IllegalStateException("Trying to start a dependent container without its dependencies being available");
++        }
++    }
++
++    @Override
++    public String getConnectionInfo() {
++        return "http://" + getHost() + ":" + getMappedPort(HTTPD_PORT);
++    }
++
++    @Override
++    public void close() {
++        super.close();
++    }
++
++    public boolean isDependencyAvailable() {
++        return otherConfig != null;
++    }
++
++    public void setOtherUrl(String value) {
++        otherConfig = value;
++    }
++}
+diff --git a/integration-tests/devservices/dependent-extension/deployment/src/main/java/io/quarkus/tests/dependentextension/deployment/DependentDevServicesProcessor.java b/integration-tests/devservices/dependent-extension/deployment/src/main/java/io/quarkus/tests/dependentextension/deployment/DependentDevServicesProcessor.java
+new file mode 100644
+index 00000000000..cbadfad934b
+--- /dev/null
++++ b/integration-tests/devservices/dependent-extension/deployment/src/main/java/io/quarkus/tests/dependentextension/deployment/DependentDevServicesProcessor.java
+@@ -0,0 +1,86 @@
++package io.quarkus.tests.dependentextension.deployment;
++
++import static io.quarkus.tests.dependentextension.Constants.QUARKUS_DEPENDENT_EXTENSION_BASE_URL;
++import static io.quarkus.tests.dependentextension.Constants.QUARKUS_DEPENDENT_EXTENSION_SEES_DEPENDENCY;
++import static io.quarkus.tests.dependentextension.Constants.QUARKUS_OPTIONAL_DEPENDENT_EXTENSION_BASE_URL;
++import static io.quarkus.tests.dependentextension.Constants.QUARKUS_OPTIONAL_DEPENDENT_EXTENSION_SEES_DEPENDENCY;
++import static io.quarkus.tests.dependentextension.Constants.QUARKUS_UNSATISFIED_DEPENDENT_EXTENSION_BASE_URL;
++import static io.quarkus.tests.dependentextension.Constants.QUARKUS_UNSATISFIED_OPTIONAL_DEPENDENT_EXTENSION_BASE_URL;
++import static io.quarkus.tests.dependentextension.Constants.QUARKUS_UNSATISFIED_OPTIONAL_DEPENDENT_EXTENSION_SEES_DEPENDENCY;
++
++import java.util.Map;
++
++import io.quarkus.deployment.IsNormal;
++import io.quarkus.deployment.annotations.BuildStep;
++import io.quarkus.deployment.builditem.DevServicesResultBuildItem;
++import io.quarkus.deployment.builditem.FeatureBuildItem;
++import io.quarkus.deployment.dev.devservices.DevServicesConfig;
++
++public class DependentDevServicesProcessor {
++
++    private static final String FEATURE = "Needy";
++
++    @BuildStep
++    FeatureBuildItem feature() {
++        return new FeatureBuildItem(FEATURE);
++    }
++
++    @BuildStep(onlyIfNot = IsNormal.class, onlyIf = DevServicesConfig.Enabled.class)
++    public DevServicesResultBuildItem createDependentContainer() {
++
++        return DevServicesResultBuildItem.owned()
++                .feature(FEATURE)
++                .serviceName(FEATURE)
++                .startable(() -> new DependentContainer()) // Builds could be speeded up a bit by using an in-process service, but coverage is probably better with a container
++                .configProvider(Map.of(QUARKUS_DEPENDENT_EXTENSION_BASE_URL,
++                        c -> c.getConnectionInfo(), QUARKUS_DEPENDENT_EXTENSION_SEES_DEPENDENCY,
++                        c -> String.valueOf(c.isDependencyAvailable())))
++                .dependsOnConfig("acme.simpleextension.base-url", (s, v) -> s.setOtherUrl(v))
++                .build();
++
++    }
++
++    @BuildStep(onlyIfNot = IsNormal.class, onlyIf = DevServicesConfig.Enabled.class)
++    public DevServicesResultBuildItem createDependentContainerWithUnsatisfiedDependencies() {
++
++        return DevServicesResultBuildItem.owned()
++                .feature(FEATURE)
++                .serviceName(FEATURE + "unsat")
++                .startable(() -> new DependentContainer()) // Builds could be speeded up a bit by using an in-process service, but coverage is probably better with a container
++                .configProvider(Map.of(QUARKUS_UNSATISFIED_DEPENDENT_EXTENSION_BASE_URL,
++                        c -> c.getConnectionInfo()))
++                .dependsOnConfig("impossible", (s, v) -> s.setOtherUrl(v))
++                .build();
++
++    }
++
++    @BuildStep(onlyIfNot = IsNormal.class, onlyIf = DevServicesConfig.Enabled.class)
++    public DevServicesResultBuildItem createDependentContainerWithOptionalDependencies() {
++
++        return DevServicesResultBuildItem.owned()
++                .feature("quarkus-dependent")
++                .serviceName(FEATURE + "opt")
++                .startable(() -> new DependentContainer()) // Builds could be speeded up a bit by using an in-process service, but coverage is probably better with a container
++                .configProvider(Map.of(QUARKUS_OPTIONAL_DEPENDENT_EXTENSION_BASE_URL,
++                        c -> c.getConnectionInfo(), QUARKUS_OPTIONAL_DEPENDENT_EXTENSION_SEES_DEPENDENCY,
++                        c -> String.valueOf(c.isDependencyAvailable())))
++                .dependsOnConfig("acme.simpleextension.base-url", (s, v) -> s.setOtherUrl(v), true)
++                .build();
++
++    }
++
++    @BuildStep(onlyIfNot = IsNormal.class, onlyIf = DevServicesConfig.Enabled.class)
++    public DevServicesResultBuildItem createDependentContainerWithUnsatisfiedOptionalDependencies() {
++
++        return DevServicesResultBuildItem.owned()
++                .feature(FEATURE)
++                .serviceName(FEATURE + "unsat-opt")
++                .startable(() -> new OptionallyDependentContainer()) // Builds could be speeded up a bit by using an in-process service, but coverage is probably better with a container
++                .configProvider(Map.of(QUARKUS_UNSATISFIED_OPTIONAL_DEPENDENT_EXTENSION_BASE_URL,
++                        c -> c.getConnectionInfo(), QUARKUS_UNSATISFIED_OPTIONAL_DEPENDENT_EXTENSION_SEES_DEPENDENCY,
++                        c -> String.valueOf(c.isDependencyAvailable())))
++                .dependsOnConfig("impossible", (s, v) -> s.setOtherUrl(v), true)
++                .build();
++
++    }
++}
+diff --git a/integration-tests/devservices/dependent-extension/deployment/src/main/java/io/quarkus/tests/dependentextension/deployment/OptionallyDependentContainer.java b/integration-tests/devservices/dependent-extension/deployment/src/main/java/io/quarkus/tests/dependentextension/deployment/OptionallyDependentContainer.java
+new file mode 100644
+index 00000000000..0d32c09fdfd
+--- /dev/null
++++ b/integration-tests/devservices/dependent-extension/deployment/src/main/java/io/quarkus/tests/dependentextension/deployment/OptionallyDependentContainer.java
+@@ -0,0 +1,48 @@
++package io.quarkus.tests.dependentextension.deployment;
++
++import org.testcontainers.containers.GenericContainer;
++import org.testcontainers.utility.DockerImageName;
++
++import io.quarkus.deployment.builditem.Startable;
++
++public class OptionallyDependentContainer extends GenericContainer<OptionallyDependentContainer>
++        implements Startable {
++
++    private static final DockerImageName dockerImageName = DockerImageName.parse("httpd");
++    public static final int HTTPD_PORT = 80;
++    private String otherConfig;
++
++    public OptionallyDependentContainer() {
++        super(dockerImageName);
++        this //.waitingFor(Wait.forLogMessage(".*" + "resuming normal operations" + ".*", 1))
++                .withReuse(true)
++                .withExposedPorts(HTTPD_PORT);
++    }
++
++    @Override
++    public void start() {
++        // Start, even if the config is not available
++        super.start();
++    }
++
++    @Override
++    public String getConnectionInfo() {
++        return "http://" + getHost() + ":" + getMappedPort(HTTPD_PORT);
++    }
++
++    @Override
++    public void close() {
++        super.close();
++    }
++
++    public void setOtherUrl(String value) {
++        if (otherConfig == null) {
++            throw new IllegalArgumentException("Should not attempt to set other config if it is not available");
++        }
++        otherConfig = value;
++    }
++
++    public boolean isDependencyAvailable() {
++        return otherConfig != null;
++    }
++}
+diff --git a/integration-tests/devservices/dependent-extension/pom.xml b/integration-tests/devservices/dependent-extension/pom.xml
+new file mode 100644
+index 00000000000..de6361c72c6
+--- /dev/null
++++ b/integration-tests/devservices/dependent-extension/pom.xml
+@@ -0,0 +1,21 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<project xmlns="http://maven.apache.org/POM/4.0.0"
++         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
++         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
++    <parent>
++        <artifactId>quarkus-integration-test-devservices</artifactId>
++        <groupId>io.quarkus</groupId>
++        <version>999-SNAPSHOT</version>
++    </parent>
++    <modelVersion>4.0.0</modelVersion>
++
++    <artifactId>quarkus-integration-test-devservices-dependent-extension-parent</artifactId>
++    <name>Quarkus - Integration Tests - Dev Services - Extension A</name>
++    <packaging>pom</packaging>
++
++
++    <modules>
++        <module>deployment</module>
++        <module>runtime</module>
++    </modules>
++</project>
+diff --git a/integration-tests/devservices/dependent-extension/runtime/pom.xml b/integration-tests/devservices/dependent-extension/runtime/pom.xml
+new file mode 100644
+index 00000000000..1bed9368ded
+--- /dev/null
++++ b/integration-tests/devservices/dependent-extension/runtime/pom.xml
+@@ -0,0 +1,106 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<project xmlns="http://maven.apache.org/POM/4.0.0"
++         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
++         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
++    <parent>
++        <artifactId>quarkus-integration-test-devservices-dependent-extension-parent</artifactId>
++        <groupId>io.quarkus</groupId>
++        <version>999-SNAPSHOT</version>
++    </parent>
++    <modelVersion>4.0.0</modelVersion>
++
++    <artifactId>quarkus-integration-test-devservices-dependent-extension</artifactId>
++
++    <dependencies>
++        <dependency>
++            <groupId>io.quarkus</groupId>
++            <artifactId>quarkus-arc</artifactId>
++        </dependency>
++
++        <dependency>
++            <groupId>io.quarkus</groupId>
++            <artifactId>quarkus-core</artifactId>
++        </dependency>
++        <dependency>
++            <groupId>io.quarkus</groupId>
++            <artifactId>quarkus-devservices</artifactId>
++        </dependency>
++
++        <!-- Minimal test dependencies to *-deployment artifacts for consistent build order -->
++        <dependency>
++            <groupId>io.quarkus</groupId>
++            <artifactId>quarkus-arc-deployment</artifactId>
++            <version>${project.version}</version>
++            <type>pom</type>
++            <scope>test</scope>
++            <exclusions>
++                <exclusion>
++                    <groupId>*</groupId>
++                    <artifactId>*</artifactId>
++                </exclusion>
++            </exclusions>
++        </dependency>
++        <dependency>
++            <groupId>io.quarkus</groupId>
++            <artifactId>quarkus-core-deployment</artifactId>
++            <version>${project.version}</version>
++            <type>pom</type>
++            <scope>test</scope>
++            <exclusions>
++                <exclusion>
++                    <groupId>*</groupId>
++                    <artifactId>*</artifactId>
++                </exclusion>
++            </exclusions>
++        </dependency>
++        <!-- Minimal test dependencies to *-deployment artifacts for consistent build order -->
++        <dependency>
++            <groupId>io.quarkus</groupId>
++            <artifactId>quarkus-devservices-deployment</artifactId>
++            <version>${project.version}</version>
++            <type>pom</type>
++            <scope>test</scope>
++            <exclusions>
++                <exclusion>
++                    <groupId>*</groupId>
++                    <artifactId>*</artifactId>
++                </exclusion>
++            </exclusions>
++        </dependency>
++    </dependencies>
++
++    <build>
++        <plugins>
++            <plugin>
++                <groupId>io.quarkus</groupId>
++                <artifactId>quarkus-extension-maven-plugin</artifactId>
++                <configuration>
++                    <capabilities>
++                        <provides>io.quarkus.dependent-extension</provides>
++                    </capabilities>
++                </configuration>
++            </plugin>
++            <plugin>
++                <artifactId>maven-compiler-plugin</artifactId>
++                <executions>
++                    <execution>
++                        <id>default-compile</id>
++                        <configuration>
++                            <annotationProcessorPaths>
++                                <path>
++                                    <groupId>io.quarkus</groupId>
++                                    <artifactId>quarkus-extension-processor</artifactId>
++                                    <version>${project.version}</version>
++                                </path>
++                            </annotationProcessorPaths>
++                            <compilerArgs>
++                                <arg>-AgenerateDoc=false</arg>
++                            </compilerArgs>
++                        </configuration>
++                    </execution>
++                </executions>
++            </plugin>
++        </plugins>
++    </build>
++</project>
++
+diff --git a/integration-tests/devservices/dependent-extension/runtime/src/main/java/io/quarkus/tests/dependentextension/Constants.java b/integration-tests/devservices/dependent-extension/runtime/src/main/java/io/quarkus/tests/dependentextension/Constants.java
+new file mode 100644
+index 00000000000..99456115ca2
+--- /dev/null
++++ b/integration-tests/devservices/dependent-extension/runtime/src/main/java/io/quarkus/tests/dependentextension/Constants.java
+@@ -0,0 +1,13 @@
++package io.quarkus.tests.dependentextension;
++
++public class Constants {
++    public static final String QUARKUS_DEPENDENT_EXTENSION_BASE_URL = "acme.dependentextension.base-url";
++    public static final String QUARKUS_DEPENDENT_EXTENSION_SEES_DEPENDENCY = "acme.dependentextension.dependency.available";
++    public static final String QUARKUS_UNSATISFIED_DEPENDENT_EXTENSION_BASE_URL = "acme.dependentextension.unsat-base-url";
++    public static final String QUARKUS_OPTIONAL_DEPENDENT_EXTENSION_BASE_URL = "acme.dependentextension.optional-base-url";
++    public static final String QUARKUS_UNSATISFIED_OPTIONAL_DEPENDENT_EXTENSION_BASE_URL = "acme.dependentextension.unsat-optional-base-url";
++
++    public static final String QUARKUS_OPTIONAL_DEPENDENT_EXTENSION_SEES_DEPENDENCY = "acme.dependentextension.optional.dependency.available";
++    public static final String QUARKUS_UNSATISFIED_OPTIONAL_DEPENDENT_EXTENSION_SEES_DEPENDENCY = "acme.dependentextension.unsat.optional.dependency.available";
++
++}
+diff --git a/integration-tests/devservices/pom.xml b/integration-tests/devservices/pom.xml
+new file mode 100644
+index 00000000000..66c07ab9a1b
+--- /dev/null
++++ b/integration-tests/devservices/pom.xml
+@@ -0,0 +1,21 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<project xmlns="http://maven.apache.org/POM/4.0.0"
++         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
++         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
++    <parent>
++        <artifactId>quarkus-integration-tests-parent</artifactId>
++        <groupId>io.quarkus</groupId>
++        <version>999-SNAPSHOT</version>
++    </parent>
++    <modelVersion>4.0.0</modelVersion>
++
++    <artifactId>quarkus-integration-test-devservices</artifactId>
++    <name>Quarkus - Integration Tests - Dev services</name>
++    <packaging>pom</packaging>
++
++    <modules>
++        <module>simple-extension</module>
++        <module>dependent-extension</module>
++        <module>tests</module>
++    </modules>
++</project>
+diff --git a/integration-tests/devservices/simple-extension/deployment/pom.xml b/integration-tests/devservices/simple-extension/deployment/pom.xml
+new file mode 100644
+index 00000000000..5c2f02b69e6
+--- /dev/null
++++ b/integration-tests/devservices/simple-extension/deployment/pom.xml
+@@ -0,0 +1,74 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<project xmlns="http://maven.apache.org/POM/4.0.0"
++         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
++         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
++    <parent>
++        <artifactId>quarkus-integration-test-devservices-simple-extension-parent</artifactId>
++        <groupId>io.quarkus</groupId>
++        <version>999-SNAPSHOT</version>
++    </parent>
++    <modelVersion>4.0.0</modelVersion>
++
++    <artifactId>quarkus-integration-test-devservices-simple-extension-deployment</artifactId>
++
++    <dependencies>
++        <dependency>
++            <groupId>io.quarkus</groupId>
++            <artifactId>quarkus-integration-test-devservices-simple-extension</artifactId>
++            <version>${project.version}</version>
++        </dependency>
++        <dependency>
++            <groupId>io.quarkus</groupId>
++            <artifactId>quarkus-devservices-deployment</artifactId>
++        </dependency>
++
++        <!-- test dependencies -->
++        <dependency>
++            <groupId>io.quarkus</groupId>
++            <artifactId>quarkus-junit</artifactId>
++            <scope>test</scope>
++        </dependency>
++        <dependency>
++            <groupId>org.assertj</groupId>
++            <artifactId>assertj-core</artifactId>
++            <scope>test</scope>
++        </dependency>
++        <dependency>
++            <groupId>io.rest-assured</groupId>
++            <artifactId>rest-assured</artifactId>
++            <scope>test</scope>
++            <exclusions>
++                <exclusion>
++                    <groupId>org.apache.commons</groupId>
++                    <artifactId>commons-lang3</artifactId>
++                </exclusion>
++            </exclusions>
++        </dependency>
++    </dependencies>
++
++    <build>
++        <plugins>
++            <plugin>
++                <artifactId>maven-compiler-plugin</artifactId>
++                <executions>
++                    <execution>
++                        <id>default-compile</id>
++                        <configuration>
++                            <annotationProcessorPaths>
++                                <path>
++                                    <groupId>io.quarkus</groupId>
++                                    <artifactId>quarkus-extension-processor</artifactId>
++                                    <version>${project.version}</version>
++                                </path>
++                            </annotationProcessorPaths>
++                            <compilerArgs>
++                                <arg>-AgenerateDoc=false</arg>
++                            </compilerArgs>
++                        </configuration>
++                    </execution>
++                </executions>
++            </plugin>
++        </plugins>
++    </build>
++
++</project>
+diff --git a/integration-tests/devservices/simple-extension/deployment/src/main/java/io/quarkus/tests/simpleextension/deployment/SimpleContainer.java b/integration-tests/devservices/simple-extension/deployment/src/main/java/io/quarkus/tests/simpleextension/deployment/SimpleContainer.java
+new file mode 100644
+index 00000000000..3d1ba51a717
+--- /dev/null
++++ b/integration-tests/devservices/simple-extension/deployment/src/main/java/io/quarkus/tests/simpleextension/deployment/SimpleContainer.java
+@@ -0,0 +1,35 @@
++package io.quarkus.tests.simpleextension.deployment;
++
++import org.testcontainers.containers.GenericContainer;
++import org.testcontainers.utility.DockerImageName;
++
++import io.quarkus.deployment.builditem.Startable;
++
++public class SimpleContainer extends GenericContainer<io.quarkus.tests.simpleextension.deployment.SimpleContainer>
++        implements Startable {
++
++    private static final DockerImageName dockerImageName = DockerImageName.parse("httpd");
++    public static final int HTTPD_PORT = 80;
++
++    public SimpleContainer() {
++        super(dockerImageName);
++        this //.waitingFor(Wait.forLogMessage(".*" + "resuming normal operations" + ".*", 1))
++                .withReuse(true)
++                .withExposedPorts(HTTPD_PORT);
++    }
++
++    @Override
++    public void start() {
++        super.start();
++    }
++
++    @Override
++    public String getConnectionInfo() {
++        return "http://" + getHost() + ":" + getMappedPort(HTTPD_PORT);
++    }
++
++    @Override
++    public void close() {
++        super.close();
++    }
++}
+diff --git a/integration-tests/devservices/simple-extension/deployment/src/main/java/io/quarkus/tests/simpleextension/deployment/SimpleDevServicesProcessor.java b/integration-tests/devservices/simple-extension/deployment/src/main/java/io/quarkus/tests/simpleextension/deployment/SimpleDevServicesProcessor.java
+new file mode 100644
+index 00000000000..294e1595856
+--- /dev/null
++++ b/integration-tests/devservices/simple-extension/deployment/src/main/java/io/quarkus/tests/simpleextension/deployment/SimpleDevServicesProcessor.java
+@@ -0,0 +1,36 @@
++package io.quarkus.tests.simpleextension.deployment;
++
++import static io.quarkus.tests.simpleextension.Constants.QUARKUS_SIMPLE_EXTENSION_BASE_URL;
++import static io.quarkus.tests.simpleextension.Constants.QUARKUS_SIMPLE_EXTENSION_STATIC_THING;
++
++import java.util.Map;
++
++import io.quarkus.deployment.IsNormal;
++import io.quarkus.deployment.annotations.BuildStep;
++import io.quarkus.deployment.builditem.DevServicesResultBuildItem;
++import io.quarkus.deployment.builditem.FeatureBuildItem;
++import io.quarkus.deployment.dev.devservices.DevServicesConfig;
++
++public class SimpleDevServicesProcessor {
++
++    private static final String FEATURE = "Simples";
++
++    @BuildStep
++    FeatureBuildItem feature() {
++        return new FeatureBuildItem(FEATURE);
++    }
++
++    @BuildStep(onlyIfNot = IsNormal.class, onlyIf = DevServicesConfig.Enabled.class)
++    public DevServicesResultBuildItem createContainer() {
++
++        return DevServicesResultBuildItem.owned()
++                .feature("quarkus-Basic")
++                .serviceName(FEATURE)
++                .startable(SimpleContainer::new) // Builds could be speeded up a bit by using an in-process service, but coverage is probably better with a container
++                .config(Map.of(QUARKUS_SIMPLE_EXTENSION_STATIC_THING, "some value"))
++                .configProvider(Map.of(QUARKUS_SIMPLE_EXTENSION_BASE_URL,
++                        c -> c.getConnectionInfo()))
++                .build();
++
++    }
++}
+diff --git a/integration-tests/devservices/simple-extension/pom.xml b/integration-tests/devservices/simple-extension/pom.xml
+new file mode 100644
+index 00000000000..d188fd36d64
+--- /dev/null
++++ b/integration-tests/devservices/simple-extension/pom.xml
+@@ -0,0 +1,21 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<project xmlns="http://maven.apache.org/POM/4.0.0"
++         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
++         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
++    <parent>
++        <artifactId>quarkus-integration-test-devservices</artifactId>
++        <groupId>io.quarkus</groupId>
++        <version>999-SNAPSHOT</version>
++    </parent>
++    <modelVersion>4.0.0</modelVersion>
++
++    <artifactId>quarkus-integration-test-devservices-simple-extension-parent</artifactId>
++    <name>Quarkus - Integration Tests - Dev Services - Extension A</name>
++    <packaging>pom</packaging>
++
++
++    <modules>
++        <module>deployment</module>
++        <module>runtime</module>
++    </modules>
++</project>
+diff --git a/integration-tests/devservices/simple-extension/runtime/pom.xml b/integration-tests/devservices/simple-extension/runtime/pom.xml
+new file mode 100644
+index 00000000000..7cf3369b950
+--- /dev/null
++++ b/integration-tests/devservices/simple-extension/runtime/pom.xml
+@@ -0,0 +1,106 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<project xmlns="http://maven.apache.org/POM/4.0.0"
++         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
++         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
++    <parent>
++        <artifactId>quarkus-integration-test-devservices-simple-extension-parent</artifactId>
++        <groupId>io.quarkus</groupId>
++        <version>999-SNAPSHOT</version>
++    </parent>
++    <modelVersion>4.0.0</modelVersion>
++
++    <artifactId>quarkus-integration-test-devservices-simple-extension</artifactId>
++
++    <dependencies>
++        <dependency>
++            <groupId>io.quarkus</groupId>
++            <artifactId>quarkus-arc</artifactId>
++        </dependency>
++
++        <dependency>
++            <groupId>io.quarkus</groupId>
++            <artifactId>quarkus-core</artifactId>
++        </dependency>
++        <dependency>
++            <groupId>io.quarkus</groupId>
++            <artifactId>quarkus-devservices</artifactId>
++        </dependency>
++
++        <!-- Minimal test dependencies to *-deployment artifacts for consistent build order -->
++        <dependency>
++            <groupId>io.quarkus</groupId>
++            <artifactId>quarkus-arc-deployment</artifactId>
++            <version>${project.version}</version>
++            <type>pom</type>
++            <scope>test</scope>
++            <exclusions>
++                <exclusion>
++                    <groupId>*</groupId>
++                    <artifactId>*</artifactId>
++                </exclusion>
++            </exclusions>
++        </dependency>
++        <dependency>
++            <groupId>io.quarkus</groupId>
++            <artifactId>quarkus-core-deployment</artifactId>
++            <version>${project.version}</version>
++            <type>pom</type>
++            <scope>test</scope>
++            <exclusions>
++                <exclusion>
++                    <groupId>*</groupId>
++                    <artifactId>*</artifactId>
++                </exclusion>
++            </exclusions>
++        </dependency>
++        <!-- Minimal test dependencies to *-deployment artifacts for consistent build order -->
++        <dependency>
++            <groupId>io.quarkus</groupId>
++            <artifactId>quarkus-devservices-deployment</artifactId>
++            <version>${project.version}</version>
++            <type>pom</type>
++            <scope>test</scope>
++            <exclusions>
++                <exclusion>
++                    <groupId>*</groupId>
++                    <artifactId>*</artifactId>
++                </exclusion>
++            </exclusions>
++        </dependency>
++    </dependencies>
++
++    <build>
++        <plugins>
++            <plugin>
++                <groupId>io.quarkus</groupId>
++                <artifactId>quarkus-extension-maven-plugin</artifactId>
++                <configuration>
++                    <capabilities>
++                        <provides>io.quarkus.simple-extension</provides>
++                    </capabilities>
++                </configuration>
++            </plugin>
++            <plugin>
++                <artifactId>maven-compiler-plugin</artifactId>
++                <executions>
++                    <execution>
++                        <id>default-compile</id>
++                        <configuration>
++                            <annotationProcessorPaths>
++                                <path>
++                                    <groupId>io.quarkus</groupId>
++                                    <artifactId>quarkus-extension-processor</artifactId>
++                                    <version>${project.version}</version>
++                                </path>
++                            </annotationProcessorPaths>
++                            <compilerArgs>
++                                <arg>-AgenerateDoc=false</arg>
++                            </compilerArgs>
++                        </configuration>
++                    </execution>
++                </executions>
++            </plugin>
++        </plugins>
++    </build>
++</project>
++
+diff --git a/integration-tests/devservices/simple-extension/runtime/src/main/java/io/quarkus/tests/simpleextension/Constants.java b/integration-tests/devservices/simple-extension/runtime/src/main/java/io/quarkus/tests/simpleextension/Constants.java
+new file mode 100644
+index 00000000000..efedced6e10
+--- /dev/null
++++ b/integration-tests/devservices/simple-extension/runtime/src/main/java/io/quarkus/tests/simpleextension/Constants.java
+@@ -0,0 +1,7 @@
++package io.quarkus.tests.simpleextension;
++
++public class Constants {
++    public static final String QUARKUS_SIMPLE_EXTENSION_BASE_URL = "acme.simpleextension.base-url";
++    public static final String QUARKUS_SIMPLE_EXTENSION_STATIC_THING = "acme.simpleextension.static-thing";
++
++}
+diff --git a/integration-tests/devservices/tests/pom.xml b/integration-tests/devservices/tests/pom.xml
+new file mode 100644
+index 00000000000..0942f54ba88
+--- /dev/null
++++ b/integration-tests/devservices/tests/pom.xml
+@@ -0,0 +1,191 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<project xmlns="http://maven.apache.org/POM/4.0.0"
++         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
++         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
++    <parent>
++        <artifactId>quarkus-integration-tests-parent</artifactId>
++        <groupId>io.quarkus</groupId>
++        <version>999-SNAPSHOT</version>
++        <relativePath>../../pom.xml</relativePath>
++    </parent>
++    <modelVersion>4.0.0</modelVersion>
++
++    <artifactId>quarkus-integration-test-devservices-tests</artifactId>
++    <name>Quarkus - Integration Tests - Dev Services - Tests</name>
++
++    <dependencies>
++        <dependency>
++            <groupId>io.quarkus</groupId>
++            <artifactId>quarkus-core</artifactId>
++        </dependency>
++
++        <dependency>
++            <groupId>io.quarkus</groupId>
++            <artifactId>quarkus-arc</artifactId>
++        </dependency>
++
++        <dependency>
++            <groupId>io.quarkus</groupId>
++            <artifactId>quarkus-vertx-http</artifactId>
++        </dependency>
++
++        <!-- test dependencies -->
++        <dependency>
++            <groupId>io.quarkus</groupId>
++            <artifactId>quarkus-junit</artifactId>
++            <scope>test</scope>
++        </dependency>
++        <dependency>
++            <groupId>io.rest-assured</groupId>
++            <artifactId>rest-assured</artifactId>
++            <scope>test</scope>
++        </dependency>
++
++        <dependency>
++            <groupId>io.quarkus</groupId>
++            <artifactId>quarkus-integration-test-devservices-dependent-extension</artifactId>
++            <version>${project.version}</version>
++        </dependency>
++
++        <dependency>
++            <groupId>io.quarkus</groupId>
++            <artifactId>quarkus-integration-test-devservices-simple-extension</artifactId>
++            <version>${project.version}</version>
++        </dependency>
++
++        <!-- Minimal test dependencies to *-deployment artifacts for consistent build order -->
++        <dependency>
++            <groupId>io.quarkus</groupId>
++            <artifactId>quarkus-core-deployment</artifactId>
++            <version>${project.version}</version>
++            <type>pom</type>
++            <scope>test</scope>
++            <exclusions>
++                <exclusion>
++                    <groupId>*</groupId>
++                    <artifactId>*</artifactId>
++                </exclusion>
++            </exclusions>
++        </dependency>
++        <dependency>
++            <groupId>io.quarkus</groupId>
++            <artifactId>quarkus-vertx-http-deployment</artifactId>
++            <version>${project.version}</version>
++            <type>pom</type>
++            <scope>test</scope>
++            <exclusions>
++                <exclusion>
++                    <groupId>*</groupId>
++                    <artifactId>*</artifactId>
++                </exclusion>
++            </exclusions>
++        </dependency>
++        <dependency>
++            <groupId>io.quarkus</groupId>
++            <artifactId>quarkus-arc-deployment</artifactId>
++            <version>${project.version}</version>
++            <type>pom</type>
++            <scope>test</scope>
++            <exclusions>
++                <exclusion>
++                    <groupId>*</groupId>
++                    <artifactId>*</artifactId>
++                </exclusion>
++            </exclusions>
++        </dependency>
++        <dependency>
++            <groupId>io.quarkus</groupId>
++            <artifactId>quarkus-integration-test-devservices-dependent-extension-deployment</artifactId>
++            <version>${project.version}</version>
++            <type>pom</type>
++            <scope>test</scope>
++            <exclusions>
++                <exclusion>
++                    <groupId>*</groupId>
++                    <artifactId>*</artifactId>
++                </exclusion>
++            </exclusions>
++        </dependency>
++        <dependency>
++            <groupId>io.quarkus</groupId>
++            <artifactId>quarkus-integration-test-devservices-simple-extension-deployment</artifactId>
++            <version>${project.version}</version>
++            <type>pom</type>
++            <scope>test</scope>
++            <exclusions>
++                <exclusion>
++                    <groupId>*</groupId>
++                    <artifactId>*</artifactId>
++                </exclusion>
++            </exclusions>
++        </dependency>
++    </dependencies>
++
++    <build>
++        <resources>
++            <resource>
++                <directory>src/main/resources</directory>
++                <filtering>true</filtering>
++            </resource>
++        </resources>
++        <testResources>
++            <testResource>
++                <directory>src/test/resources-filtered</directory>
++                <filtering>true</filtering>
++                <excludes>
++                    <exclude>**/target/**
++                    </exclude> <!-- Target folders sometimes creep in when manually executing locally-->
++                </excludes>
++            </testResource>
++        </testResources>
++        <plugins>
++            <plugin>
++                <groupId>io.quarkus</groupId>
++                <artifactId>quarkus-maven-plugin</artifactId>
++                <executions>
++                    <execution>
++                        <goals>
++                            <goal>build</goal>
++                        </goals>
++                    </execution>
++                </executions>
++            </plugin>
++
++            <plugin>
++                <artifactId>maven-failsafe-plugin</artifactId>
++                <configuration>
++                    <skip>true</skip>
++                </configuration>
++            </plugin>
++
++            <plugin>
++                <artifactId>maven-surefire-plugin</artifactId>
++                <configuration>
++                    <skip>true</skip>
++                </configuration>
++            </plugin>
++        </plugins>
++    </build>
++
++    <profiles>
++        <profile>
++            <id>test-all</id>
++            <activation>
++                <property>
++                    <name>test-containers</name>
++                </property>
++            </activation>
++            <build>
++                <plugins>
++                    <plugin>
++                        <artifactId>maven-surefire-plugin</artifactId>
++                        <configuration>
++                            <skip>false</skip>
++                        </configuration>
++                    </plugin>
++                </plugins>
++            </build>
++        </profile>
++    </profiles>
++
++</project>
+diff --git a/integration-tests/devservices/tests/src/test/java/io/quarkus/devservices/test/DevServicesTest.java b/integration-tests/devservices/tests/src/test/java/io/quarkus/devservices/test/DevServicesTest.java
+new file mode 100644
+index 00000000000..3b8f97a639d
+--- /dev/null
++++ b/integration-tests/devservices/tests/src/test/java/io/quarkus/devservices/test/DevServicesTest.java
+@@ -0,0 +1,119 @@
++package io.quarkus.devservices.test;
++
++import static io.quarkus.tests.dependentextension.Constants.QUARKUS_DEPENDENT_EXTENSION_BASE_URL;
++import static io.quarkus.tests.dependentextension.Constants.QUARKUS_DEPENDENT_EXTENSION_SEES_DEPENDENCY;
++import static io.quarkus.tests.dependentextension.Constants.QUARKUS_OPTIONAL_DEPENDENT_EXTENSION_BASE_URL;
++import static io.quarkus.tests.dependentextension.Constants.QUARKUS_OPTIONAL_DEPENDENT_EXTENSION_SEES_DEPENDENCY;
++import static io.quarkus.tests.dependentextension.Constants.QUARKUS_UNSATISFIED_DEPENDENT_EXTENSION_BASE_URL;
++import static io.quarkus.tests.dependentextension.Constants.QUARKUS_UNSATISFIED_OPTIONAL_DEPENDENT_EXTENSION_BASE_URL;
++import static io.quarkus.tests.dependentextension.Constants.QUARKUS_UNSATISFIED_OPTIONAL_DEPENDENT_EXTENSION_SEES_DEPENDENCY;
++import static io.quarkus.tests.simpleextension.Constants.QUARKUS_SIMPLE_EXTENSION_BASE_URL;
++import static io.quarkus.tests.simpleextension.Constants.QUARKUS_SIMPLE_EXTENSION_STATIC_THING;
++import static io.restassured.RestAssured.given;
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertFalse;
++import static org.junit.jupiter.api.Assertions.assertNotEquals;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++import org.eclipse.microprofile.config.inject.ConfigProperty;
++import org.junit.jupiter.api.Assertions;
++import org.junit.jupiter.api.Test;
++
++import io.quarkus.test.junit.QuarkusTest;
++
++@QuarkusTest
++public class DevServicesTest {
++    private static final String UNSET = "unset";
++
++    @ConfigProperty(name = QUARKUS_SIMPLE_EXTENSION_BASE_URL, defaultValue = UNSET)
++    String simpleExtensionBaseUrl;
++
++    @ConfigProperty(name = QUARKUS_SIMPLE_EXTENSION_STATIC_THING, defaultValue = UNSET)
++    String staticProperty;
++
++    @ConfigProperty(name = QUARKUS_DEPENDENT_EXTENSION_BASE_URL, defaultValue = UNSET)
++    String dependentExtensionBaseUrl;
++
++    @ConfigProperty(name = QUARKUS_UNSATISFIED_DEPENDENT_EXTENSION_BASE_URL, defaultValue = UNSET)
++    String unsatisfiedDependentExtensionBaseUrl;
++
++    @ConfigProperty(name = QUARKUS_OPTIONAL_DEPENDENT_EXTENSION_BASE_URL, defaultValue = UNSET)
++    String optionalDependentExtensionBaseUrl;
++
++    @ConfigProperty(name = QUARKUS_UNSATISFIED_OPTIONAL_DEPENDENT_EXTENSION_BASE_URL, defaultValue = UNSET)
++    String unsatisfiedOptionalDependentExtensionBaseUrl;
++
++    @ConfigProperty(name = QUARKUS_DEPENDENT_EXTENSION_SEES_DEPENDENCY, defaultValue = "false")
++    boolean dependentExtensionSeesDependencyService;
++
++    @ConfigProperty(name = QUARKUS_OPTIONAL_DEPENDENT_EXTENSION_SEES_DEPENDENCY, defaultValue = "false")
++    boolean optionalDependentExtensionSeesDependencyService;
++
++    @ConfigProperty(name = QUARKUS_UNSATISFIED_OPTIONAL_DEPENDENT_EXTENSION_SEES_DEPENDENCY, defaultValue = "false")
++    boolean unsatisfiedOptionalDependentExtensionSeesDependencyService;
++
++    @Test
++    public void testTheLazyDevServicesConfigIsAvailable() {
++        assertIsSet(simpleExtensionBaseUrl);
++    }
++
++    @Test
++    public void testTheBuildTimeServicesConfigIsAvailable() {
++        assertIsSet(staticProperty);
++    }
++
++    @Test
++    public void testServiceIsListeningOnTheDeclaredPort() {
++        given()
++                .relaxedHTTPSValidation()
++                .when()
++                .head(simpleExtensionBaseUrl)
++                .then()
++                .statusCode(200);
++    }
++
++    @Test
++    public void testDependentServiceHasAccessToConfigFromOtherService() {
++        assertIsSet(dependentExtensionBaseUrl);
++    }
++
++    @Test
++    public void testDependentServiceIsListeningOnTheDeclaredPort() {
++        given()
++                .relaxedHTTPSValidation()
++                .when()
++                .head(dependentExtensionBaseUrl)
++                .then()
++                .statusCode(200);
++    }
++
++    /* We can't test the order directly from the test, but the service can record what it saw and we can check that */
++    @Test
++    public void testDependentServiceIsStartedAfterOtherService() {
++        assertTrue(dependentExtensionSeesDependencyService);
++    }
++
++    @Test
++    public void testDependentServiceWithUnsatisfiedDependencyIsNotStarted() {
++        assertEquals(UNSET, unsatisfiedDependentExtensionBaseUrl);
++    }
++
++    @Test
++    public void testOptionalDependentServiceWithDependencyIsStarted() {
++        assertIsSet(optionalDependentExtensionBaseUrl);
++        assertTrue(optionalDependentExtensionSeesDependencyService);
++    }
++
++    @Test
++    public void testOptionalDependentServiceWithUnsatisfiedDependencyIsStarted() {
++        assertIsSet(unsatisfiedOptionalDependentExtensionBaseUrl);
++        assertFalse(unsatisfiedOptionalDependentExtensionSeesDependencyService);
++    }
++
++    private void assertIsSet(String value) {
++        Assertions.assertNotNull(value);
++        // Config properties need to be set, so most likely the value will be UNSET if it's reverted to the default
++        assertNotEquals(UNSET, value);
++    }
++
++}
+diff --git a/integration-tests/injectmock/src/test/java/io/quarkus/it/mockbean/FooResourceTest.java b/integration-tests/injectmock/src/test/java/io/quarkus/it/mockbean/FooResourceTest.java
+index ea234186b96..c538e64d6e2 100644
+--- a/integration-tests/injectmock/src/test/java/io/quarkus/it/mockbean/FooResourceTest.java
++++ b/integration-tests/injectmock/src/test/java/io/quarkus/it/mockbean/FooResourceTest.java
+@@ -1,7 +1,9 @@
+ package io.quarkus.it.mockbean;
+ 
+ import static io.restassured.RestAssured.given;
+-import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.hamcrest.Matchers.equalTo;
++import static org.hamcrest.Matchers.is;
++import static org.hamcrest.Matchers.nullValue;
+ import static org.mockito.ArgumentMatchers.any;
+ import static org.mockito.ArgumentMatchers.anyInt;
+ import static org.mockito.ArgumentMatchers.anyString;
+@@ -25,12 +27,12 @@ public void testGreet() {
+         Mockito.when(fooService.newFoo(anyString()).count(anyInt()).bar(any(Foo.Bar.class)))
+                 .thenReturn(new Foo.FooBuilder("dummy"));
+ 
+-        String responseStr = given()
++        given()
+                 .when().get("/foo/test/100/test2")
+                 .then()
+                 .statusCode(200)
+-                .extract().body().asString();
+-
+-        assertEquals("{\"name\":\"dummy\",\"count\":0,\"bar\":null}", responseStr);
++                .body("name", equalTo("dummy"))
++                .body("count", equalTo(0))
++                .body("bar", is(nullValue()));
+     }
+ }
+diff --git a/integration-tests/main/src/main/java/io/quarkus/it/rest/TestResource.java b/integration-tests/main/src/main/java/io/quarkus/it/rest/TestResource.java
+index bb58c4aaf77..add61929ef9 100644
+--- a/integration-tests/main/src/main/java/io/quarkus/it/rest/TestResource.java
++++ b/integration-tests/main/src/main/java/io/quarkus/it/rest/TestResource.java
+@@ -224,6 +224,17 @@ public ParentClass subclass() {
+         return child;
+     }
+ 
++    @GET
++    @Path("/subsubclass")
++    @Produces("application/json")
++    public ParentClass subsubclass() {
++        GrandChildClass grandChild = new GrandChildClass();
++        grandChild.setName("your name");
++        grandChild.setValue("your value");
++        grandChild.setToy("your toy");
++        return grandChild;
++    }
++
+     @GET
+     @Path("/implementor")
+     @Produces("application/json")
+@@ -489,6 +500,18 @@ public void setValue(String value) {
+         }
+     }
+ 
++    public static class GrandChildClass extends ChildClass {
++        private String toy;
++
++        public String getToy() {
++            return toy;
++        }
++
++        public void setToy(String toy) {
++            this.toy = toy;
++        }
++    }
++
+     public static class MyImplementor implements MyInterface {
+         private String name;
+         private String value;
+diff --git a/integration-tests/main/src/test/java/io/quarkus/it/main/JaxRSTestCase.java b/integration-tests/main/src/test/java/io/quarkus/it/main/JaxRSTestCase.java
+index 9f61ac77e21..a59a2b6ec8f 100644
+--- a/integration-tests/main/src/test/java/io/quarkus/it/main/JaxRSTestCase.java
++++ b/integration-tests/main/src/test/java/io/quarkus/it/main/JaxRSTestCase.java
+@@ -152,6 +152,14 @@ public void testSubclass() {
+                         "value", is("my value"));
+     }
+ 
++    @Test
++    public void testSubSubclass() {
++        RestAssured.when().get("/test/subsubclass").then()
++                .body("name", is("your name"),
++                        "value", is("your value"),
++                        "toy", is("your toy"));
++    }
++
+     @Test
+     public void testImplementor() {
+         RestAssured.when().get("/test/implementor").then()
+diff --git a/integration-tests/maven/src/test/resources/__snapshots__/CreateExtensionMojoIT/testCreateStandaloneExtension/my-org-my-own-ext_pom.xml b/integration-tests/maven/src/test/resources/__snapshots__/CreateExtensionMojoIT/testCreateStandaloneExtension/my-org-my-own-ext_pom.xml
+index 315bb6db4e2..5bc15babc63 100644
+--- a/integration-tests/maven/src/test/resources/__snapshots__/CreateExtensionMojoIT/testCreateStandaloneExtension/my-org-my-own-ext_pom.xml
++++ b/integration-tests/maven/src/test/resources/__snapshots__/CreateExtensionMojoIT/testCreateStandaloneExtension/my-org-my-own-ext_pom.xml
+@@ -46,7 +46,6 @@
+                     <artifactId>maven-surefire-plugin</artifactId>
+                     <version>${surefire-plugin.version}</version>
+                     <configuration>
+-                        <argLine>@{argLine}</argLine>
+                         <systemPropertyVariables>
+                             <java.util.logging.manager>org.jboss.logmanager.LogManager</java.util.logging.manager>
+                             <maven.home>${maven.home}</maven.home>
+@@ -58,7 +57,6 @@
+                     <artifactId>maven-failsafe-plugin</artifactId>
+                     <version>${failsafe-plugin.version}</version>
+                     <configuration>
+-                        <argLine>@{argLine}</argLine>
+                         <systemPropertyVariables>
+                             <java.util.logging.manager>org.jboss.logmanager.LogManager</java.util.logging.manager>
+                             <maven.home>${maven.home}</maven.home>
+diff --git a/integration-tests/pom.xml b/integration-tests/pom.xml
+index c2e851f69cc..8f26e365822 100644
+--- a/integration-tests/pom.xml
++++ b/integration-tests/pom.xml
+@@ -284,6 +284,7 @@
+                 <module>reactive-mysql-client</module>
+                 <module>reactive-mssql-client</module>
+                 <module>reactive-oracle-client</module>
++<!--   disabled because of incremental build problems             <module>devservices</module>-->
+                 <module>test-extension</module>
+                 <module>amazon-lambda</module>
+                 <module>amazon-lambda-s3event</module>

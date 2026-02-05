@@ -1,0 +1,304 @@
+diff --git a/docs/src/main/asciidoc/scheduler-reference.adoc b/docs/src/main/asciidoc/scheduler-reference.adoc
+index 031380b177f..eda9ea20371 100644
+--- a/docs/src/main/asciidoc/scheduler-reference.adoc
++++ b/docs/src/main/asciidoc/scheduler-reference.adoc
+@@ -575,6 +575,45 @@ In this case, the method is invoked on a virtual thread.
+ The method must return `void` and your Java runtime must provide support for virtual threads.
+ Read xref:./virtual-threads.adoc[the virtual thread guide] for more details.
+ 
++== Assign a user and roles to a scheduled task
++
++You can use the `@RunAsUser` annotation on methods annotated with the `@Scheduled` annotation to configure the `SecurityIdentity` for the task execution.
++The `@RunAsUser` annotation works only for the scheduled tasks.
++
++.Example scheduled task with `@RunAsUser`
++[source,java]
++----
++import io.quarkus.scheduler.Scheduled;
++import io.quarkus.security.identity.RunAsUser;
++import jakarta.annotation.security.RolesAllowed;
++import jakarta.enterprise.context.ApplicationScoped;
++
++class MyJob {
++
++    @Inject
++    MyService myService;
++
++    @RunAsUser(user = "Alice", roles = "admin") <1>
++    @Scheduled(every = "1s")
++    void updateTask() {
++        myService.update();   <2>
++    }
++
++}
++
++@ApplicationScoped
++class MyService {
++
++    @RolesAllowed("admin")
++    void update() { }
++
++}
++----
++<1> Assign the user `Alice` to the scheduled `updateTask`.
++<2> The call to the `MyService#update` method succeeds, because the configured user has role `admin`.
++
++IMPORTANT: The `@RunAsUser` annotation creates an identity for scheduled tasks. It does not temporarily replace the current identity.
++
+ == Configuration Reference
+ 
+ include::{generated-dir}/config/quarkus-scheduler.adoc[leveloffset=+1, opts=optional]
+diff --git a/extensions/scheduler/deployment/pom.xml b/extensions/scheduler/deployment/pom.xml
+index f468fc301c5..a56897d4bcf 100644
+--- a/extensions/scheduler/deployment/pom.xml
++++ b/extensions/scheduler/deployment/pom.xml
+@@ -38,6 +38,10 @@
+           <groupId>io.quarkus</groupId>
+           <artifactId>quarkus-assistant-deployment-spi</artifactId>
+       </dependency>
++      <dependency>
++          <groupId>io.quarkus</groupId>
++          <artifactId>quarkus-security-spi</artifactId>
++      </dependency>
+       <dependency>
+           <groupId>io.quarkus</groupId>
+           <artifactId>quarkus-vertx-http-deployment</artifactId>
+diff --git a/extensions/scheduler/deployment/src/main/java/io/quarkus/scheduler/deployment/SchedulerProcessor.java b/extensions/scheduler/deployment/src/main/java/io/quarkus/scheduler/deployment/SchedulerProcessor.java
+index 61b6a69e820..14404021a9a 100644
+--- a/extensions/scheduler/deployment/src/main/java/io/quarkus/scheduler/deployment/SchedulerProcessor.java
++++ b/extensions/scheduler/deployment/src/main/java/io/quarkus/scheduler/deployment/SchedulerProcessor.java
+@@ -95,6 +95,7 @@
+ import io.quarkus.scheduler.runtime.SchedulerConfig;
+ import io.quarkus.scheduler.runtime.SchedulerRecorder;
+ import io.quarkus.scheduler.runtime.SimpleScheduler;
++import io.quarkus.security.spi.RunAsUserPredicateBuildItem;
+ import io.smallrye.common.annotation.Identifier;
+ 
+ public class SchedulerProcessor {
+@@ -756,4 +757,8 @@ void produceCoroutineScope(BuildProducer<AdditionalBeanBuildItem> buildItemBuild
+                 .setUnremovable().build());
+     }
+ 
++    @BuildStep
++    RunAsUserPredicateBuildItem allowRunAsUserAnnotationForScheduledMethods() {
++        return RunAsUserPredicateBuildItem.ofAnnotation(Scheduled.class);
++    }
+ }
+diff --git a/extensions/security/deployment/src/main/java/io/quarkus/security/deployment/SecurityProcessor.java b/extensions/security/deployment/src/main/java/io/quarkus/security/deployment/SecurityProcessor.java
+index ce7c6bb1b9f..7ca52db99cc 100644
+--- a/extensions/security/deployment/src/main/java/io/quarkus/security/deployment/SecurityProcessor.java
++++ b/extensions/security/deployment/src/main/java/io/quarkus/security/deployment/SecurityProcessor.java
+@@ -71,6 +71,7 @@
+ import io.quarkus.arc.processor.AnnotationStore;
+ import io.quarkus.arc.processor.BuildExtension;
+ import io.quarkus.arc.processor.BuiltinScope;
++import io.quarkus.arc.processor.InterceptorBindingRegistrar;
+ import io.quarkus.arc.processor.ObserverInfo;
+ import io.quarkus.builder.item.MultiBuildItem;
+ import io.quarkus.builder.item.SimpleBuildItem;
+@@ -114,6 +115,7 @@
+ import io.quarkus.security.Authenticated;
+ import io.quarkus.security.PermissionsAllowed;
+ import io.quarkus.security.deployment.PermissionSecurityChecks.PermissionSecurityChecksBuilder;
++import io.quarkus.security.identity.RunAsUser;
+ import io.quarkus.security.identity.SecurityIdentityAugmentor;
+ import io.quarkus.security.runtime.IdentityProviderManagerCreator;
+ import io.quarkus.security.runtime.PrincipalProducer;
+@@ -130,6 +132,7 @@
+ import io.quarkus.security.runtime.interceptor.PermissionsAllowedInterceptor;
+ import io.quarkus.security.runtime.interceptor.PermitAllInterceptor;
+ import io.quarkus.security.runtime.interceptor.RolesAllowedInterceptor;
++import io.quarkus.security.runtime.interceptor.RunAsUserInterceptor;
+ import io.quarkus.security.runtime.interceptor.SecurityCheckStorageBuilder;
+ import io.quarkus.security.runtime.interceptor.SecurityConstrainer;
+ import io.quarkus.security.runtime.interceptor.SecurityHandler;
+@@ -144,6 +147,7 @@
+ import io.quarkus.security.spi.PermissionsAllowedMetaAnnotationBuildItem;
+ import io.quarkus.security.spi.RegisterClassSecurityCheckBuildItem;
+ import io.quarkus.security.spi.RolesAllowedConfigExpResolverBuildItem;
++import io.quarkus.security.spi.RunAsUserPredicateBuildItem;
+ import io.quarkus.security.spi.SecuredInterfaceAnnotationBuildItem;
+ import io.quarkus.security.spi.SecurityTransformer;
+ import io.quarkus.security.spi.SecurityTransformer.AuthorizationType;
+@@ -1311,6 +1315,52 @@ void gatherClassSecurityChecks(BuildProducer<RegisterClassSecurityCheckBuildItem
+         }
+     }
+ 
++    @BuildStep
++    InterceptorBindingRegistrarBuildItem registerRunAsUserInterceptorBinding() {
++        return new InterceptorBindingRegistrarBuildItem(new InterceptorBindingRegistrar() {
++            @Override
++            public List<InterceptorBinding> getAdditionalBindings() {
++                return List.of(InterceptorBindingRegistrar.InterceptorBinding.of(RunAsUser.class, m -> true));
++            }
++        });
++    }
++
++    @BuildStep
++    void registerRunAsUserInterceptorBean(BuildProducer<AnnotationsTransformerBuildItem> annotationsTransformerProducer,
++            BuildProducer<AdditionalBeanBuildItem> additionalBeanProducer) {
++        annotationsTransformerProducer.produce(new AnnotationsTransformerBuildItem(AnnotationTransformation
++                .forClasses().whenClass(RunAsUserInterceptor.class)
++                .transform(tc -> tc.add(AnnotationInstance.builder(RunAsUser.class).add("user", "").build()))));
++        additionalBeanProducer.produce(AdditionalBeanBuildItem.unremovableOf(RunAsUserInterceptor.class));
++    }
++
++    @BuildStep
++    void validateRunAsUserUsage(List<RunAsUserPredicateBuildItem> runAsUserPredicates,
++            BeanArchiveIndexBuildItem beanArchiveIndexBuildItem,
++            BuildProducer<ValidationErrorBuildItem> errors) {
++        var annotationInstances = beanArchiveIndexBuildItem.getIndex().getAnnotations(RunAsUser.class);
++        if (annotationInstances.isEmpty()) {
++            return;
++        }
++
++        var targetNotAllowedPredicate = Predicate.not(RunAsUserPredicateBuildItem.get(runAsUserPredicates));
++        var notAllowedTargets = annotationInstances.stream()
++                .map(AnnotationInstance::target)
++                .filter(targetNotAllowedPredicate)
++                .map(AnnotationTarget::asMethod)
++                .map(SecurityProcessor::toString)
++                .collect(Collectors.joining(", "));
++        if (!notAllowedTargets.isEmpty()) {
++            errors.produce(
++                    new ValidationErrorBuildItem(new RuntimeException("Annotation '%s' cannot be used on following methods: %s"
++                            .formatted(RunAsUser.class.getName(), notAllowedTargets))));
++        }
++    }
++
++    private static String toString(MethodInfo mi) {
++        return "%s#%s".formatted(mi.declaringClass().name().toString(), mi.name());
++    }
++
+     private static boolean hasClassLevelStandardSecurityAnnotation(MethodInfo method, AnnotationStore annotationStore,
+             SecurityTransformer securityTransformer) {
+         return applyClassLevenInterceptor(method, annotationStore)
+diff --git a/extensions/security/runtime/src/main/java/io/quarkus/security/runtime/interceptor/RunAsUserInterceptor.java b/extensions/security/runtime/src/main/java/io/quarkus/security/runtime/interceptor/RunAsUserInterceptor.java
+new file mode 100644
+index 00000000000..e1659e222d8
+--- /dev/null
++++ b/extensions/security/runtime/src/main/java/io/quarkus/security/runtime/interceptor/RunAsUserInterceptor.java
+@@ -0,0 +1,84 @@
++package io.quarkus.security.runtime.interceptor;
++
++import static io.quarkus.security.spi.runtime.SecurityHandlerConstants.SECURITY_INTERCEPTOR_PRIORITY;
++
++import java.util.Set;
++import java.util.concurrent.CompletionStage;
++
++import jakarta.annotation.Priority;
++import jakarta.inject.Inject;
++import jakarta.interceptor.AroundInvoke;
++import jakarta.interceptor.Interceptor;
++import jakarta.interceptor.InvocationContext;
++
++import io.quarkus.security.identity.CurrentIdentityAssociation;
++import io.quarkus.security.identity.RunAsUser;
++import io.quarkus.security.identity.SecurityIdentity;
++import io.quarkus.security.runtime.QuarkusPrincipal;
++import io.quarkus.security.runtime.QuarkusSecurityIdentity;
++import io.smallrye.mutiny.Uni;
++
++/**
++ * This is a CDI interceptor used for the {@link RunAsUser} interceptor binding type.
++ * The interceptor binding type is registered during the build time via the annotation transformer.
++ * Also, the {@link RunAsUser} interceptor binding is currently registered via a build item.
++ */
++@Interceptor
++@Priority(SECURITY_INTERCEPTOR_PRIORITY)
++public final class RunAsUserInterceptor {
++
++    @Inject
++    CurrentIdentityAssociation identityAssociation;
++
++    @AroundInvoke
++    Object intercept(InvocationContext ic) throws Exception {
++        Class<?> returnType = ic.getMethod().getReturnType();
++        if (Uni.class.isAssignableFrom(returnType)) {
++            configureIdentityFromAnnotation(ic);
++            try {
++                return ((Uni<?>) ic.proceed()).onTermination().invoke(this::cleanIdentity);
++            } catch (Throwable throwable) {
++                cleanIdentity();
++                throw throwable;
++            }
++        } else if (CompletionStage.class.isAssignableFrom(returnType)) {
++            configureIdentityFromAnnotation(ic);
++            try {
++                return ((CompletionStage<?>) ic.proceed()).whenComplete((item, failure) -> cleanIdentity());
++            } catch (Throwable throwable) {
++                cleanIdentity();
++                throw throwable;
++            }
++        } else {
++            configureIdentityFromAnnotation(ic);
++            try {
++                return ic.proceed();
++            } finally {
++                cleanIdentity();
++            }
++        }
++    }
++
++    private void cleanIdentity() {
++        try {
++            identityAssociation.setIdentity((SecurityIdentity) null);
++        } catch (Throwable ignored) {
++            // theoretically, this could be for example inactive CDI request
++            // make this silent, we only try to "clear" the association to cover every eventuality
++            // currently supported scheduled methods should not need it anyway
++        }
++    }
++
++    private void configureIdentityFromAnnotation(InvocationContext ic) {
++        identityAssociation.setIdentity(createIdentity(ic));
++    }
++
++    private static SecurityIdentity createIdentity(InvocationContext ic) {
++        var runAsUser = ic.getInterceptorBinding(RunAsUser.class);
++        var identityBuilder = QuarkusSecurityIdentity.builder().setPrincipal(new QuarkusPrincipal(runAsUser.user()));
++        if (runAsUser.roles() != null && runAsUser.roles().length > 0) {
++            identityBuilder.addRoles(Set.of(runAsUser.roles()));
++        }
++        return identityBuilder.build();
++    }
++}
+diff --git a/extensions/security/spi/src/main/java/io/quarkus/security/spi/RunAsUserPredicateBuildItem.java b/extensions/security/spi/src/main/java/io/quarkus/security/spi/RunAsUserPredicateBuildItem.java
+new file mode 100644
+index 00000000000..b6658643feb
+--- /dev/null
++++ b/extensions/security/spi/src/main/java/io/quarkus/security/spi/RunAsUserPredicateBuildItem.java
+@@ -0,0 +1,33 @@
++package io.quarkus.security.spi;
++
++import static org.jboss.jandex.AnnotationTarget.Kind.METHOD;
++
++import java.lang.annotation.Annotation;
++import java.util.List;
++import java.util.function.Predicate;
++
++import org.jboss.jandex.AnnotationTarget;
++
++import io.quarkus.builder.item.MultiBuildItem;
++
++/**
++ * The {@link io.quarkus.security.identity.RunAsUser} annotation can only be used on the {@link AnnotationTarget}
++ * matching a predicate registered with this build item. Using the annotation on any other {@link AnnotationTarget}
++ * results in validation failure that prevents unsupported scenarios.
++ */
++public final class RunAsUserPredicateBuildItem extends MultiBuildItem {
++
++    private final Predicate<AnnotationTarget> annotationTargetPredicate;
++
++    private RunAsUserPredicateBuildItem(Predicate<AnnotationTarget> annotationTargetPredicate) {
++        this.annotationTargetPredicate = annotationTargetPredicate;
++    }
++
++    public static Predicate<AnnotationTarget> get(List<RunAsUserPredicateBuildItem> items) {
++        return at -> items.stream().map(i -> i.annotationTargetPredicate).anyMatch(p -> p.test(at));
++    }
++
++    public static RunAsUserPredicateBuildItem ofAnnotation(Class<? extends Annotation> annotationClass) {
++        return new RunAsUserPredicateBuildItem(at -> at.kind() == METHOD && at.hasAnnotation(annotationClass));
++    }
++}

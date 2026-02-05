@@ -1,0 +1,166 @@
+diff --git a/okhttp-dnsoverhttps/src/main/kotlin/okhttp3/dnsoverhttps/DnsOverHttps.kt b/okhttp-dnsoverhttps/src/main/kotlin/okhttp3/dnsoverhttps/DnsOverHttps.kt
+index 2944ddebb..cc3872e5e 100644
+--- a/okhttp-dnsoverhttps/src/main/kotlin/okhttp3/dnsoverhttps/DnsOverHttps.kt
++++ b/okhttp-dnsoverhttps/src/main/kotlin/okhttp3/dnsoverhttps/DnsOverHttps.kt
+@@ -187,15 +187,22 @@ class DnsOverHttps internal constructor(
+   }
+ 
+   private fun getCacheOnlyResponse(request: Request): Response? {
+-    if (!post && client.cache != null) {
++    if (client.cache != null) {
+       try {
+         // Use the cache without hitting the network first
+         // 504 code indicates that the Cache is stale
+-        val preferCache =
++        val onlyIfCached =
+           CacheControl.Builder()
+             .onlyIfCached()
+             .build()
+-        val cacheRequest = request.newBuilder().cacheControl(preferCache).build()
++
++        var cacheUrl = request.url
++
++        val cacheRequest =
++          request.newBuilder()
++            .cacheControl(onlyIfCached)
++            .cacheUrlOverride(cacheUrl)
++            .build()
+ 
+         val cacheResponse = client.newCall(cacheRequest).execute()
+ 
+@@ -247,7 +254,12 @@ class DnsOverHttps internal constructor(
+       val query = DnsRecordCodec.encodeQuery(hostname, type)
+ 
+       if (post) {
+-        url(url).post(query.toRequestBody(DNS_MESSAGE))
++        url(url)
++          .cacheUrlOverride(
++            url.newBuilder()
++              .addQueryParameter("hostname", hostname).build(),
++          )
++          .post(query.toRequestBody(DNS_MESSAGE))
+       } else {
+         val encoded = query.base64Url().replace("=", "")
+         val requestUrl = url.newBuilder().addQueryParameter("dns", encoded).build()
+diff --git a/okhttp/api/okhttp.api b/okhttp/api/okhttp.api
+index 8b7d85d03..f784a8736 100644
+--- a/okhttp/api/okhttp.api
++++ b/okhttp/api/okhttp.api
+@@ -1030,6 +1030,7 @@ public final class okhttp3/Request {
+ 	public synthetic fun <init> (Lokhttp3/HttpUrl;Lokhttp3/Headers;Ljava/lang/String;Lokhttp3/RequestBody;ILkotlin/jvm/internal/DefaultConstructorMarker;)V
+ 	public final fun body ()Lokhttp3/RequestBody;
+ 	public final fun cacheControl ()Lokhttp3/CacheControl;
++	public final fun cacheUrlOverride ()Lokhttp3/HttpUrl;
+ 	public final fun header (Ljava/lang/String;)Ljava/lang/String;
+ 	public final fun headers ()Lokhttp3/Headers;
+ 	public final fun headers (Ljava/lang/String;)Ljava/util/List;
+@@ -1048,6 +1049,7 @@ public class okhttp3/Request$Builder {
+ 	public fun addHeader (Ljava/lang/String;Ljava/lang/String;)Lokhttp3/Request$Builder;
+ 	public fun build ()Lokhttp3/Request;
+ 	public fun cacheControl (Lokhttp3/CacheControl;)Lokhttp3/Request$Builder;
++	public final fun cacheUrlOverride (Lokhttp3/HttpUrl;)Lokhttp3/Request$Builder;
+ 	public final fun delete ()Lokhttp3/Request$Builder;
+ 	public fun delete (Lokhttp3/RequestBody;)Lokhttp3/Request$Builder;
+ 	public static synthetic fun delete$default (Lokhttp3/Request$Builder;Lokhttp3/RequestBody;ILjava/lang/Object;)Lokhttp3/Request$Builder;
+diff --git a/okhttp/src/main/kotlin/okhttp3/Request.kt b/okhttp/src/main/kotlin/okhttp3/Request.kt
+index 4e399789c..57cdc93f3 100644
+--- a/okhttp/src/main/kotlin/okhttp3/Request.kt
++++ b/okhttp/src/main/kotlin/okhttp3/Request.kt
+@@ -54,6 +54,9 @@ class Request internal constructor(builder: Builder) {
+   @get:JvmName("body")
+   val body: RequestBody? = builder.body
+ 
++  @get:JvmName("cacheUrlOverride")
++  val cacheUrlOverride: HttpUrl? = builder.cacheUrlOverride
++
+   internal val tags: Map<KClass<*>, Any> = builder.tags.toMap()
+ 
+   internal var lazyCacheControl: CacheControl? = null
+@@ -183,6 +186,7 @@ class Request internal constructor(builder: Builder) {
+     internal var method: String
+     internal var headers: Headers.Builder
+     internal var body: RequestBody? = null
++    internal var cacheUrlOverride: HttpUrl? = null
+ 
+     /** A mutable map of tags, or an immutable empty map if we don't have any. */
+     internal var tags = mapOf<KClass<*>, Any>()
+@@ -202,6 +206,7 @@ class Request internal constructor(builder: Builder) {
+           else -> request.tags.toMutableMap()
+         }
+       this.headers = request.headers.newBuilder()
++      this.cacheUrlOverride = request.cacheUrlOverride
+     }
+ 
+     open fun url(url: HttpUrl): Builder =
+@@ -316,6 +321,18 @@ class Request internal constructor(builder: Builder) {
+       tag: T?,
+     ) = commonTag(type.kotlin, tag)
+ 
++    /**
++     * Override the [Request.url] for caching, if it is either polluted with
++     * transient query params, or has a canonical URL possibly for a CDN.
++     *
++     * Note that POST requests will not be sent to the server if this URL is set
++     * and matches a cached response.
++     */
++    fun cacheUrlOverride(cacheUrlOverride: HttpUrl?) =
++      apply {
++        this.cacheUrlOverride = cacheUrlOverride
++      }
++
+     open fun build(): Request = Request(this)
+   }
+ }
+diff --git a/okhttp/src/main/kotlin/okhttp3/internal/cache/CacheInterceptor.kt b/okhttp/src/main/kotlin/okhttp3/internal/cache/CacheInterceptor.kt
+index e86c2470b..47c4bf013 100644
+--- a/okhttp/src/main/kotlin/okhttp3/internal/cache/CacheInterceptor.kt
++++ b/okhttp/src/main/kotlin/okhttp3/internal/cache/CacheInterceptor.kt
+@@ -25,6 +25,7 @@ import okhttp3.EventListener
+ import okhttp3.Headers
+ import okhttp3.Interceptor
+ import okhttp3.Protocol
++import okhttp3.Request
+ import okhttp3.Response
+ import okhttp3.internal.closeQuietly
+ import okhttp3.internal.connection.RealCall
+@@ -44,7 +45,7 @@ class CacheInterceptor(internal val cache: Cache?) : Interceptor {
+   @Throws(IOException::class)
+   override fun intercept(chain: Interceptor.Chain): Response {
+     val call = chain.call()
+-    val cacheCandidate = cache?.get(chain.request())
++    val cacheCandidate = cache?.get(chain.request().requestForCache())
+ 
+     val now = System.currentTimeMillis()
+ 
+@@ -132,9 +133,11 @@ class CacheInterceptor(internal val cache: Cache?) : Interceptor {
+         .build()
+ 
+     if (cache != null) {
+-      if (response.promisesBody() && CacheStrategy.isCacheable(response, networkRequest)) {
++      val cacheNetworkRequest = networkRequest.requestForCache()
++
++      if (response.promisesBody() && CacheStrategy.isCacheable(response, cacheNetworkRequest)) {
+         // Offer this request to the cache.
+-        val cacheRequest = cache.put(response)
++        val cacheRequest = cache.put(response.newBuilder().request(cacheNetworkRequest).build())
+         return cacheWritingResponse(cacheRequest, response).also {
+           if (cacheResponse != null) {
+             // This will log a conditional cache miss only.
+@@ -285,3 +288,17 @@ class CacheInterceptor(internal val cache: Cache?) : Interceptor {
+     }
+   }
+ }
++
++private fun Request.requestForCache(): Request {
++  val cacheUrlOverride = cacheUrlOverride
++
++  return if (cacheUrlOverride != null && (method == "GET" || method == "POST")) {
++    newBuilder()
++      .get()
++      .url(cacheUrlOverride)
++      .cacheUrlOverride(null)
++      .build()
++  } else {
++    this
++  }
++}

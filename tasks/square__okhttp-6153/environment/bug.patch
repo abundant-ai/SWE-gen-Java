@@ -1,0 +1,150 @@
+diff --git a/okhttp-tls/src/main/kotlin/okhttp3/tls/HeldCertificate.kt b/okhttp-tls/src/main/kotlin/okhttp3/tls/HeldCertificate.kt
+index c5f9194f3..148419797 100644
+--- a/okhttp-tls/src/main/kotlin/okhttp3/tls/HeldCertificate.kt
++++ b/okhttp-tls/src/main/kotlin/okhttp3/tls/HeldCertificate.kt
+@@ -49,6 +49,7 @@ import okhttp3.tls.internal.der.Validity
+ import okio.ByteString
+ import okio.ByteString.Companion.decodeBase64
+ import okio.ByteString.Companion.toByteString
++import org.bouncycastle.asn1.pkcs.PrivateKeyInfo
+ import org.bouncycastle.jce.provider.BouncyCastleProvider
+ 
+ /**
+@@ -179,8 +180,8 @@ class HeldCertificate(
+   }
+ 
+   private fun pkcs1Bytes(): ByteString {
+-    val decoded = CertificateAdapters.privateKeyInfo.fromDer(keyPair.private.encoded.toByteString())
+-    return decoded.privateKey
++    val privateKeyInfo = PrivateKeyInfo.getInstance(keyPair.private.encoded)
++    return privateKeyInfo.parsePrivateKey().toASN1Primitive().encoded.toByteString()
+   }
+ 
+   /** Build a held certificate with reasonable defaults. */
+diff --git a/okhttp-tls/src/main/kotlin/okhttp3/tls/internal/der/CertificateAdapters.kt b/okhttp-tls/src/main/kotlin/okhttp3/tls/internal/der/CertificateAdapters.kt
+index bedebd833..27b4fd00a 100644
+--- a/okhttp-tls/src/main/kotlin/okhttp3/tls/internal/der/CertificateAdapters.kt
++++ b/okhttp-tls/src/main/kotlin/okhttp3/tls/internal/der/CertificateAdapters.kt
+@@ -16,7 +16,6 @@
+ package okhttp3.tls.internal.der
+ 
+ import java.math.BigInteger
+-import okio.ByteString
+ 
+ /**
+  * ASN.1 adapters adapted from the specifications in [RFC 5280][rfc_5280].
+@@ -322,25 +321,4 @@ internal object CertificateAdapters {
+         )
+       }
+   )
+-
+-  internal val privateKeyInfo = Adapters.sequence(
+-      "PrivateKeyInfo",
+-      Adapters.INTEGER_AS_LONG,
+-      algorithmIdentifier,
+-      Adapters.OCTET_STRING,
+-      decompose = {
+-        listOf(
+-            it.version,
+-            it.algorithmIdentifier,
+-            it.privateKey
+-        )
+-      },
+-      construct = {
+-        PrivateKeyInfo(
+-            version = it[0] as Long,
+-            algorithmIdentifier = it[1] as AlgorithmIdentifier,
+-            privateKey = it[2] as ByteString
+-        )
+-      }
+-  )
+ }
+diff --git a/okhttp-tls/src/main/kotlin/okhttp3/tls/internal/der/certificates.kt b/okhttp-tls/src/main/kotlin/okhttp3/tls/internal/der/certificates.kt
+index 41b6897b7..f525dd434 100644
+--- a/okhttp-tls/src/main/kotlin/okhttp3/tls/internal/der/certificates.kt
++++ b/okhttp-tls/src/main/kotlin/okhttp3/tls/internal/der/certificates.kt
+@@ -23,7 +23,6 @@ import java.security.SignatureException
+ import java.security.cert.CertificateFactory
+ import java.security.cert.X509Certificate
+ import okio.Buffer
+-import okio.ByteString
+ 
+ internal data class Certificate(
+   val tbsCertificate: TbsCertificate,
+@@ -176,41 +175,3 @@ internal data class BasicConstraints(
+   val ca: Boolean,
+   val pathLenConstraint: Long?
+ )
+-
+-/**
+- * A private key. Note that this class doesn't support attributes or an embedded public key.
+- *
+- * ```
+- * Version ::= INTEGER { v1(0), v2(1) } (v1, ..., v2)
+- *
+- * PrivateKeyAlgorithmIdentifier ::= AlgorithmIdentifier
+- *
+- * PrivateKey ::= OCTET STRING
+- *
+- * OneAsymmetricKey ::= SEQUENCE {
+- *   version                   Version,
+- *   privateKeyAlgorithm       PrivateKeyAlgorithmIdentifier,
+- *   privateKey                PrivateKey,
+- *   attributes            [0] Attributes OPTIONAL,
+- *   ...,
+- *   [[2: publicKey        [1] PublicKey OPTIONAL ]],
+- *   ...
+- * }
+- *
+- * PrivateKeyInfo ::= OneAsymmetricKey
+- * ```
+- */
+-internal data class PrivateKeyInfo(
+-  val version: Long, // v1(0), v2(1)
+-  val algorithmIdentifier: AlgorithmIdentifier, // v1(0), v2(1)
+-  val privateKey: ByteString
+-) {
+-  // Avoid Long.hashCode(long) which isn't available on Android 5.
+-  override fun hashCode(): Int {
+-    var result = 0
+-    result = 31 * result + version.toInt()
+-    result = 31 * result + algorithmIdentifier.hashCode()
+-    result = 31 * result + privateKey.hashCode()
+-    return result
+-  }
+-}
+diff --git a/okhttp-tls/src/test/java/okhttp3/tls/internal/der/DerCertificatesTest.kt b/okhttp-tls/src/test/java/okhttp3/tls/internal/der/DerCertificatesTest.kt
+index ab55ce1f8..981656ef1 100644
+--- a/okhttp-tls/src/test/java/okhttp3/tls/internal/der/DerCertificatesTest.kt
++++ b/okhttp-tls/src/test/java/okhttp3/tls/internal/der/DerCertificatesTest.kt
+@@ -732,30 +732,6 @@ internal class DerCertificatesTest {
+     assertThat(encoded).isEqualTo(certificateByteString)
+   }
+ 
+-  @Test
+-  fun `private key info`() {
+-    val privateKeyInfoByteString = ("MIICdQIBADANBgkqhkiG9w0BAQEFAASCAl8wggJbAgEAAoGBAICkUeG2stqf" +
+-        "byr6gyiVm5pN9YEDRXlowi+rfYGyWhC7ouW9fXAnhgShQKMOU862mG3tcttSYGdsjM3z1crhQlUzpKqncrzwqbzP" +
+-        "uAyt2t9Oib/bvjAvbl8gJH7IMRDl9RVgGYkApdkXVqgjSYigTHTEWxCEgnrfu/YzEkO6l3rXAgMBAAECgYB99mhn" +
+-        "B6piADOuddXv626NzUBTr4xbsYRTgSxHzwf50oFTTBSDuW+1IOBVyTWu94SSPyt0LllPbC8Di3sQSTnVGpSqAvEX" +
+-        "knBMzIc0UO74Rn9p3gZjEenPt1l77fIBa2nK06/rdsJCoE/1P1JSfM9w7LU1RsTmseYMLeJl5F79gQJBAO/BbAKq" +
+-        "g1yzK7VijygvBoUrr+rt2lbmKgcUQ/rxu8IIQk0M/xgJqSkXDXuOnboGM7sQSKfJAZUtT7xozvLzV7ECQQCJW59w" +
+-        "7NIM0qZ/gIX2gcNZr1B/V3zcGlolTDciRm+fnKGNt2EEDKnVL3swzbEfTCa48IT0QKgZJqpXZERa26UHAkBLXmiP" +
+-        "5f5pk8F3wcXzAeVw06z3k1IB41Tu6MX+CyPU+TeudRlz+wV8b0zDvK+EnRKCCbptVFj1Bkt8lQ4JfcnhAkAk2Y3G" +
+-        "z+HySrkcT7Cg12M/NkdUQnZe3jr88pt/+IGNwomc6Wt/mJ4fcWONTkGMcfOZff1NQeNXDAZ6941XCsIVAkASOg02" +
+-        "PlVHLidU7mIE65swMM5/RNhS4aFjez/MwxFNOHaxc9VgCwYPXCLOtdf7AVovdyG0XWgbUXH+NyxKwboE")
+-        .decodeBase64()!!
+-
+-    val decoded = CertificateAdapters.privateKeyInfo.fromDer(privateKeyInfoByteString)
+-
+-    assertThat(decoded.version).isEqualTo(0L)
+-    assertThat(decoded.algorithmIdentifier).isEqualTo(AlgorithmIdentifier(rsaEncryption, null))
+-    assertThat(decoded.privateKey.size).isEqualTo(607)
+-
+-    val encoded = CertificateAdapters.privateKeyInfo.toDer(decoded)
+-    assertThat(encoded).isEqualTo(privateKeyInfoByteString)
+-  }
+-
+   @Test
+   fun `RSA issuer and signature`() {
+     val root = HeldCertificate.Builder()

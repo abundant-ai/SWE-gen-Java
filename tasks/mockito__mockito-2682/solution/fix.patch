@@ -1,0 +1,163 @@
+diff --git a/src/main/java/org/mockito/internal/creation/bytebuddy/InlineDelegateByteBuddyMockMaker.java b/src/main/java/org/mockito/internal/creation/bytebuddy/InlineDelegateByteBuddyMockMaker.java
+index bf6cf4b73..6fcb6a500 100644
+--- a/src/main/java/org/mockito/internal/creation/bytebuddy/InlineDelegateByteBuddyMockMaker.java
++++ b/src/main/java/org/mockito/internal/creation/bytebuddy/InlineDelegateByteBuddyMockMaker.java
+@@ -251,6 +251,7 @@ class InlineDelegateByteBuddyMockMaker
+ 
+         ThreadLocal<Class<?>> currentConstruction = new ThreadLocal<>();
+         ThreadLocal<Boolean> isSuspended = ThreadLocal.withInitial(() -> false);
++        Predicate<Class<?>> isCallFromSubclassConstructor = StackWalkerChecker.orFallback();
+         Predicate<Class<?>> isMockConstruction =
+                 type -> {
+                     if (isSuspended.get()) {
+@@ -260,6 +261,11 @@ class InlineDelegateByteBuddyMockMaker
+                     }
+                     Map<Class<?>, ?> interceptors = mockedConstruction.get();
+                     if (interceptors != null && interceptors.containsKey(type)) {
++                        // We only initiate a construction mock, if the call originates from an
++                        // un-mocked (as suppression is not enabled) subclass constructor.
++                        if (isCallFromSubclassConstructor.test(type)) {
++                            return false;
++                        }
+                         currentConstruction.set(type);
+                         return true;
+                     } else {
+diff --git a/src/main/java/org/mockito/internal/creation/bytebuddy/StackTraceChecker.java b/src/main/java/org/mockito/internal/creation/bytebuddy/StackTraceChecker.java
+new file mode 100644
+index 000000000..18f92ba69
+--- /dev/null
++++ b/src/main/java/org/mockito/internal/creation/bytebuddy/StackTraceChecker.java
+@@ -0,0 +1,36 @@
++/*
++ * Copyright (c) 2022 Mockito contributors
++ * This program is made available under the terms of the MIT License.
++ */
++package org.mockito.internal.creation.bytebuddy;
++
++import java.util.function.Predicate;
++
++class StackTraceChecker implements Predicate<Class<?>> {
++
++    @Override
++    public boolean test(Class<?> type) {
++        StackTraceElement[] stackTrace = Thread.currentThread().getStackTrace();
++        for (int index = 1; index < stackTrace.length - 1; index++) {
++            if (!stackTrace[index].getClassName().startsWith("org.mockito.internal.")) {
++                if (stackTrace[index + 1].getMethodName().startsWith("<init>")) {
++                    try {
++                        if (!stackTrace[index + 1].getClassName().equals(type.getName())
++                                && type.isAssignableFrom(
++                                        Class.forName(
++                                                stackTrace[index + 1].getClassName(),
++                                                false,
++                                                type.getClassLoader()))) {
++                            return true;
++                        } else {
++                            break;
++                        }
++                    } catch (ClassNotFoundException ignored) {
++                        break;
++                    }
++                }
++            }
++        }
++        return false;
++    }
++}
+diff --git a/src/main/java/org/mockito/internal/creation/bytebuddy/StackWalkerChecker.java b/src/main/java/org/mockito/internal/creation/bytebuddy/StackWalkerChecker.java
+new file mode 100644
+index 000000000..c16439dbc
+--- /dev/null
++++ b/src/main/java/org/mockito/internal/creation/bytebuddy/StackWalkerChecker.java
+@@ -0,0 +1,91 @@
++/*
++ * Copyright (c) 2022 Mockito contributors
++ * This program is made available under the terms of the MIT License.
++ */
++package org.mockito.internal.creation.bytebuddy;
++
++import java.lang.reflect.Method;
++import java.util.Iterator;
++import java.util.function.Function;
++import java.util.function.Predicate;
++import java.util.stream.Stream;
++
++class StackWalkerChecker implements Predicate<Class<?>> {
++
++    private final Method stackWalkerGetInstance;
++    private final Method stackWalkerWalk;
++    private final Method stackWalkerStackFrameGetDeclaringClass;
++    private final Enum<?> stackWalkerOptionRetainClassReference;
++
++    StackWalkerChecker() throws Exception {
++        Class<?> stackWalker = Class.forName("java.lang.StackWalker");
++        @SuppressWarnings({"unchecked", "rawtypes"})
++        Class<? extends Enum> stackWalkerOption =
++                (Class<? extends Enum<?>>) Class.forName("java.lang.StackWalker$Option");
++        stackWalkerGetInstance = stackWalker.getMethod("getInstance", stackWalkerOption);
++        stackWalkerWalk = stackWalker.getMethod("walk", Function.class);
++        Class<?> stackWalkerStackFrame = Class.forName("java.lang.StackWalker$StackFrame");
++        stackWalkerStackFrameGetDeclaringClass =
++                stackWalkerStackFrame.getMethod("getDeclaringClass");
++        @SuppressWarnings("unchecked")
++        Enum<?> stackWalkerOptionRetainClassReference =
++                Enum.valueOf(stackWalkerOption, "RETAIN_CLASS_REFERENCE");
++        this.stackWalkerOptionRetainClassReference = stackWalkerOptionRetainClassReference;
++    }
++
++    static Predicate<Class<?>> orFallback() {
++        try {
++            return new StackWalkerChecker();
++        } catch (Exception e) {
++            return new StackTraceChecker();
++        }
++    }
++
++    @Override
++    public boolean test(Class<?> type) {
++        try {
++            Object walker =
++                    stackWalkerGetInstance.invoke(null, stackWalkerOptionRetainClassReference);
++            return (Boolean)
++                    stackWalkerWalk.invoke(
++                            walker,
++                            (Function<?, ?>)
++                                    stream -> {
++                                        Iterator<?> iterator = ((Stream<?>) stream).iterator();
++                                        while (iterator.hasNext()) {
++                                            try {
++                                                Object frame = iterator.next();
++                                                if (((Class<?>)
++                                                                stackWalkerStackFrameGetDeclaringClass
++                                                                        .invoke(frame))
++                                                        .getName()
++                                                        .startsWith("org.mockito.internal.")) {
++                                                    continue;
++                                                }
++                                                if (iterator.hasNext()) {
++                                                    Object next = iterator.next();
++                                                    Class<?> declaringClass =
++                                                            (Class<?>)
++                                                                    stackWalkerStackFrameGetDeclaringClass
++                                                                            .invoke(next);
++                                                    if (type != declaringClass
++                                                            && type.isAssignableFrom(
++                                                                    declaringClass)) {
++                                                        return true;
++                                                    } else {
++                                                        break;
++                                                    }
++                                                } else {
++                                                    break;
++                                                }
++                                            } catch (Exception ignored) {
++                                                return false;
++                                            }
++                                        }
++                                        return false;
++                                    });
++        } catch (Exception ignored) {
++            return false;
++        }
++    }
++}

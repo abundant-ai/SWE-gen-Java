@@ -1,0 +1,159 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 9fc4597d..722607af 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -9,6 +9,7 @@
+    The following converters support this feature through a new `withStreaming()` factory method:
+    - Gson
+    - Moshi
++   - Protobuf
+    - Wire
+ 
+ **Changed**
+diff --git a/retrofit-converters/protobuf/build.gradle b/retrofit-converters/protobuf/build.gradle
+index 0e7a4b2c..9bc29b84 100644
+--- a/retrofit-converters/protobuf/build.gradle
++++ b/retrofit-converters/protobuf/build.gradle
+@@ -10,6 +10,7 @@ dependencies {
+   testImplementation libs.junit
+   testImplementation libs.truth
+   testImplementation libs.okhttp.mockwebserver
++  testImplementation libs.testParameterInjector
+ }
+ 
+ jar {
+diff --git a/retrofit-converters/protobuf/src/main/java/retrofit2/converter/protobuf/ProtoConverterFactory.java b/retrofit-converters/protobuf/src/main/java/retrofit2/converter/protobuf/ProtoConverterFactory.java
+index 32a23eea..501a1306 100644
+--- a/retrofit-converters/protobuf/src/main/java/retrofit2/converter/protobuf/ProtoConverterFactory.java
++++ b/retrofit-converters/protobuf/src/main/java/retrofit2/converter/protobuf/ProtoConverterFactory.java
+@@ -26,6 +26,7 @@ import java.lang.reflect.Type;
+ import javax.annotation.Nullable;
+ import okhttp3.RequestBody;
+ import okhttp3.ResponseBody;
++import retrofit2.Call;
+ import retrofit2.Converter;
+ import retrofit2.Retrofit;
+ 
+@@ -37,18 +38,30 @@ import retrofit2.Retrofit;
+  */
+ public final class ProtoConverterFactory extends Converter.Factory {
+   public static ProtoConverterFactory create() {
+-    return new ProtoConverterFactory(null);
++    return new ProtoConverterFactory(null, false);
+   }
+ 
+   /** Create an instance which uses {@code registry} when deserializing. */
+   public static ProtoConverterFactory createWithRegistry(@Nullable ExtensionRegistryLite registry) {
+-    return new ProtoConverterFactory(registry);
++    return new ProtoConverterFactory(registry, false);
+   }
+ 
+   private final @Nullable ExtensionRegistryLite registry;
++  private final boolean streaming;
+ 
+-  private ProtoConverterFactory(@Nullable ExtensionRegistryLite registry) {
++  private ProtoConverterFactory(@Nullable ExtensionRegistryLite registry, boolean streaming) {
+     this.registry = registry;
++    this.streaming = streaming;
++  }
++
++  /**
++   * Return a new factory which streams serialization of request messages to bytes on the HTTP thread
++   * This is either the calling thread for {@link Call#execute()}, or one of OkHttp's background
++   * threads for {@link Call#enqueue}. Response bytes are always converted to message instances on
++   * one of OkHttp's background threads.
++   */
++  public ProtoConverterFactory withStreaming() {
++    return new ProtoConverterFactory(registry, true);
+   }
+ 
+   @Override
+@@ -98,6 +111,6 @@ public final class ProtoConverterFactory extends Converter.Factory {
+     if (!MessageLite.class.isAssignableFrom((Class<?>) type)) {
+       return null;
+     }
+-    return new ProtoRequestBodyConverter<>();
++    return new ProtoRequestBodyConverter<>(streaming);
+   }
+ }
+diff --git a/retrofit-converters/protobuf/src/main/java/retrofit2/converter/protobuf/ProtoRequestBodyConverter.java b/retrofit-converters/protobuf/src/main/java/retrofit2/converter/protobuf/ProtoRequestBodyConverter.java
+index c29c9475..2ecb2030 100644
+--- a/retrofit-converters/protobuf/src/main/java/retrofit2/converter/protobuf/ProtoRequestBodyConverter.java
++++ b/retrofit-converters/protobuf/src/main/java/retrofit2/converter/protobuf/ProtoRequestBodyConverter.java
+@@ -16,16 +16,25 @@
+ package retrofit2.converter.protobuf;
+ 
+ import com.google.protobuf.MessageLite;
+-import java.io.IOException;
+ import okhttp3.MediaType;
+ import okhttp3.RequestBody;
+ import retrofit2.Converter;
+ 
+ final class ProtoRequestBodyConverter<T extends MessageLite> implements Converter<T, RequestBody> {
+-  private static final MediaType MEDIA_TYPE = MediaType.get("application/x-protobuf");
++  static final MediaType MEDIA_TYPE = MediaType.get("application/x-protobuf");
++
++  private final boolean streaming;
++
++  ProtoRequestBodyConverter(boolean streaming) {
++    this.streaming = streaming;
++  }
+ 
+   @Override
+-  public RequestBody convert(T value) throws IOException {
++  public RequestBody convert(T value) {
++    if (streaming) {
++      return new ProtoStreamingRequestBody(value);
++    }
++
+     byte[] bytes = value.toByteArray();
+     return RequestBody.create(MEDIA_TYPE, bytes);
+   }
+diff --git a/retrofit-converters/protobuf/src/main/java/retrofit2/converter/protobuf/ProtoStreamingRequestBody.java b/retrofit-converters/protobuf/src/main/java/retrofit2/converter/protobuf/ProtoStreamingRequestBody.java
+new file mode 100644
+index 00000000..aee99465
+--- /dev/null
++++ b/retrofit-converters/protobuf/src/main/java/retrofit2/converter/protobuf/ProtoStreamingRequestBody.java
+@@ -0,0 +1,42 @@
++/*
++ * Copyright (C) 2025 Square, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package retrofit2.converter.protobuf;
++
++import static retrofit2.converter.protobuf.ProtoRequestBodyConverter.MEDIA_TYPE;
++
++import com.google.protobuf.MessageLite;
++import java.io.IOException;
++import okhttp3.MediaType;
++import okhttp3.RequestBody;
++import okio.BufferedSink;
++
++final class ProtoStreamingRequestBody extends RequestBody {
++  private final MessageLite value;
++
++  public ProtoStreamingRequestBody(MessageLite value) {
++    this.value = value;
++  }
++
++  @Override
++  public MediaType contentType() {
++    return MEDIA_TYPE;
++  }
++
++  @Override
++  public void writeTo(BufferedSink sink) throws IOException {
++    value.writeTo(sink.outputStream());
++  }
++}

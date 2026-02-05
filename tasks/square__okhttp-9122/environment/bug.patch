@@ -1,0 +1,884 @@
+diff --git a/gradle/libs.versions.toml b/gradle/libs.versions.toml
+index b6a300a65..94b68b837 100644
+--- a/gradle/libs.versions.toml
++++ b/gradle/libs.versions.toml
+@@ -9,7 +9,7 @@ graalvm = "25.0.0"
+ #noinspection UnusedVersionCatalogEntry
+ junit-platform = "1.13.4"
+ kotlinx-serialization = "1.9.0"
+-ksp = "2.2.20-2.0.3"
++ksp = "2.2.20-2.0.4"
+ lintGradle = "1.0.0-alpha05"
+ mockserverClient = "5.15.0"
+ org-bouncycastle = "1.82"
+diff --git a/okhttp-testing-support/src/main/kotlin/okhttp3/TestValueFactory.kt b/okhttp-testing-support/src/main/kotlin/okhttp3/TestValueFactory.kt
+index 948482c2c..dee06c026 100644
+--- a/okhttp-testing-support/src/main/kotlin/okhttp3/TestValueFactory.kt
++++ b/okhttp-testing-support/src/main/kotlin/okhttp3/TestValueFactory.kt
+@@ -35,6 +35,7 @@ import okhttp3.internal.RecordingOkAuthenticator
+ import okhttp3.internal.concurrent.TaskFaker
+ import okhttp3.internal.concurrent.TaskRunner
+ import okhttp3.internal.concurrent.withLock
++import okhttp3.internal.connection.CallConnectionUser
+ import okhttp3.internal.connection.ConnectionListener
+ import okhttp3.internal.connection.RealCall
+ import okhttp3.internal.connection.RealConnection
+@@ -193,8 +194,12 @@ class TestValueFactory : Closeable {
+       fastFallback = client.fastFallback,
+       address = address,
+       routeDatabase = client.routeDatabase,
+-      call = call,
+-      request = call.request(),
++      connectionUser =
++        CallConnectionUser(
++          call,
++          client.connectionPool.delegate.connectionListener,
++          chain,
++        ),
+     )
+   }
+ 
+diff --git a/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/connection/CallConnectionUser.kt b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/connection/CallConnectionUser.kt
+new file mode 100644
+index 000000000..5f2c7a315
+--- /dev/null
++++ b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/connection/CallConnectionUser.kt
+@@ -0,0 +1,146 @@
++/*
++ * Copyright (C) 2025 Block, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package okhttp3.internal.connection
++
++import java.io.IOException
++import java.net.InetAddress
++import java.net.Proxy
++import java.net.Socket
++import okhttp3.Connection
++import okhttp3.EventListener
++import okhttp3.Handshake
++import okhttp3.HttpUrl
++import okhttp3.Protocol
++import okhttp3.Route
++import okhttp3.internal.http.RealInterceptorChain
++
++/**
++ * A connection user that is a specific [RealCall].
++ */
++internal class CallConnectionUser(
++  private val call: RealCall,
++  private val poolConnectionListener: ConnectionListener,
++  private val chain: RealInterceptorChain,
++) : ConnectionUser {
++  private val eventListener: EventListener
++    get() = call.eventListener
++
++  override fun addPlanToCancel(connectPlan: ConnectPlan) {
++    call.plansToCancel += connectPlan
++  }
++
++  override fun removePlanToCancel(connectPlan: ConnectPlan) {
++    call.plansToCancel -= connectPlan
++  }
++
++  override fun updateRouteDatabaseAfterSuccess(route: Route) {
++    call.client.routeDatabase.connected(route)
++  }
++
++  override fun connectStart(route: Route) {
++    eventListener.connectStart(call, route.socketAddress, route.proxy)
++    poolConnectionListener.connectStart(route, call)
++  }
++
++  override fun connectFailed(
++    route: Route,
++    protocol: Protocol?,
++    e: IOException,
++  ) {
++    eventListener.connectFailed(call, route.socketAddress, route.proxy, null, e)
++    poolConnectionListener.connectFailed(route, call, e)
++  }
++
++  override fun secureConnectStart() {
++    eventListener.secureConnectStart(call)
++  }
++
++  override fun secureConnectEnd(handshake: Handshake?) {
++    eventListener.secureConnectEnd(call, handshake)
++  }
++
++  override fun callConnectEnd(
++    route: Route,
++    protocol: Protocol?,
++  ) {
++    eventListener.connectEnd(call, route.socketAddress, route.proxy, protocol)
++  }
++
++  override fun connectionConnectEnd(
++    connection: Connection,
++    route: Route,
++  ) {
++    poolConnectionListener.connectEnd(connection, route, call)
++  }
++
++  override fun connectionAcquired(connection: Connection) {
++    eventListener.connectionAcquired(call, connection)
++  }
++
++  override fun acquireConnectionNoEvents(connection: RealConnection) {
++    call.acquireConnectionNoEvents(connection)
++  }
++
++  override fun releaseConnectionNoEvents(): Socket? = call.releaseConnectionNoEvents()
++
++  override fun connectionReleased(connection: Connection) {
++    eventListener.connectionReleased(call, connection)
++  }
++
++  override fun connectionConnectionAcquired(connection: RealConnection) {
++    connection.connectionListener.connectionAcquired(connection, call)
++  }
++
++  override fun connectionConnectionReleased(connection: RealConnection) {
++    connection.connectionListener.connectionReleased(connection, call)
++  }
++
++  override fun connectionConnectionClosed(connection: RealConnection) {
++    connection.connectionListener.connectionClosed(connection)
++  }
++
++  override fun noNewExchanges(connection: RealConnection) {
++    connection.connectionListener.noNewExchanges(connection)
++  }
++
++  override fun doExtensiveHealthChecks(): Boolean = chain.request.method != "GET"
++
++  override fun isCanceled(): Boolean = call.isCanceled()
++
++  override fun candidateConnection(): RealConnection? = call.connection
++
++  override fun proxySelectStart(url: HttpUrl) {
++    eventListener.proxySelectStart(call, url)
++  }
++
++  override fun proxySelectEnd(
++    url: HttpUrl,
++    proxies: List<Proxy>,
++  ) {
++    eventListener.proxySelectEnd(call, url, proxies)
++  }
++
++  override fun dnsStart(socketHost: String) {
++    eventListener.dnsStart(call, socketHost)
++  }
++
++  override fun dnsEnd(
++    socketHost: String,
++    result: List<InetAddress>,
++  ) {
++    eventListener.dnsEnd(call, socketHost, result)
++  }
++}
+diff --git a/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/connection/ConnectPlan.kt b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/connection/ConnectPlan.kt
+index a83bb3559..2ad364175 100644
+--- a/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/connection/ConnectPlan.kt
++++ b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/connection/ConnectPlan.kt
+@@ -54,7 +54,7 @@ import okhttp3.internal.toHostHeader
+  * Each step may fail. If a retry is possible, a new instance is created with the next plan, which
+  * will be configured differently.
+  */
+-class ConnectPlan internal constructor(
++class ConnectPlan(
+   private val taskRunner: TaskRunner,
+   private val connectionPool: RealConnectionPool,
+   private val readTimeoutMillis: Int,
+@@ -63,7 +63,7 @@ class ConnectPlan internal constructor(
+   private val socketReadTimeoutMillis: Int,
+   private val pingIntervalMillis: Int,
+   private val retryOnConnectionFailure: Boolean,
+-  private val call: RealCall,
++  private val user: ConnectionUser,
+   private val routePlanner: RealRoutePlanner,
+   // Specifics to this plan.
+   override val route: Route,
+@@ -111,7 +111,7 @@ class ConnectPlan internal constructor(
+       socketReadTimeoutMillis = socketReadTimeoutMillis,
+       pingIntervalMillis = pingIntervalMillis,
+       retryOnConnectionFailure = retryOnConnectionFailure,
+-      call = call,
++      user = user,
+       routePlanner = routePlanner,
+       route = route,
+       routes = routes,
+@@ -127,10 +127,9 @@ class ConnectPlan internal constructor(
+     var success = false
+ 
+     // Tell the call about the connecting call so async cancels work.
+-    call.plansToCancel += this
++    user.addPlanToCancel(this)
+     try {
+-      call.eventListener.connectStart(call, route.socketAddress, route.proxy)
+-      connectionPool.connectionListener.connectStart(route, call)
++      user.connectStart(route)
+ 
+       connectSocket()
+       success = true
+@@ -144,11 +143,10 @@ class ConnectPlan internal constructor(
+           e,
+         )
+       }
+-      call.eventListener.connectFailed(call, route.socketAddress, route.proxy, null, e)
+-      connectionPool.connectionListener.connectFailed(route, call, e)
++      user.connectFailed(route, null, e)
+       return ConnectResult(plan = this, throwable = e)
+     } finally {
+-      call.plansToCancel -= this
++      user.removePlanToCancel(this)
+       if (!success) {
+         rawSocket?.closeQuietly()
+       }
+@@ -164,7 +162,7 @@ class ConnectPlan internal constructor(
+     var success = false
+ 
+     // Tell the call about the connecting call so async cancels work.
+-    call.plansToCancel += this
++    user.addPlanToCancel(this)
+     try {
+       if (tunnelRequest != null) {
+         val tunnelResult = connectTunnel()
+@@ -184,7 +182,7 @@ class ConnectPlan internal constructor(
+           throw IOException("TLS tunnel buffered too many bytes!")
+         }
+ 
+-        call.eventListener.secureConnectStart(call)
++        user.secureConnectStart()
+ 
+         // Create the wrapper over the connected socket.
+         val sslSocket =
+@@ -204,7 +202,7 @@ class ConnectPlan internal constructor(
+ 
+         connectionSpec.apply(sslSocket, isFallback = tlsEquipPlan.isTlsFallback)
+         connectTls(sslSocket, connectionSpec)
+-        call.eventListener.secureConnectEnd(call, handshake)
++        user.secureConnectEnd(handshake)
+       } else {
+         javaNetSocket = rawSocket
+         protocol =
+@@ -231,12 +229,11 @@ class ConnectPlan internal constructor(
+       connection.start()
+ 
+       // Success.
+-      call.eventListener.connectEnd(call, route.socketAddress, route.proxy, protocol)
++      user.callConnectEnd(route, protocol)
+       success = true
+       return ConnectResult(plan = this)
+     } catch (e: IOException) {
+-      call.eventListener.connectFailed(call, route.socketAddress, route.proxy, null, e)
+-      connectionPool.connectionListener.connectFailed(route, call, e)
++      user.connectFailed(route, null, e)
+ 
+       if (!retryOnConnectionFailure || !retryTlsHandshake(e)) {
+         retryTlsConnection = null
+@@ -248,7 +245,7 @@ class ConnectPlan internal constructor(
+         throwable = e,
+       )
+     } finally {
+-      call.plansToCancel -= this
++      user.removePlanToCancel(this)
+       if (!success) {
+         javaNetSocket?.closeQuietly()
+         rawSocket.closeQuietly()
+@@ -313,7 +310,7 @@ class ConnectPlan internal constructor(
+     val nextAttempt = attempt + 1
+     return when {
+       nextAttempt < MAX_TUNNEL_ATTEMPTS -> {
+-        call.eventListener.connectEnd(call, route.socketAddress, route.proxy, null)
++        user.callConnectEnd(route, null)
+         ConnectResult(
+           plan = this,
+           nextPlan =
+@@ -328,8 +325,7 @@ class ConnectPlan internal constructor(
+           ProtocolException(
+             "Too many tunnel connections attempted: $MAX_TUNNEL_ATTEMPTS",
+           )
+-        call.eventListener.connectFailed(call, route.socketAddress, route.proxy, null, failure)
+-        connectionPool.connectionListener.connectFailed(route, call, failure)
++        user.connectFailed(route, null, failure)
+         return ConnectResult(plan = this, throwable = failure)
+       }
+     }
+@@ -495,10 +491,10 @@ class ConnectPlan internal constructor(
+ 
+   /** Returns the connection to use, which might be different from [connection]. */
+   override fun handleSuccess(): RealConnection {
+-    call.client.routeDatabase.connected(route)
++    user.updateRouteDatabaseAfterSuccess(route)
+ 
+     val connection = this.connection!!
+-    connection.connectionListener.connectEnd(connection, route, call)
++    user.connectionConnectEnd(connection, route)
+ 
+     // If we raced another call connecting to this host, coalesce the connections. This makes for
+     // 3 different lookups in the connection pool!
+@@ -507,11 +503,11 @@ class ConnectPlan internal constructor(
+ 
+     connection.withLock {
+       connectionPool.put(connection)
+-      call.acquireConnectionNoEvents(connection)
++      user.acquireConnectionNoEvents(connection)
+     }
+ 
+-    call.eventListener.connectionAcquired(call, connection)
+-    connection.connectionListener.connectionAcquired(connection, call)
++    user.connectionAcquired(connection)
++    user.connectionConnectionAcquired(connection)
+     return connection
+   }
+ 
+@@ -542,7 +538,7 @@ class ConnectPlan internal constructor(
+       socketReadTimeoutMillis = socketReadTimeoutMillis,
+       pingIntervalMillis = pingIntervalMillis,
+       retryOnConnectionFailure = retryOnConnectionFailure,
+-      call = call,
++      user = user,
+       routePlanner = routePlanner,
+       route = route,
+       routes = routes,
+diff --git a/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/connection/ConnectionUser.kt b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/connection/ConnectionUser.kt
+new file mode 100644
+index 000000000..d6856c0d1
+--- /dev/null
++++ b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/connection/ConnectionUser.kt
+@@ -0,0 +1,95 @@
++/*
++ * Copyright (C) 2024 Square, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package okhttp3.internal.connection
++
++import java.io.IOException
++import java.net.InetAddress
++import java.net.Proxy
++import java.net.Socket
++import okhttp3.Connection
++import okhttp3.Handshake
++import okhttp3.HttpUrl
++import okhttp3.Protocol
++import okhttp3.Route
++
++/**
++ * The object that is asking for a connection. Either a call or a connect policy from the pool.
++ */
++interface ConnectionUser {
++  fun addPlanToCancel(connectPlan: ConnectPlan)
++
++  fun removePlanToCancel(connectPlan: ConnectPlan)
++
++  fun updateRouteDatabaseAfterSuccess(route: Route)
++
++  fun connectStart(route: Route)
++
++  fun secureConnectStart()
++
++  fun secureConnectEnd(handshake: Handshake?)
++
++  fun callConnectEnd(
++    route: Route,
++    protocol: Protocol?,
++  )
++
++  fun connectionConnectEnd(
++    connection: Connection,
++    route: Route,
++  )
++
++  fun connectFailed(
++    route: Route,
++    protocol: Protocol?,
++    e: IOException,
++  )
++
++  fun connectionAcquired(connection: Connection)
++
++  fun acquireConnectionNoEvents(connection: RealConnection)
++
++  fun releaseConnectionNoEvents(): Socket?
++
++  fun connectionReleased(connection: Connection)
++
++  fun connectionConnectionAcquired(connection: RealConnection)
++
++  fun connectionConnectionReleased(connection: RealConnection)
++
++  fun connectionConnectionClosed(connection: RealConnection)
++
++  fun noNewExchanges(connection: RealConnection)
++
++  fun doExtensiveHealthChecks(): Boolean
++
++  fun isCanceled(): Boolean
++
++  fun candidateConnection(): RealConnection?
++
++  fun proxySelectStart(url: HttpUrl)
++
++  fun proxySelectEnd(
++    url: HttpUrl,
++    proxies: List<Proxy>,
++  )
++
++  fun dnsStart(socketHost: String)
++
++  fun dnsEnd(
++    socketHost: String,
++    result: List<InetAddress>,
++  )
++}
+diff --git a/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/connection/PoolConnectionUser.kt b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/connection/PoolConnectionUser.kt
+new file mode 100644
+index 000000000..cccdb50aa
+--- /dev/null
++++ b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/connection/PoolConnectionUser.kt
+@@ -0,0 +1,116 @@
++/*
++ * Copyright (C) 2024 Square, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package okhttp3.internal.connection
++
++import java.io.IOException
++import java.net.InetAddress
++import java.net.Proxy
++import java.net.Socket
++import okhttp3.Connection
++import okhttp3.Handshake
++import okhttp3.HttpUrl
++import okhttp3.Protocol
++import okhttp3.Route
++
++/**
++ * A user that is a connection pool creating connections in the background
++ * without an intent to immediately use them.
++ */
++object PoolConnectionUser : ConnectionUser {
++  override fun addPlanToCancel(connectPlan: ConnectPlan) {
++  }
++
++  override fun removePlanToCancel(connectPlan: ConnectPlan) {
++  }
++
++  override fun updateRouteDatabaseAfterSuccess(route: Route) {
++  }
++
++  override fun connectStart(route: Route) {
++  }
++
++  override fun secureConnectStart() {
++  }
++
++  override fun secureConnectEnd(handshake: Handshake?) {
++  }
++
++  override fun callConnectEnd(
++    route: Route,
++    protocol: Protocol?,
++  ) {
++  }
++
++  override fun connectionConnectEnd(
++    connection: Connection,
++    route: Route,
++  ) {
++  }
++
++  override fun connectFailed(
++    route: Route,
++    protocol: Protocol?,
++    e: IOException,
++  ) {
++  }
++
++  override fun connectionAcquired(connection: Connection) {
++  }
++
++  override fun acquireConnectionNoEvents(connection: RealConnection) {
++  }
++
++  override fun releaseConnectionNoEvents(): Socket? = null
++
++  override fun connectionReleased(connection: Connection) {
++  }
++
++  override fun connectionConnectionAcquired(connection: RealConnection) {
++  }
++
++  override fun connectionConnectionReleased(connection: RealConnection) {
++  }
++
++  override fun connectionConnectionClosed(connection: RealConnection) {
++  }
++
++  override fun noNewExchanges(connection: RealConnection) {
++  }
++
++  override fun doExtensiveHealthChecks(): Boolean = false
++
++  override fun isCanceled(): Boolean = false
++
++  override fun candidateConnection(): RealConnection? = null
++
++  override fun proxySelectStart(url: HttpUrl) {
++  }
++
++  override fun proxySelectEnd(
++    url: HttpUrl,
++    proxies: List<Proxy>,
++  ) {
++  }
++
++  override fun dnsStart(socketHost: String) {
++  }
++
++  override fun dnsEnd(
++    socketHost: String,
++    result: List<InetAddress>,
++  ) {
++  }
++}
+diff --git a/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/connection/RealCall.kt b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/connection/RealCall.kt
+index c6e0f53fb..7d6f9755a 100644
+--- a/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/connection/RealCall.kt
++++ b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/connection/RealCall.kt
+@@ -133,7 +133,7 @@ class RealCall(
+    * and response body streams; otherwise resources may be leaked.
+    *
+    * This method is safe to be called concurrently, but provides limited guarantees. If a transport
+-   * layer connection has been established (such as a HTTP/2 stream) that is terminated. Otherwise,
++   * layer connection has been established (such as a HTTP/2 stream) that is terminated. Otherwise
+    * if a socket connection is being established, that is terminated.
+    */
+   override fun cancel() {
+@@ -257,9 +257,8 @@ class RealCall(
+           retryOnConnectionFailure = client.retryOnConnectionFailure,
+           fastFallback = client.fastFallback,
+           address = client.address(request.url),
++          connectionUser = CallConnectionUser(this, connectionPool.connectionListener, chain),
+           routeDatabase = client.routeDatabase,
+-          call = this,
+-          request = request,
+         )
+       this.exchangeFinder =
+         when {
+diff --git a/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/connection/RealConnectionPool.kt b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/connection/RealConnectionPool.kt
+index 85b334cd6..b7d84907d 100644
+--- a/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/connection/RealConnectionPool.kt
++++ b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/connection/RealConnectionPool.kt
+@@ -68,9 +68,9 @@ class RealConnectionPool internal constructor(
+   fun connectionCount(): Int = connections.size
+ 
+   /**
+-   * Attempts to acquire a recycled connection to [address] for [call]. Returns the connection if it
++   * Attempts to acquire a recycled connection to [address] for [connectionUser]. Returns the connection if it
+    * was acquired, or null if no connection was acquired. The acquired connection will also be
+-   * given to [call] who may (for example) assign it to a [RealCall.connection].
++   * given to [connectionUser] who may (for example) assign it to a [RealCall.connection].
+    *
+    * This confirms the returned connection is healthy before returning it. If this encounters any
+    * unhealthy connections in its search, this will clean them up.
+@@ -79,10 +79,10 @@ class RealConnectionPool internal constructor(
+    * This is used to coalesce related domains to the same HTTP/2 connection, such as `square.com`
+    * and `square.ca`.
+    */
+-  internal fun callAcquirePooledConnection(
++  fun callAcquirePooledConnection(
+     doExtensiveHealthChecks: Boolean,
+     address: Address,
+-    call: RealCall,
++    connectionUser: ConnectionUser,
+     routes: List<Route>?,
+     requireMultiplexed: Boolean,
+   ): RealConnection? {
+@@ -94,7 +94,7 @@ class RealConnectionPool internal constructor(
+             requireMultiplexed && !connection.isMultiplexed -> false
+             !connection.isEligible(address, routes) -> false
+             else -> {
+-              call.acquireConnectionNoEvents(connection)
++              connectionUser.acquireConnectionNoEvents(connection)
+               true
+             }
+           }
+@@ -111,7 +111,7 @@ class RealConnectionPool internal constructor(
+         connection.withLock {
+           noNewExchangesEvent = !connection.noNewExchanges
+           connection.noNewExchanges = true
+-          call.releaseConnectionNoEvents()
++          connectionUser.releaseConnectionNoEvents()
+         }
+       if (toClose != null) {
+         toClose.closeQuietly()
+diff --git a/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/connection/RealRoutePlanner.kt b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/connection/RealRoutePlanner.kt
+index 5b6e6ddcb..8ce85aa66 100644
+--- a/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/connection/RealRoutePlanner.kt
++++ b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/connection/RealRoutePlanner.kt
+@@ -35,7 +35,7 @@ import okhttp3.internal.connection.RoutePlanner.Plan
+ import okhttp3.internal.platform.Platform
+ import okhttp3.internal.toHostHeader
+ 
+-class RealRoutePlanner internal constructor(
++class RealRoutePlanner(
+   private val taskRunner: TaskRunner,
+   private val connectionPool: RealConnectionPool,
+   private val readTimeoutMillis: Int,
+@@ -47,17 +47,15 @@ class RealRoutePlanner internal constructor(
+   private val fastFallback: Boolean,
+   override val address: Address,
+   private val routeDatabase: RouteDatabase,
+-  private val call: RealCall,
+-  request: Request,
++  private val connectionUser: ConnectionUser,
+ ) : RoutePlanner {
+-  private val doExtensiveHealthChecks = request.method != "GET"
+   private var routeSelection: RouteSelector.Selection? = null
+   private var routeSelector: RouteSelector? = null
+   private var nextRouteToTry: Route? = null
+ 
+   override val deferredPlans = ArrayDeque<Plan>()
+ 
+-  override fun isCanceled(): Boolean = call.isCanceled()
++  override fun isCanceled(): Boolean = connectionUser.isCanceled()
+ 
+   @Throws(IOException::class)
+   override fun plan(): Plan {
+@@ -90,11 +88,11 @@ class RealRoutePlanner internal constructor(
+    */
+   private fun planReuseCallConnection(): ReusePlan? {
+     // This may be mutated by releaseConnectionNoEvents()!
+-    val candidate = call.connection ?: return null
++    val candidate = connectionUser.candidateConnection() ?: return null
+ 
+     // Make sure this connection is healthy & eligible for new exchanges. If it's no longer needed
+     // then we're on the hook to close it.
+-    val healthy = candidate.isHealthy(doExtensiveHealthChecks)
++    val healthy = candidate.isHealthy(connectionUser.doExtensiveHealthChecks())
+     var noNewExchangesEvent = false
+     val toClose: Socket? =
+       candidate.withLock {
+@@ -102,10 +100,10 @@ class RealRoutePlanner internal constructor(
+           !healthy -> {
+             noNewExchangesEvent = !candidate.noNewExchanges
+             candidate.noNewExchanges = true
+-            call.releaseConnectionNoEvents()
++            connectionUser.releaseConnectionNoEvents()
+           }
+           candidate.noNewExchanges || !sameHostAndPort(candidate.route().address.url) -> {
+-            call.releaseConnectionNoEvents()
++            connectionUser.releaseConnectionNoEvents()
+           }
+           else -> null
+         }
+@@ -113,19 +111,19 @@ class RealRoutePlanner internal constructor(
+ 
+     // If the call's connection wasn't released, reuse it. We don't call connectionAcquired() here
+     // because we already acquired it.
+-    if (call.connection != null) {
++    if (connectionUser.candidateConnection() != null) {
+       check(toClose == null)
+       return ReusePlan(candidate)
+     }
+ 
+     // The call's connection was released.
+     toClose?.closeQuietly()
+-    call.eventListener.connectionReleased(call, candidate)
+-    candidate.connectionListener.connectionReleased(candidate, call)
++    connectionUser.connectionReleased(candidate)
++    connectionUser.connectionConnectionReleased(candidate)
+     if (toClose != null) {
+-      candidate.connectionListener.connectionClosed(candidate)
++      connectionUser.connectionConnectionClosed(candidate)
+     } else if (noNewExchangesEvent) {
+-      candidate.connectionListener.noNewExchanges(candidate)
++      connectionUser.noNewExchanges(candidate)
+     }
+     return null
+   }
+@@ -153,7 +151,7 @@ class RealRoutePlanner internal constructor(
+         RouteSelector(
+           address = address,
+           routeDatabase = routeDatabase,
+-          call = call,
++          connectionUser = connectionUser,
+           fastFallback = fastFallback,
+         )
+       routeSelector = newRouteSelector
+@@ -182,9 +180,9 @@ class RealRoutePlanner internal constructor(
+   ): ReusePlan? {
+     val result =
+       connectionPool.callAcquirePooledConnection(
+-        doExtensiveHealthChecks = doExtensiveHealthChecks,
++        doExtensiveHealthChecks = connectionUser.doExtensiveHealthChecks(),
+         address = address,
+-        call = call,
++        connectionUser = connectionUser,
+         routes = routes,
+         requireMultiplexed = planToReplace != null && planToReplace.isReady,
+       ) ?: return null
+@@ -196,8 +194,8 @@ class RealRoutePlanner internal constructor(
+       planToReplace.closeQuietly()
+     }
+ 
+-    call.eventListener.connectionAcquired(call, result)
+-    result.connectionListener.connectionAcquired(result, call)
++    connectionUser.connectionAcquired(result)
++    connectionUser.connectionConnectionAcquired(result)
+     return ReusePlan(result)
+   }
+ 
+@@ -239,7 +237,7 @@ class RealRoutePlanner internal constructor(
+       socketReadTimeoutMillis = socketReadTimeoutMillis,
+       pingIntervalMillis = pingIntervalMillis,
+       retryOnConnectionFailure = retryOnConnectionFailure,
+-      call = call,
++      user = connectionUser,
+       routePlanner = this,
+       route = route,
+       routes = routes,
+diff --git a/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/connection/RouteSelector.kt b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/connection/RouteSelector.kt
+index c4fc3149d..8d90cca78 100644
+--- a/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/connection/RouteSelector.kt
++++ b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/connection/RouteSelector.kt
+@@ -21,6 +21,7 @@ import java.net.InetSocketAddress
+ import java.net.Proxy
+ import java.net.SocketException
+ import java.net.UnknownHostException
++import java.util.NoSuchElementException
+ import okhttp3.Address
+ import okhttp3.HttpUrl
+ import okhttp3.Route
+@@ -32,10 +33,10 @@ import okhttp3.internal.toImmutableList
+  * Selects routes to connect to an origin server. Each connection requires a choice of proxy server,
+  * IP address, and TLS mode. Connections may also be recycled.
+  */
+-class RouteSelector internal constructor(
++class RouteSelector(
+   private val address: Address,
+   private val routeDatabase: RouteDatabase,
+-  private val call: RealCall,
++  private val connectionUser: ConnectionUser,
+   private val fastFallback: Boolean,
+ ) {
+   // State for negotiating the next proxy to use.
+@@ -111,10 +112,10 @@ class RouteSelector internal constructor(
+       return proxiesOrNull.toImmutableList()
+     }
+ 
+-    call.eventListener.proxySelectStart(call, url)
++    connectionUser.proxySelectStart(url)
+     proxies = selectProxies()
+     nextProxyIndex = 0
+-    call.eventListener.proxySelectEnd(call, url, proxies)
++    connectionUser.proxySelectEnd(url, proxies)
+   }
+ 
+   /** Returns true if there's another proxy to try. */
+@@ -165,14 +166,14 @@ class RouteSelector internal constructor(
+         if (socketHost.canParseAsIpAddress()) {
+           listOf(InetAddress.getByName(socketHost))
+         } else {
+-          call.eventListener.dnsStart(call, socketHost)
++          connectionUser.dnsStart(socketHost)
+ 
+           val result = address.dns.lookup(socketHost)
+           if (result.isEmpty()) {
+             throw UnknownHostException("${address.dns} returned no addresses for $socketHost")
+           }
+ 
+-          call.eventListener.dnsEnd(call, socketHost, result)
++          connectionUser.dnsEnd(socketHost, result)
+           result
+         }
+ 
+diff --git a/okhttp/src/jvmTest/kotlin/okhttp3/internal/connection/RouteSelectorTest.kt b/okhttp/src/jvmTest/kotlin/okhttp3/internal/connection/RouteSelectorTest.kt
+index ff50fbf89..d61136b64 100644
+--- a/okhttp/src/jvmTest/kotlin/okhttp3/internal/connection/RouteSelectorTest.kt
++++ b/okhttp/src/jvmTest/kotlin/okhttp3/internal/connection/RouteSelectorTest.kt
+@@ -19,7 +19,7 @@ import assertk.assertThat
+ import assertk.assertions.containsExactly
+ import assertk.assertions.isEqualTo
+ import assertk.assertions.isFalse
+-import assertk.assertions.isSameInstanceAs
++import assertk.assertions.isSameAs
+ import assertk.assertions.isTrue
+ import java.io.IOException
+ import java.net.InetAddress
+@@ -37,6 +37,7 @@ import okhttp3.Request
+ import okhttp3.Route
+ import okhttp3.TestValueFactory
+ import okhttp3.internal.connection.RouteSelector.Companion.socketHost
++import okhttp3.internal.http.RealInterceptorChain
+ import okhttp3.internal.http.RecordingProxySelector
+ import okhttp3.testing.PlatformRule
+ import org.junit.jupiter.api.AfterEach
+@@ -386,8 +387,8 @@ class RouteSelectorTest {
+     val routes = selection.routes
+     assertRoute(routes[0], address, Proxy.NO_PROXY, dns.lookup(uriHost, 0), uriPort)
+     assertRoute(routes[1], address, Proxy.NO_PROXY, dns.lookup(uriHost, 1), uriPort)
+-    assertThat(selection.next()).isSameInstanceAs(routes[0])
+-    assertThat(selection.next()).isSameInstanceAs(routes[1])
++    assertThat(selection.next()).isSameAs(routes[0])
++    assertThat(selection.next()).isSameAs(routes[1])
+     assertThat(selection.hasNext()).isFalse()
+     assertThat(routeSelector.hasNext()).isFalse()
+   }
+@@ -553,7 +554,19 @@ class RouteSelectorTest {
+       address = address,
+       routeDatabase = routeDatabase,
+       fastFallback = fastFallback,
++      connectionUser = CallConnectionUser(call, ConnectionListener.NONE, newChain(call)),
++    )
++
++  private fun newChain(call: RealCall): RealInterceptorChain =
++    RealInterceptorChain(
+       call = call,
++      interceptors = listOf(),
++      index = 0,
++      exchange = null,
++      request = call.request(),
++      connectTimeoutMillis = 10_000,
++      readTimeoutMillis = 10_000,
++      writeTimeoutMillis = 10_000,
+     )
+ 
+   companion object {

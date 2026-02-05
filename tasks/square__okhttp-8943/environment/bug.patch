@@ -1,0 +1,415 @@
+diff --git a/buildSrc/build.gradle.kts b/buildSrc/build.gradle.kts
+index 16dcc6831..90a3bde87 100644
+--- a/buildSrc/build.gradle.kts
++++ b/buildSrc/build.gradle.kts
+@@ -15,11 +15,11 @@
+  */
+ 
+ plugins {
+-  `kotlin-dsl`
++    `kotlin-dsl`
+ }
+ 
+ repositories {
+-  mavenCentral()
++    mavenCentral()
+ }
+ 
+ dependencies {
+diff --git a/gradle/libs.versions.toml b/gradle/libs.versions.toml
+index c6c9fd129..7fbf9f8ee 100644
+--- a/gradle/libs.versions.toml
++++ b/gradle/libs.versions.toml
+@@ -106,4 +106,3 @@ squareup-okio-fakefilesystem = { module = "com.squareup.okio:okio-fakefilesystem
+ squareup-okio-nodefilesystem = { module = "com.squareup.okio:okio-nodefilesystem", version.ref = "com-squareup-okio" }
+ testcontainers = { module = "org.testcontainers:testcontainers", version.ref = "testcontainers" }
+ testcontainers-junit5 = { module = "org.testcontainers:junit-jupiter", version.ref = "testcontainers" }
+-zstd-kmp-okio = { module = "com.squareup.zstd:zstd-kmp-okio", version = "0.3.0" }
+diff --git a/okhttp-zstd/README.md b/okhttp-zstd/README.md
+deleted file mode 100644
+index 4dabca5ea..000000000
+--- a/okhttp-zstd/README.md
++++ /dev/null
+@@ -1,20 +0,0 @@
+-OkHttp Zstandard (zstd) Integration
+-===================================
+-
+-This module enables [Zstandard (zstd)][1] response compression in addition to Gzip, as long as
+-the `Accept-Encoding` header is not otherwise set. Web servers must be configured to return zstd
+-responses.
+-
+-Note that zstd is not used for sending requests.
+-
+-```java
+-OkHttpClient client = new OkHttpClient.Builder()
+-  .addInterceptor(ZstdInterceptor.INSTANCE)
+-  .build();
+-```
+-
+-```kotlin
+-implementation("com.squareup.okhttp3:okhttp-zstd:0.0.0")
+-```
+-
+- [1]: https://github.com/facebook/zstd
+diff --git a/okhttp-zstd/api/okhttp-zstd.api b/okhttp-zstd/api/okhttp-zstd.api
+deleted file mode 100644
+index af53dcaff..000000000
+--- a/okhttp-zstd/api/okhttp-zstd.api
++++ /dev/null
+@@ -1,5 +0,0 @@
+-public final class okhttp3/zstd/ZstdInterceptor : okhttp3/Interceptor {
+-	public static final field INSTANCE Lokhttp3/zstd/ZstdInterceptor;
+-	public fun intercept (Lokhttp3/Interceptor$Chain;)Lokhttp3/Response;
+-}
+-
+diff --git a/okhttp-zstd/build.gradle.kts b/okhttp-zstd/build.gradle.kts
+deleted file mode 100644
+index 359eb646a..000000000
+--- a/okhttp-zstd/build.gradle.kts
++++ /dev/null
+@@ -1,29 +0,0 @@
+-import com.vanniktech.maven.publish.JavadocJar
+-import com.vanniktech.maven.publish.KotlinJvm
+-
+-plugins {
+-  kotlin("jvm")
+-  id("org.jetbrains.dokka")
+-  id("com.vanniktech.maven.publish.base")
+-  id("binary-compatibility-validator")
+-}
+-
+-project.applyOsgi(
+-  "Export-Package: okhttp3.zstd",
+-  "Automatic-Module-Name: okhttp3.zstd",
+-  "Bundle-SymbolicName: com.squareup.okhttp3.zstd"
+-)
+-
+-dependencies {
+-  api(projects.okhttp)
+-  implementation(libs.zstd.kmp.okio)
+-
+-  testImplementation(projects.okhttpTestingSupport)
+-  testImplementation(libs.kotlin.test.common)
+-  testImplementation(libs.kotlin.test.junit)
+-  testImplementation(libs.assertk)
+-}
+-
+-mavenPublishing {
+-  configure(KotlinJvm(javadocJar = JavadocJar.Empty()))
+-}
+diff --git a/okhttp-zstd/src/main/kotlin/okhttp3/zstd/ZstdInterceptor.kt b/okhttp-zstd/src/main/kotlin/okhttp3/zstd/ZstdInterceptor.kt
+deleted file mode 100644
+index 82d3dd41e..000000000
+--- a/okhttp-zstd/src/main/kotlin/okhttp3/zstd/ZstdInterceptor.kt
++++ /dev/null
+@@ -1,75 +0,0 @@
+-/*
+- * Copyright (C) 2025 Square, Inc.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-package okhttp3.zstd
+-
+-import com.squareup.zstd.okio.zstdDecompress
+-import okhttp3.Interceptor
+-import okhttp3.Response
+-import okhttp3.ResponseBody.Companion.asResponseBody
+-import okhttp3.internal.http.promisesBody
+-import okio.buffer
+-import okio.gzip
+-
+-/**
+- * Transparent Zstandard response support.
+- *
+- * This must be installed as an application interceptor.
+- *
+- * Adds `Accept-Encoding: zstd,gzip` to request and checks (and strips) for `Content-Encoding: zstd`
+- * in responses.
+- *
+- * This replaces the transparent gzip compression in OkHttp.
+- */
+-object ZstdInterceptor : Interceptor {
+-  override fun intercept(chain: Interceptor.Chain): Response {
+-    val originalRequest = chain.request()
+-
+-    if (originalRequest.header("Accept-Encoding") != null) {
+-      return chain.proceed(originalRequest)
+-    }
+-
+-    val request =
+-      originalRequest
+-        .newBuilder()
+-        .header("Accept-Encoding", "zstd,gzip")
+-        .build()
+-
+-    return decompress(chain.proceed(request))
+-  }
+-
+-  internal fun decompress(response: Response): Response {
+-    if (!response.promisesBody()) {
+-      return response
+-    }
+-
+-    val body = response.body
+-    val encoding = response.header("Content-Encoding") ?: return response
+-
+-    val decompressedSource =
+-      when {
+-        encoding.equals("zstd", ignoreCase = true) -> body.source().zstdDecompress()
+-        encoding.equals("gzip", ignoreCase = true) -> body.source().gzip()
+-        else -> return response
+-      }
+-
+-    return response
+-      .newBuilder()
+-      .removeHeader("Content-Encoding")
+-      .removeHeader("Content-Length")
+-      .body(decompressedSource.buffer().asResponseBody(body.contentType(), -1L))
+-      .build()
+-  }
+-}
+diff --git a/okhttp-zstd/src/test/java/okhttp3/zstd/ZstdInterceptorTest.kt b/okhttp-zstd/src/test/java/okhttp3/zstd/ZstdInterceptorTest.kt
+deleted file mode 100644
+index 52092bc1c..000000000
+--- a/okhttp-zstd/src/test/java/okhttp3/zstd/ZstdInterceptorTest.kt
++++ /dev/null
+@@ -1,167 +0,0 @@
+-/*
+- * Copyright (C) 2025 Square, Inc.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-package okhttp3.zstd
+-
+-import assertk.assertThat
+-import assertk.assertions.hasMessage
+-import assertk.assertions.isEmpty
+-import assertk.assertions.isEqualTo
+-import assertk.assertions.isNull
+-import com.squareup.zstd.okio.zstdCompress
+-import java.io.IOException
+-import kotlin.test.assertFailsWith
+-import okhttp3.MediaType.Companion.toMediaType
+-import okhttp3.Protocol
+-import okhttp3.Request
+-import okhttp3.Response
+-import okhttp3.ResponseBody.Companion.toResponseBody
+-import okhttp3.zstd.ZstdInterceptor.decompress
+-import okio.Buffer
+-import okio.ByteString
+-import okio.ByteString.Companion.EMPTY
+-import okio.ByteString.Companion.encodeUtf8
+-import okio.Sink
+-import okio.buffer
+-import okio.gzip
+-import org.junit.jupiter.api.Test
+-
+-class ZstdInterceptorTest {
+-  @Test
+-  fun testDecompressZstd() {
+-    val s = "hello zstd world".encodeUtf8().zstdCompress()
+-
+-    val response =
+-      response("https://example.com/", s) {
+-        header("Content-Encoding", "zstd")
+-      }
+-
+-    val decompressed = decompress(response)
+-    assertThat(decompressed.header("Content-Encoding")).isNull()
+-
+-    val responseString = decompressed.body.string()
+-    assertThat(responseString).isEqualTo("hello zstd world")
+-  }
+-
+-  @Test
+-  fun testDecompressGzip() {
+-    val s = "hello gzip world".encodeUtf8().gzipCompress()
+-
+-    val response =
+-      response("https://example.com/", s) {
+-        header("Content-Encoding", "gzip")
+-      }
+-
+-    val decompressed = decompress(response)
+-    assertThat(decompressed.header("Content-Encoding")).isNull()
+-
+-    val responseString = decompressed.body.string()
+-    assertThat(responseString).isEqualTo("hello gzip world")
+-  }
+-
+-  @Test
+-  fun testNoDecompress() {
+-    val s = "hello not compressed world".encodeUtf8()
+-
+-    val response = response("https://example.com/", s)
+-
+-    val decompressed = decompress(response)
+-    assertThat(decompressed.header("Content-Encoding")).isNull()
+-
+-    val responseString = decompressed.body.string()
+-    assertThat(responseString).isEqualTo("hello not compressed world")
+-  }
+-
+-  @Test
+-  fun testUnknownAlgorithm() {
+-    val s = "hello unknown algorithm world".encodeUtf8()
+-
+-    val response =
+-      response("https://example.com/", s) {
+-        header("Content-Encoding", "deflate")
+-      }
+-
+-    val decompressed = decompress(response)
+-    assertThat(decompressed.header("Content-Encoding")).isEqualTo("deflate")
+-
+-    val responseString = decompressed.body.string()
+-    assertThat(responseString).isEqualTo("hello unknown algorithm world")
+-  }
+-
+-  @Test
+-  fun testFailsDecompress() {
+-    val s = "this is not valid zstd".encodeUtf8()
+-
+-    val response =
+-      response("https://example.com/", s) {
+-        header("Content-Encoding", "zstd")
+-      }
+-
+-    val decompressed = decompress(response)
+-    assertThat(decompressed.header("Content-Encoding")).isNull()
+-
+-    assertFailsWith<IOException> {
+-      decompressed.body.string()
+-    }.also { ioe ->
+-      assertThat(ioe).hasMessage("zstd decompress failed: Unknown frame descriptor")
+-    }
+-  }
+-
+-  @Test
+-  fun testSkipDecompressNoContentResponse() {
+-    val response =
+-      response("https://example.com/", EMPTY) {
+-        header("Content-Encoding", "zstd")
+-        code(204)
+-        message("NO CONTENT")
+-      }
+-
+-    val same = decompress(response)
+-
+-    val responseString = same.body.string()
+-    assertThat(responseString).isEmpty()
+-  }
+-
+-  private fun ByteString.zstdCompress(): ByteString {
+-    val result = Buffer()
+-    result.zstdCompress().buffer().use {
+-      it.write(this@zstdCompress)
+-    }
+-    return result.readByteString()
+-  }
+-
+-  private fun ByteString.gzipCompress(): ByteString {
+-    val result = Buffer()
+-    (result as Sink).gzip().buffer().use {
+-      it.write(this@gzipCompress)
+-    }
+-    return result.readByteString()
+-  }
+-
+-  private fun response(
+-    url: String,
+-    body: ByteString,
+-    fn: Response.Builder.() -> Unit = {},
+-  ): Response =
+-    Response
+-      .Builder()
+-      .body(body.toResponseBody("text/plain".toMediaType()))
+-      .code(200)
+-      .message("OK")
+-      .request(Request.Builder().url(url).build())
+-      .protocol(Protocol.HTTP_2)
+-      .apply(fn)
+-      .build()
+-}
+diff --git a/okhttp-zstd/src/test/java/okhttp3/zstd/ZstdTestMain.kt b/okhttp-zstd/src/test/java/okhttp3/zstd/ZstdTestMain.kt
+deleted file mode 100644
+index 4d7388f0c..000000000
+--- a/okhttp-zstd/src/test/java/okhttp3/zstd/ZstdTestMain.kt
++++ /dev/null
+@@ -1,44 +0,0 @@
+-/*
+- * Copyright (C) 2025 Square, Inc.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-package okhttp3.zstd
+-
+-import okhttp3.OkHttpClient
+-import okhttp3.Request
+-
+-fun main() {
+-  val client =
+-    OkHttpClient
+-      .Builder()
+-      .addInterceptor(ZstdInterceptor)
+-      .build()
+-
+-  sendRequest("https://developers.facebook.com/docs/", client)
+-  sendRequest("https://www.facebook.com/robots.txt", client)
+-  sendRequest("https://www.instagram.com/robots.txt", client)
+-}
+-
+-private fun sendRequest(
+-  url: String,
+-  client: OkHttpClient,
+-) {
+-  val req = Request.Builder().url(url).build()
+-
+-  client.newCall(req).execute().use {
+-    println(url)
+-    println("""Content-Encoding: ${it.networkResponse?.header("Content-Encoding")}""")
+-    println("| ${it.body.string().replace("\n", "\n| ")}")
+-  }
+-}
+diff --git a/settings.gradle.kts b/settings.gradle.kts
+index c478b9158..41b6eb1b1 100644
+--- a/settings.gradle.kts
++++ b/settings.gradle.kts
+@@ -42,7 +42,6 @@ include(":okhttp-sse")
+ include(":okhttp-testing-support")
+ include(":okhttp-tls")
+ include(":okhttp-urlconnection")
+-include(":okhttp-zstd")
+ include(":samples:compare")
+ include(":samples:crawler")
+ include(":samples:guide")

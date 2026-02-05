@@ -1,0 +1,676 @@
+diff --git a/docs/src/main/asciidoc/security-oidc-expanded-configuration.adoc b/docs/src/main/asciidoc/security-oidc-expanded-configuration.adoc
+index e6ca819359e..f840568796a 100644
+--- a/docs/src/main/asciidoc/security-oidc-expanded-configuration.adoc
++++ b/docs/src/main/asciidoc/security-oidc-expanded-configuration.adoc
+@@ -1310,7 +1310,6 @@ In turn, a client that requested the protected resource metadata can use its pro
+ 
+ |quarkus.oidc.resource-metadata.enabled |false|Enable resource metadata properties
+ |quarkus.oidc.resource-metadata.resource ||Resource identifier
+-|quarkus.oidc.resource-metadata.scopes ||Supported scopes
+ |quarkus.oidc.resource-metadata.authorization-server ||Authorization server URL
+ |quarkus.oidc.resource-metadata.force-https-scheme |true|Force that a resource identifier URL has an HTTPS scheme
+ |====
+diff --git a/extensions/mailer/runtime/src/main/java/io/quarkus/mailer/runtime/BlockingMailerImpl.java b/extensions/mailer/runtime/src/main/java/io/quarkus/mailer/runtime/BlockingMailerImpl.java
+index d223ae1ac23..32c46dc3ebe 100644
+--- a/extensions/mailer/runtime/src/main/java/io/quarkus/mailer/runtime/BlockingMailerImpl.java
++++ b/extensions/mailer/runtime/src/main/java/io/quarkus/mailer/runtime/BlockingMailerImpl.java
+@@ -1,5 +1,7 @@
+ package io.quarkus.mailer.runtime;
+ 
++import java.time.Duration;
++
+ import io.quarkus.mailer.Mail;
+ import io.quarkus.mailer.Mailer;
+ import io.quarkus.mailer.reactive.ReactiveMailer;
+@@ -10,13 +12,21 @@
+ public class BlockingMailerImpl implements Mailer {
+ 
+     private final ReactiveMailer mailer;
++    private final Duration timeout;
+ 
+-    BlockingMailerImpl(ReactiveMailer mailer) {
++    BlockingMailerImpl(ReactiveMailer mailer, Duration timeout) {
+         this.mailer = mailer;
++        this.timeout = timeout;
+     }
+ 
+     @Override
+     public void send(Mail... mails) {
+-        mailer.send(mails).await().indefinitely();
++        if (timeout == null || timeout.isZero()) {
++            // Backward compatibility: if timeout is 0 or null, wait indefinitely
++            mailer.send(mails).await().indefinitely();
++        } else {
++            // Use the configured timeout
++            mailer.send(mails).await().atMost(timeout);
++        }
+     }
+ }
+diff --git a/extensions/mailer/runtime/src/main/java/io/quarkus/mailer/runtime/MailerRuntimeConfig.java b/extensions/mailer/runtime/src/main/java/io/quarkus/mailer/runtime/MailerRuntimeConfig.java
+index 5948a234995..6142da02030 100644
+--- a/extensions/mailer/runtime/src/main/java/io/quarkus/mailer/runtime/MailerRuntimeConfig.java
++++ b/extensions/mailer/runtime/src/main/java/io/quarkus/mailer/runtime/MailerRuntimeConfig.java
+@@ -261,4 +261,17 @@ public interface MailerRuntimeConfig {
+      */
+     @WithDefault("false")
+     boolean logInvalidRecipients();
++
++    /**
++     * Sets the timeout duration for blocking mailer operations.
++     * When using the blocking mailer ({@link io.quarkus.mailer.Mailer} interface), this timeout determines how long to wait
++     * for the mail to be sent before throwing a {@link java.util.concurrent.TimeoutException}.
++     * <p>
++     * This prevents indefinite thread blocking when SMTP servers are misconfigured or unreachable.
++     * A value of 0 means no timeout (wait indefinitely) - which is not recommended.
++     * <p>
++     * Default is 60 seconds.
++     */
++    @WithDefault("PT60S")
++    Duration timeout();
+ }
+diff --git a/extensions/mailer/runtime/src/main/java/io/quarkus/mailer/runtime/Mailers.java b/extensions/mailer/runtime/src/main/java/io/quarkus/mailer/runtime/Mailers.java
+index c8f792ea077..184ea06bccf 100644
+--- a/extensions/mailer/runtime/src/main/java/io/quarkus/mailer/runtime/Mailers.java
++++ b/extensions/mailer/runtime/src/main/java/io/quarkus/mailer/runtime/Mailers.java
+@@ -54,6 +54,7 @@ public class Mailers {
+     private final Map<String, io.vertx.mutiny.ext.mail.MailClient> mutinyClients;
+     private final Map<String, MockMailboxImpl> mockMailboxes;
+     private final Map<String, MutinyMailerImpl> mutinyMailers;
++    private final MailersRuntimeConfig mailersRuntimeConfig;
+ 
+     public Mailers(Vertx vertx, io.vertx.mutiny.core.Vertx mutinyVertx, MailersRuntimeConfig mailersRuntimeConfig,
+             LaunchMode launchMode, MailerSupport mailerSupport, TlsConfigurationRegistry tlsRegistry,
+@@ -111,6 +112,7 @@ public Mailers(Vertx vertx, io.vertx.mutiny.core.Vertx mutinyVertx, MailersRunti
+         this.mutinyClients = Collections.unmodifiableMap(localMutinyClients);
+         this.mockMailboxes = Collections.unmodifiableMap(localMockMailboxes);
+         this.mutinyMailers = Collections.unmodifiableMap(localMutinyMailers);
++        this.mailersRuntimeConfig = mailersRuntimeConfig;
+     }
+ 
+     public MailClient mailClientFromName(String name) {
+@@ -122,7 +124,8 @@ public io.vertx.mutiny.ext.mail.MailClient reactiveMailClientFromName(String nam
+     }
+ 
+     public Mailer mailerFromName(String name) {
+-        return new BlockingMailerImpl(reactiveMailerFromName(name));
++        MailerRuntimeConfig config = mailersRuntimeConfig.mailers().get(name);
++        return new BlockingMailerImpl(reactiveMailerFromName(name), config.timeout());
+     }
+ 
+     public ReactiveMailer reactiveMailerFromName(String name) {
+diff --git a/extensions/mailer/runtime/src/test/java/io/quarkus/mailer/runtime/BlockingMailerImplTest.java b/extensions/mailer/runtime/src/test/java/io/quarkus/mailer/runtime/BlockingMailerImplTest.java
+new file mode 100644
+index 00000000000..f9d73400d55
+--- /dev/null
++++ b/extensions/mailer/runtime/src/test/java/io/quarkus/mailer/runtime/BlockingMailerImplTest.java
+@@ -0,0 +1,126 @@
++package io.quarkus.mailer.runtime;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.assertj.core.api.Assertions.assertThatCode;
++import static org.assertj.core.api.Assertions.assertThatThrownBy;
++
++import java.time.Duration;
++
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++
++import io.quarkus.mailer.Mail;
++import io.quarkus.mailer.Mailer;
++import io.quarkus.mailer.reactive.ReactiveMailer;
++import io.smallrye.mutiny.Uni;
++import io.vertx.mutiny.core.Vertx;
++
++class BlockingMailerImplTest {
++
++    private Vertx vertx;
++
++    @BeforeEach
++    void setup() {
++        vertx = Vertx.vertx();
++    }
++
++    @AfterEach
++    void tearDown() {
++        if (vertx != null) {
++            vertx.close().await().indefinitely();
++        }
++    }
++
++    @Test
++    void testTimeoutThrowsException() {
++        ReactiveMailer slowMailer = new ReactiveMailer() {
++            @Override
++            public Uni<Void> send(Mail... mails) {
++                return Uni.createFrom().emitter(emitter -> {
++                    // Never complete - simulates hanging connection
++                });
++            }
++        };
++        Mailer blockingMailer = new BlockingMailerImpl(slowMailer, Duration.ofSeconds(1));
++        Mail mail = Mail.withText("test@example.com", "Subject", "Body");
++
++        assertThatThrownBy(() -> blockingMailer.send(mail))
++                .isInstanceOf(io.smallrye.mutiny.TimeoutException.class);
++    }
++
++    @Test
++    void testTimeoutZeroWaitsIndefinitely() throws InterruptedException {
++        ReactiveMailer delayedMailer = new ReactiveMailer() {
++            @Override
++            public Uni<Void> send(Mail... mails) {
++                return Uni.createFrom().voidItem()
++                        .onItem().delayIt().by(Duration.ofMillis(500));
++            }
++        };
++        Mailer blockingMailer = new BlockingMailerImpl(delayedMailer, Duration.ZERO);
++        Mail mail = Mail.withText("test@example.com", "Subject", "Body");
++
++        // Should complete successfully even though it takes 500ms
++        // because zero timeout means wait indefinitely
++        long startTime = System.currentTimeMillis();
++        blockingMailer.send(mail);
++        long duration = System.currentTimeMillis() - startTime;
++
++        assertThat(duration).isGreaterThanOrEqualTo(500);
++    }
++
++    @Test
++    void testTimeoutNullWaitsIndefinitely() {
++        ReactiveMailer delayedMailer = new ReactiveMailer() {
++            @Override
++            public Uni<Void> send(Mail... mails) {
++                return Uni.createFrom().voidItem()
++                        .onItem().delayIt().by(Duration.ofMillis(500));
++            }
++        };
++        Mailer blockingMailer = new BlockingMailerImpl(delayedMailer, null);
++        Mail mail = Mail.withText("test@example.com", "Subject", "Body");
++
++        // Should complete successfully even though it takes 500ms
++        // because null timeout means wait indefinitely
++        long startTime = System.currentTimeMillis();
++        blockingMailer.send(mail);
++        long duration = System.currentTimeMillis() - startTime;
++
++        assertThat(duration).isGreaterThanOrEqualTo(500);
++    }
++
++    @Test
++    void testSuccessfulSendWithinTimeout() {
++        ReactiveMailer fastMailer = new ReactiveMailer() {
++            @Override
++            public Uni<Void> send(Mail... mails) {
++                return Uni.createFrom().voidItem();
++            }
++        };
++        Mailer blockingMailer = new BlockingMailerImpl(fastMailer, Duration.ofSeconds(10));
++        Mail mail = Mail.withText("test@example.com", "Subject", "Body");
++
++        long startTime = System.currentTimeMillis();
++        assertThatCode(() -> blockingMailer.send(mail)).doesNotThrowAnyException();
++        long duration = System.currentTimeMillis() - startTime;
++        assertThat(duration).isLessThan(1000);
++    }
++
++    @Test
++    void testExceptionPropagation() {
++        ReactiveMailer failingMailer = new ReactiveMailer() {
++            @Override
++            public Uni<Void> send(Mail... mails) {
++                return Uni.createFrom().failure(new RuntimeException("SMTP error"));
++            }
++        };
++        Mailer blockingMailer = new BlockingMailerImpl(failingMailer, Duration.ofSeconds(10));
++        Mail mail = Mail.withText("test@example.com", "Subject", "Body");
++
++        assertThatThrownBy(() -> blockingMailer.send(mail))
++                .isInstanceOf(RuntimeException.class)
++                .hasMessage("SMTP error");
++    }
++}
+diff --git a/extensions/mailer/runtime/src/test/java/io/quarkus/mailer/runtime/FakeSmtpTestBase.java b/extensions/mailer/runtime/src/test/java/io/quarkus/mailer/runtime/FakeSmtpTestBase.java
+index ac50e055ee6..af470e755b6 100644
+--- a/extensions/mailer/runtime/src/test/java/io/quarkus/mailer/runtime/FakeSmtpTestBase.java
++++ b/extensions/mailer/runtime/src/test/java/io/quarkus/mailer/runtime/FakeSmtpTestBase.java
+@@ -313,6 +313,11 @@ public boolean logInvalidRecipients() {
+             return false;
+         }
+ 
++        @Override
++        public Duration timeout() {
++            return Duration.ofSeconds(60);
++        }
++
+     }
+ 
+ }
+diff --git a/extensions/oidc-common/runtime/src/main/java/io/quarkus/oidc/common/runtime/OidcConstants.java b/extensions/oidc-common/runtime/src/main/java/io/quarkus/oidc/common/runtime/OidcConstants.java
+index f982d23e7b7..74a6a35d5de 100644
+--- a/extensions/oidc-common/runtime/src/main/java/io/quarkus/oidc/common/runtime/OidcConstants.java
++++ b/extensions/oidc-common/runtime/src/main/java/io/quarkus/oidc/common/runtime/OidcConstants.java
+@@ -112,6 +112,5 @@ public final class OidcConstants {
+ 
+     public static final String RESOURCE_METADATA_WELL_KNOWN_PATH = "/.well-known/oauth-protected-resource";
+     public static final String RESOURCE_METADATA_RESOURCE = "resource";
+-    public static final String RESOURCE_METADATA_SCOPES = "scopes_supported";
+     public static final String RESOURCE_METADATA_AUTHORIZATION_SERVERS = "authorization_servers";
+ }
+diff --git a/extensions/oidc/runtime/src/main/java/io/quarkus/oidc/OidcTenantConfig.java b/extensions/oidc/runtime/src/main/java/io/quarkus/oidc/OidcTenantConfig.java
+index 07c30a12e04..dcb53cc6294 100644
+--- a/extensions/oidc/runtime/src/main/java/io/quarkus/oidc/OidcTenantConfig.java
++++ b/extensions/oidc/runtime/src/main/java/io/quarkus/oidc/OidcTenantConfig.java
+@@ -2759,7 +2759,6 @@ public static class ResourceMetadata implements io.quarkus.oidc.runtime.OidcTena
+ 
+         public boolean enabled;
+         public Optional<String> resource = Optional.empty();
+-        public Optional<Set<String>> scopes = Optional.empty();
+         public Optional<String> authorizationServer = Optional.empty();
+         public boolean forceHttpsScheme = true;
+ 
+@@ -2773,11 +2772,6 @@ public Optional<String> resource() {
+             return resource;
+         }
+ 
+-        @Override
+-        public Optional<Set<String>> scopes() {
+-            return scopes;
+-        }
+-
+         @Override
+         public Optional<String> authorizationServer() {
+             return authorizationServer;
+@@ -2791,7 +2785,6 @@ public boolean forceHttpsScheme() {
+         private void addConfigMappingValues(io.quarkus.oidc.runtime.OidcTenantConfig.ResourceMetadata mapping) {
+             enabled = mapping.enabled();
+             resource = mapping.resource();
+-            scopes = mapping.scopes();
+             authorizationServer = mapping.authorizationServer();
+             forceHttpsScheme = mapping.forceHttpsScheme();
+         }
+diff --git a/extensions/oidc/runtime/src/main/java/io/quarkus/oidc/OidcTenantConfigBuilder.java b/extensions/oidc/runtime/src/main/java/io/quarkus/oidc/OidcTenantConfigBuilder.java
+index 7cdaa97329f..5be1fb370bf 100644
+--- a/extensions/oidc/runtime/src/main/java/io/quarkus/oidc/OidcTenantConfigBuilder.java
++++ b/extensions/oidc/runtime/src/main/java/io/quarkus/oidc/OidcTenantConfigBuilder.java
+@@ -865,14 +865,13 @@ public CertificateChain build() {
+      */
+     public static final class ResourceMetadataBuilder {
+ 
+-        private record ResourceMetadataImpl(boolean enabled, Optional<String> resource, Optional<Set<String>> scopes,
++        private record ResourceMetadataImpl(boolean enabled, Optional<String> resource,
+                 Optional<String> authorizationServer, boolean forceHttpsScheme) implements ResourceMetadata {
+         }
+ 
+         private final OidcTenantConfigBuilder builder;
+         private boolean enabled;
+         private Optional<String> resource;
+-        private Optional<Set<String>> scopes;
+         private Optional<String> authorizationServer;
+         private boolean forceHttpsScheme;
+ 
+@@ -884,8 +883,6 @@ public ResourceMetadataBuilder(OidcTenantConfigBuilder builder) {
+             this.builder = Objects.requireNonNull(builder);
+             this.enabled = builder.resourceMetadata.enabled();
+             this.resource = builder.resourceMetadata.resource();
+-            this.scopes = builder.resourceMetadata.scopes().isEmpty() ? Optional.empty()
+-                    : Optional.of(Set.copyOf(builder.resourceMetadata.scopes().get()));
+             this.authorizationServer = builder.resourceMetadata.authorizationServer();
+             this.forceHttpsScheme = builder.resourceMetadata.forceHttpsScheme();
+         }
+@@ -917,23 +914,6 @@ public ResourceMetadataBuilder resource(String resource) {
+             return this;
+         }
+ 
+-        /**
+-         * @param scopes {@link ResourceMetadata#scopes()}
+-         * @return this builder
+-         */
+-        public ResourceMetadataBuilder scopes(String scope) {
+-            return this.scopes(Set.of(scope));
+-        }
+-
+-        /**
+-         * @param scopes {@link ResourceMetadata#scopes()}
+-         * @return this builder
+-         */
+-        public ResourceMetadataBuilder scopes(Set<String> scopes) {
+-            this.scopes = Optional.ofNullable(scopes);
+-            return this;
+-        }
+-
+         /**
+          * @param resource {@link ResourceMetadata#authorizationServer()}
+          * @return this builder
+@@ -972,7 +952,7 @@ public OidcTenantConfigBuilder end() {
+          * @return built ResourceMetadata
+          */
+         public ResourceMetadata build() {
+-            return new ResourceMetadataImpl(enabled, resource, scopes, authorizationServer, forceHttpsScheme);
++            return new ResourceMetadataImpl(enabled, resource, authorizationServer, forceHttpsScheme);
+         }
+     }
+ 
+diff --git a/extensions/oidc/runtime/src/main/java/io/quarkus/oidc/runtime/OidcTenantConfig.java b/extensions/oidc/runtime/src/main/java/io/quarkus/oidc/runtime/OidcTenantConfig.java
+index 0f8e5f12072..0c0e1397511 100644
+--- a/extensions/oidc/runtime/src/main/java/io/quarkus/oidc/runtime/OidcTenantConfig.java
++++ b/extensions/oidc/runtime/src/main/java/io/quarkus/oidc/runtime/OidcTenantConfig.java
+@@ -162,11 +162,6 @@ interface ResourceMetadata {
+          */
+         Optional<String> resource();
+ 
+-        /**
+-         * Supported scopes.
+-         */
+-        Optional<Set<String>> scopes();
+-
+         /**
+          * Authorization server URL.
+          * 'quarkus.oidc.auth-server-url' property value is reported by default.
+diff --git a/extensions/oidc/runtime/src/main/java/io/quarkus/oidc/runtime/ResourceMetadataHandler.java b/extensions/oidc/runtime/src/main/java/io/quarkus/oidc/runtime/ResourceMetadataHandler.java
+index 07b72cc46a7..890d854f18d 100644
+--- a/extensions/oidc/runtime/src/main/java/io/quarkus/oidc/runtime/ResourceMetadataHandler.java
++++ b/extensions/oidc/runtime/src/main/java/io/quarkus/oidc/runtime/ResourceMetadataHandler.java
+@@ -146,14 +146,6 @@ private String prepareMetadata(RoutingContext context) {
+             String resourceIdentifier = buildResourceIdentifierUrl(context, resolver, oidcConfig);
+             metadata.put(OidcConstants.RESOURCE_METADATA_RESOURCE, resourceIdentifier);
+ 
+-            if (oidcConfig.resourceMetadata().scopes().isPresent()) {
+-                JsonArray scopes = new JsonArray();
+-                for (String scope : oidcConfig.resourceMetadata().scopes().get()) {
+-                    scopes.add(scope);
+-                }
+-                metadata.put(OidcConstants.RESOURCE_METADATA_SCOPES, scopes);
+-            }
+-
+             JsonArray authorizationServers = new JsonArray();
+             authorizationServers.add(0, oidcConfig.resourceMetadata().authorizationServer()
+                     .orElse(oidcConfig.authServerUrl().get()));
+diff --git a/extensions/oidc/runtime/src/test/java/io/quarkus/oidc/runtime/OidcTenantConfigImpl.java b/extensions/oidc/runtime/src/test/java/io/quarkus/oidc/runtime/OidcTenantConfigImpl.java
+index 3f95905ba07..f0c2fb9f228 100644
+--- a/extensions/oidc/runtime/src/test/java/io/quarkus/oidc/runtime/OidcTenantConfigImpl.java
++++ b/extensions/oidc/runtime/src/test/java/io/quarkus/oidc/runtime/OidcTenantConfigImpl.java
+@@ -163,7 +163,6 @@ enum ConfigMappingMethods {
+         CERTIFICATION_CHAIN_TRUST_STORE_FILE_TYPE,
+         RESOURCE_METADATA_ENABLED,
+         RESOURCE_METADATA_RESOURCE,
+-        RESOURCE_METADATA_SCOPES,
+         RESOURCE_METADATA_AUTHORIZATION_SERVER,
+         RESOURCE_METADATA_FORCE_HTTPS_SCHEME,
+         LOGOUT_PATH,
+@@ -624,12 +623,6 @@ public Optional<String> resource() {
+                 return Optional.empty();
+             }
+ 
+-            @Override
+-            public Optional<Set<String>> scopes() {
+-                invocationsRecorder.put(ConfigMappingMethods.RESOURCE_METADATA_SCOPES, true);
+-                return Optional.empty();
+-            }
+-
+             @Override
+             public Optional<String> authorizationServer() {
+                 invocationsRecorder.put(ConfigMappingMethods.RESOURCE_METADATA_AUTHORIZATION_SERVER, true);
+diff --git a/independent-projects/tools/base-codestarts/src/main/resources/codestarts/quarkus-extension/code/quarkiverse/java/.github/workflows/build.tpl.qute.yml b/independent-projects/tools/base-codestarts/src/main/resources/codestarts/quarkus-extension/code/quarkiverse/java/.github/workflows/build.tpl.qute.yml
+index 02a8dc94dc2..ea683e0e4af 100644
+--- a/independent-projects/tools/base-codestarts/src/main/resources/codestarts/quarkus-extension/code/quarkiverse/java/.github/workflows/build.tpl.qute.yml
++++ b/independent-projects/tools/base-codestarts/src/main/resources/codestarts/quarkus-extension/code/quarkiverse/java/.github/workflows/build.tpl.qute.yml
+@@ -45,9 +45,9 @@ jobs:
+         run: git config --global core.autocrlf false
+         if: startsWith(matrix.os, 'windows')
+ 
+-      - uses: actions/checkout@v5
++      - uses: actions/checkout@v6
+       - name: Set up JDK {java.version}
+-        uses: actions/setup-java@v4
++        uses: actions/setup-java@v5
+         with:
+           distribution: temurin
+           java-version: {java.version}
+diff --git a/independent-projects/tools/base-codestarts/src/main/resources/codestarts/quarkus-extension/code/quarkiverse/java/.github/workflows/quarkus-snapshot.tpl.qute.yaml b/independent-projects/tools/base-codestarts/src/main/resources/codestarts/quarkus-extension/code/quarkiverse/java/.github/workflows/quarkus-snapshot.tpl.qute.yaml
+index c993510966a..1bc30dfe1b0 100644
+--- a/independent-projects/tools/base-codestarts/src/main/resources/codestarts/quarkus-extension/code/quarkiverse/java/.github/workflows/quarkus-snapshot.tpl.qute.yaml
++++ b/independent-projects/tools/base-codestarts/src/main/resources/codestarts/quarkus-extension/code/quarkiverse/java/.github/workflows/quarkus-snapshot.tpl.qute.yaml
+@@ -33,18 +33,18 @@ jobs:
+ 
+     steps:
+       - name: Set up Java
+-        uses: actions/setup-java@v4
++        uses: actions/setup-java@v5
+         with:
+           distribution: temurin
+           java-version: ${{ env.JAVA_VERSION }}
+ 
+       - name: Checkout repo
+-        uses: actions/checkout@v5
++        uses: actions/checkout@v6
+         with:
+           path: current-repo
+ 
+       - name: Checkout Ecosystem
+-        uses: actions/checkout@v5
++        uses: actions/checkout@v6
+         with:
+           repository: ${{ env.ECOSYSTEM_CI_REPO }}
+           path: ecosystem-ci
+diff --git a/independent-projects/tools/base-codestarts/src/main/resources/codestarts/quarkus/tooling/github-action/base/.github/workflows/ci.tpl.qute.yml b/independent-projects/tools/base-codestarts/src/main/resources/codestarts/quarkus/tooling/github-action/base/.github/workflows/ci.tpl.qute.yml
+index 12bce94bde7..6a53504bb04 100644
+--- a/independent-projects/tools/base-codestarts/src/main/resources/codestarts/quarkus/tooling/github-action/base/.github/workflows/ci.tpl.qute.yml
++++ b/independent-projects/tools/base-codestarts/src/main/resources/codestarts/quarkus/tooling/github-action/base/.github/workflows/ci.tpl.qute.yml
+@@ -12,10 +12,10 @@ jobs:
+   build:
+     runs-on: ubuntu-latest
+     steps:
+-      - uses: actions/checkout@v5
++      - uses: actions/checkout@v6
+ 
+       - name: Set up JDK {java.version}
+-        uses: actions/setup-java@v4
++        uses: actions/setup-java@v5
+         with:
+           java-version: {java.version}
+           distribution: temurin
+diff --git a/independent-projects/tools/devtools-common/src/main/java/io/quarkus/devtools/commands/CreateExtension.java b/independent-projects/tools/devtools-common/src/main/java/io/quarkus/devtools/commands/CreateExtension.java
+index 8857442c189..502a9b321d4 100644
+--- a/independent-projects/tools/devtools-common/src/main/java/io/quarkus/devtools/commands/CreateExtension.java
++++ b/independent-projects/tools/devtools-common/src/main/java/io/quarkus/devtools/commands/CreateExtension.java
+@@ -87,7 +87,7 @@ public enum LayoutType {
+ 
+     public static final String DEFAULT_QUARKIVERSE_PARENT_GROUP_ID = "io.quarkiverse";
+     public static final String DEFAULT_QUARKIVERSE_PARENT_ARTIFACT_ID = "quarkiverse-parent";
+-    public static final String DEFAULT_QUARKIVERSE_PARENT_VERSION = "19";
++    public static final String DEFAULT_QUARKIVERSE_PARENT_VERSION = "20";
+     public static final String DEFAULT_QUARKIVERSE_NAMESPACE_ID = "quarkus-";
+     public static final String DEFAULT_QUARKIVERSE_GUIDE_URL = "https://docs.quarkiverse.io/%s/dev/";
+ 
+diff --git a/independent-projects/tools/devtools-testing/src/test/resources/__snapshots__/QuarkusCodestartGenerationTest/generateGradleNoWrapperGithubAction/.github_workflows_ci.yml b/independent-projects/tools/devtools-testing/src/test/resources/__snapshots__/QuarkusCodestartGenerationTest/generateGradleNoWrapperGithubAction/.github_workflows_ci.yml
+index 74e2bf04f7e..93ce69e7090 100644
+--- a/independent-projects/tools/devtools-testing/src/test/resources/__snapshots__/QuarkusCodestartGenerationTest/generateGradleNoWrapperGithubAction/.github_workflows_ci.yml
++++ b/independent-projects/tools/devtools-testing/src/test/resources/__snapshots__/QuarkusCodestartGenerationTest/generateGradleNoWrapperGithubAction/.github_workflows_ci.yml
+@@ -12,10 +12,10 @@ jobs:
+   build:
+     runs-on: ubuntu-latest
+     steps:
+-      - uses: actions/checkout@v5
++      - uses: actions/checkout@v6
+ 
+       - name: Set up JDK 17
+-        uses: actions/setup-java@v4
++        uses: actions/setup-java@v5
+         with:
+           java-version: 17
+           distribution: temurin
+diff --git a/independent-projects/tools/devtools-testing/src/test/resources/__snapshots__/QuarkusCodestartGenerationTest/generateGradleWrapperGithubAction/.github_workflows_ci.yml b/independent-projects/tools/devtools-testing/src/test/resources/__snapshots__/QuarkusCodestartGenerationTest/generateGradleWrapperGithubAction/.github_workflows_ci.yml
+index b933b847a41..d6c58a22795 100644
+--- a/independent-projects/tools/devtools-testing/src/test/resources/__snapshots__/QuarkusCodestartGenerationTest/generateGradleWrapperGithubAction/.github_workflows_ci.yml
++++ b/independent-projects/tools/devtools-testing/src/test/resources/__snapshots__/QuarkusCodestartGenerationTest/generateGradleWrapperGithubAction/.github_workflows_ci.yml
+@@ -12,10 +12,10 @@ jobs:
+   build:
+     runs-on: ubuntu-latest
+     steps:
+-      - uses: actions/checkout@v5
++      - uses: actions/checkout@v6
+ 
+       - name: Set up JDK 17
+-        uses: actions/setup-java@v4
++        uses: actions/setup-java@v5
+         with:
+           java-version: 17
+           distribution: temurin
+diff --git a/independent-projects/tools/devtools-testing/src/test/resources/__snapshots__/QuarkusCodestartGenerationTest/generateMavenGithubAction/.github_workflows_ci.yml b/independent-projects/tools/devtools-testing/src/test/resources/__snapshots__/QuarkusCodestartGenerationTest/generateMavenGithubAction/.github_workflows_ci.yml
+index 09b0e3a9cd5..9e449acfc62 100644
+--- a/independent-projects/tools/devtools-testing/src/test/resources/__snapshots__/QuarkusCodestartGenerationTest/generateMavenGithubAction/.github_workflows_ci.yml
++++ b/independent-projects/tools/devtools-testing/src/test/resources/__snapshots__/QuarkusCodestartGenerationTest/generateMavenGithubAction/.github_workflows_ci.yml
+@@ -12,10 +12,10 @@ jobs:
+   build:
+     runs-on: ubuntu-latest
+     steps:
+-      - uses: actions/checkout@v5
++      - uses: actions/checkout@v6
+ 
+       - name: Set up JDK 17
+-        uses: actions/setup-java@v4
++        uses: actions/setup-java@v5
+         with:
+           java-version: 17
+           distribution: temurin
+diff --git a/integration-tests/maven/src/test/resources/__snapshots__/CreateExtensionMojoIT/testCreateQuarkiverseExtension/quarkus-my-quarkiverse-ext_.github_workflows_build.yml b/integration-tests/maven/src/test/resources/__snapshots__/CreateExtensionMojoIT/testCreateQuarkiverseExtension/quarkus-my-quarkiverse-ext_.github_workflows_build.yml
+index 3c09c181fa6..98ad0346a03 100644
+--- a/integration-tests/maven/src/test/resources/__snapshots__/CreateExtensionMojoIT/testCreateQuarkiverseExtension/quarkus-my-quarkiverse-ext_.github_workflows_build.yml
++++ b/integration-tests/maven/src/test/resources/__snapshots__/CreateExtensionMojoIT/testCreateQuarkiverseExtension/quarkus-my-quarkiverse-ext_.github_workflows_build.yml
+@@ -45,9 +45,9 @@ jobs:
+         run: git config --global core.autocrlf false
+         if: startsWith(matrix.os, 'windows')
+ 
+-      - uses: actions/checkout@v5
++      - uses: actions/checkout@v6
+       - name: Set up JDK 17
+-        uses: actions/setup-java@v4
++        uses: actions/setup-java@v5
+         with:
+           distribution: temurin
+           java-version: 17
+diff --git a/integration-tests/maven/src/test/resources/__snapshots__/CreateExtensionMojoIT/testCreateQuarkiverseExtension/quarkus-my-quarkiverse-ext_.github_workflows_quarkus-snapshot.yaml b/integration-tests/maven/src/test/resources/__snapshots__/CreateExtensionMojoIT/testCreateQuarkiverseExtension/quarkus-my-quarkiverse-ext_.github_workflows_quarkus-snapshot.yaml
+index 4f60acd0852..f72c654482b 100644
+--- a/integration-tests/maven/src/test/resources/__snapshots__/CreateExtensionMojoIT/testCreateQuarkiverseExtension/quarkus-my-quarkiverse-ext_.github_workflows_quarkus-snapshot.yaml
++++ b/integration-tests/maven/src/test/resources/__snapshots__/CreateExtensionMojoIT/testCreateQuarkiverseExtension/quarkus-my-quarkiverse-ext_.github_workflows_quarkus-snapshot.yaml
+@@ -33,18 +33,18 @@ jobs:
+ 
+     steps:
+       - name: Set up Java
+-        uses: actions/setup-java@v4
++        uses: actions/setup-java@v5
+         with:
+           distribution: temurin
+           java-version: ${{ env.JAVA_VERSION }}
+ 
+       - name: Checkout repo
+-        uses: actions/checkout@v5
++        uses: actions/checkout@v6
+         with:
+           path: current-repo
+ 
+       - name: Checkout Ecosystem
+-        uses: actions/checkout@v5
++        uses: actions/checkout@v6
+         with:
+           repository: ${{ env.ECOSYSTEM_CI_REPO }}
+           path: ecosystem-ci
+diff --git a/integration-tests/maven/src/test/resources/__snapshots__/CreateExtensionMojoIT/testCreateQuarkiverseExtension/quarkus-my-quarkiverse-ext_pom.xml b/integration-tests/maven/src/test/resources/__snapshots__/CreateExtensionMojoIT/testCreateQuarkiverseExtension/quarkus-my-quarkiverse-ext_pom.xml
+index bb948537395..719ffe4ac02 100644
+--- a/integration-tests/maven/src/test/resources/__snapshots__/CreateExtensionMojoIT/testCreateQuarkiverseExtension/quarkus-my-quarkiverse-ext_pom.xml
++++ b/integration-tests/maven/src/test/resources/__snapshots__/CreateExtensionMojoIT/testCreateQuarkiverseExtension/quarkus-my-quarkiverse-ext_pom.xml
+@@ -5,7 +5,7 @@
+     <parent>
+         <groupId>io.quarkiverse</groupId>
+         <artifactId>quarkiverse-parent</artifactId>
+-        <version>19</version>
++        <version>20</version>
+     </parent>
+     <groupId>io.quarkiverse.my-quarkiverse-ext</groupId>
+     <artifactId>quarkus-my-quarkiverse-ext-parent</artifactId>
+diff --git a/integration-tests/oidc-code-flow/src/main/resources/application.properties b/integration-tests/oidc-code-flow/src/main/resources/application.properties
+index e6b4e6b9d2c..851b11cf951 100644
+--- a/integration-tests/oidc-code-flow/src/main/resources/application.properties
++++ b/integration-tests/oidc-code-flow/src/main/resources/application.properties
+@@ -112,7 +112,6 @@ quarkus.oidc.tenant-refresh.token.refresh-expired=true
+ quarkus.oidc.tenant-refresh.authentication.remove-redirect-parameters=false
+ quarkus.oidc.tenant-refresh.authentication.cache-control=no-store
+ quarkus.oidc.tenant-refresh.resource-metadata.enabled=true
+-quarkus.oidc.tenant-refresh.resource-metadata.scopes=read,write
+ 
+ quarkus.oidc.tenant-autorefresh.auth-server-url=${quarkus.oidc.auth-server-url}
+ quarkus.oidc.tenant-autorefresh.client-id=quarkus-app
+@@ -152,7 +151,6 @@ quarkus.oidc.tenant-nonce.token-state-manager.encryption-required=false
+ quarkus.oidc.tenant-nonce.token.allow-jwt-introspection=false
+ quarkus.oidc.tenant-nonce.resource-metadata.enabled=true
+ quarkus.oidc.tenant-nonce.resource-metadata.resource=/metadata
+-quarkus.oidc.tenant-nonce.resource-metadata.scopes=read
+ quarkus.oidc.tenant-nonce.resource-metadata.authorization-server=http://localhost:8080/q/oidc
+ 
+ quarkus.oidc.tenant-javascript.auth-server-url=${quarkus.oidc.auth-server-url}
+diff --git a/integration-tests/oidc-code-flow/src/test/java/io/quarkus/it/keycloak/CodeFlowTest.java b/integration-tests/oidc-code-flow/src/test/java/io/quarkus/it/keycloak/CodeFlowTest.java
+index 6df7e7eaf66..7c1af1bed71 100644
+--- a/integration-tests/oidc-code-flow/src/test/java/io/quarkus/it/keycloak/CodeFlowTest.java
++++ b/integration-tests/oidc-code-flow/src/test/java/io/quarkus/it/keycloak/CodeFlowTest.java
+@@ -18,11 +18,9 @@
+ import java.util.Arrays;
+ import java.util.Base64;
+ import java.util.List;
+-import java.util.Set;
+ import java.util.UUID;
+ import java.util.concurrent.Callable;
+ import java.util.concurrent.TimeUnit;
+-import java.util.stream.Collectors;
+ 
+ import javax.crypto.SecretKey;
+ import javax.crypto.spec.SecretKeySpec;
+@@ -144,7 +142,7 @@ public void testCodeFlowNoConsent() throws IOException {
+             checkHealth();
+ 
+             // Static default tenant
+-            checkResourceMetadata(null, "/realms/quarkus", null);
++            checkResourceMetadata(null, "/realms/quarkus");
+         }
+     }
+ 
+@@ -500,7 +498,7 @@ public void testCodeFlowNonce() throws Exception {
+             assertEquals("Unexpected 401", ex.getMessage());
+         }
+         // Static `tenant-nonce` tenant with custom resource path
+-        checkResourceMetadata("metadata", ":8080/q/oidc", Set.of("read"));
++        checkResourceMetadata("metadata", ":8080/q/oidc");
+     }
+ 
+     private void doTestCodeFlowNonce(boolean wrongRedirect) throws Exception {
+@@ -920,8 +918,7 @@ public Boolean call() throws Exception {
+             webClient.getCookieManager().clearCookies();
+ 
+             // Static `tenant-refresh` tenant
+-            checkResourceMetadata("tenant-refresh", "/realms/logout-realm", Set.of("read", "write"));
+-
++            checkResourceMetadata("tenant-refresh", "/realms/logout-realm");
+         }
+     }
+ 
+@@ -1847,7 +1844,7 @@ private String getIdToken(Cookie sessionCookie) {
+         return sessionCookie.getValue().split("\\|")[0];
+     }
+ 
+-    private static void checkResourceMetadata(String resource, String authorizationServerSuffix, Set<String> scopes) {
++    private static void checkResourceMetadata(String resource, String authorizationServerSuffix) {
+         Response metadataResponse = RestAssured.when()
+                 .get("http://localhost:8081" + OidcConstants.RESOURCE_METADATA_WELL_KNOWN_PATH
+                         + (resource == null ? "" : "/" + resource));
+@@ -1860,11 +1857,5 @@ private static void checkResourceMetadata(String resource, String authorizationS
+         String authorizationServer = jsonAuthorizarionServers.getString(0);
+         assertTrue(authorizationServer.startsWith("http://localhost:"));
+         assertTrue(authorizationServer.endsWith(authorizationServerSuffix));
+-
+-        if (scopes != null) {
+-            JsonArray scopesArray = jsonMetadata.getJsonArray(OidcConstants.RESOURCE_METADATA_SCOPES);
+-            assertEquals(scopes.size(), scopesArray.size());
+-            assertEquals(scopes, scopesArray.stream().collect(Collectors.toSet()));
+-        }
+     }
+ }

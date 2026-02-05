@@ -1,0 +1,160 @@
+diff --git a/management/build.gradle b/management/build.gradle
+index a402b1c6fe..5156ecc38b 100644
+--- a/management/build.gradle
++++ b/management/build.gradle
+@@ -30,6 +30,7 @@ dependencies {
+         exclude group: 'io.micronaut'
+     }
+     testImplementation libs.managed.groovy.json
++    testImplementation libs.logback.classic
+ 
+     testRuntimeOnly(platform(libs.test.boms.micronaut.sql))
+     testRuntimeOnly libs.h2
+diff --git a/management/src/main/java/io/micronaut/management/health/aggregator/DefaultHealthAggregator.java b/management/src/main/java/io/micronaut/management/health/aggregator/DefaultHealthAggregator.java
+index 0e23952dac..d632f44bca 100644
+--- a/management/src/main/java/io/micronaut/management/health/aggregator/DefaultHealthAggregator.java
++++ b/management/src/main/java/io/micronaut/management/health/aggregator/DefaultHealthAggregator.java
+@@ -26,6 +26,8 @@ import io.micronaut.management.health.indicator.HealthResult;
+ import io.micronaut.runtime.ApplicationConfiguration;
+ import jakarta.inject.Singleton;
+ import org.reactivestreams.Publisher;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
+ import reactor.core.publisher.Flux;
+ import reactor.core.publisher.Mono;
+ 
+@@ -52,6 +54,8 @@ import java.util.stream.Collectors;
+ @Requires(beans = HealthEndpoint.class)
+ public class DefaultHealthAggregator implements HealthAggregator<HealthResult> {
+ 
++    private static final Logger LOG = LoggerFactory.getLogger(DefaultHealthAggregator.class);
++
+     private final ApplicationConfiguration applicationConfiguration;
+ 
+     /**
+@@ -112,9 +116,20 @@ public class DefaultHealthAggregator implements HealthAggregator<HealthResult> {
+      * @return The aggregated details for the results
+      */
+     protected Object aggregateDetails(List<HealthResult> results) {
+-        Map<String, Object> details = CollectionUtils.newHashMap(results.size());
+-        results.forEach(r -> details.put(r.getName(), buildResult(r.getStatus(), r.getDetails(), HealthLevelOfDetail.STATUS_DESCRIPTION_DETAILS)));
+-        return details;
++        Map<String, Object> aggregatedDetails = CollectionUtils.newHashMap(results.size());
++        results.forEach(r -> {
++            var name = r.getName();
++            var details = r.getDetails();
++            var status = r.getStatus();
++            aggregatedDetails.put(name, buildResult(status, details, HealthLevelOfDetail.STATUS_DESCRIPTION_DETAILS));
++            if (LOG.isTraceEnabled()) {
++                LOG.trace("Health result for {}: status {}, details {}", name, status, details != null ? details : "{}");
++            } else if (LOG.isDebugEnabled()) {
++                LOG.debug("Health result for {}: status {}", name, status);
++            }
++        });
++
++        return aggregatedDetails;
+     }
+ 
+     /**
+diff --git a/management/src/main/java/io/micronaut/management/health/monitor/HealthMonitorTask.java b/management/src/main/java/io/micronaut/management/health/monitor/HealthMonitorTask.java
+index 0dbf946e15..948eca0e78 100644
+--- a/management/src/main/java/io/micronaut/management/health/monitor/HealthMonitorTask.java
++++ b/management/src/main/java/io/micronaut/management/health/monitor/HealthMonitorTask.java
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2017-2020 original authors
++ * Copyright 2017-2023 original authors
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -33,6 +33,7 @@ import reactor.core.publisher.Flux;
+ 
+ import java.util.Arrays;
+ import java.util.List;
++import java.util.Optional;
+ import java.util.stream.Collectors;
+ 
+ /**
+@@ -85,17 +86,29 @@ public class HealthMonitorTask {
+             .map(HealthIndicator::getResult)
+             .collect(Collectors.toList());
+ 
+-        Flux
+-            .merge(resultPublishers)
++        Flux.merge(resultPublishers)
+             .collectList()
+-            .doOnError((e) -> {
++            .doOnError(e -> {
+                 if (LOG.isErrorEnabled()) {
+-                    LOG.error("Health monitor check failed with exception: " + e.getMessage(), e);
++                    LOG.error("Health monitor check failed with exception: {}", e.getMessage(), e);
+                 }
+                 currentHealthStatus.update(HealthStatus.DOWN.describe("Error occurred running health check: " + e.getMessage()));
+             })
+             .subscribe(healthResults -> {
+-                java.util.Optional<HealthResult> firstDown = healthResults.stream().filter(r -> r.getStatus().equals(io.micronaut.health.HealthStatus.DOWN) || !r.getStatus().getOperational().orElse(true))
++                if (LOG.isTraceEnabled() || LOG.isDebugEnabled()) {
++                    healthResults.forEach(healthResult -> {
++                        var status = healthResult.getStatus();
++                        var name = healthResult.getName();
++                        if (LOG.isTraceEnabled()) {
++                            var detail = healthResult.getDetails();
++                            LOG.trace("Health monitor result for {}: status {}, details {}", name, status, detail != null ? detail : "{}");
++                        } else if (LOG.isDebugEnabled()) {
++                            LOG.debug("Health monitor result for {}: status {}", name, status);
++                        }
++                    });
++                }
++                Optional<HealthResult> firstDown = healthResults.stream()
++                    .filter(r -> r.getStatus().equals(HealthStatus.DOWN) || !r.getStatus().getOperational().orElse(true))
+                     .findFirst();
+                 if (firstDown.isPresent()) {
+                     currentHealthStatus.update(firstDown.get().getStatus());
+@@ -103,6 +116,5 @@ public class HealthMonitorTask {
+                     currentHealthStatus.update(HealthStatus.UP);
+                 }
+             });
+-
+     }
+ }
+diff --git a/src/main/docs/guide/management/providedEndpoints/healthEndpoint.adoc b/src/main/docs/guide/management/providedEndpoints/healthEndpoint.adoc
+index 603a0a6c7c..a7459aacab 100644
+--- a/src/main/docs/guide/management/providedEndpoints/healthEndpoint.adoc
++++ b/src/main/docs/guide/management/providedEndpoints/healthEndpoint.adoc
+@@ -81,6 +81,36 @@ The default health aggregator returns an overall status calculated based on the
+ 
+ The "worst" status is returned as the overall status. A non-operational status is selected over an operational status. A higher severity is selected over a lower severity.
+ 
++The api:management.health.aggregator.DefaultHealthAggregator[] also emits log statements for health indicator status and details. To log this information use `Level.DEBUG` for just health indicator status or use Level.TRACE for both status and details. For example:
++
++[source,xml]
++----
++<logger name="io.micronaut.management.health.aggregator.DefaultHealthAggregator" level="trace" /> // <1>
++----
++<1> Use `level="debug"` for health indicator status, use `level="trace"` to add health indicator details
++
++== Health Monitor Task
++
++A continuous health monitor that updates the api:health.CurrentHealthStatus[] in a background thread can be enabled when using api:runtime.server.EmbeddedServer[] with the following application configuration:
++
++[configuration]
++----
++micronaut:
++  application:
++    name: foo
++  health:
++    monitor:
++      enabled: true
++----
++- Both configuration properties are required to enable the monitor background task.
++
++Similarly to `DefaultHealthAggregator` it also emits log statements for health indicator status and details. To log this use the following logger configuration:
++
++[source,xml]
++----
++<logger name="io.micronaut.management.health.monitor.HealthMonitorTask" level="trace" />
++----
++
+ == Provided Indicators
+ 
+ All the Micronaut framework provided health indicators are exposed on /health and /health/readiness endpoints.

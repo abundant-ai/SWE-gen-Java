@@ -1,0 +1,224 @@
+diff --git a/core-processor/src/main/java/io/micronaut/inject/annotation/AbstractAnnotationMetadataBuilder.java b/core-processor/src/main/java/io/micronaut/inject/annotation/AbstractAnnotationMetadataBuilder.java
+index f847b7c447..c05cefb706 100644
+--- a/core-processor/src/main/java/io/micronaut/inject/annotation/AbstractAnnotationMetadataBuilder.java
++++ b/core-processor/src/main/java/io/micronaut/inject/annotation/AbstractAnnotationMetadataBuilder.java
+@@ -1567,6 +1567,14 @@ public abstract class AbstractAnnotationMetadataBuilder<T, A> {
+         MUTATED_ANNOTATION_METADATA.clear();
+     }
+ 
++    /**
++     * Used to clear mutated metadata at the end of a compilation cycle.
++     */
++    @Internal
++    public static void clearMutated(@NonNull Object key) {
++        MUTATED_ANNOTATION_METADATA.remove(key);
++    }
++
+     /**
+      * Used to clear caches at the end of a compilation cycle.
+      */
+diff --git a/core/src/main/java/io/micronaut/core/annotation/AnnotationClassValue.java b/core/src/main/java/io/micronaut/core/annotation/AnnotationClassValue.java
+index 3ddc16ef9c..d082c5a9ce 100644
+--- a/core/src/main/java/io/micronaut/core/annotation/AnnotationClassValue.java
++++ b/core/src/main/java/io/micronaut/core/annotation/AnnotationClassValue.java
+@@ -85,7 +85,7 @@ public final class AnnotationClassValue<T> implements CharSequence, Named {
+     /**
+      * Constructs a class value for a type that is present.
+      *
+-     * @param instance The instnace
++     * @param instance The instance
+      * @since 1.1
+      */
+     @SuppressWarnings("unchecked")
+@@ -107,6 +107,9 @@ public final class AnnotationClassValue<T> implements CharSequence, Named {
+      * @since 1.1
+      */
+     public @NonNull Optional<T> getInstance() {
++        if (instance instanceof AnnotationClassValue.UnresolvedClass unresolvedClass) {
++            throw unresolvedClass.error;
++        }
+         return Optional.ofNullable(instance);
+     }
+ 
+@@ -117,7 +120,18 @@ public final class AnnotationClassValue<T> implements CharSequence, Named {
+      * @since 1.1
+      */
+     public boolean isInstantiated() {
+-        return instantiated || getInstance().isPresent();
++        return instantiated ||
++            (getInstance().isPresent() && !(getInstance().get() instanceof AnnotationClassValue.UnresolvedClass));
++    }
++
++    /**
++     * fail with an error if unresolved.
++     */
++    @Internal
++    void failIfError() {
++        if (instance instanceof AnnotationClassValue.UnresolvedClass unresolvedClass) {
++            throw unresolvedClass.error;
++        }
+     }
+ 
+     /**
+@@ -170,4 +184,11 @@ public final class AnnotationClassValue<T> implements CharSequence, Named {
+     public int hashCode() {
+         return name.hashCode();
+     }
++
++    /**
++     * Represented an unresolved type.
++     * @param error The error that should be thrown
++     */
++    @Internal
++    public record UnresolvedClass(RuntimeException error) { }
+ }
+diff --git a/core/src/main/java/io/micronaut/core/annotation/AnnotationValue.java b/core/src/main/java/io/micronaut/core/annotation/AnnotationValue.java
+index 2be9ae7ca9..e023fd43cb 100644
+--- a/core/src/main/java/io/micronaut/core/annotation/AnnotationValue.java
++++ b/core/src/main/java/io/micronaut/core/annotation/AnnotationValue.java
+@@ -723,11 +723,14 @@ public class AnnotationValue<A extends Annotation> implements AnnotationValueRes
+         }
+         Object o = values.get(member);
+         if (o instanceof AnnotationClassValue<?> annotationClassValue) {
++            annotationClassValue.failIfError();
+             return Optional.of(annotationClassValue);
+         }
+         if (o instanceof AnnotationClassValue<?>[] annotationClassValues) {
+             if (annotationClassValues.length > 0) {
+-                return Optional.of(annotationClassValues[0]);
++                AnnotationClassValue<?> acv = annotationClassValues[0];
++                acv.failIfError();
++                return Optional.of(acv);
+             }
+         }
+         if (o instanceof String className) {
+diff --git a/gradle/libs.versions.toml b/gradle/libs.versions.toml
+index 59b76cd8ed..f0860f9f86 100644
+--- a/gradle/libs.versions.toml
++++ b/gradle/libs.versions.toml
+@@ -34,6 +34,7 @@ jcache = "1.1.1"
+ junit5 = "5.10.3"
+ junit-platform="1.10.3"
+ logback = "1.5.12"
++lombok = "1.18.34"
+ logbook-netty = "3.7.0"
+ log4j = "2.23.1"
+ micronaut-aws = "4.7.1"
+@@ -232,6 +233,7 @@ log4j = { module = "org.apache.logging.log4j:log4j-core", version.ref = "log4j"
+ logback-classic = { module = "ch.qos.logback:logback-classic", version.ref = "logback" }
+ 
+ logbook-netty = { module = "org.zalando:logbook-netty", version.ref = "logbook-netty" }
++lombok = { module = "org.projectlombok:lombok", version.ref = "lombok" }
+ 
+ micronaut-docs = { module = "io.micronaut.docs:micronaut-docs-asciidoc-config-props", version.ref = "micronaut-docs" }
+ micronaut-build-plugins = { module = "io.micronaut.build.internal:micronaut-gradle-plugins", version.ref="micronaut-build-plugins"}
+diff --git a/inject-java/src/main/java/io/micronaut/annotation/processing/AbstractInjectAnnotationProcessor.java b/inject-java/src/main/java/io/micronaut/annotation/processing/AbstractInjectAnnotationProcessor.java
+index f0c865d11e..f8c531a325 100644
+--- a/inject-java/src/main/java/io/micronaut/annotation/processing/AbstractInjectAnnotationProcessor.java
++++ b/inject-java/src/main/java/io/micronaut/annotation/processing/AbstractInjectAnnotationProcessor.java
+@@ -23,6 +23,7 @@ import io.micronaut.core.util.CollectionUtils;
+ import io.micronaut.inject.annotation.AbstractAnnotationMetadataBuilder;
+ import io.micronaut.inject.visitor.TypeElementVisitor;
+ 
++import java.util.LinkedHashMap;
+ import javax.annotation.processing.AbstractProcessor;
+ import javax.annotation.processing.Filer;
+ import javax.annotation.processing.Messager;
+@@ -74,7 +75,7 @@ abstract class AbstractInjectAnnotationProcessor extends AbstractProcessor {
+     protected MutableConvertibleValues<Object> visitorAttributes = new MutableConvertibleValuesMap<>();
+     protected AnnotationProcessingOutputVisitor classWriterOutputVisitor;
+     protected JavaVisitorContext javaVisitorContext;
+-    protected Set<String> postponedTypes = new LinkedHashSet<>();
++    protected Map<String, Object> postponedTypes = new LinkedHashMap<>();
+     private boolean incremental = false;
+     private final Set<String> supportedAnnotationTypes = new HashSet<>(5);
+     private final Map<String, Boolean> isProcessedCache = new HashMap<>(30);
+@@ -219,7 +220,7 @@ abstract class AbstractInjectAnnotationProcessor extends AbstractProcessor {
+             filer,
+             visitorAttributes,
+             getVisitorKind(),
+-            postponedTypes
++            postponedTypes.keySet()
+         );
+     }
+ 
+diff --git a/inject-java/src/main/java/io/micronaut/annotation/processing/JavaAnnotationMetadataBuilder.java b/inject-java/src/main/java/io/micronaut/annotation/processing/JavaAnnotationMetadataBuilder.java
+index 9d126cbb2e..90b80f4a0b 100644
+--- a/inject-java/src/main/java/io/micronaut/annotation/processing/JavaAnnotationMetadataBuilder.java
++++ b/inject-java/src/main/java/io/micronaut/annotation/processing/JavaAnnotationMetadataBuilder.java
+@@ -371,12 +371,24 @@ public class JavaAnnotationMetadataBuilder extends AbstractAnnotationMetadataBui
+             final MetadataAnnotationValueVisitor resolver = new MetadataAnnotationValueVisitor(originatingElement, (ExecutableElement) member, resolvedDefaults);
+             value.accept(resolver, this);
+             Object resolvedValue = resolver.resolvedValue;
++
+             if (resolvedValue != null) {
+-                if (isEvaluatedExpression(resolvedValue)) {
+-                    resolvedValue = buildEvaluatedExpressionReference(originatingElement, annotationName, memberName, resolvedValue);
++                if ("<error>".equals(resolvedValue) &&
++                    Class.class.getName().equals(this.modelUtils.resolveTypeName(((ExecutableElement) member).getReturnType()))) {
++                    resolvedValue = new AnnotationClassValue<>(
++                        new AnnotationClassValue.UnresolvedClass(new PostponeToNextRoundException(
++                            originatingElement,
++                            originatingElement.getSimpleName().toString() + "@" + annotationName + "(" + memberName + ")"
++                        ))
++                    );
++                    annotationValues.put(memberName, resolvedValue);
++                } else {
++                    if (isEvaluatedExpression(resolvedValue)) {
++                        resolvedValue = buildEvaluatedExpressionReference(originatingElement, annotationName, memberName, resolvedValue);
++                    }
++                    validateAnnotationValue(originatingElement, annotationName, member, memberName, resolvedValue);
++                    annotationValues.put(memberName, resolvedValue);
+                 }
+-                validateAnnotationValue(originatingElement, annotationName, member, memberName, resolvedValue);
+-                annotationValues.put(memberName, resolvedValue);
+             }
+         }
+     }
+diff --git a/inject-java/src/main/java/io/micronaut/annotation/processing/TypeElementVisitorProcessor.java b/inject-java/src/main/java/io/micronaut/annotation/processing/TypeElementVisitorProcessor.java
+index 3eacf20325..34ae16fbcf 100644
+--- a/inject-java/src/main/java/io/micronaut/annotation/processing/TypeElementVisitorProcessor.java
++++ b/inject-java/src/main/java/io/micronaut/annotation/processing/TypeElementVisitorProcessor.java
+@@ -27,6 +27,7 @@ import io.micronaut.core.order.OrderUtil;
+ import io.micronaut.core.util.CollectionUtils;
+ import io.micronaut.core.util.StringUtils;
+ import io.micronaut.core.version.VersionUtils;
++import io.micronaut.inject.annotation.AbstractAnnotationMetadataBuilder;
+ import io.micronaut.inject.ast.ConstructorElement;
+ import io.micronaut.inject.ast.ElementQuery;
+ import io.micronaut.inject.ast.EnumConstantElement;
+@@ -240,7 +241,10 @@ public class TypeElementVisitorProcessor extends AbstractInjectAnnotationProcess
+                 roundEnv.getRootElements()
+             ).filter(notGroovyObject).forEach(elements::add);
+ 
+-            postponedTypes.stream().map(elementUtils::getTypeElement).filter(Objects::nonNull).forEach(elements::add);
++            for (Object nativeType : postponedTypes.values()) {
++                AbstractAnnotationMetadataBuilder.clearMutated(nativeType);
++            }
++            postponedTypes.keySet().stream().map(elementUtils::getTypeElement).filter(Objects::nonNull).forEach(elements::add);
+             postponedTypes.clear();
+ 
+             if (!elements.isEmpty()) {
+@@ -271,7 +275,7 @@ public class TypeElementVisitorProcessor extends AbstractInjectAnnotationProcess
+                             }
+                             error(originatingElement.element(), e.getMessage());
+                         } catch (PostponeToNextRoundException e) {
+-                            postponedTypes.add(javaClassElement.getName());
++                            postponedTypes.put(javaClassElement.getName(), e.getErrorElement());
+                         }
+                     }
+                 }
+diff --git a/test-suite/build.gradle b/test-suite/build.gradle
+index 38f7443147..29c6095ecb 100644
+--- a/test-suite/build.gradle
++++ b/test-suite/build.gradle
+@@ -63,7 +63,8 @@ dependencies {
+     testImplementation libs.testcontainers.spock
+     // end::testcontainers-dependencies[]
+     testImplementation libs.awaitility
+-
++    testImplementation(libs.lombok)
++    testAnnotationProcessor(libs.lombok)
+     testAnnotationProcessor project(":test-suite-helper")
+     testAnnotationProcessor project(":inject-java")
+     testAnnotationProcessor project(":test-suite")

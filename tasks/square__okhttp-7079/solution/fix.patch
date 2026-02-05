@@ -1,0 +1,233 @@
+diff --git a/okhttp/build.gradle.kts b/okhttp/build.gradle.kts
+index 5d7ee802c..11ec8c6f2 100644
+--- a/okhttp/build.gradle.kts
++++ b/okhttp/build.gradle.kts
+@@ -41,13 +41,13 @@ kotlin {
+       kotlin.srcDir("$buildDir/generated/sources/kotlinTemplates")
+       dependencies {
+         api(Dependencies.okio)
++        api(Dependencies.assertk)
+       }
+     }
+     val commonTest by getting {
+       dependencies {
+         implementation(Dependencies.kotlinTest)
+         implementation(Dependencies.kotlinTestAnnotations)
+-        implementation(Dependencies.assertk)
+       }
+     }
+     val nonJvmMain = create("nonJvmMain") {
+diff --git a/okhttp/src/jvmMain/kotlin/okhttp3/internal/connection/ConnectPlan.kt b/okhttp/src/jvmMain/kotlin/okhttp3/internal/connection/ConnectPlan.kt
+index 0039fa291..62477db2b 100644
+--- a/okhttp/src/jvmMain/kotlin/okhttp3/internal/connection/ConnectPlan.kt
++++ b/okhttp/src/jvmMain/kotlin/okhttp3/internal/connection/ConnectPlan.kt
+@@ -112,11 +112,9 @@ class ConnectPlan(
+     )
+   }
+ 
+-  override fun connect(): ConnectResult {
+-    check(!isConnected) { "already connected" }
++  override fun connectTcp(): ConnectResult {
++    check(rawSocket == null) { "TCP already connected" }
+ 
+-    val connectionSpecs = route.address.connectionSpecs
+-    var retryTlsConnection: ConnectPlan? = null
+     var success = false
+ 
+     // Tell the call about the connecting call so async cancels work.
+@@ -124,7 +122,30 @@ class ConnectPlan(
+     try {
+       eventListener.connectStart(call, route.socketAddress, route.proxy)
+       connectSocket()
++      success = true
++      return ConnectResult(plan = this)
++    } catch (e: IOException) {
++      eventListener.connectFailed(call, route.socketAddress, route.proxy, null, e)
++      return ConnectResult(plan = this, throwable = e)
++    } finally {
++      call.plansToCancel -= this
++      if (!success) {
++        rawSocket?.closeQuietly()
++      }
++    }
++  }
++
++  override fun connectTlsEtc(): ConnectResult {
++    check(rawSocket != null) { "TCP not connected" }
++    check(!isConnected) { "already connected" }
+ 
++    val connectionSpecs = route.address.connectionSpecs
++    var retryTlsConnection: ConnectPlan? = null
++    var success = false
++
++    // Tell the call about the connecting call so async cancels work.
++    call.plansToCancel += this
++    try {
+       if (tunnelRequest != null) {
+         val tunnelResult = connectTunnel()
+ 
+diff --git a/okhttp/src/jvmMain/kotlin/okhttp3/internal/connection/ExchangeFinder.kt b/okhttp/src/jvmMain/kotlin/okhttp3/internal/connection/ExchangeFinder.kt
+index 3ef141bed..4a36f572c 100644
+--- a/okhttp/src/jvmMain/kotlin/okhttp3/internal/connection/ExchangeFinder.kt
++++ b/okhttp/src/jvmMain/kotlin/okhttp3/internal/connection/ExchangeFinder.kt
+@@ -37,7 +37,13 @@ internal class ExchangeFinder(
+         }
+ 
+         if (!plan.isConnected) {
+-          val (_, nextPlan, failure) = plan.connect()
++          val tcpConnectResult = plan.connectTcp()
++          val connectResult = when {
++            tcpConnectResult.isSuccess -> plan.connectTlsEtc()
++            else -> tcpConnectResult
++          }
++
++          val (_, nextPlan, failure) = connectResult
+ 
+           queuedPlan = nextPlan
+           if (failure != null) throw failure
+diff --git a/okhttp/src/jvmMain/kotlin/okhttp3/internal/connection/FastFallbackExchangeFinder.kt b/okhttp/src/jvmMain/kotlin/okhttp3/internal/connection/FastFallbackExchangeFinder.kt
+index 268e37eed..0c088795b 100644
+--- a/okhttp/src/jvmMain/kotlin/okhttp3/internal/connection/FastFallbackExchangeFinder.kt
++++ b/okhttp/src/jvmMain/kotlin/okhttp3/internal/connection/FastFallbackExchangeFinder.kt
+@@ -106,7 +106,11 @@ internal class FastFallbackExchangeFinder(
+         var firstException: Throwable? = null
+         var currentPlan = plan
+         while (true) {
+-          val connectResult = currentPlan.connect()
++          val tcpConnectResult = currentPlan.connectTcp()
++          val connectResult = when {
++            tcpConnectResult.isSuccess -> currentPlan.connectTlsEtc()
++            else -> tcpConnectResult
++          }
+ 
+           if (connectResult.throwable == null) {
+             if (connectResult.nextPlan == null) return connectResult // Success.
+diff --git a/okhttp/src/jvmMain/kotlin/okhttp3/internal/connection/RealRoutePlanner.kt b/okhttp/src/jvmMain/kotlin/okhttp3/internal/connection/RealRoutePlanner.kt
+index 1a9f209e1..322a1050e 100644
+--- a/okhttp/src/jvmMain/kotlin/okhttp3/internal/connection/RealRoutePlanner.kt
++++ b/okhttp/src/jvmMain/kotlin/okhttp3/internal/connection/RealRoutePlanner.kt
+@@ -197,7 +197,11 @@ class RealRoutePlanner(
+ 
+     override val isConnected: Boolean = true
+ 
+-    override fun connect(): ConnectResult {
++    override fun connectTcp(): ConnectResult {
++      error("already connected")
++    }
++
++    override fun connectTlsEtc(): ConnectResult {
+       error("already connected")
+     }
+ 
+diff --git a/okhttp/src/jvmMain/kotlin/okhttp3/internal/connection/RoutePlanner.kt b/okhttp/src/jvmMain/kotlin/okhttp3/internal/connection/RoutePlanner.kt
+index b5f4ba4a4..56b534485 100644
+--- a/okhttp/src/jvmMain/kotlin/okhttp3/internal/connection/RoutePlanner.kt
++++ b/okhttp/src/jvmMain/kotlin/okhttp3/internal/connection/RoutePlanner.kt
+@@ -74,7 +74,9 @@ interface RoutePlanner {
+   interface Plan {
+     val isConnected: Boolean
+ 
+-    fun connect(): ConnectResult
++    fun connectTcp(): ConnectResult
++
++    fun connectTlsEtc(): ConnectResult
+ 
+     fun handleSuccess(): RealConnection
+ 
+@@ -94,5 +96,8 @@ interface RoutePlanner {
+     val plan: Plan,
+     val nextPlan: Plan? = null,
+     val throwable: Throwable? = null,
+-  )
++  ) {
++    val isSuccess: Boolean
++      get() = nextPlan == null && throwable == null
++  }
+ }
+diff --git a/okhttp/src/jvmTest/java/okhttp3/FakeRoutePlanner.kt b/okhttp/src/jvmTest/java/okhttp3/FakeRoutePlanner.kt
+index 1c1f61027..acc5bb341 100644
+--- a/okhttp/src/jvmTest/java/okhttp3/FakeRoutePlanner.kt
++++ b/okhttp/src/jvmTest/java/okhttp3/FakeRoutePlanner.kt
+@@ -82,30 +82,58 @@ class FakeRoutePlanner(
+     val id: Int
+   ) : RoutePlanner.Plan {
+     var canceled = false
++    var connectState = ConnectState.READY
+     val connection = factory.newConnection(pool, factory.newRoute(address))
+ 
+-    override var isConnected = false
+-    var connectDelayNanos = 0L
+-    var connectThrowable: Throwable? = null
++    override val isConnected: Boolean
++      get() = connectState == ConnectState.TLS_CONNECTED
+ 
+-    override fun connect(): ConnectResult {
+-      check(!isConnected) { "already connected" }
+-      events += "plan $id connecting..."
++    var tcpConnectDelayNanos = 0L
++    var tcpConnectThrowable: Throwable? = null
++    var tlsConnectDelayNanos = 0L
++    var tlsConnectThrowable: Throwable? = null
+ 
+-      taskFaker.sleep(connectDelayNanos)
++    override fun connectTcp(): ConnectResult {
++      check(connectState == ConnectState.READY)
++      events += "plan $id TCP connecting..."
++
++      taskFaker.sleep(tcpConnectDelayNanos)
++
++      return when {
++        tcpConnectThrowable != null -> {
++          events += "plan $id TCP connect failed"
++          ConnectResult(this, throwable = tcpConnectThrowable)
++        }
++        canceled -> {
++          events += "plan $id TCP connect canceled"
++          ConnectResult(this, throwable = IOException("canceled"))
++        }
++        else -> {
++          events += "plan $id TCP connected"
++          connectState = ConnectState.TCP_CONNECTED
++          ConnectResult(this)
++        }
++      }
++    }
++
++    override fun connectTlsEtc(): ConnectResult {
++      check(connectState == ConnectState.TCP_CONNECTED)
++      events += "plan $id TLS connecting..."
++
++      taskFaker.sleep(tlsConnectDelayNanos)
+ 
+       return when {
+-        connectThrowable != null -> {
+-          events += "plan $id connect failed"
+-          ConnectResult(this, throwable = connectThrowable)
++        tlsConnectThrowable != null -> {
++          events += "plan $id TLS connect failed"
++          ConnectResult(this, throwable = tlsConnectThrowable)
+         }
+         canceled -> {
+-          events += "plan $id connect canceled"
++          events += "plan $id TLS connect canceled"
+           ConnectResult(this, throwable = IOException("canceled"))
+         }
+         else -> {
+-          events += "plan $id connected"
+-          isConnected = true
++          events += "plan $id TLS connected"
++          connectState = ConnectState.TLS_CONNECTED
+           ConnectResult(this)
+         }
+       }
+@@ -118,4 +146,10 @@ class FakeRoutePlanner(
+       canceled = true
+     }
+   }
++
++  enum class ConnectState {
++    READY,
++    TCP_CONNECTED,
++    TLS_CONNECTED,
++  }
+ }

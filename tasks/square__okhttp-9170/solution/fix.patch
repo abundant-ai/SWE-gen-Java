@@ -1,0 +1,266 @@
+diff --git a/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/connection/Exchange.kt b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/connection/Exchange.kt
+index 4484ca66e..64a902a91 100644
+--- a/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/connection/Exchange.kt
++++ b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/connection/Exchange.kt
+@@ -46,10 +46,6 @@ class Exchange(
+   internal var isDuplex: Boolean = false
+     private set
+ 
+-  /** True if the request body should not be used, but the socket, instead. */
+-  internal var isSocket: Boolean = false
+-    private set
+-
+   /** True if there was an exception on the connection to the peer. */
+   internal var hasFailure: Boolean = false
+     private set
+@@ -82,7 +78,11 @@ class Exchange(
+     val contentLength = request.body!!.contentLength()
+     eventListener.requestBodyStart(call)
+     val rawRequestBody = codec.createRequestBody(request, contentLength)
+-    return RequestBodySink(rawRequestBody, contentLength)
++    return RequestBodySink(
++      delegate = rawRequestBody,
++      contentLength = contentLength,
++      isSocket = false,
++    )
+   }
+ 
+   @Throws(IOException::class)
+@@ -134,7 +134,12 @@ class Exchange(
+       val contentType = response.header("Content-Type")
+       val contentLength = codec.reportedContentLength(response)
+       val rawSource = codec.openResponseBodySource(response)
+-      val source = ResponseBodySource(rawSource, contentLength)
++      val source =
++        ResponseBodySource(
++          delegate = rawSource,
++          contentLength = contentLength,
++          isSocket = false,
++        )
+       return RealResponseBody(contentType, contentLength, source.buffer())
+     } catch (e: IOException) {
+       eventListener.responseFailed(call, e)
+@@ -147,8 +152,7 @@ class Exchange(
+   fun peekTrailers(): Headers? = codec.peekTrailers()
+ 
+   fun upgradeToSocket(): Socket {
+-    isSocket = true
+-    call.timeoutEarlyExit()
++    call.upgradeToSocket()
+     (codec.carrier as RealConnection).useAsSocket()
+ 
+     return object : Socket {
+@@ -156,8 +160,18 @@ class Exchange(
+         this@Exchange.cancel()
+       }
+ 
+-      override val sink = RequestBodySink(codec.socket.sink, -1L)
+-      override val source = ResponseBodySource(codec.socket.source, -1L)
++      override val sink =
++        RequestBodySink(
++          delegate = codec.socket.sink,
++          contentLength = -1L,
++          isSocket = true,
++        )
++      override val source =
++        ResponseBodySource(
++          delegate = codec.socket.source,
++          contentLength = -1L,
++          isSocket = true,
++        )
+     }
+   }
+ 
+@@ -179,6 +193,8 @@ class Exchange(
+       exchange = this,
+       requestDone = true,
+       responseDone = true,
++      socketSinkDone = true,
++      socketSourceDone = true,
+       e = null,
+     )
+   }
+@@ -191,6 +207,7 @@ class Exchange(
+   /** If [e] is non-null, this will return a non-null value. */
+   fun bodyComplete(
+     bytesRead: Long = -1L,
++    isSocket: Boolean,
+     responseDone: Boolean = false,
+     requestDone: Boolean = false,
+     e: IOException?,
+@@ -214,8 +231,10 @@ class Exchange(
+     }
+     return call.messageDone(
+       exchange = this,
+-      requestDone = requestDone,
+-      responseDone = responseDone,
++      requestDone = requestDone && !isSocket,
++      responseDone = responseDone && !isSocket,
++      socketSinkDone = requestDone && isSocket,
++      socketSourceDone = responseDone && isSocket,
+       e = e,
+     )
+   }
+@@ -233,6 +252,7 @@ class Exchange(
+     delegate: Sink,
+     /** The exact number of bytes to be written, or -1L if that is unknown. */
+     private val contentLength: Long,
++    private val isSocket: Boolean,
+   ) : ForwardingSink(delegate) {
+     private var completed = false
+     private var bytesReceived = 0L
+@@ -292,6 +312,7 @@ class Exchange(
+       completed = true
+       return bodyComplete(
+         bytesRead = bytesReceived,
++        isSocket = isSocket,
+         requestDone = true,
+         e = e,
+       )
+@@ -302,6 +323,7 @@ class Exchange(
+   internal inner class ResponseBodySource(
+     delegate: Source,
+     private val contentLength: Long,
++    private val isSocket: Boolean,
+   ) : ForwardingSource(delegate) {
+     private var bytesReceived = 0L
+     private var invokeStartEvent = true
+@@ -372,6 +394,7 @@ class Exchange(
+       }
+       return bodyComplete(
+         bytesRead = bytesReceived,
++        isSocket = isSocket,
+         responseDone = true,
+         e = e,
+       )
+diff --git a/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/connection/RealCall.kt b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/connection/RealCall.kt
+index c6e0f53fb..8a615fe3d 100644
+--- a/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/connection/RealCall.kt
++++ b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/connection/RealCall.kt
+@@ -103,11 +103,10 @@ class RealCall(
+   // These properties are guarded by `this`. They are typically only accessed by the thread executing
+   // the call, but they may be accessed by other threads for duplex requests.
+ 
+-  /** True if this call still has a request body open. */
+   private var requestBodyOpen = false
+-
+-  /** True if this call still has a response body open. */
+   private var responseBodyOpen = false
++  private var socketSinkOpen = false
++  private var socketSourceOpen = false
+ 
+   /** True if there are more exchanges expected for this call. */
+   private var expectMoreExchanges = true
+@@ -241,7 +240,7 @@ class RealCall(
+         "cannot make a new request because the previous response is still open: " +
+           "please call response.close()"
+       }
+-      check(!requestBodyOpen)
++      check(!requestBodyOpen && !socketSourceOpen && !socketSinkOpen)
+     }
+ 
+     if (newRoutePlanner) {
+@@ -273,8 +272,7 @@ class RealCall(
+   internal fun initExchange(chain: RealInterceptorChain): Exchange {
+     withLock {
+       check(expectMoreExchanges) { "released" }
+-      check(!responseBodyOpen)
+-      check(!requestBodyOpen)
++      check(!responseBodyOpen && !requestBodyOpen && !socketSourceOpen && !socketSinkOpen)
+     }
+ 
+     val exchangeFinder = this.exchangeFinder!!
+@@ -312,22 +310,34 @@ class RealCall(
+     exchange: Exchange,
+     requestDone: Boolean = false,
+     responseDone: Boolean = false,
++    socketSourceDone: Boolean = false,
++    socketSinkDone: Boolean = false,
+     e: IOException?,
+   ): IOException? {
+     if (exchange != this.exchange) return e // This exchange was detached violently!
+ 
+-    var bothStreamsDone = false
++    var allStreamsDone = false
+     var callDone = false
+     withLock {
+-      if (requestDone && requestBodyOpen || responseDone && responseBodyOpen) {
++      if (
++        requestDone && requestBodyOpen ||
++        responseDone && responseBodyOpen ||
++        socketSinkDone && socketSinkOpen ||
++        socketSourceDone && socketSourceOpen
++      ) {
+         if (requestDone) requestBodyOpen = false
+         if (responseDone) responseBodyOpen = false
+-        bothStreamsDone = !requestBodyOpen && !responseBodyOpen
+-        callDone = !requestBodyOpen && !responseBodyOpen && !expectMoreExchanges
++        if (socketSinkDone) socketSinkOpen = false
++        if (socketSourceDone) socketSourceOpen = false
++        allStreamsDone = !requestBodyOpen &&
++          !responseBodyOpen &&
++          !socketSinkOpen &&
++          !socketSourceOpen
++        callDone = allStreamsDone && !expectMoreExchanges
+       }
+     }
+ 
+-    if (bothStreamsDone) {
++    if (allStreamsDone) {
+       this.exchange = null
+       this.connection?.incrementSuccessCount()
+     }
+@@ -344,7 +354,7 @@ class RealCall(
+     withLock {
+       if (expectMoreExchanges) {
+         expectMoreExchanges = false
+-        callDone = !requestBodyOpen && !responseBodyOpen
++        callDone = !requestBodyOpen && !responseBodyOpen && !socketSinkOpen && !socketSourceOpen
+       }
+     }
+ 
+@@ -357,7 +367,8 @@ class RealCall(
+ 
+   /**
+    * Complete this call. This should be called once these properties are all false:
+-   * [requestBodyOpen], [responseBodyOpen], and [expectMoreExchanges].
++   * [requestBodyOpen], [responseBodyOpen], [socketSinkOpen], [socketSourceOpen], and
++   * [expectMoreExchanges].
+    *
+    * This will release the connection if it is still held.
+    *
+@@ -443,6 +454,20 @@ class RealCall(
+     timeout.exit()
+   }
+ 
++  fun upgradeToSocket() {
++    timeoutEarlyExit()
++
++    withLock {
++      check(exchange != null)
++      check(!socketSinkOpen && !socketSourceOpen)
++      check(!requestBodyOpen)
++      check(responseBodyOpen)
++      responseBodyOpen = false
++      socketSinkOpen = true
++      socketSourceOpen = true
++    }
++  }
++
+   /**
+    * @param closeExchange true if the current exchange should be closed because it will not be used.
+    *     This is usually due to either an exception or a retry.
+diff --git a/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/http/CallServerInterceptor.kt b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/http/CallServerInterceptor.kt
+index 7f910848e..4451f8ca2 100644
+--- a/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/http/CallServerInterceptor.kt
++++ b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/http/CallServerInterceptor.kt
+@@ -152,9 +152,6 @@ object CallServerInterceptor : Interceptor {
+ 
+           // This is not an upgrade response.
+           else -> {
+-            if (isUpgradeRequest) {
+-              exchange.noRequestBody() // Failed upgrade request has no outbound data.
+-            }
+             val responseBody = exchange.openResponseBody(response)
+             response
+               .newBuilder()

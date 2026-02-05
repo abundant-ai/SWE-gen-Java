@@ -1,0 +1,527 @@
+diff --git a/context/src/main/java/io/micronaut/runtime/converters/time/TimeConverterRegistrar.java b/context/src/main/java/io/micronaut/runtime/converters/time/TimeConverterRegistrar.java
+index 34445dcd18..bee86b8f2f 100644
+--- a/context/src/main/java/io/micronaut/runtime/converters/time/TimeConverterRegistrar.java
++++ b/context/src/main/java/io/micronaut/runtime/converters/time/TimeConverterRegistrar.java
+@@ -89,7 +89,7 @@ import static java.time.temporal.ChronoField.YEAR;
+ @Internal
+ public class TimeConverterRegistrar implements TypeConverterRegistrar {
+ 
+-    private static final Pattern PERIOD_MATCHER = Pattern.compile("^(-?\\d+)([unywmd])(s?)$");
++    private static final Pattern PERIOD_MATCHER = Pattern.compile("^(-?\\d+)([unywmMdD])(s?)$");
+     private static final Pattern DURATION_MATCHER = Pattern.compile("^(-?\\d+)([unsmhd])(s?)$");
+     private static final int MILLIS = 3;
+ 
+@@ -141,13 +141,6 @@ public class TimeConverterRegistrar implements TypeConverterRegistrar {
+             (integer, targetType, context) -> durationConverter.apply(integer.toString(), context)
+         );
+ 
+-        // CharSequence -> TemporalAmount
+-        conversionService.addConverter(
+-            CharSequence.class,
+-            TemporalAmount.class,
+-            (object, targetType, context) -> durationConverter.apply(object, context).map(TemporalAmount.class::cast)
+-        );
+-
+         final BiFunction<CharSequence, ConversionContext, Optional<Period>> periodConverter = periodConverter();
+ 
+         // CharSequence -> Period
+@@ -168,7 +161,17 @@ public class TimeConverterRegistrar implements TypeConverterRegistrar {
+         conversionService.addConverter(
+             CharSequence.class,
+             TemporalAmount.class,
+-            (object, targetType, context) -> periodConverter.apply(object, context).map(TemporalAmount.class::cast)
++            (object, targetType, context) -> {
++                var str = object.toString();
++                if (str.contains("y")
++                    || str.contains("M")
++                    || str.contains("w")
++                    || str.contains("D")
++                ) {
++                    return periodConverter.apply(object, context).map(TemporalAmount.class::cast);
++                }
++                return durationConverter.apply(object, context).map(TemporalAmount.class::cast);
++            }
+         );
+ 
+         addTemporalStringConverters(conversionService, Instant.class, DateTimeFormatter.ISO_INSTANT, Instant::from);
+@@ -389,13 +392,13 @@ public class TimeConverterRegistrar implements TypeConverterRegistrar {
+                             case 'y' -> {
+                                 return Optional.of(Period.ofYears(Integer.parseInt(amount)));
+                             }
+-                            case 'm' -> {
++                            case 'm', 'M' -> {
+                                 return Optional.of(Period.ofMonths(Integer.parseInt(amount)));
+                             }
+                             case 'w' -> {
+                                 return Optional.of(Period.ofWeeks(Integer.parseInt(amount)));
+                             }
+-                            case 'd' -> {
++                            case 'd', 'D' -> {
+                                 return Optional.of(Period.ofDays(Integer.parseInt(amount)));
+                             }
+                             default -> {
+diff --git a/core/src/main/java/io/micronaut/core/convert/DefaultMutableConversionService.java b/core/src/main/java/io/micronaut/core/convert/DefaultMutableConversionService.java
+index db48937a9c..cf64700dc9 100644
+--- a/core/src/main/java/io/micronaut/core/convert/DefaultMutableConversionService.java
++++ b/core/src/main/java/io/micronaut/core/convert/DefaultMutableConversionService.java
+@@ -326,11 +326,11 @@ public class DefaultMutableConversionService implements MutableConversionService
+ 
+                     @Override
+                     public Optional<T> convert(String value, Class<T> targetType, ConversionContext context) {
+-                        return typeConverter.convert((S) ((CharSequence) value).toString(), (Class<T>) CharSequence.class, context);
++                        return typeConverter.convert((S) value.toString(), (Class<T>) CharSequence.class, context);
+                     }
+                 };
+             } else {
+-                converter = (value, theTarget, context) -> typeConverter.convert((S) ((CharSequence) value).toString(), theTarget, context);
++                converter = (value, theTarget, context) -> typeConverter.convert((S) value.toString(), theTarget, context);
+             }
+             addConverterToMap(typeConverters, String.class, targetType, converter);
+         } else if (sourceType == String.class) {
+diff --git a/core/src/main/java/io/micronaut/core/execution/DelayedExecutionFlowImpl.java b/core/src/main/java/io/micronaut/core/execution/DelayedExecutionFlowImpl.java
+index 3f5d04019f..ea790adc90 100644
+--- a/core/src/main/java/io/micronaut/core/execution/DelayedExecutionFlowImpl.java
++++ b/core/src/main/java/io/micronaut/core/execution/DelayedExecutionFlowImpl.java
+@@ -31,7 +31,7 @@ final class DelayedExecutionFlowImpl<T> implements DelayedExecutionFlow<T> {
+     /**
+      * The head of the linked list of steps in this flow.
+      */
+-    private final Head head = new Head();
++    private Head head = new Head();
+     /**
+      * The tail of the linked list of steps in this flow.
+      */
+@@ -59,10 +59,14 @@ final class DelayedExecutionFlowImpl<T> implements DelayedExecutionFlow<T> {
+      * @param executionFlow The execution flow
+      */
+     private void complete0(@NonNull ExecutionFlow<Object> executionFlow) {
++        if (head == null) {
++            throw new IllegalStateException("Delayed flow has been completed");
++        }
+         Step immediateStep = head.atomicSetOutput(executionFlow);
+         if (immediateStep != null) {
+             work(immediateStep, executionFlow);
+         }
++        head = null;
+     }
+ 
+     @Override
+diff --git a/core/src/test/groovy/io/micronaut/core/execution/DelayedExecutionFlowSpec.groovy b/core/src/test/groovy/io/micronaut/core/execution/DelayedExecutionFlowSpec.groovy
+index 56c9c9a4db..7f953fd563 100644
+--- a/core/src/test/groovy/io/micronaut/core/execution/DelayedExecutionFlowSpec.groovy
++++ b/core/src/test/groovy/io/micronaut/core/execution/DelayedExecutionFlowSpec.groovy
+@@ -1,5 +1,6 @@
+ package io.micronaut.core.execution
+ 
++
+ import org.apache.groovy.internal.util.Function
+ import spock.lang.Specification
+ 
+@@ -65,6 +66,27 @@ class DelayedExecutionFlowSpec extends Specification {
+         orderOfCompletion << powerSet([0, 1, 2, 3, 4, 5, 6, 7, 8], 4)
+     }
+ 
++    def "mapping"() {
++        given:
++            DelayedExecutionFlow<String> delayedExecutionFlow = DelayedExecutionFlow.create()
++        when:
++            def flow = delayedExecutionFlow
++                    .map { it + "B"}
++                    .map { it + "C"}
++                    .map { it + "D"}
++                    .map { it + "E"}
++                    .flatMap { ExecutionFlow.just(it + "F")}
++        then:
++            delayedExecutionFlow.complete("A")
++            flow.tryComplete().value == "ABCDEF"
++            delayedExecutionFlow.@head == null
++        when:
++            delayedExecutionFlow.complete("X")
++        then:
++            def e = thrown(IllegalStateException)
++            e.message == "Delayed flow has been completed"
++    }
++
+     private static <T> List<List<T>> powerSet(List<T> base, int exp) {
+         if (exp == 0) {
+             return [[]]
+diff --git a/gradle.properties b/gradle.properties
+index c07f5b6451..71f21b2fd8 100644
+--- a/gradle.properties
++++ b/gradle.properties
+@@ -1,4 +1,4 @@
+-projectVersion=4.7.15-SNAPSHOT
++projectVersion=4.7.16-SNAPSHOT
+ projectGroupId=io.micronaut
+ projectDesc=Core components supporting the Micronaut Framework
+ title=Micronaut Core
+diff --git a/http-server-netty/src/main/java/io/micronaut/http/server/netty/NettyHttpServer.java b/http-server-netty/src/main/java/io/micronaut/http/server/netty/NettyHttpServer.java
+index d7cbadcecc..dc7a0a1988 100644
+--- a/http-server-netty/src/main/java/io/micronaut/http/server/netty/NettyHttpServer.java
++++ b/http-server-netty/src/main/java/io/micronaut/http/server/netty/NettyHttpServer.java
+@@ -28,7 +28,6 @@ import io.micronaut.core.annotation.TypeHint;
+ import io.micronaut.core.io.socket.SocketUtils;
+ import io.micronaut.core.util.CollectionUtils;
+ import io.micronaut.core.util.SupplierUtil;
+-import io.micronaut.http.context.event.HttpRequestReceivedEvent;
+ import io.micronaut.http.context.event.HttpRequestTerminatedEvent;
+ import io.micronaut.http.netty.channel.ChannelPipelineListener;
+ import io.micronaut.http.netty.channel.DefaultEventLoopGroupConfiguration;
+@@ -167,8 +166,6 @@ public class NettyHttpServer implements NettyEmbeddedServer {
+         }
+         ApplicationEventPublisher<HttpRequestTerminatedEvent> httpRequestTerminatedEventPublisher = nettyEmbeddedServices
+             .getEventPublisher(HttpRequestTerminatedEvent.class);
+-        ApplicationEventPublisher<HttpRequestReceivedEvent> httpRequestReceivedEventPublisher = nettyEmbeddedServices
+-            .getEventPublisher(HttpRequestReceivedEvent.class);
+         final Supplier<ExecutorService> ioExecutor = SupplierUtil.memoized(() ->
+             nettyEmbeddedServices.getExecutorSelector()
+                 .select(TaskExecutors.BLOCKING).orElse(null)
+@@ -178,7 +175,6 @@ public class NettyHttpServer implements NettyEmbeddedServer {
+             nettyEmbeddedServices,
+             ioExecutor,
+             httpRequestTerminatedEventPublisher,
+-            httpRequestReceivedEventPublisher,
+             applicationContext.getConversionService()
+         );
+         this.hostResolver = new DefaultHttpHostResolver(serverConfiguration, () -> NettyHttpServer.this);
+diff --git a/http-server-netty/src/main/java/io/micronaut/http/server/netty/RoutingInBoundHandler.java b/http-server-netty/src/main/java/io/micronaut/http/server/netty/RoutingInBoundHandler.java
+index 7be6c8d589..6c16664f2e 100644
+--- a/http-server-netty/src/main/java/io/micronaut/http/server/netty/RoutingInBoundHandler.java
++++ b/http-server-netty/src/main/java/io/micronaut/http/server/netty/RoutingInBoundHandler.java
+@@ -47,7 +47,6 @@ import io.micronaut.http.body.ResponseBodyWriterWrapper;
+ import io.micronaut.http.codec.CodecException;
+ import io.micronaut.http.context.ServerHttpRequestContext;
+ import io.micronaut.http.context.ServerRequestContext;
+-import io.micronaut.http.context.event.HttpRequestReceivedEvent;
+ import io.micronaut.http.context.event.HttpRequestTerminatedEvent;
+ import io.micronaut.http.exceptions.HttpStatusException;
+ import io.micronaut.http.netty.EventLoopFlow;
+@@ -125,7 +124,6 @@ public final class RoutingInBoundHandler implements RequestHandler {
+     final MessageBodyHandlerRegistry messageBodyHandlerRegistry;
+     ExecutorService ioExecutor;
+     final ApplicationEventPublisher<HttpRequestTerminatedEvent> terminateEventPublisher;
+-    final ApplicationEventPublisher<HttpRequestReceivedEvent> receivedPublisher;
+     final RouteExecutor routeExecutor;
+     final ConversionService conversionService;
+     /**
+@@ -135,26 +133,24 @@ public final class RoutingInBoundHandler implements RequestHandler {
+     boolean supportLoggingHandler = false;
+ 
+     /**
+-     * @param serverConfiguration               The Netty HTTP server configuration
+-     * @param embeddedServerContext             The embedded server context
+-     * @param ioExecutor                        The IO executor
+-     * @param terminateEventPublisher           The terminate event publisher
+-     * @param receivedPublisher                 The received publisher
+-     * @param conversionService                 The conversion service
++     * @param serverConfiguration          The Netty HTTP server configuration
++     * @param embeddedServerContext        The embedded server context
++     * @param ioExecutor                   The IO executor
++     * @param terminateEventPublisher      The terminate event publisher
++     * @param conversionService            The conversion service
+      */
+     RoutingInBoundHandler(
+         NettyHttpServerConfiguration serverConfiguration,
+         NettyEmbeddedServices embeddedServerContext,
+         Supplier<ExecutorService> ioExecutor,
+         ApplicationEventPublisher<HttpRequestTerminatedEvent> terminateEventPublisher,
+-        ApplicationEventPublisher<HttpRequestReceivedEvent> receivedPublisher, ConversionService conversionService) {
++        ConversionService conversionService) {
+         this.staticResourceResolver = embeddedServerContext.getStaticResourceResolver();
+         this.messageBodyHandlerRegistry = embeddedServerContext.getMessageBodyHandlerRegistry();
+         this.ioExecutorSupplier = ioExecutor;
+         this.requestArgumentSatisfier = embeddedServerContext.getRequestArgumentSatisfier();
+         this.serverConfiguration = serverConfiguration;
+         this.terminateEventPublisher = terminateEventPublisher;
+-        this.receivedPublisher = receivedPublisher;
+         Optional<Boolean> isMultiPartEnabled = serverConfiguration.getMultipart().getEnabled();
+         this.multipartEnabled = isMultiPartEnabled.isEmpty() || isMultiPartEnabled.get();
+         this.routeExecutor = embeddedServerContext.getRouteExecutor();
+@@ -209,9 +205,6 @@ public final class RoutingInBoundHandler implements RequestHandler {
+     @Override
+     public void accept(ChannelHandlerContext ctx, io.netty.handler.codec.http.HttpRequest request, CloseableByteBody body, OutboundAccess outboundAccess) {
+         NettyHttpRequest<Object> mnRequest = new NettyHttpRequest<>(request, body, ctx, conversionService, serverConfiguration);
+-        if (receivedPublisher != ApplicationEventPublisher.NO_OP) {
+-            receivedPublisher.publishEvent(new HttpRequestReceivedEvent(mnRequest));
+-        }
+         if (serverConfiguration.isValidateUrl()) {
+             try {
+                 mnRequest.getUri();
+diff --git a/http-server-netty/src/test/groovy/io/micronaut/runtime/http/scope/RequestScopeSpec.groovy b/http-server-netty/src/test/groovy/io/micronaut/runtime/http/scope/RequestScopeSpec.groovy
+index 1e2dd925c3..d7784aa7be 100644
+--- a/http-server-netty/src/test/groovy/io/micronaut/runtime/http/scope/RequestScopeSpec.groovy
++++ b/http-server-netty/src/test/groovy/io/micronaut/runtime/http/scope/RequestScopeSpec.groovy
+@@ -23,7 +23,6 @@ import io.micronaut.http.annotation.Controller
+ import io.micronaut.http.annotation.Get
+ import io.micronaut.http.client.HttpClient
+ import io.micronaut.http.client.annotation.Client
+-import io.micronaut.http.context.event.HttpRequestReceivedEvent
+ import io.micronaut.http.context.event.HttpRequestTerminatedEvent
+ import io.micronaut.http.server.netty.AbstractMicronautSpec
+ import io.micronaut.scheduling.TaskExecutors
+@@ -46,10 +45,8 @@ class RequestScopeSpec extends AbstractMicronautSpec {
+     PollingConditions conditions = new PollingConditions(delay: 0.5, timeout: 3)
+ 
+     def setup() {
+-        ReqTerminatedListener terminatedListener = applicationContext.getBean(ReqTerminatedListener)
+-        ReqReceivedListener receivedListener = applicationContext.getBean(ReqReceivedListener)
+-        terminatedListener.callCount = 0
+-        receivedListener.callCount = 0
++        ReqTerminatedListener listener = applicationContext.getBean(ReqTerminatedListener)
++        listener.callCount = 0
+         SimpleBean.destroyed.set(0)
+     }
+ 
+@@ -81,9 +78,7 @@ class RequestScopeSpec extends AbstractMicronautSpec {
+ 
+     void "test @Request bean created per request"() {
+         given:
+-        ReqTerminatedListener terminatedListener = applicationContext.getBean(ReqTerminatedListener)
+-        ReqReceivedListener receivedListener = applicationContext.getBean(ReqReceivedListener)
+-
++        ReqTerminatedListener listener = applicationContext.getBean(ReqTerminatedListener)
+ 
+         when:
+         def result = httpClient.toBlocking().retrieve(HttpRequest.GET("/test-request-scope"), String)
+@@ -93,8 +88,7 @@ class RequestScopeSpec extends AbstractMicronautSpec {
+         RequestBean.BEANS_CREATED.size() == 1
+         RequestScopeFactoryBean.BEANS_CREATED.size() == 1
+         conditions.eventually {
+-            terminatedListener.callCount == 1
+-            receivedListener.callCount == 1
++            listener.callCount == 1
+             RequestBean.BEANS_CREATED.first().dead
+             RequestScopeFactoryBean.BEANS_CREATED.first().dead
+         }
+@@ -102,7 +96,7 @@ class RequestScopeSpec extends AbstractMicronautSpec {
+         when:
+         RequestBean.BEANS_CREATED.clear()
+         RequestScopeFactoryBean.BEANS_CREATED.clear()
+-        terminatedListener.callCount = 0
++        listener.callCount = 0
+         result = httpClient.toBlocking().retrieve(HttpRequest.GET("/test-request-scope"), String)
+ 
+         then:
+@@ -110,7 +104,7 @@ class RequestScopeSpec extends AbstractMicronautSpec {
+         RequestBean.BEANS_CREATED.size() == 1
+         RequestScopeFactoryBean.BEANS_CREATED.size() == 1
+         conditions.eventually {
+-            terminatedListener.callCount == 1
++            listener.callCount == 1
+             RequestBean.BEANS_CREATED.first().dead
+             RequestScopeFactoryBean.BEANS_CREATED.first().dead
+         }
+@@ -118,7 +112,7 @@ class RequestScopeSpec extends AbstractMicronautSpec {
+         when:
+         RequestBean.BEANS_CREATED.clear()
+         RequestScopeFactoryBean.BEANS_CREATED.clear()
+-        terminatedListener.callCount = 0
++        listener.callCount = 0
+         result = httpClient.toBlocking().retrieve(HttpRequest.GET("/test-request-scope"), String)
+ 
+         then:
+@@ -126,7 +120,7 @@ class RequestScopeSpec extends AbstractMicronautSpec {
+         RequestBean.BEANS_CREATED.size() == 1
+         RequestScopeFactoryBean.BEANS_CREATED.size() == 1
+         conditions.eventually {
+-            terminatedListener.callCount == 1
++            listener.callCount == 1
+             RequestBean.BEANS_CREATED.first().dead
+             RequestScopeFactoryBean.BEANS_CREATED.first().dead
+         }
+@@ -134,7 +128,7 @@ class RequestScopeSpec extends AbstractMicronautSpec {
+         when:
+         RequestBean.BEANS_CREATED.clear()
+         RequestScopeFactoryBean.BEANS_CREATED.clear()
+-        terminatedListener.callCount = 0
++        listener.callCount = 0
+         result = httpClient.toBlocking().retrieve(HttpRequest.GET("/test-request-scope-stream"), String)
+ 
+         then:
+@@ -142,7 +136,7 @@ class RequestScopeSpec extends AbstractMicronautSpec {
+         RequestBean.BEANS_CREATED.size() == 1
+         RequestScopeFactoryBean.BEANS_CREATED.size() == 1
+         conditions.eventually {
+-            terminatedListener.callCount == 1
++            listener.callCount == 1
+             RequestBean.BEANS_CREATED.first().dead
+             RequestScopeFactoryBean.BEANS_CREATED.first().dead
+         }
+@@ -318,15 +312,4 @@ class RequestScopeSpec extends AbstractMicronautSpec {
+             callCount++
+         }
+     }
+-
+-    @Requires(property = "spec.name", value = "RequestScopeSpec")
+-    @Singleton
+-    static class ReqReceivedListener implements ApplicationEventListener<HttpRequestReceivedEvent> {
+-        int callCount
+-
+-        @Override
+-        void onApplicationEvent(HttpRequestReceivedEvent event) {
+-            callCount++
+-        }
+-    }
+ }
+diff --git a/http/src/main/java/io/micronaut/http/cookie/Cookie.java b/http/src/main/java/io/micronaut/http/cookie/Cookie.java
+index 6a44989fd1..78dda16db8 100644
+--- a/http/src/main/java/io/micronaut/http/cookie/Cookie.java
++++ b/http/src/main/java/io/micronaut/http/cookie/Cookie.java
+@@ -15,9 +15,10 @@
+  */
+ package io.micronaut.http.cookie;
+ 
+-import io.micronaut.core.util.ArgumentUtils;
+ import io.micronaut.core.annotation.NonNull;
+ import io.micronaut.core.annotation.Nullable;
++import io.micronaut.core.util.ArgumentUtils;
++
+ import java.io.Serializable;
+ import java.time.temporal.ChronoUnit;
+ import java.time.temporal.TemporalAmount;
+diff --git a/inject/src/main/java/io/micronaut/context/DefaultApplicationContext.java b/inject/src/main/java/io/micronaut/context/DefaultApplicationContext.java
+index a5e735c2b2..7b94f8005d 100644
+--- a/inject/src/main/java/io/micronaut/context/DefaultApplicationContext.java
++++ b/inject/src/main/java/io/micronaut/context/DefaultApplicationContext.java
+@@ -950,6 +950,7 @@ public class DefaultApplicationContext extends DefaultBeanContext implements Con
+         public Environment stop() {
+             if (bootstrapEnvironment != null) {
+                 bootstrapEnvironment.stop();
++                bootstrapEnvironment = null;
+             }
+             return super.stop();
+         }
+diff --git a/inject/src/main/java/io/micronaut/context/env/DefaultEnvironment.java b/inject/src/main/java/io/micronaut/context/env/DefaultEnvironment.java
+index 74340ecaaa..89e5ffc774 100644
+--- a/inject/src/main/java/io/micronaut/context/env/DefaultEnvironment.java
++++ b/inject/src/main/java/io/micronaut/context/env/DefaultEnvironment.java
+@@ -53,6 +53,7 @@ import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.Collection;
+ import java.util.Collections;
++import java.util.HashMap;
+ import java.util.HashSet;
+ import java.util.LinkedHashMap;
+ import java.util.LinkedHashSet;
+@@ -868,6 +869,7 @@ public class DefaultEnvironment extends PropertySourcePropertyResolver implement
+     }
+ 
+     private void diffMap(Map<String, Object> map, Map<String, Object> newMap, Map<String, Object> changes) {
++        Map<String, Object> remainingMap = new LinkedHashMap<>(map);
+         for (Map.Entry<String, Object> entry : newMap.entrySet()) {
+             String key = entry.getKey();
+             Object newValue = entry.getValue();
+@@ -884,8 +886,12 @@ public class DefaultEnvironment extends PropertySourcePropertyResolver implement
+                 } else if (hasNew && hasOld && hasChanged(newValue, oldValue)) {
+                     changes.put(key, oldValue);
+                 }
++                remainingMap.remove(key);
+             }
+         }
++        remainingMap.forEach((key, value) -> {
++            changes.put(key, value);
++        });
+     }
+ 
+     private static boolean hasChanged(Object newValue, Object oldValue) {
+diff --git a/inject/src/test/groovy/io/micronaut/context/env/DefaultEnvironmentSpec.groovy b/inject/src/test/groovy/io/micronaut/context/env/DefaultEnvironmentSpec.groovy
+index bbc44ca468..d8fe8a6e96 100644
+--- a/inject/src/test/groovy/io/micronaut/context/env/DefaultEnvironmentSpec.groovy
++++ b/inject/src/test/groovy/io/micronaut/context/env/DefaultEnvironmentSpec.groovy
+@@ -18,8 +18,10 @@ package io.micronaut.context.env
+ import com.github.stefanbirkner.systemlambda.SystemLambda
+ import io.micronaut.context.ApplicationContext
+ import io.micronaut.context.ApplicationContextConfiguration
++import io.micronaut.context.DefaultApplicationContext
+ import io.micronaut.context.exceptions.ConfigurationException
+ import io.micronaut.core.naming.NameUtils
++import io.micronaut.core.util.StringUtils
+ import io.micronaut.core.version.SemanticVersion
+ import spock.lang.Issue
+ import spock.lang.Requires
+@@ -65,6 +67,20 @@ class DefaultEnvironmentSpec extends Specification {
+         env.getProperty("test.foo", Map.class).get() == [bar: "10", baz: "20"]
+     }
+ 
++    void "test environment refresh and diff"() {
++        given:
++        System.setProperty(Environment.BOOTSTRAP_CONTEXT_PROPERTY, StringUtils.TRUE)
++        System.setProperty("micronaut.bootstrap.name", "custom-bootstrap")
++        DefaultApplicationContext context = new DefaultApplicationContext("test")
++        context.start()
++
++        when:
++        def diff = context.getEnvironment().refreshAndDiff()
++
++        then:
++        diff.isEmpty()
++    }
++
+     void "test environment system property refresh"() {
+         when:
+         System.setProperty("test.foo.bar", "10")
+diff --git a/runtime/src/test/groovy/io/micronaut/runtime/converters/time/TimeConverterRegistrarSpec.groovy b/runtime/src/test/groovy/io/micronaut/runtime/converters/time/TimeConverterRegistrarSpec.groovy
+index 9730049e5a..85b0ed5e07 100644
+--- a/runtime/src/test/groovy/io/micronaut/runtime/converters/time/TimeConverterRegistrarSpec.groovy
++++ b/runtime/src/test/groovy/io/micronaut/runtime/converters/time/TimeConverterRegistrarSpec.groovy
+@@ -16,6 +16,8 @@
+ package io.micronaut.runtime.converters.time
+ 
+ import io.micronaut.core.convert.DefaultMutableConversionService
++import java.time.temporal.ChronoUnit
++import java.time.temporal.TemporalAmount
+ import spock.lang.Specification
+ import spock.lang.Unroll
+ 
+@@ -47,12 +49,12 @@ class TimeConverterRegistrarSpec extends Specification {
+ 
+         where:
+         val    | expected
++        '10ns' | Duration.ofNanos(10)
+         '10ms' | Duration.ofMillis(10)
+         '10s'  | Duration.ofSeconds(10)
+         '10m'  | Duration.ofMinutes(10)
+-        '10d'  | Duration.ofDays(10)
+         '10h'  | Duration.ofHours(10)
+-        '10ns' | Duration.ofNanos(10)
++        '10d'  | Duration.ofDays(10)
+     }
+ 
+     @Unroll
+@@ -66,10 +68,34 @@ class TimeConverterRegistrarSpec extends Specification {
+ 
+         where:
+         val   | expected
+-        '10y' | Period.ofYears(10)
++        '10d' | Period.ofDays(10)
++        '10D' | Period.ofDays(10)
++        '10w' | Period.ofWeeks(10)
+         '10m' | Period.ofMonths(10)
++        '10M' | Period.ofMonths(10)
++        '10y' | Period.ofYears(10)
++    }
++
++    @Unroll
++    void "test convert to TemporalAmount #val"() {
++        given:
++        def conversionService = new DefaultMutableConversionService()
++        new TimeConverterRegistrar().register(conversionService)
++
++        expect:
++        conversionService.convert(val, TemporalAmount).get() == expected
++
++        where:
++        val   | expected
++        '10ns' | Duration.ofNanos(10)
++        '10ms' | Duration.ofMillis(10)
++        '10s' | Duration.ofSeconds(10)
++        '10m' | Duration.ofMinutes(10)
++        '10d' | Duration.ofDays(10)
++        '10D' | Period.ofDays(10)
++        '10M' | Period.ofMonths(10)
+         '10w' | Period.ofWeeks(10)
+-        '10d' | Period.ofDays(10)
++        '10y' | Period.ofYears(10)
+     }
+ 
+     @Unroll

@@ -1,0 +1,200 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 89233553..511a9e05 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -12,7 +12,7 @@
+ 
+ **Fixed**
+ 
+- - Ensure that exceptions thrown from failure to parse method annotations can be observed by multiple threads/callers. Previously only the first caller would see the actual parsing exception and other callers would get a cryptic `ClassCastException`.
++ - Nothing yet!
+ 
+ 
+ ## [2.10.0] - 2024-03-18
+diff --git a/retrofit/java-test/src/test/java/retrofit2/RetrofitTest.java b/retrofit/java-test/src/test/java/retrofit2/RetrofitTest.java
+index 5bd2c261..20886bc7 100644
+--- a/retrofit/java-test/src/test/java/retrofit2/RetrofitTest.java
++++ b/retrofit/java-test/src/test/java/retrofit2/RetrofitTest.java
+@@ -21,7 +21,6 @@ import static okhttp3.mockwebserver.SocketPolicy.DISCONNECT_AT_START;
+ import static org.junit.Assert.assertEquals;
+ import static org.junit.Assert.assertNotNull;
+ import static org.junit.Assert.assertSame;
+-import static org.junit.Assert.assertThrows;
+ import static org.junit.Assert.assertTrue;
+ import static org.junit.Assert.fail;
+ import static retrofit2.AnnotationArraySubject.assertThat;
+@@ -1717,89 +1716,4 @@ public final class RetrofitTest {
+ 
+     assertEquals("/?i=201", server.takeRequest().getPath());
+   }
+-
+-  @Test
+-  public void annotationParsingFailureObservedByWaitingThreads() throws InterruptedException {
+-    AtomicInteger fails = new AtomicInteger();
+-    CountDownLatch startedParsing = new CountDownLatch(1);
+-    CountDownLatch failParsing = new CountDownLatch(1);
+-    RuntimeException failure = new RuntimeException("boom!");
+-    Retrofit retrofit =
+-        new Retrofit.Builder()
+-            .baseUrl(server.url("/"))
+-            .addConverterFactory(
+-                new Converter.Factory() {
+-                  @Nullable
+-                  @Override
+-                  public Converter<ResponseBody, ?> responseBodyConverter(
+-                      Type type, Annotation[] annotations, Retrofit retrofit) {
+-                    startedParsing.countDown();
+-                    try {
+-                      failParsing.await();
+-                    } catch (InterruptedException e) {
+-                      throw new AssertionError(e);
+-                    }
+-                    fails.incrementAndGet();
+-                    throw failure;
+-                  }
+-                })
+-            .build();
+-    Annotated service = retrofit.create(Annotated.class);
+-
+-    AtomicReference<RuntimeException> result1 = new AtomicReference<>();
+-    Thread thread1 =
+-        new Thread(
+-            () -> {
+-              try {
+-                service.method();
+-              } catch (RuntimeException e) {
+-                result1.set(e);
+-              }
+-            });
+-    thread1.start();
+-
+-    // Wait for thread1 to enter the converter. This means it has inserted and taken a lock on
+-    // parsing for the method.
+-    startedParsing.await();
+-
+-    CountDownLatch thread2Locked = new CountDownLatch(1);
+-    AtomicReference<RuntimeException> result2 = new AtomicReference<>();
+-    Thread thread2 =
+-        new Thread(
+-            () -> {
+-              try {
+-                thread2Locked.countDown();
+-                service.method();
+-              } catch (RuntimeException e) {
+-                result2.set(e);
+-              }
+-            });
+-    thread2.start();
+-    thread2Locked.await();
+-
+-    // Wait for thread2 to lock on the shared object. This should be pretty fast after the last
+-    // signal, but we have no way of knowing for sure it happened.
+-    Thread.sleep(1_000);
+-
+-    failParsing.countDown();
+-    thread1.join();
+-    thread2.join();
+-
+-    RuntimeException failure1 = result1.get();
+-    assertThat(failure1).isInstanceOf(IllegalArgumentException.class);
+-    assertThat(failure1).hasCauseThat().isSameInstanceAs(failure);
+-
+-    RuntimeException failure2 = result2.get();
+-    assertThat(failure2).isInstanceOf(IllegalArgumentException.class);
+-    assertThat(failure2).hasCauseThat().isSameInstanceAs(failure);
+-
+-    // Importantly, even though the second thread was locked waiting on the first, failure of the
+-    // first thread caused the second thread to retry parsing.
+-    assertThat(fails.get()).isEqualTo(2);
+-
+-    // Make sure now that both threads have released the lock, new callers also retry.
+-    RuntimeException failure3 = assertThrows(IllegalArgumentException.class, service::method);
+-    assertThat(failure3).hasCauseThat().isSameInstanceAs(failure);
+-    assertThat(fails.get()).isEqualTo(3);
+-  }
+ }
+diff --git a/retrofit/src/main/java/retrofit2/Retrofit.java b/retrofit/src/main/java/retrofit2/Retrofit.java
+index 9e5a5bd5..c66f8212 100644
+--- a/retrofit/src/main/java/retrofit2/Retrofit.java
++++ b/retrofit/src/main/java/retrofit2/Retrofit.java
+@@ -212,53 +212,38 @@ public final class Retrofit {
+   }
+ 
+   ServiceMethod<?> loadServiceMethod(Class<?> service, Method method) {
+-    while (true) {
+-      // Note: Once we are minSdk 24 this whole method can be replaced by computeIfAbsent.
+-      Object lookup = serviceMethodCache.get(method);
++    // Note: Once we are minSdk 24 this whole method can be replaced by computeIfAbsent.
++    Object lookup = serviceMethodCache.get(method);
+ 
+-      if (lookup instanceof ServiceMethod<?>) {
+-        // Happy path: method is already parsed into the model.
+-        return (ServiceMethod<?>) lookup;
+-      }
++    if (lookup instanceof ServiceMethod<?>) {
++      // Happy path: method is already parsed into the model.
++      return (ServiceMethod<?>) lookup;
++    }
+ 
+-      if (lookup == null) {
+-        // Map does not contain any value. Try to put in a lock for this method. We MUST synchronize
+-        // on the lock before it is visible to others via the map to signal we are doing the work.
+-        Object lock = new Object();
+-        synchronized (lock) {
+-          lookup = serviceMethodCache.putIfAbsent(method, lock);
+-          if (lookup == null) {
+-            // On successful lock insertion, perform the work and update the map before releasing.
+-            // Other threads may be waiting on lock now and will expect the parsed model.
+-            ServiceMethod<Object> result;
+-            try {
+-              result = ServiceMethod.parseAnnotations(this, service, method);
+-            } catch (Throwable e) {
+-              // Remove the lock on failure. Any other locked threads will retry as a result.
+-              serviceMethodCache.remove(method);
+-              throw e;
+-            }
+-            serviceMethodCache.put(method, result);
+-            return result;
+-          }
++    if (lookup == null) {
++      // Map does not contain any value. Try to put in a lock for this method. We MUST synchronize
++      // on the lock before it is visible to others via the map to signal we are doing the work.
++      Object lock = new Object();
++      synchronized (lock) {
++        lookup = serviceMethodCache.putIfAbsent(method, lock);
++        if (lookup == null) {
++          // On successful lock insertion, perform the work and update the map before releasing.
++          // Other threads may be waiting on lock now and will expect the parsed model.
++          ServiceMethod<Object> result = ServiceMethod.parseAnnotations(this, service, method);
++          serviceMethodCache.put(method, result);
++          return result;
+         }
+       }
++    }
+ 
+-      // Either the initial lookup or the attempt to put our lock in the map has returned someone
+-      // else's lock. This means they are doing the parsing, and will update the map before
+-      // releasing
+-      // the lock. Once we can take the lock, the map is guaranteed to contain the model or null.
+-      // Note: There's a chance that our effort to put a lock into the map has actually returned a
+-      // finished model instead of a lock. In that case this code will perform a pointless lock and
+-      // redundant lookup in the map of the same instance. This is rare, and ultimately harmless.
+-      synchronized (lookup) {
+-        Object result = serviceMethodCache.get(method);
+-        if (result == null) {
+-          // The other thread failed its parsing. We will retry (and probably also fail).
+-          continue;
+-        }
+-        return (ServiceMethod<?>) result;
+-      }
++    // Either the initial lookup or the attempt to put our lock in the map has returned someone
++    // else's lock. This means they are doing the parsing, and will update the map before releasing
++    // the lock. Once we can take the lock, the map is guaranteed to contain the model.
++    // Note: There's a chance that our effort to put a lock into the map has actually returned a
++    // finished model instead of a lock. In that case this code will perform a pointless lock and
++    // redundant lookup in the map of the same instance. This is rare, and ultimately harmless.
++    synchronized (lookup) {
++      return (ServiceMethod<?>) serviceMethodCache.get(method);
+     }
+   }
+ 

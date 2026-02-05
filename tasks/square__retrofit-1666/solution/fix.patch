@@ -1,0 +1,186 @@
+diff --git a/retrofit/src/main/java/retrofit2/ParameterHandler.java b/retrofit/src/main/java/retrofit2/ParameterHandler.java
+index d1b80c59..4162b62f 100644
+--- a/retrofit/src/main/java/retrofit2/ParameterHandler.java
++++ b/retrofit/src/main/java/retrofit2/ParameterHandler.java
+@@ -21,6 +21,7 @@ import java.lang.reflect.Array;
+ import java.net.URI;
+ import java.util.Map;
+ import okhttp3.Headers;
++import okhttp3.MultipartBody;
+ import okhttp3.RequestBody;
+ 
+ import static retrofit2.Utils.checkNotNull;
+@@ -220,6 +221,19 @@ abstract class ParameterHandler<T> {
+     }
+   }
+ 
++  static final class RawPart extends ParameterHandler<MultipartBody.Part> {
++    static final RawPart INSTANCE = new RawPart();
++
++    private RawPart() {
++    }
++
++    @Override void apply(RequestBuilder builder, MultipartBody.Part value) throws IOException {
++      if (value != null) { // Skip null values.
++        builder.addPart(value);
++      }
++    }
++  }
++
+   static final class PartMap<T> extends ParameterHandler<Map<String, T>> {
+     private final Converter<T, RequestBody> valueConverter;
+     private final String transferEncoding;
+diff --git a/retrofit/src/main/java/retrofit2/RequestBuilder.java b/retrofit/src/main/java/retrofit2/RequestBuilder.java
+index 902c5a50..115e350f 100644
+--- a/retrofit/src/main/java/retrofit2/RequestBuilder.java
++++ b/retrofit/src/main/java/retrofit2/RequestBuilder.java
+@@ -167,6 +167,10 @@ final class RequestBuilder {
+     multipartBuilder.addPart(headers, body);
+   }
+ 
++  void addPart(MultipartBody.Part part) {
++    multipartBuilder.addPart(part);
++  }
++
+   void setBody(RequestBody body) {
+     this.body = body;
+   }
+diff --git a/retrofit/src/main/java/retrofit2/ServiceMethod.java b/retrofit/src/main/java/retrofit2/ServiceMethod.java
+index 7367d99f..0d5e6dc7 100644
+--- a/retrofit/src/main/java/retrofit2/ServiceMethod.java
++++ b/retrofit/src/main/java/retrofit2/ServiceMethod.java
+@@ -29,6 +29,7 @@ import java.util.regex.Pattern;
+ import okhttp3.Headers;
+ import okhttp3.HttpUrl;
+ import okhttp3.MediaType;
++import okhttp3.MultipartBody;
+ import okhttp3.Request;
+ import okhttp3.RequestBody;
+ import okhttp3.ResponseBody;
+@@ -535,33 +536,47 @@ final class ServiceMethod<T> {
+           throw parameterError(p, "@Part parameters can only be used with multipart encoding.");
+         }
+         Part part = (Part) annotation;
+-        Headers headers = Headers.of(
+-            "Content-Disposition", "form-data; name=\"" + part.value() + "\"",
+-            "Content-Transfer-Encoding", part.encoding());
++        gotPart = true;
+ 
++        String partName = part.value();
+         Class<?> rawParameterType = Utils.getRawType(type);
+-        gotPart = true;
+-        if (Iterable.class.isAssignableFrom(rawParameterType)) {
+-          if (!(type instanceof ParameterizedType)) {
+-            throw parameterError(p, rawParameterType.getSimpleName()
+-                + " must include generic type (e.g., "
+-                + rawParameterType.getSimpleName()
+-                + "<String>)");
++        if (partName.isEmpty()) {
++          if (!MultipartBody.Part.class.isAssignableFrom(rawParameterType)) {
++            throw parameterError(p,
++                "@Part annotation must supply a name or use MultipartBody.Part parameter type.");
+           }
+-          ParameterizedType parameterizedType = (ParameterizedType) type;
+-          Type iterableType = Utils.getParameterUpperBound(0, parameterizedType);
+-          Converter<?, RequestBody> converter = retrofit.requestBodyConverter(
+-              iterableType, annotations, methodAnnotations);
+-          return new ParameterHandler.Part<>(headers, converter).iterable();
+-        } else if (rawParameterType.isArray()) {
+-          Class<?> arrayComponentType = boxIfPrimitive(rawParameterType.getComponentType());
+-          Converter<?, RequestBody> converter =
+-              retrofit.requestBodyConverter(arrayComponentType, annotations, methodAnnotations);
+-          return new ParameterHandler.Part<>(headers, converter).array();
++
++          return ParameterHandler.RawPart.INSTANCE;
+         } else {
+-          Converter<?, RequestBody> converter =
+-              retrofit.requestBodyConverter(type, annotations, methodAnnotations);
+-          return new ParameterHandler.Part<>(headers, converter);
++          Headers headers =
++              Headers.of("Content-Disposition", "form-data; name=\"" + partName + "\"",
++                  "Content-Transfer-Encoding", part.encoding());
++
++          if (Iterable.class.isAssignableFrom(rawParameterType)) {
++            if (!(type instanceof ParameterizedType)) {
++              throw parameterError(p, rawParameterType.getSimpleName()
++                  + " must include generic type (e.g., "
++                  + rawParameterType.getSimpleName()
++                  + "<String>)");
++            }
++            ParameterizedType parameterizedType = (ParameterizedType) type;
++            Type iterableType = Utils.getParameterUpperBound(0, parameterizedType);
++            Converter<?, RequestBody> converter =
++                retrofit.requestBodyConverter(iterableType, annotations, methodAnnotations);
++            return new ParameterHandler.Part<>(headers, converter).iterable();
++          } else if (rawParameterType.isArray()) {
++            Class<?> arrayComponentType = boxIfPrimitive(rawParameterType.getComponentType());
++            Converter<?, RequestBody> converter =
++                retrofit.requestBodyConverter(arrayComponentType, annotations, methodAnnotations);
++            return new ParameterHandler.Part<>(headers, converter).array();
++          } else if (MultipartBody.Part.class.isAssignableFrom(rawParameterType)) {
++            throw parameterError(p, "@Part parameters using the MultipartBody.Part must not "
++                + "include a part name in the annotation.");
++          } else {
++            Converter<?, RequestBody> converter =
++                retrofit.requestBodyConverter(type, annotations, methodAnnotations);
++            return new ParameterHandler.Part<>(headers, converter);
++          }
+         }
+ 
+       } else if (annotation instanceof PartMap) {
+@@ -578,11 +593,18 @@ final class ServiceMethod<T> {
+           throw parameterError(p, "Map must include generic types (e.g., Map<String, String>)");
+         }
+         ParameterizedType parameterizedType = (ParameterizedType) mapType;
++
+         Type keyType = Utils.getParameterUpperBound(0, parameterizedType);
+         if (String.class != keyType) {
+           throw parameterError(p, "@PartMap keys must be of type String: " + keyType);
+         }
++
+         Type valueType = Utils.getParameterUpperBound(1, parameterizedType);
++        if (MultipartBody.Part.class.isAssignableFrom(Utils.getRawType(valueType))) {
++          throw parameterError(p, "@PartMap values cannot be MultipartBody.Part. "
++              + "Use @Part List<Part> or a different value type instead.");
++        }
++
+         Converter<?, RequestBody> valueConverter =
+             retrofit.requestBodyConverter(valueType, annotations, methodAnnotations);
+ 
+diff --git a/retrofit/src/main/java/retrofit2/http/Part.java b/retrofit/src/main/java/retrofit2/http/Part.java
+index 33cadecc..1fb5c2a6 100644
+--- a/retrofit/src/main/java/retrofit2/http/Part.java
++++ b/retrofit/src/main/java/retrofit2/http/Part.java
+@@ -26,12 +26,16 @@ import static java.lang.annotation.RetentionPolicy.RUNTIME;
+ /**
+  * Denotes a single part of a multi-part request.
+  * <p>
+- * The parameter type on which this annotation exists will be processed in one of two ways:
++ * The parameter type on which this annotation exists will be processed in one of three ways:
+  * <ul>
++ * <li>If the type is {@link okhttp3.MultipartBody.Part} the contents will be used directly. Omit
++ * the name from the annotation (i.e., {@code @Part MultipartBody.Part part}).</li>
+  * <li>If the type is {@link okhttp3.RequestBody RequestBody} the value will be used
+- * directly with its content type.</li>
++ * directly with its content type. Supply the part name in the annotation (e.g.,
++ * {@code @Part("foo") RequestBody foo}).</li>
+  * <li>Other object types will be converted to an appropriate representation by using
+- * {@linkplain Converter a converter}.</li>
++ * {@linkplain Converter a converter}. Supply the part name in the annotation (e.g.,
++ * {@code @Part("foo") RequestBody foo}).</li>
+  * </ul>
+  * <p>
+  * Values may be {@code null} which will omit them from the request body.
+@@ -50,7 +54,11 @@ import static java.lang.annotation.RetentionPolicy.RUNTIME;
+ @Target(PARAMETER)
+ @Retention(RUNTIME)
+ public @interface Part {
+-  String value();
++  /**
++   * The name of the part. Required for all parameter types except
++   * {@link okhttp3.MultipartBody.Part}.
++   */
++  String value() default "";
+   /** The {@code Content-Transfer-Encoding} of this part. */
+   String encoding() default "binary";
+ }

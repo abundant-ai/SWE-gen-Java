@@ -1,0 +1,110 @@
+diff --git a/core/src/main/java/io/micronaut/core/annotation/TypeHint.java b/core/src/main/java/io/micronaut/core/annotation/TypeHint.java
+index c6128bd128..2cf0929ae4 100644
+--- a/core/src/main/java/io/micronaut/core/annotation/TypeHint.java
++++ b/core/src/main/java/io/micronaut/core/annotation/TypeHint.java
+@@ -78,6 +78,10 @@ public @interface TypeHint {
+         /**
+          * All public fields require access.
+          */
+-        ALL_PUBLIC_FIELDS
++        ALL_PUBLIC_FIELDS,
++        /**
++         * The type is a dynamic proxy.
++         */
++        DYNAMIC_PROXY
+     }
+ }
+diff --git a/core/src/main/java/io/micronaut/core/graal/GraalReflectionConfigurer.java b/core/src/main/java/io/micronaut/core/graal/GraalReflectionConfigurer.java
+index 12d84c2240..389187e6cb 100644
+--- a/core/src/main/java/io/micronaut/core/graal/GraalReflectionConfigurer.java
++++ b/core/src/main/java/io/micronaut/core/graal/GraalReflectionConfigurer.java
+@@ -68,6 +68,9 @@ public interface GraalReflectionConfigurer extends AnnotationMetadataProvider {
+                 final Set<TypeHint.AccessType> accessType = CollectionUtils.setOf(
+                     accessTypes
+                 );
++                if (accessType.contains(TypeHint.AccessType.DYNAMIC_PROXY)) {
++                    context.registerDynamicProxy(t);
++                }
+                 if (accessType.contains(TypeHint.AccessType.ALL_PUBLIC_METHODS)) {
+                     final Method[] methods = t.getMethods();
+                     for (Method method : methods) {
+@@ -196,5 +199,11 @@ public interface GraalReflectionConfigurer extends AnnotationMetadataProvider {
+          * @param constructors The constructors
+          */
+         void register(Constructor<?>... constructors);
++
++        /**
++         * Register a dynamic proxy.
++         * @param proxyClass The proxy class
++         */
++        void registerDynamicProxy(Class<?> proxyClass);
+     }
+ }
+diff --git a/core/src/main/java/io/micronaut/core/io/service/ServiceLoaderFeature.java b/core/src/main/java/io/micronaut/core/io/service/ServiceLoaderFeature.java
+index 1c7da8aab3..071e85623e 100644
+--- a/core/src/main/java/io/micronaut/core/io/service/ServiceLoaderFeature.java
++++ b/core/src/main/java/io/micronaut/core/io/service/ServiceLoaderFeature.java
+@@ -28,6 +28,7 @@ import io.micronaut.core.util.ArrayUtils;
+ import org.graalvm.nativeimage.ImageSingletons;
+ import org.graalvm.nativeimage.hosted.Feature;
+ import org.graalvm.nativeimage.hosted.RuntimeClassInitialization;
++import org.graalvm.nativeimage.hosted.RuntimeProxyCreation;
+ import org.graalvm.nativeimage.hosted.RuntimeReflection;
+ 
+ import java.io.IOException;
+@@ -233,6 +234,11 @@ class ServiceLoaderFeature implements Feature {
+             public void register(Constructor<?>... constructors) {
+                 RuntimeReflection.register(constructors);
+             }
++
++            @Override
++            public void registerDynamicProxy(Class<?> proxyClass) {
++                RuntimeProxyCreation.register(proxyClass);
++            }
+         };
+         for (GraalReflectionConfigurer configurer : configurers) {
+             initializeAtBuildTime(configurer.getClass());
+diff --git a/graal/src/main/java/io/micronaut/graal/reflect/GraalTypeElementVisitor.java b/graal/src/main/java/io/micronaut/graal/reflect/GraalTypeElementVisitor.java
+index 023edae985..25b4a181f2 100644
+--- a/graal/src/main/java/io/micronaut/graal/reflect/GraalTypeElementVisitor.java
++++ b/graal/src/main/java/io/micronaut/graal/reflect/GraalTypeElementVisitor.java
+@@ -27,7 +27,6 @@ import io.micronaut.core.annotation.NonNull;
+ import io.micronaut.core.annotation.ReflectionConfig;
+ import io.micronaut.core.annotation.ReflectiveAccess;
+ import io.micronaut.core.annotation.TypeHint;
+-import io.micronaut.core.util.StringUtils;
+ import io.micronaut.inject.annotation.MutableAnnotationMetadata;
+ import io.micronaut.inject.ast.ClassElement;
+ import io.micronaut.inject.ast.ElementModifier;
+@@ -156,20 +155,18 @@ public class GraalTypeElementVisitor implements TypeElementVisitor<Object, Objec
+             }
+ 
+             if (element.hasAnnotation(TypeHint.class)) {
+-                final String[] introspectedClasses = element.stringValues(TypeHint.class);
+-                final TypeHint typeHint = element.synthesize(TypeHint.class);
+-                TypeHint.AccessType[] accessTypes = DEFAULT_ACCESS_TYPE;
+-
+-                if (typeHint != null) {
+-                    accessTypes = typeHint.accessType();
++                String[] introspectedClasses = element.stringValues(TypeHint.class);
++                String[] typeNames = element.stringValues(TypeHint.class, "typeNames");
++                TypeHint.AccessType[] accessTypes = element.enumValues(TypeHint.class, "accessType", TypeHint.AccessType.class);
++                if (accessTypes.length == 0) {
++                    accessTypes = DEFAULT_ACCESS_TYPE;
++                }
++                if (introspectedClasses.length == 0 && typeNames.length == 0) {
++                    processClasses(accessTypes, reflectiveClasses, element.getName());
++                } else {
++                    processClasses(accessTypes, reflectiveClasses, introspectedClasses);
++                    processClasses(accessTypes, reflectiveClasses, typeNames);
+                 }
+-                processClasses(accessTypes, reflectiveClasses, introspectedClasses);
+-                processClasses(accessTypes, reflectiveClasses, element.getValue(
+-                        TypeHint.class,
+-                        "typeNames",
+-                        String[].class).orElse(StringUtils.EMPTY_STRING_ARRAY
+-                    )
+-                );
+             }
+ 
+             if (element.hasAnnotation(Import.class)) {

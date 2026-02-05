@@ -1,0 +1,245 @@
+diff --git a/src/main/java/org/mockito/Mockito.java b/src/main/java/org/mockito/Mockito.java
+index 9d8bc8ceb..184cc1407 100644
+--- a/src/main/java/org/mockito/Mockito.java
++++ b/src/main/java/org/mockito/Mockito.java
+@@ -102,6 +102,7 @@ import java.util.function.Function;
+  *      <a href="#47">47. New API for clearing mock state in inline mocking (Since 2.25.0)</a><br/>
+  *      <a href="#48">48. New API for mocking static methods (Since 3.4.0)</a><br/>
+  *      <a href="#49">49. New API for mocking object construction (Since 3.5.0)</a><br/>
++ *      <a href="#50">50. Avoiding code generation when restricting mocks to interfaces (Since 3.12.2)</a><br/>
+  * </b>
+  *
+  * <h3 id="0">0. <a class="meaningful_link" href="#mockito2" name="mockito2">Migrating to Mockito 2</a></h3>
+@@ -1589,6 +1590,19 @@ import java.util.function.Function;
+  * Due to the defined scope of the mocked construction, object construction returns to its original behavior once the scope is
+  * released. To define mock behavior and to verify method invocations, use the <code>MockedConstruction</code> that is returned.
+  * <p>
++ *
++ * <h3 id="50">50. <a class="meaningful_link" href="#proxy_mock_maker" name="mocked_construction">Avoiding code generation when only interfaces are mocked</a> (since 3.12.2)</h3>
++ *
++ * The JVM offers the {@link java.lang.reflect.Proxy} facility for creating dynamic proxies of interface types. For most applications, Mockito
++ * must be capable of mocking classes as supported by the default mock maker, or even final classes, as supported by the inline mock maker. To
++ * create such mocks, Mockito requires to setup diverse JVM facilities and must apply code generation. If only interfaces are supposed to be
++ * mocked, one can however choose to use a {@link org.mockito.internal.creation.proxy.ProxyMockMaker} that is based on the {@link java.lang.reflect.Proxy}
++ * API which avoids diverse overhead of the other mock makers but also limits mocking to interfaces.
++ *
++ * This mock maker can be activated explicitly by the mockito extension mechanism, just create in the classpath a file
++ * <code>/mockito-extensions/org.mockito.plugins.MockMaker</code> containing the value <code>mock-maker-proxy</code>.
++ *
++ * <p>
+  */
+ @CheckReturnValue
+ @SuppressWarnings("unchecked")
+diff --git a/src/main/java/org/mockito/internal/configuration/plugins/DefaultMockitoPlugins.java b/src/main/java/org/mockito/internal/configuration/plugins/DefaultMockitoPlugins.java
+index d06a8fb62..559a90d59 100644
+--- a/src/main/java/org/mockito/internal/configuration/plugins/DefaultMockitoPlugins.java
++++ b/src/main/java/org/mockito/internal/configuration/plugins/DefaultMockitoPlugins.java
+@@ -21,6 +21,7 @@ class DefaultMockitoPlugins implements MockitoPlugins {
+ 
+     private static final Map<String, String> DEFAULT_PLUGINS = new HashMap<>();
+     static final String INLINE_ALIAS = "mock-maker-inline";
++    static final String PROXY_ALIAS = "mock-maker-proxy";
+     static final String MODULE_ALIAS = "member-accessor-module";
+ 
+     static {
+@@ -40,6 +41,7 @@ class DefaultMockitoPlugins implements MockitoPlugins {
+                 "org.mockito.internal.configuration.InjectingAnnotationEngine");
+         DEFAULT_PLUGINS.put(
+                 INLINE_ALIAS, "org.mockito.internal.creation.bytebuddy.InlineByteBuddyMockMaker");
++        DEFAULT_PLUGINS.put(PROXY_ALIAS, "org.mockito.internal.creation.proxy.ProxyMockMaker");
+         DEFAULT_PLUGINS.put(
+                 MockitoLogger.class.getName(), "org.mockito.internal.util.ConsoleMockitoLogger");
+         DEFAULT_PLUGINS.put(
+diff --git a/src/main/java/org/mockito/internal/creation/proxy/ProxyMockMaker.java b/src/main/java/org/mockito/internal/creation/proxy/ProxyMockMaker.java
+new file mode 100644
+index 000000000..31a13124c
+--- /dev/null
++++ b/src/main/java/org/mockito/internal/creation/proxy/ProxyMockMaker.java
+@@ -0,0 +1,172 @@
++/*
++ * Copyright (c) 2021 Mockito contributors
++ * This program is made available under the terms of the MIT License.
++ */
++package org.mockito.internal.creation.proxy;
++
++import org.mockito.exceptions.base.MockitoException;
++import org.mockito.internal.debugging.LocationImpl;
++import org.mockito.internal.invocation.RealMethod;
++import org.mockito.internal.invocation.SerializableMethod;
++import org.mockito.internal.util.Platform;
++import org.mockito.invocation.MockHandler;
++import org.mockito.mock.MockCreationSettings;
++import org.mockito.plugins.MockMaker;
++
++import java.lang.reflect.*;
++import java.util.concurrent.atomic.AtomicReference;
++
++import static org.mockito.internal.invocation.DefaultInvocationFactory.createInvocation;
++import static org.mockito.internal.util.StringUtil.join;
++
++/**
++ * A mock maker that is using the {@link Proxy} utility and is therefore only capable of mocking interfaces but
++ * does not rely on manual byte code generation but only uses official and public Java API.
++ */
++public class ProxyMockMaker implements MockMaker {
++
++    private final Method invokeDefault;
++
++    public ProxyMockMaker() {
++        Method m;
++        try {
++            m =
++                    InvocationHandler.class.getMethod(
++                            "invokeDefault", Object.class, Method.class, Object[].class);
++        } catch (NoSuchMethodException ignored) {
++            m = null;
++        }
++        invokeDefault = m;
++    }
++
++    @Override
++    @SuppressWarnings("unchecked")
++    public <T> T createMock(MockCreationSettings<T> settings, MockHandler handler) {
++        Class<?>[] ifaces = new Class<?>[settings.getExtraInterfaces().size() + 1];
++        ifaces[0] = settings.getTypeToMock();
++        int index = 1;
++        for (Class<?> iface : settings.getExtraInterfaces()) {
++            ifaces[index++] = iface;
++        }
++        return (T)
++                Proxy.newProxyInstance(
++                        settings.getTypeToMock().getClassLoader(),
++                        ifaces,
++                        new MockInvocationHandler(handler, settings));
++    }
++
++    @Override
++    public MockHandler getHandler(Object mock) {
++        if (!Proxy.isProxyClass(mock.getClass())) {
++            return null;
++        }
++        InvocationHandler handler = Proxy.getInvocationHandler(mock);
++        if (!(handler instanceof MockInvocationHandler)) {
++            return null;
++        }
++        return ((MockInvocationHandler) handler).handler.get();
++    }
++
++    @Override
++    public void resetMock(Object mock, MockHandler newHandler, MockCreationSettings settings) {
++        ((MockInvocationHandler) Proxy.getInvocationHandler(mock)).handler.set(newHandler);
++    }
++
++    @Override
++    public TypeMockability isTypeMockable(Class<?> type) {
++        return new TypeMockability() {
++            @Override
++            public boolean mockable() {
++                return type.isInterface();
++            }
++
++            @Override
++            public String nonMockableReason() {
++                return mockable() ? "" : "non-interface";
++            }
++        };
++    }
++
++    private class MockInvocationHandler implements InvocationHandler {
++
++        private final AtomicReference<MockHandler<?>> handler;
++
++        private final MockCreationSettings<?> settings;
++
++        private MockInvocationHandler(MockHandler<?> handler, MockCreationSettings<?> settings) {
++            this.handler = new AtomicReference<>(handler);
++            this.settings = settings;
++        }
++
++        @Override
++        public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
++            if (method.getDeclaringClass() == Object.class) {
++                switch (method.getName()) {
++                    case "hashCode":
++                        return System.identityHashCode(proxy);
++                    case "equals":
++                        return proxy == args[0];
++                    case "toString":
++                        return "";
++                    default:
++                        throw new MockitoException(
++                                join(
++                                        "Unexpected overridable method of Object class found",
++                                        "",
++                                        "The method "
++                                                + method
++                                                + " was not expected to be declared. Either your JVM build offers "
++                                                + "non-official API or the current functionality is not supported",
++                                        Platform.describe()));
++                }
++            }
++            RealMethod realMethod;
++            if (invokeDefault == null || Modifier.isAbstract(method.getModifiers())) {
++                realMethod = RealMethod.IsIllegal.INSTANCE;
++            } else {
++                realMethod = new RealDefaultMethod(proxy, method, args);
++            }
++            return handler.get()
++                    .handle(
++                            createInvocation(
++                                    proxy, method, args, realMethod, settings, new LocationImpl()));
++        }
++    }
++
++    private class RealDefaultMethod implements RealMethod {
++
++        private final Object proxy;
++        private final SerializableMethod serializableMethod;
++        private final Object[] args;
++
++        private RealDefaultMethod(Object proxy, Method method, Object[] args) {
++            this.proxy = proxy;
++            this.serializableMethod = new SerializableMethod(method);
++            this.args = args;
++        }
++
++        @Override
++        public boolean isInvokable() {
++            return true;
++        }
++
++        @Override
++        public Object invoke() throws Throwable {
++            try {
++                return invokeDefault.invoke(null, proxy, serializableMethod.getJavaMethod(), args);
++            } catch (InvocationTargetException e) {
++                throw e.getTargetException();
++            } catch (IllegalAccessException | IllegalArgumentException e) {
++                throw new MockitoException(
++                        join(
++                                "Failed to access default method or invoked method with illegal arguments",
++                                "",
++                                "Method "
++                                        + serializableMethod.getJavaMethod()
++                                        + " could not be delegated, this is not supposed to happen",
++                                Platform.describe()),
++                        e);
++            }
++        }
++    }
++}
+diff --git a/src/main/java/org/mockito/internal/creation/proxy/package-info.java b/src/main/java/org/mockito/internal/creation/proxy/package-info.java
+new file mode 100644
+index 000000000..0649d3ba5
+--- /dev/null
++++ b/src/main/java/org/mockito/internal/creation/proxy/package-info.java
+@@ -0,0 +1,9 @@
++/*
++ * Copyright (c) 2007 Mockito contributors
++ * This program is made available under the terms of the MIT License.
++ */
++
++/**
++ * Mock makers based on the {@link java.lang.reflect.Proxy} utility.
++ */
++package org.mockito.internal.creation.proxy;

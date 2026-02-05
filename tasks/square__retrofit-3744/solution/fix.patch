@@ -1,0 +1,339 @@
+diff --git a/retrofit/src/main/java/retrofit2/HttpServiceMethod.java b/retrofit/src/main/java/retrofit2/HttpServiceMethod.java
+index 38b7318a..d285c0ae 100644
+--- a/retrofit/src/main/java/retrofit2/HttpServiceMethod.java
++++ b/retrofit/src/main/java/retrofit2/HttpServiceMethod.java
+@@ -154,8 +154,9 @@ abstract class HttpServiceMethod<ResponseT, ReturnT> extends ServiceMethod<Retur
+   }
+ 
+   @Override
+-  final @Nullable ReturnT invoke(Object[] args) {
+-    Call<ResponseT> call = new OkHttpCall<>(requestFactory, args, callFactory, responseConverter);
++  final @Nullable ReturnT invoke(Object instance, Object[] args) {
++    Call<ResponseT> call =
++        new OkHttpCall<>(requestFactory, instance, args, callFactory, responseConverter);
+     return adapt(call, args);
+   }
+ 
+diff --git a/retrofit/src/main/java/retrofit2/Invocation.java b/retrofit/src/main/java/retrofit2/Invocation.java
+index 84e50e08..cd6d7a72 100644
+--- a/retrofit/src/main/java/retrofit2/Invocation.java
++++ b/retrofit/src/main/java/retrofit2/Invocation.java
+@@ -20,6 +20,7 @@ import java.util.ArrayList;
+ import java.util.Collections;
+ import java.util.List;
+ import java.util.Objects;
++import javax.annotation.Nullable;
+ 
+ /**
+  * A single invocation of a Retrofit service interface method. This class captures both the method
+@@ -35,8 +36,9 @@ import java.util.Objects;
+  *     Invocation invocation = request.tag(Invocation.class);
+  *     if (invocation != null) {
+  *       System.out.printf("%s.%s %s%n",
+- *           invocation.method().getDeclaringClass().getSimpleName(),
+- *           invocation.method().getName(), invocation.arguments());
++ *           invocation.service().getSimpleName(),
++ *           invocation.method().getName(),
++ *           invocation.arguments());
+  *     }
+  *     return chain.proceed(request);
+  *   }
+@@ -49,21 +51,50 @@ import java.util.Objects;
+  * types for parameters!
+  */
+ public final class Invocation {
++  public static <T> Invocation of(Class<T> service, T instance, Method method, List<?> arguments) {
++    Objects.requireNonNull(service, "service == null");
++    Objects.requireNonNull(instance, "instance == null");
++    Objects.requireNonNull(method, "method == null");
++    Objects.requireNonNull(arguments, "arguments == null");
++    return new Invocation(service, instance, method, new ArrayList<>(arguments)); // Defensive copy.
++  }
++
++  @Deprecated
+   public static Invocation of(Method method, List<?> arguments) {
+     Objects.requireNonNull(method, "method == null");
+     Objects.requireNonNull(arguments, "arguments == null");
+-    return new Invocation(method, new ArrayList<>(arguments)); // Defensive copy.
++    return new Invocation(
++        method.getDeclaringClass(), null, method, new ArrayList<>(arguments)); // Defensive copy.
+   }
+ 
++  private final Class<?> service;
++  @Nullable private final Object instance;
+   private final Method method;
+   private final List<?> arguments;
+ 
+   /** Trusted constructor assumes ownership of {@code arguments}. */
+-  Invocation(Method method, List<?> arguments) {
++  Invocation(Class<?> service, @Nullable Object instance, Method method, List<?> arguments) {
++    this.service = service;
++    this.instance = instance;
+     this.method = method;
+     this.arguments = Collections.unmodifiableList(arguments);
+   }
+ 
++  public Class<?> service() {
++    return service;
++  }
++
++  /**
++   * The instance of {@link #service}.
++   * <p>
++   * This will never be null when created by Retrofit. Null will only be returned when created
++   * by {@link #of(Method, List)}.
++   */
++  @Nullable
++  public Object instance() {
++    return instance;
++  }
++
+   public Method method() {
+     return method;
+   }
+@@ -74,7 +105,6 @@ public final class Invocation {
+ 
+   @Override
+   public String toString() {
+-    return String.format(
+-        "%s.%s() %s", method.getDeclaringClass().getName(), method.getName(), arguments);
++    return String.format("%s.%s() %s", service.getName(), method.getName(), arguments);
+   }
+ }
+diff --git a/retrofit/src/main/java/retrofit2/KotlinExtensions.kt b/retrofit/src/main/java/retrofit2/KotlinExtensions.kt
+index 09b81b26..2444c883 100644
+--- a/retrofit/src/main/java/retrofit2/KotlinExtensions.kt
++++ b/retrofit/src/main/java/retrofit2/KotlinExtensions.kt
+@@ -39,9 +39,10 @@ suspend fun <T : Any> Call<T>.await(): T {
+           val body = response.body()
+           if (body == null) {
+             val invocation = call.request().tag(Invocation::class.java)!!
++            val service = invocation.service()
+             val method = invocation.method()
+             val e = KotlinNullPointerException(
+-              "Response from ${method.declaringClass.name}.${method.name}" +
++              "Response from ${service.name}.${method.name}" +
+                 " was null but response body type was declared as non-null",
+             )
+             continuation.resumeWithException(e)
+diff --git a/retrofit/src/main/java/retrofit2/OkHttpCall.java b/retrofit/src/main/java/retrofit2/OkHttpCall.java
+index 14c53521..ff676122 100644
+--- a/retrofit/src/main/java/retrofit2/OkHttpCall.java
++++ b/retrofit/src/main/java/retrofit2/OkHttpCall.java
+@@ -32,6 +32,7 @@ import okio.Timeout;
+ 
+ final class OkHttpCall<T> implements Call<T> {
+   private final RequestFactory requestFactory;
++  private final Object instance;
+   private final Object[] args;
+   private final okhttp3.Call.Factory callFactory;
+   private final Converter<ResponseBody, T> responseConverter;
+@@ -49,10 +50,12 @@ final class OkHttpCall<T> implements Call<T> {
+ 
+   OkHttpCall(
+       RequestFactory requestFactory,
++      Object instance,
+       Object[] args,
+       okhttp3.Call.Factory callFactory,
+       Converter<ResponseBody, T> responseConverter) {
+     this.requestFactory = requestFactory;
++    this.instance = instance;
+     this.args = args;
+     this.callFactory = callFactory;
+     this.responseConverter = responseConverter;
+@@ -61,7 +64,7 @@ final class OkHttpCall<T> implements Call<T> {
+   @SuppressWarnings("CloneDoesntCallSuperClone") // We are a final type & this saves clearing state.
+   @Override
+   public OkHttpCall<T> clone() {
+-    return new OkHttpCall<>(requestFactory, args, callFactory, responseConverter);
++    return new OkHttpCall<>(requestFactory, instance, args, callFactory, responseConverter);
+   }
+ 
+   @Override
+@@ -205,7 +208,7 @@ final class OkHttpCall<T> implements Call<T> {
+   }
+ 
+   private okhttp3.Call createRawCall() throws IOException {
+-    okhttp3.Call call = callFactory.newCall(requestFactory.create(args));
++    okhttp3.Call call = callFactory.newCall(requestFactory.create(instance, args));
+     if (call == null) {
+       throw new NullPointerException("Call.Factory returned null.");
+     }
+diff --git a/retrofit/src/main/java/retrofit2/RequestFactory.java b/retrofit/src/main/java/retrofit2/RequestFactory.java
+index 52a4b1e6..6a30a991 100644
+--- a/retrofit/src/main/java/retrofit2/RequestFactory.java
++++ b/retrofit/src/main/java/retrofit2/RequestFactory.java
+@@ -63,10 +63,11 @@ import retrofit2.http.Tag;
+ import retrofit2.http.Url;
+ 
+ final class RequestFactory {
+-  static RequestFactory parseAnnotations(Retrofit retrofit, Method method) {
+-    return new Builder(retrofit, method).build();
++  static RequestFactory parseAnnotations(Retrofit retrofit, Class<?> service, Method method) {
++    return new Builder(retrofit, service, method).build();
+   }
+ 
++  private final Class<?> service;
+   private final Method method;
+   private final HttpUrl baseUrl;
+   final String httpMethod;
+@@ -80,6 +81,7 @@ final class RequestFactory {
+   final boolean isKotlinSuspendFunction;
+ 
+   RequestFactory(Builder builder) {
++    service = builder.service;
+     method = builder.method;
+     baseUrl = builder.retrofit.baseUrl;
+     httpMethod = builder.httpMethod;
+@@ -93,7 +95,7 @@ final class RequestFactory {
+     isKotlinSuspendFunction = builder.isKotlinSuspendFunction;
+   }
+ 
+-  okhttp3.Request create(Object[] args) throws IOException {
++  okhttp3.Request create(@Nullable Object instance, Object[] args) throws IOException {
+     @SuppressWarnings("unchecked") // It is an error to invoke a method with the wrong arg types.
+     ParameterHandler<Object>[] handlers = (ParameterHandler<Object>[]) parameterHandlers;
+ 
+@@ -129,7 +131,10 @@ final class RequestFactory {
+       handlers[p].apply(requestBuilder, args[p]);
+     }
+ 
+-    return requestBuilder.get().tag(Invocation.class, new Invocation(method, argumentList)).build();
++    return requestBuilder
++        .get()
++        .tag(Invocation.class, new Invocation(service, instance, method, argumentList))
++        .build();
+   }
+ 
+   /**
+@@ -144,6 +149,7 @@ final class RequestFactory {
+     private static final Pattern PARAM_NAME_REGEX = Pattern.compile(PARAM);
+ 
+     final Retrofit retrofit;
++    final Class<?> service;
+     final Method method;
+     final Annotation[] methodAnnotations;
+     final Annotation[][] parameterAnnotationsArray;
+@@ -168,8 +174,9 @@ final class RequestFactory {
+     @Nullable ParameterHandler<?>[] parameterHandlers;
+     boolean isKotlinSuspendFunction;
+ 
+-    Builder(Retrofit retrofit, Method method) {
++    Builder(Retrofit retrofit, Class<?> service, Method method) {
+       this.retrofit = retrofit;
++      this.service = service;
+       this.method = method;
+       this.methodAnnotations = method.getAnnotations();
+       this.parameterTypes = method.getGenericParameterTypes();
+diff --git a/retrofit/src/main/java/retrofit2/Retrofit.java b/retrofit/src/main/java/retrofit2/Retrofit.java
+index a2b68f4d..c66f8212 100644
+--- a/retrofit/src/main/java/retrofit2/Retrofit.java
++++ b/retrofit/src/main/java/retrofit2/Retrofit.java
+@@ -174,7 +174,7 @@ public final class Retrofit {
+                 Reflection reflection = Platform.reflection;
+                 return reflection.isDefaultMethod(method)
+                     ? reflection.invokeDefaultMethod(method, service, proxy, args)
+-                    : loadServiceMethod(method).invoke(args);
++                    : loadServiceMethod(service, method).invoke(proxy, args);
+               }
+             });
+   }
+@@ -205,13 +205,13 @@ public final class Retrofit {
+         if (!reflection.isDefaultMethod(method)
+             && !Modifier.isStatic(method.getModifiers())
+             && !method.isSynthetic()) {
+-          loadServiceMethod(method);
++          loadServiceMethod(service, method);
+         }
+       }
+     }
+   }
+ 
+-  ServiceMethod<?> loadServiceMethod(Method method) {
++  ServiceMethod<?> loadServiceMethod(Class<?> service, Method method) {
+     // Note: Once we are minSdk 24 this whole method can be replaced by computeIfAbsent.
+     Object lookup = serviceMethodCache.get(method);
+ 
+@@ -229,7 +229,7 @@ public final class Retrofit {
+         if (lookup == null) {
+           // On successful lock insertion, perform the work and update the map before releasing.
+           // Other threads may be waiting on lock now and will expect the parsed model.
+-          ServiceMethod<Object> result = ServiceMethod.parseAnnotations(this, method);
++          ServiceMethod<Object> result = ServiceMethod.parseAnnotations(this, service, method);
+           serviceMethodCache.put(method, result);
+           return result;
+         }
+diff --git a/retrofit/src/main/java/retrofit2/ServiceMethod.java b/retrofit/src/main/java/retrofit2/ServiceMethod.java
+index ea4330ed..f3117e11 100644
+--- a/retrofit/src/main/java/retrofit2/ServiceMethod.java
++++ b/retrofit/src/main/java/retrofit2/ServiceMethod.java
+@@ -22,8 +22,8 @@ import java.lang.reflect.Type;
+ import javax.annotation.Nullable;
+ 
+ abstract class ServiceMethod<T> {
+-  static <T> ServiceMethod<T> parseAnnotations(Retrofit retrofit, Method method) {
+-    RequestFactory requestFactory = RequestFactory.parseAnnotations(retrofit, method);
++  static <T> ServiceMethod<T> parseAnnotations(Retrofit retrofit, Class<?> service, Method method) {
++    RequestFactory requestFactory = RequestFactory.parseAnnotations(retrofit, service, method);
+ 
+     Type returnType = method.getGenericReturnType();
+     if (Utils.hasUnresolvableType(returnType)) {
+@@ -39,5 +39,5 @@ abstract class ServiceMethod<T> {
+     return HttpServiceMethod.parseAnnotations(retrofit, method, requestFactory);
+   }
+ 
+-  abstract @Nullable T invoke(Object[] args);
++  abstract @Nullable T invoke(Object instance, Object[] args);
+ }
+diff --git a/retrofit/test-helpers/src/main/java/retrofit2/TestingUtils.java b/retrofit/test-helpers/src/main/java/retrofit2/TestingUtils.java
+index 703133ea..912b1384 100644
+--- a/retrofit/test-helpers/src/main/java/retrofit2/TestingUtils.java
++++ b/retrofit/test-helpers/src/main/java/retrofit2/TestingUtils.java
+@@ -31,7 +31,7 @@ final class TestingUtils {
+ 
+     Method method = onlyMethod(cls);
+     try {
+-      return RequestFactory.parseAnnotations(retrofit, method).create(args);
++      return RequestFactory.parseAnnotations(retrofit, cls, method).create(null, args);
+     } catch (RuntimeException e) {
+       throw e;
+     } catch (Exception e) {
+diff --git a/samples/src/main/java/com/example/retrofit/ErrorHandlingAdapter.java b/samples/src/main/java/com/example/retrofit/ErrorHandlingAdapter.java
+index 1c7fb0e1..afc7d329 100644
+--- a/samples/src/main/java/com/example/retrofit/ErrorHandlingAdapter.java
++++ b/samples/src/main/java/com/example/retrofit/ErrorHandlingAdapter.java
+@@ -125,8 +125,8 @@ public final class ErrorHandlingAdapter {
+             @Override
+             public void onResponse(Call<T> call, Response<T> response) {
+               // TODO if 'callbackExecutor' is not null, the 'callback' methods should be executed
+-              // on that executor by submitting a Runnable. This is left as an exercise for the
+-              // reader.
++              //  on that executor by submitting a Runnable. This is left as an exercise for the
++              //  reader.
+ 
+               int code = response.code();
+               if (code >= 200 && code < 300) {
+@@ -145,8 +145,8 @@ public final class ErrorHandlingAdapter {
+             @Override
+             public void onFailure(Call<T> call, Throwable t) {
+               // TODO if 'callbackExecutor' is not null, the 'callback' methods should be executed
+-              // on that executor by submitting a Runnable. This is left as an exercise for the
+-              // reader.
++              //  on that executor by submitting a Runnable. This is left as an exercise for the
++              //  reader.
+ 
+               if (t instanceof IOException) {
+                 callback.networkError((IOException) t);
+diff --git a/samples/src/main/java/com/example/retrofit/InvocationMetrics.java b/samples/src/main/java/com/example/retrofit/InvocationMetrics.java
+index a4d5d768..0d491b76 100644
+--- a/samples/src/main/java/com/example/retrofit/InvocationMetrics.java
++++ b/samples/src/main/java/com/example/retrofit/InvocationMetrics.java
+@@ -55,7 +55,7 @@ public final class InvocationMetrics {
+       if (invocation != null) {
+         System.out.printf(
+             "%s.%s %s HTTP %s (%.0f ms)%n",
+-            invocation.method().getDeclaringClass().getSimpleName(),
++            invocation.service().getSimpleName(),
+             invocation.method().getName(),
+             invocation.arguments(),
+             response.code(),

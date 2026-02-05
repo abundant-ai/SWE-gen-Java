@@ -1,0 +1,409 @@
+diff --git a/gradle/libs.versions.toml b/gradle/libs.versions.toml
+index 09007145c3..b04f6cebf1 100644
+--- a/gradle/libs.versions.toml
++++ b/gradle/libs.versions.toml
+@@ -82,7 +82,6 @@ managed-kotlin-coroutines = "1.8.1"
+ managed-methvin-directory-watcher = "0.19.1"
+ managed-netty = "4.2.7.Final"
+ managed-netty-tcnative = "2.0.74.Final"
+-managed-netty-contrib-multipart = "1.0.0.Alpha1"
+ managed-reactive-streams = "1.0.4"
+ # This should be kept aligned with https://github.com/micronaut-projects/micronaut-reactor/blob/master/gradle.properties from the BOM
+ managed-reactor = "3.7.12"
+@@ -169,7 +168,6 @@ managed-netty-transport-native-iouring = { module = "io.netty:netty-transport-na
+ managed-netty-transport-native-unix-common = { module = "io.netty:netty-transport-native-unix-common", version.ref = "managed-netty" }
+ managed-netty-pkitesting = { module = "io.netty:netty-pkitesting", version.ref = "managed-netty" }
+ managed-netty-tcnative-boringssl-static = { module = "io.netty:netty-tcnative-boringssl-static", version.ref = "managed-netty-tcnative" }
+-managed-netty-contrib-multipart-vintage = { module = "io.netty.contrib:netty-codec-multipart-vintage", version.ref = "managed-netty-contrib-multipart" }
+ 
+ managed-reactive-streams = { module = "org.reactivestreams:reactive-streams", version.ref = "managed-reactive-streams" }
+ 
+diff --git a/http-server-netty/build.gradle.kts b/http-server-netty/build.gradle.kts
+index ebc8c84bfa..54522e7acd 100644
+--- a/http-server-netty/build.gradle.kts
++++ b/http-server-netty/build.gradle.kts
+@@ -34,7 +34,6 @@ dependencies {
+     compileOnly(projects.micronautWebsocket)
+     compileOnly(libs.managed.kotlin.stdlib)
+     compileOnly(libs.managed.netty.transport.native.unix.common)
+-    compileOnly(libs.managed.netty.contrib.multipart.vintage)
+     compileOnly(projects.micronautHttpNettyHttp3)
+     compileOnly(libs.brotli4j)
+ 
+@@ -126,7 +125,6 @@ dependencies {
+         exclude(group = "io.micronaut")
+     }
+     testImplementation(libs.junit.jupiter.api)
+-    testRuntimeOnly(libs.managed.netty.contrib.multipart.vintage)
+ }
+ 
+ tasks.withType<Test>().configureEach {
+diff --git a/http-server-netty/src/main/java/io/micronaut/http/server/netty/FormDataHttpContentProcessor.java b/http-server-netty/src/main/java/io/micronaut/http/server/netty/FormDataHttpContentProcessor.java
+index e22557b8da..a039dd9fd4 100644
+--- a/http-server-netty/src/main/java/io/micronaut/http/server/netty/FormDataHttpContentProcessor.java
++++ b/http-server-netty/src/main/java/io/micronaut/http/server/netty/FormDataHttpContentProcessor.java
+@@ -15,17 +15,12 @@
+  */
+ package io.micronaut.http.server.netty;
+ 
+-import io.micronaut.context.exceptions.ConfigurationException;
+ import io.micronaut.core.annotation.Internal;
+-import io.micronaut.core.convert.ConversionService;
+ import io.micronaut.http.MediaType;
+ import io.micronaut.http.exceptions.ContentLengthExceededException;
+ import io.micronaut.http.server.HttpServerConfiguration;
+ import io.micronaut.http.server.netty.configuration.NettyHttpServerConfiguration;
+ import io.netty.buffer.ByteBufHolder;
+-import io.netty.contrib.multipart.DecoderQuirk;
+-import io.netty.contrib.multipart.FormDecoderException;
+-import io.netty.contrib.multipart.TooManyFormFieldsException;
+ import io.netty.handler.codec.http.HttpContent;
+ import io.netty.handler.codec.http.HttpRequest;
+ import io.netty.handler.codec.http.LastHttpContent;
+@@ -43,7 +38,6 @@ import java.io.IOException;
+ import java.nio.charset.Charset;
+ import java.util.Collection;
+ import java.util.concurrent.atomic.AtomicLong;
+-import java.util.function.Supplier;
+ 
+ /**
+  * <p>Decodes {@link MediaType#MULTIPART_FORM_DATA} in a non-blocking manner.</p>
+@@ -56,8 +50,6 @@ import java.util.function.Supplier;
+ @Internal
+ public final class FormDataHttpContentProcessor {
+ 
+-    private static boolean contribCodecMissing;
+-
+     protected final NettyHttpRequest<?> nettyHttpRequest;
+     protected final long advertisedLength;
+     protected final long requestMaxSize;
+@@ -97,38 +89,12 @@ public final class FormDataHttpContentProcessor {
+         HttpDataFactory factory = new MicronautHttpData.Factory(multipart, characterEncoding);
+         // prevent the decoders from immediately parsing the content
+         HttpRequest nativeRequest = nettyHttpRequest.toHttpRequestWithoutBody();
+-        this.decoder = createDecoder(factory, nativeRequest, characterEncoding, configuration);
+-        this.partMaxSize = multipart.getMaxFileSize();
+-    }
+-
+-    private static InterfaceHttpPostRequestDecoder createDecoder(HttpDataFactory factory, HttpRequest request, Charset charset, NettyHttpServerConfiguration configuration) {
+-        if (!contribCodecMissing) {
+-            try {
+-                var builder = io.netty.contrib.multipart.vintage.HttpPostRequestDecoder.builder()
+-                    .dataFactory(factory)
+-                    .charset(charset)
+-                    .maxFields(configuration.getFormMaxFields())
+-                    .undecodedLimit(configuration.getFormMaxBufferedBytes())
+-                    .enableQuirks(configuration.getFormDecoderQuirks().stream()
+-                        .map(name -> ConversionService.SHARED.convertRequired(name, DecoderQuirk.class))
+-                        .toArray(DecoderQuirk[]::new));
+-                if (HttpPostRequestDecoder.isMultipart(request)) {
+-                    return builder.buildMultipart(request);
+-                } else {
+-                    return builder.buildStandard(request);
+-                }
+-            } catch (LinkageError e) {
+-                if (!configuration.getFormDecoderQuirks().isEmpty()) {
+-                    throw new ConfigurationException("Configuration contained form-decoder-quirks, but failed to load new decoder implementation", e);
+-                }
+-                contribCodecMissing = true;
+-            }
+-        }
+-        if (HttpPostRequestDecoder.isMultipart(request)) {
+-            return new HttpPostMultipartRequestDecoder(factory, request, charset, configuration.getFormMaxFields(), configuration.getFormMaxBufferedBytes());
++        if (HttpPostRequestDecoder.isMultipart(nativeRequest)) {
++            this.decoder = new HttpPostMultipartRequestDecoder(factory, nativeRequest, characterEncoding, configuration.getFormMaxFields(), configuration.getFormMaxBufferedBytes());
+         } else {
+-            return new HttpPostStandardRequestDecoder(factory, request, charset, configuration.getFormMaxFields(), configuration.getFormMaxBufferedBytes());
++            this.decoder = new HttpPostStandardRequestDecoder(factory, nativeRequest, characterEncoding, configuration.getFormMaxFields(), configuration.getFormMaxBufferedBytes());
+         }
++        this.partMaxSize = multipart.getMaxFileSize();
+     }
+ 
+     protected void onData(ByteBufHolder message, Collection<? super InterfaceHttpData> out) {
+@@ -181,11 +147,20 @@ public final class FormDataHttpContentProcessor {
+                         postRequestDecoder.removeHttpDataFromClean(currentPartialHttpData);
+                     }
+ 
+-                } catch (RuntimeException e) {
+-                    RuntimeException mapped = mapFormException(e);
+-                    if (mapped != null) {
+-                        throw mapped;
++                } catch (HttpPostRequestDecoder.EndOfDataDecoderException e) {
++                    // ok, ignore
++                } catch (HttpPostRequestDecoder.ErrorDataDecoderException e) {
++                    Throwable cause = e.getCause();
++                    if (cause instanceof IOException && cause.getMessage().equals("Size exceed allowed maximum capacity")) {
++                        String partName = decoder.currentPartialHttpData().getName();
++                        throw new ContentLengthExceededException("The part named [" + partName + "] exceeds the maximum allowed content length [" + partMaxSize + "]");
++                    } else {
++                        throw e;
+                     }
++                } catch (HttpPostRequestDecoder.TooManyFormFieldsException e) {
++                    throw new ContentLengthExceededException("Number of form fields exceeds configured limit of [" + configuration.getFormMaxFields() + "]");
++                } catch (HttpPostRequestDecoder.TooLongFormFieldException e) {
++                    throw new ContentLengthExceededException("Length of buffered form field exceeds configured limit of [" + configuration.getFormMaxBufferedBytes() + "]");
+                 } finally {
+                     httpContent.release();
+                 }
+@@ -198,41 +173,6 @@ public final class FormDataHttpContentProcessor {
+         }
+     }
+ 
+-    private RuntimeException mapFormException(RuntimeException original) {
+-        if (original instanceof HttpPostRequestDecoder.EndOfDataDecoderException ||
+-            instanceOfSafe(original, () -> io.netty.contrib.multipart.vintage.HttpPostRequestDecoder.EndOfDataDecoderException.class)) {
+-            // ok, ignore
+-            return null;
+-        } else if (original instanceof HttpPostRequestDecoder.ErrorDataDecoderException ||
+-            instanceOfSafe(original, () -> io.netty.contrib.multipart.vintage.HttpPostRequestDecoder.ErrorDataDecoderException.class)) {
+-            Throwable cause = original.getCause();
+-            if (cause instanceof IOException && cause.getMessage().equals("Size exceed allowed maximum capacity")) {
+-                String partName = decoder.currentPartialHttpData().getName();
+-                return new ContentLengthExceededException("The part named [" + partName + "] exceeds the maximum allowed content length [" + partMaxSize + "]");
+-            } else {
+-                return original;
+-            }
+-        } else if (original instanceof HttpPostRequestDecoder.TooManyFormFieldsException ||
+-            instanceOfSafe(original, () -> TooManyFormFieldsException.class)) {
+-            return new ContentLengthExceededException("Number of form fields exceeds configured limit of [" + configuration.getFormMaxFields() + "]");
+-        } else if (original instanceof HttpPostRequestDecoder.TooLongFormFieldException ||
+-            (instanceOfSafe(original, () -> FormDecoderException.class) && original.getMessage().equals("Undecoded data limit exceeded"))) {
+-            return new ContentLengthExceededException("Length of buffered form field exceeds configured limit of [" + configuration.getFormMaxBufferedBytes() + "]");
+-        } else {
+-            return original;
+-        }
+-    }
+-
+-    private static <B> boolean instanceOfSafe(B object, Supplier<Class<? extends B>> type) {
+-        Class<? extends B> cl;
+-        try {
+-            cl = type.get();
+-        } catch (LinkageError e) {
+-            return false;
+-        }
+-        return cl.isInstance(object);
+-    }
+-
+     public void add(ByteBufHolder message, Collection<? super InterfaceHttpData> out) throws Throwable {
+         try {
+             receivedLast |= message instanceof LastHttpContent;
+diff --git a/http-server-netty/src/main/java/io/micronaut/http/server/netty/MicronautHttpData.java b/http-server-netty/src/main/java/io/micronaut/http/server/netty/MicronautHttpData.java
+index 2aa64f42fb..5327d1350b 100644
+--- a/http-server-netty/src/main/java/io/micronaut/http/server/netty/MicronautHttpData.java
++++ b/http-server-netty/src/main/java/io/micronaut/http/server/netty/MicronautHttpData.java
+@@ -280,7 +280,6 @@ public abstract sealed class MicronautHttpData<D extends HttpData> extends Abstr
+             } catch (IOException e) {
+                 LOG.warn("Failed to close temp file channel", e);
+             }
+-            channel = null;
+         }
+         if (path != null) {
+             try {
+@@ -288,23 +287,21 @@ public abstract sealed class MicronautHttpData<D extends HttpData> extends Abstr
+             } catch (IOException e) {
+                 LOG.warn("Failed to delete temp file", e);
+             }
+-            path = null;
+         }
+         for (Chunk chunk : chunks) {
+             chunk.release();
+         }
+-        chunks.clear();
+         if (mmapSegments != null) {
+             for (ByteBuf segment : mmapSegments) {
+                 segment.release();
+             }
+-            mmapSegments = null;
+         }
+     }
+ 
+     @Override
+     public void setContent(ByteBuf buffer) throws IOException {
+         dealloc0();
++        chunks.clear();
+ 
+         Chunk ch = new Chunk(0);
+         chunks.add(ch);
+diff --git a/http-server-netty/src/main/java/io/micronaut/http/server/netty/configuration/NettyHttpServerConfiguration.java b/http-server-netty/src/main/java/io/micronaut/http/server/netty/configuration/NettyHttpServerConfiguration.java
+index d78bba224a..d08baa0650 100644
+--- a/http-server-netty/src/main/java/io/micronaut/http/server/netty/configuration/NettyHttpServerConfiguration.java
++++ b/http-server-netty/src/main/java/io/micronaut/http/server/netty/configuration/NettyHttpServerConfiguration.java
+@@ -23,7 +23,6 @@ import io.micronaut.context.annotation.Replaces;
+ import io.micronaut.context.annotation.Requires;
+ import io.micronaut.core.annotation.Experimental;
+ import io.micronaut.core.annotation.Internal;
+-import io.micronaut.core.annotation.NextMajorVersion;
+ import io.micronaut.core.annotation.NonNull;
+ import io.micronaut.core.annotation.Nullable;
+ import io.micronaut.core.convert.format.ReadableBytes;
+@@ -46,7 +45,6 @@ import java.util.List;
+ import java.util.Map;
+ import java.util.Objects;
+ import java.util.Optional;
+-import java.util.Set;
+ 
+ /**
+  * Allows configuring Netty within {@link io.micronaut.http.server.netty.NettyHttpServer}.
+@@ -224,8 +222,6 @@ public class NettyHttpServerConfiguration extends HttpServerConfiguration {
+     private int formMaxFields = DEFAULT_FORM_MAX_FIELDS;
+     private int formMaxBufferedBytes = DEFAULT_FORM_MAX_BUFFERED_BYTES;
+     private boolean requestDecompressionEnabled = true;
+-    @NextMajorVersion("Move to DecoderQuirk enum once it becomes mandatory")
+-    private Set<String> formDecoderQuirks = Collections.emptySet();
+ 
+     /**
+      * Default empty constructor.
+@@ -877,30 +873,6 @@ public class NettyHttpServerConfiguration extends HttpServerConfiguration {
+         this.formMaxBufferedBytes = formMaxBufferedBytes;
+     }
+ 
+-    /**
+-     * The decoder quirks for the
+-     * <a href="https://github.com/netty-contrib/codec-multipart/">next-generation multipart
+-     * parser</a>, if present. No quirks by default.
+-     *
+-     * @return The decoder quirks
+-     */
+-    @Experimental
+-    public Set<String> getFormDecoderQuirks() {
+-        return formDecoderQuirks;
+-    }
+-
+-    /**
+-     * The decoder quirks for the
+-     * <a href="https://github.com/netty-contrib/codec-multipart/">next-generation multipart
+-     * parser</a>, if present. No quirks by default.
+-     *
+-     * @param formDecoderQuirks The decoder quirks
+-     */
+-    @Experimental
+-    public void setFormDecoderQuirks(Set<String> formDecoderQuirks) {
+-        this.formDecoderQuirks = formDecoderQuirks;
+-    }
+-
+     /**
+      * Http2 settings.
+      */
+diff --git a/http-server-netty/src/test/java/io/micronaut/http/server/netty/FormBodyQuirkTest.java b/http-server-netty/src/test/java/io/micronaut/http/server/netty/FormBodyQuirkTest.java
+deleted file mode 100644
+index 4b376f6d02..0000000000
+--- a/http-server-netty/src/test/java/io/micronaut/http/server/netty/FormBodyQuirkTest.java
++++ /dev/null
+@@ -1,117 +0,0 @@
+-package io.micronaut.http.server.netty;
+-
+-import io.micronaut.context.ApplicationContext;
+-import io.micronaut.context.annotation.Requires;
+-import io.micronaut.http.MediaType;
+-import io.micronaut.http.annotation.Consumes;
+-import io.micronaut.http.annotation.Controller;
+-import io.micronaut.http.annotation.Part;
+-import io.micronaut.http.annotation.Post;
+-import io.micronaut.http.annotation.RequestFilter;
+-import io.micronaut.http.annotation.ServerFilter;
+-import io.micronaut.runtime.server.EmbeddedServer;
+-import io.netty.bootstrap.Bootstrap;
+-import io.netty.buffer.ByteBufUtil;
+-import io.netty.channel.Channel;
+-import io.netty.channel.ChannelHandlerContext;
+-import io.netty.channel.ChannelInboundHandlerAdapter;
+-import io.netty.channel.ChannelInitializer;
+-import io.netty.channel.EventLoopGroup;
+-import io.netty.channel.socket.nio.NioSocketChannel;
+-import io.netty.handler.codec.http.DefaultHttpContent;
+-import io.netty.handler.codec.http.DefaultHttpRequest;
+-import io.netty.handler.codec.http.DefaultLastHttpContent;
+-import io.netty.handler.codec.http.FullHttpResponse;
+-import io.netty.handler.codec.http.HttpClientCodec;
+-import io.netty.handler.codec.http.HttpHeaderNames;
+-import io.netty.handler.codec.http.HttpMethod;
+-import io.netty.handler.codec.http.HttpObjectAggregator;
+-import io.netty.handler.codec.http.HttpVersion;
+-import io.netty.util.ReferenceCountUtil;
+-import jakarta.inject.Singleton;
+-import org.junit.jupiter.params.ParameterizedTest;
+-import org.junit.jupiter.params.provider.ValueSource;
+-
+-import java.nio.charset.StandardCharsets;
+-import java.util.List;
+-import java.util.Map;
+-import java.util.concurrent.CompletableFuture;
+-
+-import static org.junit.jupiter.api.Assertions.assertEquals;
+-
+-public class FormBodyQuirkTest {
+-    // test the functioning of the new multipart parser api and its quirks.
+-    @ParameterizedTest
+-    @ValueSource(booleans = {false, true})
+-    public void test(boolean quirk) throws Exception {
+-        try (ApplicationContext ctx = ApplicationContext.run(Map.of(
+-            "spec.name", "FormBodyQuirkTest",
+-            "micronaut.server.port", "0",
+-            "micronaut.server.netty.form-decoder-quirks", quirk ? List.of("forward-chunk-cr") : List.of()
+-        ));
+-             EmbeddedServer server = ctx.getBean(EmbeddedServer.class)) {
+-            server.start();
+-
+-            CompletableFuture<String> response = new CompletableFuture<>();
+-            Channel channel = new Bootstrap()
+-                .channel(NioSocketChannel.class)
+-                .group(ctx.getBean(EventLoopGroup.class))
+-                .handler(new ChannelInitializer<>() {
+-                    @Override
+-                    protected void initChannel(Channel ch) {
+-                        ch.pipeline().addLast(new HttpClientCodec(), new HttpObjectAggregator(1024), new ChannelInboundHandlerAdapter() {
+-                            @Override
+-                            public void channelRead(ChannelHandlerContext ctx, Object msg) {
+-                                try {
+-                                    FullHttpResponse r = (FullHttpResponse) msg;
+-                                    response.complete(r.content().toString(StandardCharsets.UTF_8));
+-                                } catch (Exception e) {
+-                                    response.completeExceptionally(e);
+-                                } finally {
+-                                    ReferenceCountUtil.release(msg);
+-                                }
+-                            }
+-                        });
+-                    }
+-                })
+-                .connect(server.getHost(), server.getPort()).sync().channel();
+-
+-            DefaultHttpRequest request = new DefaultHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.POST, "/quirk-echo");
+-            request.headers().add(HttpHeaderNames.HOST, "example.com");
+-            request.headers().add(HttpHeaderNames.CONTENT_TYPE, "multipart/form-data; boundary=\"xyz\"");
+-            request.headers().add(HttpHeaderNames.TRANSFER_ENCODING, "chunked");
+-            channel.write(request, channel.voidPromise());
+-            channel.writeAndFlush(new DefaultHttpContent(ByteBufUtil.writeUtf8(channel.alloc(), """
+-                --xyz\r
+-                Content-Disposition: form-data; name="foo"\r
+-                \r
+-                bar\r"""))).sync();
+-            ctx.getBean(MyFilter.class).requestReceived.get();
+-            channel.writeAndFlush(new DefaultLastHttpContent(ByteBufUtil.writeUtf8(channel.alloc(), "\n--xyz--"))).sync();
+-
+-            assertEquals(quirk ? "bar\r" : "bar", response.get());
+-        }
+-    }
+-
+-    @Controller
+-    @Requires(property = "spec.name", value = "FormBodyQuirkTest")
+-    public static class MyController {
+-        @Post("/quirk-echo")
+-        @Consumes(MediaType.MULTIPART_FORM_DATA)
+-        public String echo(@Part("foo") String foo) {
+-            return foo;
+-        }
+-    }
+-
+-    @Singleton
+-    @ServerFilter
+-    @Requires(property = "spec.name", value = "FormBodyQuirkTest")
+-    public static class MyFilter {
+-        final CompletableFuture<?> requestReceived = new CompletableFuture<>();
+-
+-        @RequestFilter("/quirk-echo")
+-        public void onRequest() {
+-            requestReceived.complete(null);
+-        }
+-    }
+-}

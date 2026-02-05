@@ -1,0 +1,286 @@
+diff --git a/docs/src/main/asciidoc/hibernate-orm.adoc b/docs/src/main/asciidoc/hibernate-orm.adoc
+index a86bfc06d67..20eef819a43 100644
+--- a/docs/src/main/asciidoc/hibernate-orm.adoc
++++ b/docs/src/main/asciidoc/hibernate-orm.adoc
+@@ -559,6 +559,10 @@ See <<json_xml_serialization_deserialization>>.
+ See <<multitenancy>>.
+ `io.quarkus.hibernate.orm.runtime.tenant.TenantConnectionResolver`::
+ See <<programmatically-resolving-tenants-connections>>.
++`org.hibernate.boot.model.FunctionContributor`::
++See <<custom-functions-and-types>>.
++`org.hibernate.boot.model.TypeContributor`::
++See <<custom-functions-and-types>>.
+ 
+ [[persistence-unit-active]]
+ === Activate/deactivate persistence units
+@@ -1574,6 +1578,149 @@ public class ExampleTenantConnectionResolver implements TenantConnectionResolver
+ }
+ ----
+ 
++[[custom-functions-and-types]]
++=== Custom functions, types and mappings
++
++To register custom SQL functions or types, in Hibernate ORM, you can implement the standard Hibernate interfaces:
++
++* `org.hibernate.boot.model.FunctionContributor`
++* `org.hibernate.boot.model.TypeContributor`
++
++Creating an application-scoped bean that implements one of these interfaces and annotating it with `@PersistenceUnitExtension`
++(or `@PersistenceUnitExtension("nameOfYourPU")` for a <<multiple-persistence-units,named persistence unit>>)
++will automatically register it with the corresponding persistence unit.
++
++Here is an example of a custom function contributor:
++
++[source,java]
++----
++import java.util.List;
++import org.hibernate.boot.model.FunctionContributions;
++import org.hibernate.boot.model.FunctionContributor;
++import org.hibernate.query.sqm.function.AbstractSqmSelfRenderingFunctionDescriptor;
++import org.hibernate.query.sqm.produce.function.StandardArgumentsValidators;
++import org.hibernate.query.sqm.produce.function.StandardFunctionArgumentTypeResolvers;
++import org.hibernate.query.sqm.produce.function.StandardFunctionReturnTypeResolvers;
++import org.hibernate.sql.ast.SqlAstTranslator;
++import org.hibernate.sql.ast.spi.SqlAppender;
++import org.hibernate.sql.ast.tree.SqlAstNode;
++import org.hibernate.sql.ast.tree.expression.ReturnableType;
++import org.hibernate.sql.ast.tree.expression.SqlAstNodeRenderingMode;
++import org.hibernate.type.StandardBasicTypes;
++import org.hibernate.type.spi.TypeConfiguration;
++import io.quarkus.hibernate.orm.PersistenceUnitExtension;
++import jakarta.enterprise.context.ApplicationScoped;
++
++@ApplicationScoped
++@PersistenceUnitExtension
++public class CustomFunctionContributor implements FunctionContributor {
++
++    @Override
++    public void contributeFunctions(FunctionContributions functionContributions) {
++        functionContributions.getFunctionRegistry().register(
++                "addHardcodedSuffix",
++                new HardcodedSuffixFunction(
++                        functionContributions.getTypeConfiguration(), "_some_suffix"));
++    }
++
++    private static final class HardcodedSuffixFunction extends AbstractSqmSelfRenderingFunctionDescriptor {
++        private final String suffix;
++
++        private HardcodedSuffixFunction(TypeConfiguration typeConfiguration, String suffix) {
++            super("addHardcodedSuffix",
++                    StandardArgumentsValidators.exactly(1),
++                    StandardFunctionReturnTypeResolvers.invariant(
++                            typeConfiguration.getBasicTypeRegistry().resolve(StandardBasicTypes.STRING)),
++                    StandardFunctionArgumentTypeResolvers.impliedOrInvariant(typeConfiguration, StandardBasicTypes.STRING)
++            );
++            this.suffix = suffix;
++        }
++
++        @Override
++        public void render(SqlAppender sqlAppender, List<? extends SqlAstNode> sqlAstArguments, ReturnableType<?> returnType,
++                           SqlAstTranslator<?> walker) {
++            sqlAppender.appendSql('(');
++            walker.render(sqlAstArguments.get(0), SqlAstNodeRenderingMode.DEFAULT);
++            sqlAppender.appendSql(" || '" + suffix + "')");
++        }
++    }
++}
++
++----
++
++And here is an example of a custom type contributor that registers a custom `UserType` (e.g. mapping a Boolean to "Y"/"N"):
++
++[source,java]
++----
++import java.sql.PreparedStatement;
++import java.sql.ResultSet;
++import java.sql.SQLException;
++import org.hibernate.boot.model.TypeContributions;
++import org.hibernate.boot.model.TypeContributor;
++import org.hibernate.engine.spi.SharedSessionContractImplementor;
++import org.hibernate.service.ServiceRegistry;
++import org.hibernate.type.SqlTypes;
++import org.hibernate.type.descriptor.WrapperOptions;
++import org.hibernate.usertype.UserType;
++import io.quarkus.hibernate.orm.PersistenceUnitExtension;
++import jakarta.enterprise.context.ApplicationScoped;
++
++@ApplicationScoped
++@PersistenceUnitExtension
++public class CustomTypeContributor implements TypeContributor {
++
++    @Override
++    public void contribute(TypeContributions typeContributions, ServiceRegistry serviceRegistry) {
++        // Registers the custom type so it can be used via @Type(value = BooleanYesNoType.class) on your entity property
++        typeContributions.getTypeConfiguration()
++                .getBasicTypeRegistry()
++                .register(new BooleanYesNoType(), "boolean_yes_no");
++    }
++
++    public static final class BooleanYesNoType implements UserType<Boolean> {
++        @Override
++        public int getSqlType() {
++            return SqlTypes.VARCHAR;
++        }
++
++        @Override
++        public Class<Boolean> returnedClass() {
++            return Boolean.class;
++        }
++
++        @Override
++        public Boolean nullSafeGet(ResultSet rs, int position, WrapperOptions options) throws SQLException {
++            String value = rs.getString(position);
++
++            if (value == null) {
++                return null;
++            }
++
++            return "Y".equalsIgnoreCase(value) || "true".equalsIgnoreCase(value);
++        }
++
++        @Override
++        public void nullSafeSet(PreparedStatement st, Boolean value, int position, WrapperOptions options) throws SQLException {
++            if (value == null) {
++                st.setNull(position, SqlTypes.VARCHAR);
++            } else {
++                st.setString(position, value ? "Y" : "N");
++            }
++        }
++
++        @Override
++        public Boolean deepCopy(Boolean value) {
++            return value;
++        }
++
++        @Override
++        public boolean isMutable() {
++            return false;
++        }
++    }
++}
++----
++
+ [[interceptors]]
+ == Interceptors
+ 
+diff --git a/extensions/hibernate-orm/deployment/src/main/java/io/quarkus/hibernate/orm/deployment/ClassNames.java b/extensions/hibernate-orm/deployment/src/main/java/io/quarkus/hibernate/orm/deployment/ClassNames.java
+index 0e2d095c148..6f6fd34d971 100644
+--- a/extensions/hibernate-orm/deployment/src/main/java/io/quarkus/hibernate/orm/deployment/ClassNames.java
++++ b/extensions/hibernate-orm/deployment/src/main/java/io/quarkus/hibernate/orm/deployment/ClassNames.java
+@@ -71,6 +71,8 @@ private static DotName createConstant(String fqcn) {
+     public static final DotName FORMAT_MAPPER = createConstant("org.hibernate.type.format.FormatMapper");
+     public static final DotName JSON_FORMAT = createConstant("io.quarkus.hibernate.orm.JsonFormat");
+     public static final DotName XML_FORMAT = createConstant("io.quarkus.hibernate.orm.XmlFormat");
++    public static final DotName FUNCTION_CONTRIBUTOR = createConstant("org.hibernate.boot.model.FunctionContributor");
++    public static final DotName TYPE_CONTRIBUTOR = createConstant("org.hibernate.boot.model.TypeContributor");
+ 
+     public static final List<DotName> GENERATORS = List.of(
+             createConstant("org.hibernate.generator.Assigned"),
+diff --git a/extensions/hibernate-orm/deployment/src/main/java/io/quarkus/hibernate/orm/deployment/HibernateOrmCdiProcessor.java b/extensions/hibernate-orm/deployment/src/main/java/io/quarkus/hibernate/orm/deployment/HibernateOrmCdiProcessor.java
+index 50b3cf55fe7..bed462675e9 100644
+--- a/extensions/hibernate-orm/deployment/src/main/java/io/quarkus/hibernate/orm/deployment/HibernateOrmCdiProcessor.java
++++ b/extensions/hibernate-orm/deployment/src/main/java/io/quarkus/hibernate/orm/deployment/HibernateOrmCdiProcessor.java
+@@ -92,7 +92,9 @@ public class HibernateOrmCdiProcessor {
+             ClassNames.TENANT_CONNECTION_RESOLVER,
+             ClassNames.INTERCEPTOR,
+             ClassNames.STATEMENT_INSPECTOR,
+-            ClassNames.FORMAT_MAPPER);
++            ClassNames.FORMAT_MAPPER,
++            ClassNames.FUNCTION_CONTRIBUTOR,
++            ClassNames.TYPE_CONTRIBUTOR);
+ 
+     @BuildStep
+     AnnotationsTransformerBuildItem convertJpaResourceAnnotationsToQualifier(
+diff --git a/extensions/hibernate-orm/deployment/src/main/java/io/quarkus/hibernate/orm/deployment/HibernateOrmConfigPersistenceUnit.java b/extensions/hibernate-orm/deployment/src/main/java/io/quarkus/hibernate/orm/deployment/HibernateOrmConfigPersistenceUnit.java
+index 3dcf952e010..c442ad16f30 100644
+--- a/extensions/hibernate-orm/deployment/src/main/java/io/quarkus/hibernate/orm/deployment/HibernateOrmConfigPersistenceUnit.java
++++ b/extensions/hibernate-orm/deployment/src/main/java/io/quarkus/hibernate/orm/deployment/HibernateOrmConfigPersistenceUnit.java
+@@ -135,9 +135,11 @@ public interface HibernateOrmConfigPersistenceUnit {
+      *
+      * This setting is exposed mainly to allow registration of types, converters and SQL functions.
+      * ====
++     * * @deprecated Use TypeContributor, FunctionContributor or AdditionalMappingContributor instead.
+      *
+      * @asciidoclet
+      */
++    @Deprecated
+     Optional<@WithConverter(TrimmedStringConverter.class) String> metadataBuilderContributor();
+ 
+     /**
+diff --git a/extensions/hibernate-orm/runtime/src/main/java/io/quarkus/hibernate/orm/runtime/PersistenceUnitUtil.java b/extensions/hibernate-orm/runtime/src/main/java/io/quarkus/hibernate/orm/runtime/PersistenceUnitUtil.java
+index 0a79c26d008..763fca561e1 100644
+--- a/extensions/hibernate-orm/runtime/src/main/java/io/quarkus/hibernate/orm/runtime/PersistenceUnitUtil.java
++++ b/extensions/hibernate-orm/runtime/src/main/java/io/quarkus/hibernate/orm/runtime/PersistenceUnitUtil.java
+@@ -36,10 +36,11 @@ public static Annotation qualifier(String persistenceUnitName) {
+         }
+     }
+ 
+-    public static <T> InjectableInstance<T> singleExtensionInstanceForPersistenceUnit(Class<T> beanType,
++    public static <T> InjectableInstance<T> singleExtensionInstanceForPersistenceUnit(
++            Class<T> beanType,
+             String persistenceUnitName,
+             Annotation... additionalQualifiers) {
+-        InjectableInstance<T> instance = extensionInstanceForPersistenceUnit(beanType, persistenceUnitName,
++        InjectableInstance<T> instance = extensionInstancesForPersistenceUnit(beanType, persistenceUnitName,
+                 additionalQualifiers);
+         if (instance.isAmbiguous()) {
+             List<String> ambiguousClassNames = instance.handlesStream().map(h -> h.getBean().getBeanClass().getCanonicalName())
+@@ -52,7 +53,9 @@ public static <T> InjectableInstance<T> singleExtensionInstanceForPersistenceUni
+         return instance;
+     }
+ 
+-    public static <T> InjectableInstance<T> extensionInstanceForPersistenceUnit(Class<T> beanType, String persistenceUnitName,
++    public static <T> InjectableInstance<T> extensionInstancesForPersistenceUnit(
++            Class<T> beanType,
++            String persistenceUnitName,
+             Annotation... additionalQualifiers) {
+         if (additionalQualifiers.length == 0) {
+             return Arc.container().select(beanType, new PersistenceUnitExtension.Literal(persistenceUnitName));
+diff --git a/extensions/hibernate-orm/runtime/src/main/java/io/quarkus/hibernate/orm/runtime/boot/FastBootMetadataBuilder.java b/extensions/hibernate-orm/runtime/src/main/java/io/quarkus/hibernate/orm/runtime/boot/FastBootMetadataBuilder.java
+index ea5c2a40032..5fbfc8b7262 100644
+--- a/extensions/hibernate-orm/runtime/src/main/java/io/quarkus/hibernate/orm/runtime/boot/FastBootMetadataBuilder.java
++++ b/extensions/hibernate-orm/runtime/src/main/java/io/quarkus/hibernate/orm/runtime/boot/FastBootMetadataBuilder.java
+@@ -39,6 +39,8 @@
+ import org.hibernate.boot.archive.scan.spi.Scanner;
+ import org.hibernate.boot.beanvalidation.BeanValidationIntegrator;
+ import org.hibernate.boot.internal.MetadataImpl;
++import org.hibernate.boot.model.FunctionContributor;
++import org.hibernate.boot.model.TypeContributor;
+ import org.hibernate.boot.model.process.spi.ManagedResources;
+ import org.hibernate.boot.model.process.spi.MetadataBuildingProcess;
+ import org.hibernate.boot.registry.StandardServiceRegistry;
+@@ -68,6 +70,7 @@
+ 
+ import io.quarkus.hibernate.orm.runtime.BuildTimeSettings;
+ import io.quarkus.hibernate.orm.runtime.IntegrationSettings;
++import io.quarkus.hibernate.orm.runtime.PersistenceUnitUtil;
+ import io.quarkus.hibernate.orm.runtime.boot.xml.RecordableXmlMapping;
+ import io.quarkus.hibernate.orm.runtime.integration.HibernateOrmIntegrationStaticDescriptor;
+ import io.quarkus.hibernate.orm.runtime.integration.HibernateOrmIntegrationStaticInitListener;
+@@ -188,6 +191,9 @@ public FastBootMetadataBuilder(final QuarkusPersistenceUnitDefinition puDefiniti
+ 
+         applyMetadataBuilderContributor();
+ 
++        applyTypeContributors();
++        applyFunctionContributors();
++
+         // Unable to automatically handle:
+         // AvailableSettings.ENHANCER_ENABLE_DIRTY_TRACKING,
+         // AvailableSettings.ENHANCER_ENABLE_LAZY_INITIALIZATION,
+@@ -663,6 +669,16 @@ private void applyMetadataBuilderContributor() {
+         }
+     }
+ 
++    private void applyTypeContributors() {
++        PersistenceUnitUtil.extensionInstancesForPersistenceUnit(TypeContributor.class, persistenceUnit.getName())
++                .stream().forEach(metamodelBuilder::applyTypes);
++    }
++
++    private void applyFunctionContributors() {
++        PersistenceUnitUtil.extensionInstancesForPersistenceUnit(FunctionContributor.class, persistenceUnit.getName())
++                .stream().forEach(metamodelBuilder::applyFunctions);
++    }
++
+     @SuppressWarnings("unchecked")
+     private <T> T loadSettingInstance(String settingName, Object settingValue, Class<T> clazz) {
+         T instance = null;

@@ -1,0 +1,1433 @@
+diff --git a/core-processor/src/main/java/io/micronaut/inject/beans/visitor/BeanIntrospectionWriter.java b/core-processor/src/main/java/io/micronaut/inject/beans/visitor/BeanIntrospectionWriter.java
+index 3c4fdc5a7e..177e0f2dc6 100644
+--- a/core-processor/src/main/java/io/micronaut/inject/beans/visitor/BeanIntrospectionWriter.java
++++ b/core-processor/src/main/java/io/micronaut/inject/beans/visitor/BeanIntrospectionWriter.java
+@@ -32,7 +32,6 @@ import io.micronaut.inject.annotation.AnnotationMetadataReference;
+ import io.micronaut.inject.annotation.AnnotationMetadataWriter;
+ import io.micronaut.inject.annotation.MutableAnnotationMetadata;
+ import io.micronaut.inject.ast.ClassElement;
+-import io.micronaut.inject.ast.ConstructorElement;
+ import io.micronaut.inject.ast.ElementQuery;
+ import io.micronaut.inject.ast.FieldElement;
+ import io.micronaut.inject.ast.KotlinParameterElement;
+@@ -57,7 +56,6 @@ import java.io.IOException;
+ import java.io.OutputStream;
+ import java.util.ArrayList;
+ import java.util.Arrays;
+-import java.util.Collection;
+ import java.util.Collections;
+ import java.util.HashMap;
+ import java.util.HashSet;
+@@ -66,9 +64,10 @@ import java.util.List;
+ import java.util.Map;
+ import java.util.Objects;
+ import java.util.Set;
+-import java.util.function.BiConsumer;
+ import java.util.stream.Collectors;
+ 
++import static io.micronaut.inject.writer.WriterUtils.invokeBeanConstructor;
++
+ /**
+  * A class file writer that writes a {@link BeanIntrospectionReference} and associated
+  * {@link BeanIntrospection} for the given class.
+@@ -357,36 +356,26 @@ final class BeanIntrospectionWriter extends AbstractAnnotationMetadataWriter {
+ 
+             classWriter.visitField(ACC_PRIVATE | ACC_FINAL | ACC_STATIC, FIELD_BEAN_PROPERTIES_REFERENCES, beanPropertiesRefs.getDescriptor(), null, null);
+ 
+-            int size = beanProperties.size();
+-
+-            pushNewArray(staticInit, AbstractInitializableBeanIntrospection.BeanPropertyRef.class, size);
+-            int i = 0;
+-            for (BeanPropertyData beanPropertyData : beanProperties) {
+-                pushStoreInArray(staticInit, i++, size, () ->
+-                    pushBeanPropertyReference(
+-                        classWriter,
+-                        staticInit,
+-                        beanPropertyData
+-                    )
++            pushNewArray(staticInit, AbstractInitializableBeanIntrospection.BeanPropertyRef.class, beanProperties, beanPropertyData -> {
++                pushBeanPropertyReference(
++                    classWriter,
++                    staticInit,
++                    beanPropertyData
+                 );
+-            }
++            });
+             staticInit.putStatic(introspectionType, FIELD_BEAN_PROPERTIES_REFERENCES, beanPropertiesRefs);
+         }
+         if (!beanMethods.isEmpty()) {
+             Type beanMethodsRefs = Type.getType(AbstractInitializableBeanIntrospection.BeanMethodRef[].class);
+ 
+             classWriter.visitField(ACC_PRIVATE | ACC_FINAL | ACC_STATIC, FIELD_BEAN_METHODS_REFERENCES, beanMethodsRefs.getDescriptor(), null, null);
+-            pushNewArray(staticInit, AbstractInitializableBeanIntrospection.BeanMethodRef.class, beanMethods.size());
+-            int i = 0;
+-            for (BeanMethodData beanMethodData : beanMethods) {
+-                pushStoreInArray(staticInit, i++, beanMethods.size(), () ->
+-                    pushBeanMethodReference(
+-                        classWriter,
+-                        staticInit,
+-                        beanMethodData
+-                    )
++            pushNewArray(staticInit, AbstractInitializableBeanIntrospection.BeanMethodRef.class, beanMethods, beanMethodData -> {
++                pushBeanMethodReference(
++                    classWriter,
++                    staticInit,
++                    beanMethodData
+                 );
+-            }
++            });
+             staticInit.putStatic(introspectionType, FIELD_BEAN_METHODS_REFERENCES, beanMethodsRefs);
+         }
+ 
+@@ -803,91 +792,22 @@ final class BeanIntrospectionWriter extends AbstractAnnotationMetadataWriter {
+             methodName,
+             desc);
+ 
+-        invokeBeanConstructor(instantiateInternal, constructor, true, args.length == 0, (index, parameter) -> {
+-            instantiateInternal.loadArg(0);
+-            instantiateInternal.push(index);
+-            instantiateInternal.arrayLoad(TYPE_OBJECT);
+-            pushCastToType(instantiateInternal, JavaModelUtils.getTypeReference(parameter.getType()));
+-        });
++        if (args.length == 0) {
++            invokeBeanConstructor(instantiateInternal, constructor, true, null);
++        } else {
++            invokeBeanConstructor(instantiateInternal, constructor, true, (index, parameter) -> {
++                instantiateInternal.loadArg(0);
++                instantiateInternal.push(index);
++                instantiateInternal.arrayLoad(TYPE_OBJECT);
++                pushCastToType(instantiateInternal, JavaModelUtils.getTypeReference(parameter));
++            });
++        }
+ 
+         instantiateInternal.returnValue();
+         instantiateInternal.visitMaxs(3, 1);
+         instantiateInternal.visitEnd();
+     }
+ 
+-    private void invokeBeanConstructor(GeneratorAdapter writer, MethodElement constructor, boolean allowDefaults, boolean allValuesAreNull, BiConsumer<Integer, ParameterElement> argumentsPusher) {
+-        boolean isConstructor = constructor instanceof ConstructorElement;
+-        boolean isCompanion = constructor.getDeclaringType().getSimpleName().endsWith("$Companion");
+-
+-        List<ParameterElement> constructorArguments = Arrays.asList(constructor.getParameters());
+-        Collection<Type> argumentTypes = constructorArguments.stream().map(pe ->
+-            JavaModelUtils.getTypeReference(pe.getType())
+-        ).toList();
+-        boolean isKotlinDefault = allowDefaults && constructorArguments.stream().anyMatch(p -> p instanceof KotlinParameterElement kp && kp.hasDefault());
+-
+-        int maskLocal = -1;
+-        if (isKotlinDefault) {
+-            // Calculate the Kotlin defaults mask
+-            // Every bit indicated true/false if the parameter should have the default value set
+-            maskLocal = DispatchWriter.computeKotlinDefaultsMask(writer, argumentsPusher, constructorArguments, allValuesAreNull);
+-        }
+-
+-        if (isConstructor) {
+-            writer.newInstance(beanType);
+-            writer.dup();
+-        } else if (isCompanion) {
+-            writer.getStatic(beanType, "Companion", JavaModelUtils.getTypeReference(constructor.getDeclaringType()));
+-        }
+-
+-        if (allValuesAreNull) {
+-            for (ParameterElement parameter : constructorArguments) {
+-                if (parameter.isPrimitive() && !parameter.isArray()) {
+-                    writer.push(0);
+-                    writer.cast(Type.INT_TYPE, JavaModelUtils.getTypeReference(parameter.getType()));
+-                } else {
+-                    writer.push((String) null);
+-                }
+-            }
+-        } else {
+-            int index = 0;
+-            for (ParameterElement constructorArgument : constructorArguments) {
+-                argumentsPusher.accept(index, constructorArgument);
+-                index++;
+-            }
+-        }
+-
+-        if (isConstructor) {
+-            final String constructorDescriptor = getConstructorDescriptor(constructorArguments);
+-            Method method = new Method("<init>", constructorDescriptor);
+-            if (isKotlinDefault) {
+-                method = asDefaultKotlinConstructor(method);
+-                writer.loadLocal(maskLocal, Type.INT_TYPE); // Bit mask of defaults
+-                writer.push((String) null); // Last parameter is just a marker and is always null
+-            }
+-            writer.invokeConstructor(beanType, method);
+-        } else if (constructor.isStatic()) {
+-            final String methodDescriptor = getMethodDescriptor(beanType, argumentTypes);
+-            Method method = new Method(constructor.getName(), methodDescriptor);
+-            if (classElement.isInterface()) {
+-                writer.visitMethodInsn(INVOKESTATIC, getTypeReference(constructor.getDeclaringType()).getInternalName(), method.getName(),
+-                    method.getDescriptor(), true);
+-            } else {
+-                writer.invokeStatic(getTypeReference(constructor.getDeclaringType()), method);
+-            }
+-        } else if (isCompanion) {
+-            writer.invokeVirtual(JavaModelUtils.getTypeReference(constructor.getDeclaringType()), new Method(constructor.getName(), getMethodDescriptor(beanType, argumentTypes)));
+-        }
+-    }
+-
+-    private Method asDefaultKotlinConstructor(Method method) {
+-        Type[] argumentTypes = method.getArgumentTypes();
+-        int length = argumentTypes.length;
+-        Type[] newArgumentTypes = Arrays.copyOf(argumentTypes, length + 2);
+-        newArgumentTypes[length] = Type.INT_TYPE;
+-        newArgumentTypes[length + 1] = Type.getObjectType("kotlin/jvm/internal/DefaultConstructorMarker");
+-        return new Method(method.getName(), method.getReturnType(), newArgumentTypes);
+-    }
+-
+     private void writeIntrospectionReference(ClassWriterOutputVisitor classWriterOutputVisitor) throws IOException {
+         Type superType = Type.getType(AbstractBeanIntrospectionReference.class);
+         final String referenceName = targetClassType.getClassName();
+@@ -1139,7 +1059,7 @@ final class BeanIntrospectionWriter extends AbstractAnnotationMetadataWriter {
+ 
+                 // NOTE: It doesn't make sense to check defaults for the copy constructor
+ 
+-                invokeBeanConstructor(writer, constructor, false, false, (paramIndex, parameter) -> {
++                invokeBeanConstructor(writer, constructor, false, (paramIndex, parameter) -> {
+                     Object constructorArgument = constructorArguments[paramIndex];
+                     boolean isPrimitive;
+                     if (constructorArgument instanceof MethodElement readMethod) {
+diff --git a/core-processor/src/main/java/io/micronaut/inject/writer/AbstractClassFileWriter.java b/core-processor/src/main/java/io/micronaut/inject/writer/AbstractClassFileWriter.java
+index c112c49feb..e06889ee6b 100644
+--- a/core-processor/src/main/java/io/micronaut/inject/writer/AbstractClassFileWriter.java
++++ b/core-processor/src/main/java/io/micronaut/inject/writer/AbstractClassFileWriter.java
+@@ -51,15 +51,16 @@ import java.io.IOException;
+ import java.io.OutputStream;
+ import java.lang.reflect.Array;
+ import java.util.AbstractMap;
++import java.util.Arrays;
+ import java.util.Collection;
+ import java.util.HashSet;
+-import java.util.Iterator;
+ import java.util.List;
+ import java.util.Locale;
+ import java.util.Map;
+ import java.util.Objects;
+ import java.util.Set;
+ import java.util.TreeSet;
++import java.util.function.BiConsumer;
+ import java.util.function.Consumer;
+ import java.util.regex.Matcher;
+ import java.util.regex.Pattern;
+@@ -85,7 +86,7 @@ public abstract class AbstractClassFileWriter implements Opcodes, OriginatingEle
+     protected static final Method METHOD_DEFAULT_CONSTRUCTOR = new Method(CONSTRUCTOR_NAME, DESCRIPTOR_DEFAULT_CONSTRUCTOR);
+     protected static final Type TYPE_OBJECT = Type.getType(Object.class);
+     protected static final Type TYPE_CLASS = Type.getType(Class.class);
+-    protected static final int DEFAULT_MAX_STACK = 13;
++    protected static final int DEFAULT_MAX_STACK = 23;
+     protected static final Type TYPE_GENERATED = Type.getType(Generated.class);
+     protected static final Pattern ARRAY_PATTERN = Pattern.compile("(\\[\\])+$");
+ 
+@@ -271,43 +272,30 @@ public abstract class AbstractClassFileWriter implements Opcodes, OriginatingEle
+             }
+         }
+ 
+-        int len = types.size();
+         // Build calls to Argument.create(...)
+-        pushNewArray(generatorAdapter, Argument.class, len);
+-        int i = 0;
+-        for (Map.Entry<String, ClassElement> entry : types.entrySet()) {
+-            // the array index
+-            generatorAdapter.push(i);
++        pushNewArray(generatorAdapter, Argument.class, types.entrySet(), entry -> {
+             String argumentName = entry.getKey();
+             ClassElement classElement = entry.getValue();
+             Type classReference = JavaModelUtils.getTypeReference(classElement);
+             Map<String, ClassElement> typeArguments = classElement.getTypeArguments();
+             if (CollectionUtils.isNotEmpty(typeArguments) || !classElement.getAnnotationMetadata().isEmpty()) {
+                 buildArgumentWithGenerics(
+-                        annotationMetadataWithDefaults,
+-                        owningType,
+-                        declaringClassWriter,
+-                        generatorAdapter,
+-                        argumentName,
+-                        classReference,
+-                        classElement,
+-                        typeArguments,
+-                        visitedTypes,
+-                        defaults,
+-                        loadTypeMethods
++                    annotationMetadataWithDefaults,
++                    owningType,
++                    declaringClassWriter,
++                    generatorAdapter,
++                    argumentName,
++                    classReference,
++                    classElement,
++                    typeArguments,
++                    visitedTypes,
++                    defaults,
++                    loadTypeMethods
+                 );
+             } else {
+                 buildArgument(generatorAdapter, argumentName, classElement);
+             }
+-
+-            // store the type reference
+-            generatorAdapter.arrayStore(Type.getType(Argument.class));
+-            // if we are not at the end of the array duplicate array onto the stack
+-            if (i != (len - 1)) {
+-                generatorAdapter.dup();
+-            }
+-            i++;
+-        }
++        });
+     }
+ 
+     /**
+@@ -501,14 +489,7 @@ public abstract class AbstractClassFileWriter implements Opcodes, OriginatingEle
+         );
+ 
+         // 3rd argument, the generics
+-        pushNewArray(generatorAdapter, Class.class, generics.length);
+-        final int len = generics.length;
+-        for (int i = 0; i < len; i++) {
+-            ClassElement generic = generics[i];
+-            pushStoreInArray(generatorAdapter, i, len, () ->
+-                    generatorAdapter.push(getTypeReference(generic))
+-            );
+-        }
++        pushNewArray(generatorAdapter, Class.class, generics, g -> generatorAdapter.push(getTypeReference(g)));
+ 
+         // Argument.create( .. )
+         invokeInterfaceStaticMethod(
+@@ -537,12 +518,7 @@ public abstract class AbstractClassFileWriter implements Opcodes, OriginatingEle
+             Collection<ParameterElement> argumentTypes,
+             Map<String, Integer> defaults,
+             Map<String, GeneratorAdapter> loadTypeMethods) {
+-        int len = argumentTypes.size();
+-        pushNewArray(generatorAdapter, Argument.class, len);
+-        int i = 0;
+-        for (ParameterElement entry : argumentTypes) {
+-            // the array index position
+-            generatorAdapter.push(i);
++        pushNewArray(generatorAdapter, Argument.class, argumentTypes, entry -> {
+ 
+             ClassElement genericType = entry.getGenericType();
+ 
+@@ -569,24 +545,17 @@ public abstract class AbstractClassFileWriter implements Opcodes, OriginatingEle
+ 
+             Map<String, ClassElement> typeArguments = genericType.getTypeArguments();
+             pushCreateArgument(
+-                    annotationMetadataWithDefaults,
+-                    declaringElementName,
+-                    owningType,
+-                    declaringClassWriter,
+-                    generatorAdapter,
+-                    argumentName,
+-                    genericType,
+-                    annotationMetadata,
+-                    typeArguments, defaults, loadTypeMethods
++                annotationMetadataWithDefaults,
++                declaringElementName,
++                owningType,
++                declaringClassWriter,
++                generatorAdapter,
++                argumentName,
++                genericType,
++                annotationMetadata,
++                typeArguments, defaults, loadTypeMethods
+             );
+-            // store the type reference
+-            generatorAdapter.arrayStore(Type.getType(Argument.class));
+-            // if we are not at the end of the array duplicate array onto the stack
+-            if (i != (len - 1)) {
+-                generatorAdapter.dup();
+-            }
+-            i++;
+-        }
++        });
+     }
+ 
+     /**
+@@ -920,20 +889,97 @@ public abstract class AbstractClassFileWriter implements Opcodes, OriginatingEle
+     protected static void pushMethodNameAndTypesArguments(GeneratorAdapter methodVisitor, String methodName, Collection<ClassElement> argumentTypes) {
+         // and the method name
+         methodVisitor.push(methodName);
++        pushNewArray(methodVisitor, Class.class, argumentTypes, item -> pushType(methodVisitor, item));
++    }
+ 
+-        int argTypeCount = argumentTypes.size();
+-        if (!argumentTypes.isEmpty()) {
+-            pushNewArray(methodVisitor, Class.class, argTypeCount);
+-            Iterator<ClassElement> argIterator = argumentTypes.iterator();
+-            for (int i = 0; i < argTypeCount; i++) {
+-                pushStoreTypeInArray(methodVisitor, i, argTypeCount, argIterator.next());
++    /**
++     * @param methodVisitor The method visitor as {@link GeneratorAdapter}
++     * @param arrayType     The array class
++     * @param collection    The collection
++     * @param itemConsumer  The item consumer
++     * @param <T> The type
++     */
++    protected static <T> void pushNewArray(GeneratorAdapter methodVisitor,
++                                           Class<?> arrayType,
++                                           Collection<T> collection,
++                                           Consumer<T> itemConsumer) {
++        final Type type = Type.getType(arrayType);
++        // the size of the array
++        int size = collection.size();
++        methodVisitor.push(size);
++        // define the array
++        methodVisitor.newArray(type);
++        // add a reference to the array on the stack
++        if (size > 0) {
++            methodVisitor.dup();
++            int index = 0;
++            for (T item : collection) {
++                // the array index position
++                methodVisitor.push(index);
++                // Push value
++                itemConsumer.accept(item);
++                // store the value in the position
++                methodVisitor.arrayStore(type);
++                if (index != (size - 1)) {
++                    // if we are not at the end of the array duplicate array onto the stack
++                    methodVisitor.dup();
++                }
++                index++;
+             }
+-        } else {
+-            // no arguments
+-            pushNewArray(methodVisitor, Class.class, 0);
+         }
+     }
+ 
++    /**
++     * @param methodVisitor The method visitor as {@link GeneratorAdapter}
++     * @param arrayType     The array class
++     * @param collection    The collection
++     * @param itemConsumer  The item consumer
++     * @param <T> The type
++     */
++    protected static <T> void pushNewArrayIndexed(GeneratorAdapter methodVisitor,
++                                                  Class<?> arrayType,
++                                                  Collection<T> collection,
++                                                  BiConsumer<Integer, T> itemConsumer) {
++        final Type type = Type.getType(arrayType);
++        // the size of the array
++        int size = collection.size();
++        methodVisitor.push(size);
++        // define the array
++        methodVisitor.newArray(type);
++        // add a reference to the array on the stack
++        if (size > 0) {
++            methodVisitor.dup();
++            int index = 0;
++            for (T item : collection) {
++                // the array index position
++                methodVisitor.push(index);
++                // Push value
++                itemConsumer.accept(index, item);
++                // store the value in the position
++                methodVisitor.arrayStore(type);
++                if (index != (size - 1)) {
++                    // if we are not at the end of the array duplicate array onto the stack
++                    methodVisitor.dup();
++                }
++                index++;
++            }
++        }
++    }
++
++    /**
++     * @param methodVisitor The method visitor as {@link GeneratorAdapter}
++     * @param arrayType     The array class
++     * @param array    The collection
++     * @param itemConsumer  The item consumer
++     * @param <T> The type
++     */
++    protected static <T> void pushNewArray(GeneratorAdapter methodVisitor,
++                                           Class<?> arrayType,
++                                           T[] array,
++                                           Consumer<T> itemConsumer) {
++        pushNewArray(methodVisitor, arrayType, Arrays.asList(array), itemConsumer);
++    }
++
+     /**
+      * @param methodVisitor The method visitor as {@link GeneratorAdapter}
+      * @param arrayType     The array class
+@@ -961,21 +1007,31 @@ public abstract class AbstractClassFileWriter implements Opcodes, OriginatingEle
+     }
+ 
+     /**
+-     * @param methodVisitor The method visitor as {@link GeneratorAdapter}
+-     * @param index         The index
++     * @param methodVisitor The method visitor as {@link org.objectweb.asm.commons.GeneratorAdapter}
++     * @param arrayType     The array class
+      * @param size          The size
+-     * @param string        The string
++     * @param itemConsumer  The item consumer
+      */
+-    protected static void pushStoreStringInArray(GeneratorAdapter methodVisitor, int index, int size, String string) {
+-        // the array index position
+-        methodVisitor.push(index);
+-        // load the constant string
+-        methodVisitor.push(string);
+-        // store the string in the position
+-        methodVisitor.arrayStore(Type.getType(String.class));
+-        if (index != (size - 1)) {
+-            // if we are not at the end of the array duplicate array onto the stack
++    protected static void pushNewArray(GeneratorAdapter methodVisitor, Type arrayType, int size, Consumer<Integer> itemConsumer) {
++        // the size of the array
++        methodVisitor.push(size);
++        // define the array
++        methodVisitor.newArray(arrayType);
++        // add a reference to the array on the stack
++        if (size > 0) {
+             methodVisitor.dup();
++            for (int i = 0; i < size; i++) {
++                // the array index position
++                methodVisitor.push(i);
++                // Push value
++                itemConsumer.accept(i);
++                // store the value in the position
++                methodVisitor.arrayStore(arrayType);
++                if (i != (size - 1)) {
++                    // if we are not at the end of the array duplicate array onto the stack
++                    methodVisitor.dup();
++                }
++            }
+         }
+     }
+ 
+@@ -1009,16 +1065,7 @@ public abstract class AbstractClassFileWriter implements Opcodes, OriginatingEle
+         }
+     }
+ 
+-    /**
+-     * @param methodVisitor The method visitor as {@link GeneratorAdapter}
+-     * @param index         The index
+-     * @param size          The size
+-     * @param type          The type
+-     */
+-    protected static void pushStoreTypeInArray(GeneratorAdapter methodVisitor, int index, int size, ClassElement type) {
+-        // the array index position
+-        methodVisitor.push(index);
+-        // the type reference
++    private static void pushType(GeneratorAdapter methodVisitor, ClassElement type) {
+         if (type.isPrimitive()) {
+             Class<?> typeClass = ClassUtils.getPrimitiveType(type.getName()).orElse(null);
+             if (typeClass != null) {
+@@ -1035,12 +1082,6 @@ public abstract class AbstractClassFileWriter implements Opcodes, OriginatingEle
+         } else {
+             methodVisitor.push(JavaModelUtils.getTypeReference(type));
+         }
+-        // store the type reference
+-        methodVisitor.arrayStore(TYPE_CLASS);
+-        // if we are not at the end of the array duplicate array onto the stack
+-        if (index < (size - 1)) {
+-            methodVisitor.dup();
+-        }
+     }
+ 
+     /**
+@@ -1499,19 +1540,12 @@ public abstract class AbstractClassFileWriter implements Opcodes, OriginatingEle
+             }
+             invokeInterfaceStatic(generatorAdapter, MAP_TYPE, MAP_OF[entrySet.size()]);
+         } else {
+-            int totalSize = entrySet.size();
+             // start a new array
+-            pushNewArray(generatorAdapter, Map.Entry.class, totalSize);
+-            int i = 0;
+-            for (Map.Entry<? extends CharSequence, T> entry : entrySet) {
+-
+-                pushStoreInArray(generatorAdapter, i++, totalSize, () -> {
+-                    generatorAdapter.push(entry.getKey().toString());
+-                    pushValue.accept(entry.getValue());
+-                    invokeInterfaceStatic(generatorAdapter, MAP_TYPE, MAP_ENTRY);
+-                });
+-
+-            }
++            pushNewArray(generatorAdapter, Map.Entry.class, entrySet, entry -> {
++                generatorAdapter.push(entry.getKey());
++                pushValue.accept(entry.getValue());
++                invokeInterfaceStatic(generatorAdapter, MAP_TYPE, MAP_ENTRY);
++            });
+             invokeInterfaceStatic(generatorAdapter, MAP_TYPE, MAP_BY_ARRAY);
+         }
+     }
+@@ -1530,13 +1564,7 @@ public abstract class AbstractClassFileWriter implements Opcodes, OriginatingEle
+             }
+             invokeInterfaceStatic(methodVisitor, LIST_TYPE, LIST_OF[names.size()]);
+         } else {
+-            int totalSize = names.size();
+-            // start a new array
+-            pushNewArray(methodVisitor, String.class, totalSize);
+-            int i = 0;
+-            for (String name : names) {
+-                pushStoreStringInArray(methodVisitor, i++, totalSize, name);
+-            }
++            pushNewArray(methodVisitor, String.class, names, methodVisitor::push);
+             invokeInterfaceStatic(methodVisitor, LIST_TYPE, LIST_BY_ARRAY);
+         }
+     }
+diff --git a/core-processor/src/main/java/io/micronaut/inject/writer/BeanDefinitionWriter.java b/core-processor/src/main/java/io/micronaut/inject/writer/BeanDefinitionWriter.java
+index 29e7e1aaf8..bee21ae265 100644
+--- a/core-processor/src/main/java/io/micronaut/inject/writer/BeanDefinitionWriter.java
++++ b/core-processor/src/main/java/io/micronaut/inject/writer/BeanDefinitionWriter.java
+@@ -56,7 +56,6 @@ import io.micronaut.core.convert.ConversionServiceProvider;
+ import io.micronaut.core.expressions.EvaluatedExpressionReference;
+ import io.micronaut.core.naming.NameUtils;
+ import io.micronaut.core.reflect.ClassUtils;
+-import io.micronaut.core.reflect.InstantiationUtils;
+ import io.micronaut.core.reflect.ReflectionUtils;
+ import io.micronaut.core.type.Argument;
+ import io.micronaut.core.type.DefaultArgument;
+@@ -1065,43 +1064,33 @@ public class BeanDefinitionWriter extends AbstractClassFileWriter implements Bea
+         classWriter.visitField(ACC_PRIVATE | ACC_FINAL | ACC_STATIC, FIELD_CONSTRUCTOR,
+                 Type.getType(AbstractInitializableBeanDefinition.MethodOrFieldReference.class).getDescriptor(), null, null);
+ 
+-        int methodsLength = allMethodVisits.size();
+-        if (!superBeanDefinition && methodsLength > 0) {
++        if (!superBeanDefinition && !allMethodVisits.isEmpty()) {
+             Type methodsFieldType = Type.getType(AbstractInitializableBeanDefinition.MethodReference[].class);
+             classWriter.visitField(ACC_PRIVATE | ACC_FINAL | ACC_STATIC, FIELD_INJECTION_METHODS, methodsFieldType.getDescriptor(), null, null);
+-            pushNewArray(staticInit, AbstractInitializableBeanDefinition.MethodReference.class, methodsLength);
+-            int i = 0;
+-            for (MethodVisitData methodVisitData : allMethodVisits) {
+-                pushStoreInArray(staticInit, i++, methodsLength, () ->
+-                        pushNewMethodReference(
+-                                staticInit,
+-                                JavaModelUtils.getTypeReference(methodVisitData.beanType),
+-                                methodVisitData.methodElement,
+-                                methodVisitData.getAnnotationMetadata(),
+-                                methodVisitData.isPostConstruct(),
+-                                methodVisitData.isPreDestroy()
+-                        )
++            pushNewArray(staticInit, AbstractInitializableBeanDefinition.MethodReference.class, allMethodVisits, methodVisitData -> {
++                pushNewMethodReference(
++                    staticInit,
++                    JavaModelUtils.getTypeReference(methodVisitData.beanType),
++                    methodVisitData.methodElement,
++                    methodVisitData.getAnnotationMetadata(),
++                    methodVisitData.isPostConstruct(),
++                    methodVisitData.isPreDestroy()
+                 );
+-            }
++            });
+             staticInit.putStatic(beanDefinitionType, FIELD_INJECTION_METHODS, methodsFieldType);
+         }
+ 
+         if (!fieldInjectionPoints.isEmpty()) {
+             Type fieldsFieldType = Type.getType(AbstractInitializableBeanDefinition.FieldReference[].class);
+             classWriter.visitField(ACC_PRIVATE | ACC_FINAL | ACC_STATIC, FIELD_INJECTION_FIELDS, fieldsFieldType.getDescriptor(), null, null);
+-            int length = fieldInjectionPoints.size();
+-            pushNewArray(staticInit, AbstractInitializableBeanDefinition.FieldReference.class, length);
+-            for (int i = 0; i < length; i++) {
+-                FieldVisitData fieldVisitData = fieldInjectionPoints.get(i);
+-                pushStoreInArray(staticInit, i, length, () ->
+-                        pushNewFieldReference(
+-                                staticInit,
+-                                JavaModelUtils.getTypeReference(fieldVisitData.beanType),
+-                                fieldVisitData.fieldElement,
+-                                fieldVisitData.annotationMetadata
+-                        )
++            pushNewArray(staticInit, AbstractInitializableBeanDefinition.FieldReference.class, fieldInjectionPoints, fieldVisitData -> {
++                pushNewFieldReference(
++                    staticInit,
++                    JavaModelUtils.getTypeReference(fieldVisitData.beanType),
++                    fieldVisitData.fieldElement,
++                    fieldVisitData.annotationMetadata
+                 );
+-            }
++            });
+             staticInit.putStatic(beanDefinitionType, FIELD_INJECTION_FIELDS, fieldsFieldType);
+         }
+ 
+@@ -1111,13 +1100,9 @@ public class BeanDefinitionWriter extends AbstractClassFileWriter implements Bea
+                     annotationInjectionsFieldType.getDescriptor(), null, null);
+ 
+             List<Type> injectedTypes = new ArrayList<>(annotationInjectionPoints.keySet());
+-            int length = injectedTypes.size();
+-            pushNewArray(staticInit, AbstractInitializableBeanDefinition.AnnotationReference.class, length);
+-
+-            for (int i = 0; i < length; i++) {
+-                Type annotationVisitData = injectedTypes.get(i);
+-                pushStoreInArray(staticInit, i, length, () -> pushNewAnnotationReference(staticInit, annotationVisitData));
+-            }
++            pushNewArray(staticInit, AbstractInitializableBeanDefinition.AnnotationReference.class, injectedTypes, annotationVisitData -> {
++                pushNewAnnotationReference(staticInit, annotationVisitData);
++            });
+             staticInit.putStatic(beanDefinitionType, FIELD_ANNOTATION_INJECTIONS, annotationInjectionsFieldType);
+         }
+ 
+@@ -2291,16 +2276,9 @@ public class BeanDefinitionWriter extends AbstractClassFileWriter implements Bea
+                 pushQualifierForAnnotation(generatorAdapter, element, annotationName, resolveArgument);
+             } else {
+                 // composite qualifier
+-                final int len = qualifierNames.size();
+-                pushNewArray(generatorAdapter, TYPE_QUALIFIER, len);
+-                for (int i = 0; i < len; i++) {
+-                    final String annotationName = qualifierNames.get(i);
+-                    pushStoreInArray(generatorAdapter, i, len, () ->
+-                            pushQualifierForAnnotation(generatorAdapter, element, annotationName, resolveArgument)
+-                    );
+-                }
++                pushNewArray(generatorAdapter, Qualifier.class, qualifierNames,
++                    name -> pushQualifierForAnnotation(generatorAdapter, element, name, resolveArgument));
+                 generatorAdapter.invokeStatic(TYPE_QUALIFIERS, METHOD_QUALIFIER_BY_QUALIFIERS);
+-
+             }
+         } else if (element.hasAnnotation(AnnotationUtil.ANN_INTERCEPTOR_BINDING_QUALIFIER)) {
+             resolveArgument.run();
+@@ -2367,12 +2345,7 @@ public class BeanDefinitionWriter extends AbstractClassFileWriter implements Bea
+     }
+ 
+     private void pushArrayOfClasses(GeneratorAdapter writer, String[] byType) {
+-        int len = byType.length;
+-        pushNewArray(writer, Class.class, len);
+-        for (int i = 0; i < len; i++) {
+-            final String type = byType[i];
+-            pushStoreInArray(writer, i, len, () -> pushClass(writer, type));
+-        }
++        pushNewArray(writer, Class.class, byType, type -> pushClass(writer, type));
+     }
+ 
+     private void pushClass(GeneratorAdapter writer, String className) {
+@@ -2421,7 +2394,6 @@ public class BeanDefinitionWriter extends AbstractClassFileWriter implements Bea
+ 
+ 
+         MethodElement methodElement = methodVisitData.getMethodElement();
+-        final AnnotationMetadata annotationMetadata = methodVisitData.getAnnotationMetadata();
+         final List<ParameterElement> argumentTypes = Arrays.asList(methodElement.getParameters());
+         applyDefaultNamedToParameters(argumentTypes);
+         final TypedElement declaringType = methodVisitData.beanType;
+@@ -2468,20 +2440,10 @@ public class BeanDefinitionWriter extends AbstractClassFileWriter implements Bea
+             injectMethodVisitor.loadArg(INJECT_METHOD_BEAN_CONTEXT_PARAM);
+             injectMethodVisitor.push(currentMethodIndex);
+             injectMethodVisitor.loadLocal(injectInstanceLocalVarIndex, beanType);
+-            if (hasArguments) {
+-                pushNewArray(injectMethodVisitor, Object.class, argumentTypes.size());
+-                Iterator<ParameterElement> argIterator = argumentTypes.iterator();
+-                for (int i = 0; i < argCount; i++) {
+-                    int finalI = i;
+-                    pushStoreInArray(injectMethodVisitor, i, argumentTypes.size(), () -> {
+-                        ParameterElement entry = argIterator.next();
+-                        pushMethodParameterValue(injectMethodVisitor, finalI, entry);
+-                        pushBoxPrimitiveIfNecessary(entry.getType(), injectMethodVisitor);
+-                    });
+-                }
+-            } else {
+-                pushNewArray(injectMethodVisitor, Object.class, 0);
+-            }
++            pushNewArrayIndexed(injectMethodVisitor, Object.class, argumentTypes, (index, entry) -> {
++                pushMethodParameterValue(injectMethodVisitor, index, entry);
++                pushBoxPrimitiveIfNecessary(entry.getType(), injectMethodVisitor);
++            });
+             injectMethodVisitor.invokeVirtual(superType, INVOKE_WITH_REFLECTION_METHOD);
+         }
+ 
+@@ -3301,40 +3263,48 @@ public class BeanDefinitionWriter extends AbstractClassFileWriter implements Bea
+                 final int parametersIndex = createParameterArray(parameters, buildMethodVisitor);
+                 invokeConstructorChain(buildMethodVisitor, constructorIndex, parametersIndex, parameters);
+             } else {
+-                if (constructor.isStatic()) {
+-                    pushConstructorArguments(buildMethodVisitor, parameterArray);
+-                    final String methodDescriptor = getMethodDescriptor(constructor.getReturnType(), parameters);
+-                    buildMethodVisitor.invokeStatic(
+-                            getTypeReference(constructor.getDeclaringType()),
+-                            new org.objectweb.asm.commons.Method(constructor.getName(), methodDescriptor)
+-                    );
++                boolean isKotlin = constructor.getClass().getSimpleName().startsWith("Kotlin");
++                if (isKotlin) {
++                    Map<Integer, Integer> checksLocals = new HashMap<>();
++                    Map<Integer, Integer> valuesLocals = new HashMap<>();
++                    WriterUtils.invokeBeanConstructor(buildMethodVisitor, constructor, requiresReflection, true, (index, parameter) -> {
++                        Integer checkLocal = checksLocals.get(index);
++                        if (checkLocal != null) {
++                            buildMethodVisitor.loadLocal(checkLocal);
++                            buildMethodVisitor.push(true);
++                            Label end = new Label();
++                            Label propertyMissingLabel = new Label();
++                            buildMethodVisitor.ifCmp(Type.BOOLEAN_TYPE, GeneratorAdapter.NE, propertyMissingLabel);
++                            pushConstructorArgument(buildMethodVisitor, parameter, index);
++                            buildMethodVisitor.goTo(end);
++                            buildMethodVisitor.visitLabel(propertyMissingLabel);
++                            WriterUtils.pushDefaultTypeValue(buildMethodVisitor, parameter.getType());
++                            buildMethodVisitor.goTo(end);
++                            buildMethodVisitor.visitLabel(end);
++                            return;
++                        }
++                        int loadedLocal = valuesLocals.computeIfAbsent(index, integer -> {
++                            pushConstructorArgument(buildMethodVisitor, parameter, index);
++                            int local = buildMethodVisitor.newLocal(getTypeReference(parameter));
++                            buildMethodVisitor.storeLocal(local);
++                            return local;
++                        });
++                        buildMethodVisitor.loadLocal(loadedLocal);
++                    }, (index, parameterElement) -> {
++                        if (parameterElement.hasAnnotation(Property.class)) {
++                            int local = buildMethodVisitor.newLocal(Type.BOOLEAN_TYPE);
++                            pushContainsPropertyCheck(buildMethodVisitor, parameterElement);
++                            buildMethodVisitor.storeLocal(local);
++                            buildMethodVisitor.loadLocal(local);
++                            checksLocals.put(index, local);
++                            return true;
++                        }
++                        return false;
++                    });
+                 } else {
+-                    if (requiresReflection) {
+-                        final int parameterArrayLocalVarIndex = createParameterArray(parameters, buildMethodVisitor);
+-                        final int parameterTypeArrayLocalVarIndex = createParameterTypeArray(parameters, buildMethodVisitor);
+-                        buildMethodVisitor.push(beanType);
+-                        buildMethodVisitor.loadLocal(parameterTypeArrayLocalVarIndex);
+-                        buildMethodVisitor.loadLocal(parameterArrayLocalVarIndex);
+-                        buildMethodVisitor.invokeStatic(
+-                                Type.getType(InstantiationUtils.class),
+-                                org.objectweb.asm.commons.Method.getMethod(
+-                                        ReflectionUtils.getRequiredInternalMethod(
+-                                                InstantiationUtils.class,
+-                                            METHOD_NAME_INSTANTIATE,
+-                                                Class.class,
+-                                                Class[].class,
+-                                                Object[].class
+-                                        )
+-                                )
+-                        );
+-                        pushCastToType(buildMethodVisitor, beanType);
+-                    } else {
+-                        buildMethodVisitor.newInstance(beanType);
+-                        buildMethodVisitor.dup();
+-                        pushConstructorArguments(buildMethodVisitor, parameterArray);
+-                        String constructorDescriptor = getConstructorDescriptor(parameters);
+-                        buildMethodVisitor.invokeConstructor(beanType, new org.objectweb.asm.commons.Method("<init>", constructorDescriptor));
+-                    }
++                    WriterUtils.invokeBeanConstructor(buildMethodVisitor, constructor, requiresReflection, true, (index, parameter) -> {
++                        pushConstructorArgument(buildMethodVisitor, parameter, index);
++                    }, null);
+                 }
+             }
+ 
+@@ -3349,6 +3319,22 @@ public class BeanDefinitionWriter extends AbstractClassFileWriter implements Bea
+         }
+     }
+ 
++    private void pushContainsPropertyCheck(GeneratorAdapter writer, ParameterElement parameterElement) {
++        String propertyValue = parameterElement.stringValue(Property.class, "name").orElseThrow();
++        writer.loadThis();
++        // 1st argument load BeanResolutionContext
++        writer.loadArg(0);
++        // 2nd argument load BeanContext
++        writer.loadArg(1);
++        // 3rd argument push property name
++        writer.push(propertyValue);
++        if (isMultiValueProperty(parameterElement.getType())) {
++            writer.invokeVirtual(beanDefinitionType, CONTAINS_PROPERTIES_VALUE_METHOD);
++        } else {
++            writer.invokeVirtual(beanDefinitionType, CONTAINS_PROPERTY_VALUE_METHOD);
++        }
++    }
++
+     private void invokeCheckIfShouldLoadIfNecessary(GeneratorAdapter buildMethodVisitor) {
+         AnnotationValue<Requires> requiresAnnotation = annotationMetadata.getAnnotation(Requires.class);
+         if (requiresAnnotation != null
+@@ -3436,32 +3422,21 @@ public class BeanDefinitionWriter extends AbstractClassFileWriter implements Bea
+                     TYPE_BEAN_DEFINITION,
+                     factoryType
+             });
+-            protectedConstructor = new GeneratorAdapter(
+-                    interceptedConstructorWriter.visitMethod(
+-                            ACC_PROTECTED, CONSTRUCTOR_NAME,
+-                            interceptedConstructorDescriptor,
+-                            null,
+-                            null
+-                    ),
+-                    ACC_PROTECTED,
+-                    CONSTRUCTOR_NAME,
+-                    interceptedConstructorDescriptor
+-            );
+         } else {
+             interceptedConstructorDescriptor = constructorMethod.getDescriptor();
+-            protectedConstructor = new GeneratorAdapter(
+-                    interceptedConstructorWriter.visitMethod(
+-                            ACC_PROTECTED, CONSTRUCTOR_NAME,
+-                            interceptedConstructorDescriptor,
+-                            null,
+-                            null
+-                    ),
+-                    ACC_PROTECTED,
+-                    CONSTRUCTOR_NAME,
+-                    interceptedConstructorDescriptor
+-            );
+ 
+         }
++        protectedConstructor = new GeneratorAdapter(
++                interceptedConstructorWriter.visitMethod(
++                        ACC_PROTECTED, CONSTRUCTOR_NAME,
++                        interceptedConstructorDescriptor,
++                        null,
++                        null
++                ),
++                ACC_PROTECTED,
++                CONSTRUCTOR_NAME,
++                interceptedConstructorDescriptor
++        );
+         if (hasFactoryMethod) {
+             protectedConstructor.loadThis();
+             protectedConstructor.loadArg(1);
+@@ -3583,37 +3558,15 @@ public class BeanDefinitionWriter extends AbstractClassFileWriter implements Bea
+         return this.beanDefinitionName + "$" + ++innerClassIndex;
+     }
+ 
+-    private int createParameterTypeArray(List<ParameterElement> parameters, GeneratorAdapter buildMethodVisitor) {
+-        final int pLen = parameters.size();
+-        pushNewArray(buildMethodVisitor, Class.class, pLen);
+-        for (int i = 0; i < pLen; i++) {
+-            final ParameterElement parameter = parameters.get(i);
+-            pushStoreInArray(buildMethodVisitor, i, pLen, () ->
+-                    buildMethodVisitor.push(getTypeReference(parameter))
+-            );
+-        }
+-        int local = buildMethodVisitor.newLocal(Type.getType(Object[].class));
+-        buildMethodVisitor.storeLocal(local);
+-        return local;
+-    }
+-
+     private int createParameterArray(List<ParameterElement> parameters, GeneratorAdapter buildMethodVisitor) {
+-        final int pLen = parameters.size();
+-        pushNewArray(buildMethodVisitor, Object.class, pLen);
+-        for (int i = 0; i < pLen; i++) {
+-            final ParameterElement parameter = parameters.get(i);
+-            int parameterIndex = i;
+-            pushStoreInArray(buildMethodVisitor, i, pLen, () ->
+-                    pushConstructorArgument(
+-                            buildMethodVisitor,
+-                            parameter.getName(),
+-                            parameter,
+-                            parameter.getAnnotationMetadata(),
+-                            parameterIndex,
+-                            false
+-                    )
++        pushNewArrayIndexed(buildMethodVisitor, Object.class, parameters, (index, parameter) -> {
++            pushConstructorArgument(
++                buildMethodVisitor,
++                parameter,
++                index,
++                true
+             );
+-        }
++        });
+         int local = buildMethodVisitor.newLocal(Type.getType(Object[].class));
+         buildMethodVisitor.storeLocal(local);
+         return local;
+@@ -3686,7 +3639,7 @@ public class BeanDefinitionWriter extends AbstractClassFileWriter implements Bea
+         if (size > 0) {
+             for (int i = 0; i < parameters.length; i++) {
+                 ParameterElement parameter = parameters[i];
+-                pushConstructorArgument(buildMethodVisitor, parameter.getName(), parameter, parameter.getAnnotationMetadata(), i, false);
++                pushConstructorArgument(buildMethodVisitor, parameter, i);
+                 if (parameter.hasDeclaredAnnotation(InjectScope.class)) {
+                     hasInjectScope = true;
+                 }
+@@ -3696,49 +3649,51 @@ public class BeanDefinitionWriter extends AbstractClassFileWriter implements Bea
+     }
+ 
+     private boolean pushParametersAsArray(GeneratorAdapter buildMethodVisitor, ParameterElement[] parameters) {
+-        final int pLen = parameters.length;
++        pushNewArrayIndexed(buildMethodVisitor, Object.class, Arrays.asList(parameters), (index, parameter) -> {
++            pushConstructorArgument(buildMethodVisitor, parameter, index, true);
++        });
+         boolean hasInjectScope = false;
+-        pushNewArray(buildMethodVisitor, Object.class, pLen);
+-        for (int i = 0; i < pLen; i++) {
+-            final ParameterElement parameter = parameters[i];
++        for (ParameterElement parameter : parameters) {
+             if (parameter.hasDeclaredAnnotation(InjectScope.class)) {
+                 hasInjectScope = true;
+             }
+-            int finalI = i;
+-            pushStoreInArray(buildMethodVisitor, i, pLen, () ->
+-                    pushConstructorArgument(buildMethodVisitor, parameter.getName(), parameter, parameter.getAnnotationMetadata(), finalI, true)
+-            );
+         }
+         return hasInjectScope;
+     }
+ 
+     private void pushConstructorArgument(GeneratorAdapter buildMethodVisitor,
+-                                         String argumentName,
+-                                         ParameterElement argumentType,
+-                                         AnnotationMetadata annotationMetadata,
+-                                         int index, boolean castToObject) {
++                                         ParameterElement parameter,
++                                         int index) {
++        pushConstructorArgument(buildMethodVisitor, parameter, index, false);
++    }
++
++    private void pushConstructorArgument(GeneratorAdapter buildMethodVisitor,
++                                         ParameterElement parameter,
++                                         int index,
++                                         boolean castToObject) {
++        AnnotationMetadata annotationMetadata = parameter.getAnnotationMetadata();
+         if (isAnnotatedWithParameter(annotationMetadata) && isParametrized) {
+             // load the args
+             buildMethodVisitor.loadArg(2);
+             // the argument name
+-            buildMethodVisitor.push(argumentName);
++            buildMethodVisitor.push(parameter.getName());
+             buildMethodVisitor.invokeInterface(Type.getType(Map.class), org.objectweb.asm.commons.Method.getMethod(ReflectionUtils.getRequiredMethod(Map.class, "get", Object.class)));
+-            pushCastToType(buildMethodVisitor, argumentType);
+-        } else if (!pushValueBypassingBeanContext(buildMethodVisitor, argumentType.getGenericType())) {
++            pushCastToType(buildMethodVisitor, parameter);
++        } else if (!pushValueBypassingBeanContext(buildMethodVisitor, parameter.getGenericType())) {
+             boolean hasGenericType = false;
+-            boolean isArray = false;
++            boolean isArray;
+             Method methodToInvoke;
+-            final ClassElement genericType = argumentType.getGenericType();
++            final ClassElement genericType = parameter.getGenericType();
+             if (isValueType(annotationMetadata) && !isInnerType(genericType)) {
+-                Optional<String> property = argumentType.stringValue(Property.class, "name");
++                Optional<String> property = parameter.stringValue(Property.class, "name");
+                 if (property.isPresent()) {
+-                    pushInvokeGetPropertyValueForConstructor(buildMethodVisitor, index, argumentType, property.get());
++                    pushInvokeGetPropertyValueForConstructor(buildMethodVisitor, index, parameter, property.get());
+                 } else {
+-                    if (argumentType.getValue(Value.class, EvaluatedExpressionReference.class).isPresent()) {
+-                        pushInvokeGetEvaluatedExpressionValueForConstructorArgument(buildMethodVisitor, index, argumentType);
++                    if (parameter.getValue(Value.class, EvaluatedExpressionReference.class).isPresent()) {
++                        pushInvokeGetEvaluatedExpressionValueForConstructorArgument(buildMethodVisitor, index, parameter);
+                     } else {
+-                        Optional<String> valueValue = argumentType.stringValue(Value.class);
+-                        valueValue.ifPresent(s -> pushInvokeGetPropertyPlaceholderValueForConstructor(buildMethodVisitor, index, argumentType, s));
++                        Optional<String> valueValue = parameter.stringValue(Value.class);
++                        valueValue.ifPresent(s -> pushInvokeGetPropertyPlaceholderValueForConstructor(buildMethodVisitor, index, parameter, s));
+                     }
+                 }
+                 return;
+@@ -3781,23 +3736,23 @@ public class BeanDefinitionWriter extends AbstractClassFileWriter implements Bea
+             // pass the index of the method as the third argument
+             buildMethodVisitor.push(index);
+             if (hasGenericType) {
+-                resolveConstructorArgumentGenericType(buildMethodVisitor, argumentType.getGenericType(), index);
++                resolveConstructorArgumentGenericType(buildMethodVisitor, parameter.getGenericType(), index);
+             }
+             // push qualifier
+-            pushQualifier(buildMethodVisitor, argumentType, () -> {
++            pushQualifier(buildMethodVisitor, parameter, () -> {
+                 resolveConstructorArgument(buildMethodVisitor, index);
+             });
+             // invoke method
+             pushInvokeMethodOnSuperClass(buildMethodVisitor, methodToInvoke);
+             if (isArray && hasGenericType) {
+-                convertToArray(argumentType.getGenericType().fromArray(), buildMethodVisitor);
++                convertToArray(parameter.getGenericType().fromArray(), buildMethodVisitor);
+             }
+             if (castToObject) {
+-                if (argumentType.isPrimitive()) {
++                if (parameter.isPrimitive()) {
+                     pushCastToType(buildMethodVisitor, Object.class);
+                 }
+             } else {
+-                pushCastToType(buildMethodVisitor, argumentType);
++                pushCastToType(buildMethodVisitor, parameter);
+             }
+         }
+     }
+@@ -4685,7 +4640,7 @@ public class BeanDefinitionWriter extends AbstractClassFileWriter implements Bea
+          * @param beanType           The declaring type
+          * @param methodElement      The method element
+          * @param requiresReflection Whether reflection is required
+-         * @param annotationMetadata
++         * @param annotationMetadata The annotation metadata
+          */
+         MethodVisitData(
+                 TypedElement beanType,
+@@ -4760,10 +4715,8 @@ public class BeanDefinitionWriter extends AbstractClassFileWriter implements Bea
+         private final ClassWriter innerClassWriter;
+         private final String constructorInternalName;
+         private final Type innerClassType;
+-        private final String innerClassName;
+ 
+         public InnerClassDef(String interceptedConstructorWriterName, ClassWriter innerClassWriter, String constructorInternalName, Type innerClassType) {
+-            this.innerClassName = interceptedConstructorWriterName;
+             this.innerClassWriter = innerClassWriter;
+             this.constructorInternalName = constructorInternalName;
+             this.innerClassType = innerClassType;
+diff --git a/core-processor/src/main/java/io/micronaut/inject/writer/DispatchWriter.java b/core-processor/src/main/java/io/micronaut/inject/writer/DispatchWriter.java
+index fbabbb7107..07f6c3bcaa 100644
+--- a/core-processor/src/main/java/io/micronaut/inject/writer/DispatchWriter.java
++++ b/core-processor/src/main/java/io/micronaut/inject/writer/DispatchWriter.java
+@@ -17,6 +17,7 @@ package io.micronaut.inject.writer;
+ 
+ import io.micronaut.core.annotation.Internal;
+ import io.micronaut.core.annotation.NonNull;
++import io.micronaut.core.annotation.Nullable;
+ import io.micronaut.core.reflect.ReflectionUtils;
+ import io.micronaut.core.util.ArrayUtils;
+ import io.micronaut.inject.ast.ClassElement;
+@@ -41,8 +42,12 @@ import java.util.Collections;
+ import java.util.HashMap;
+ import java.util.Iterator;
+ import java.util.List;
+-import java.util.function.BiConsumer;
+ import java.util.Map;
++import java.util.function.BiConsumer;
++import java.util.function.BiFunction;
++
++import static io.micronaut.expressions.parser.ast.util.TypeDescriptors.BOOLEAN;
++import static org.objectweb.asm.commons.GeneratorAdapter.EQ;
+ 
+ /**
+  * Switch based dispatch writer.
+@@ -317,19 +322,9 @@ public final class DispatchWriter extends AbstractClassFileWriter implements Opc
+         builder.push(declaringTypeObject);
+         builder.push(methodElement.getName());
+         if (!argumentTypes.isEmpty()) {
+-            int len = argumentTypes.size();
+-            Iterator<ParameterElement> iter = argumentTypes.iterator();
+-            pushNewArray(builder, Class.class, len);
+-            for (int i = 0; i < len; i++) {
+-                ParameterElement type = iter.next();
+-                pushStoreInArray(
+-                    builder,
+-                        i,
+-                        len,
+-                        () -> builder.push(JavaModelUtils.getTypeReference(type))
+-                );
+-
+-            }
++            pushNewArray(builder, Class.class, argumentTypes, parameterElement -> {
++                builder.push(JavaModelUtils.getTypeReference(parameterElement));
++            });
+         } else {
+             builder.getStatic(TYPE_REFLECTION_UTILS, "EMPTY_CLASS_ARRAY", Type.getType(Class[].class));
+         }
+@@ -358,18 +353,20 @@ public final class DispatchWriter extends AbstractClassFileWriter implements Opc
+     /**
+      * Computes Kotlin default method mask.
+      *
+-     * @param writer          The writer
+-     * @param argumentsPusher The argument pusher
+-     * @param parameters      The arguments
+-     * @param allValuesAreNull Is all parameters values are null
++     * @param writer                       The writer
++     * @param argumentValuePusher          The argument value pusher
++     * @param argumentValueIsPresentPusher The argument is present pusher
++     * @param parameters                   The arguments
+      * @return The mask
+      */
+     public static int computeKotlinDefaultsMask(GeneratorAdapter writer,
+-                                                BiConsumer<Integer, ParameterElement> argumentsPusher,
+-                                                List<ParameterElement> parameters,
+-                                                boolean allValuesAreNull) {
++                                                @Nullable
++                                                BiConsumer<Integer, ParameterElement> argumentValuePusher,
++                                                @Nullable
++                                                BiFunction<Integer, ParameterElement, Boolean> argumentValueIsPresentPusher,
++                                                List<ParameterElement> parameters) {
+         int maskLocal = writer.newLocal(Type.INT_TYPE);
+-        if (allValuesAreNull) {
++        if (argumentValueIsPresentPusher == null && argumentValuePusher == null) {
+             writer.push((int) Math.pow(2, parameters.size()) - 1);
+             writer.storeLocal(maskLocal);
+         } else {
+@@ -378,15 +375,8 @@ public final class DispatchWriter extends AbstractClassFileWriter implements Opc
+             int maskIndex = 1;
+             int paramIndex = 0;
+             for (ParameterElement parameter : parameters) {
+-                if (parameter instanceof KotlinParameterElement kp && kp.hasDefault() && (!kp.getType().isPrimitive() || kp.getType().isArray())) {
+-                    Label elseLabel = writer.newLabel();
+-                    argumentsPusher.accept(paramIndex, parameter);
+-                    writer.ifNonNull(elseLabel);
+-                    writer.push(maskIndex);
+-                    writer.loadLocal(maskLocal, Type.INT_TYPE);
+-                    writer.math(GeneratorAdapter.OR, Type.INT_TYPE);
+-                    writer.storeLocal(maskLocal);
+-                    writer.visitLabel(elseLabel);
++                if (parameter instanceof KotlinParameterElement kp && kp.hasDefault()) {
++                    writeMask(writer, argumentValuePusher, argumentValueIsPresentPusher, kp, paramIndex, maskIndex, maskLocal);
+                 }
+                 maskIndex *= 2;
+                 paramIndex++;
+@@ -395,6 +385,32 @@ public final class DispatchWriter extends AbstractClassFileWriter implements Opc
+         return maskLocal;
+     }
+ 
++    private static void writeMask(GeneratorAdapter writer,
++                                  BiConsumer<Integer, ParameterElement> argumentValuePusher,
++                                  BiFunction<Integer, ParameterElement, Boolean> argumentValueIsPresentPusher,
++                                  KotlinParameterElement kp,
++                                  int paramIndex,
++                                  int maskIndex,
++                                  int maskLocal) {
++        Label elseLabel = writer.newLabel();
++        if (argumentValueIsPresentPusher != null && argumentValueIsPresentPusher.apply(paramIndex, kp)) {
++            // Is present boolean pushed to the stack
++            writer.push(true);
++            writer.ifCmp(BOOLEAN, EQ, elseLabel);
++        } else if (kp.getType().isPrimitive() && !kp.getType().isArray()) {
++            // We cannot recognize the default from a primitive value
++            return;
++        } else {
++            argumentValuePusher.accept(paramIndex, kp);
++            writer.ifNonNull(elseLabel);
++        }
++        writer.push(maskIndex);
++        writer.loadLocal(maskLocal, Type.INT_TYPE);
++        writer.math(GeneratorAdapter.OR, Type.INT_TYPE);
++        writer.storeLocal(maskLocal);
++        writer.visitLabel(elseLabel);
++    }
++
+     /**
+      * Dispatch target implementation writer.
+      */
+@@ -683,7 +699,7 @@ public final class DispatchWriter extends AbstractClassFileWriter implements Opc
+                             writer.loadArg(2);
+                             writer.push(paramIndex);
+                             writer.visitInsn(AALOAD);
+-                        }, argumentTypes, false);
++                        }, null, argumentTypes);
+                     }
+                     if (isMulti) {
+                         int argCount = argumentTypes.size();
+diff --git a/core-processor/src/main/java/io/micronaut/inject/writer/ExecutableMethodsDefinitionWriter.java b/core-processor/src/main/java/io/micronaut/inject/writer/ExecutableMethodsDefinitionWriter.java
+index bbe75ce805..b59336b95c 100644
+--- a/core-processor/src/main/java/io/micronaut/inject/writer/ExecutableMethodsDefinitionWriter.java
++++ b/core-processor/src/main/java/io/micronaut/inject/writer/ExecutableMethodsDefinitionWriter.java
+@@ -260,19 +260,15 @@ public class ExecutableMethodsDefinitionWriter extends AbstractClassFileWriter i
+     private void buildStaticInit(ClassWriter classWriter, Type methodsFieldType) {
+         GeneratorAdapter staticInit = visitStaticInitializer(classWriter);
+         classWriter.visitField(ACC_PRIVATE | ACC_FINAL | ACC_STATIC, FIELD_METHODS_REFERENCES, methodsFieldType.getDescriptor(), null, null);
+-        pushNewArray(staticInit, AbstractExecutableMethodsDefinition.MethodReference.class, methodDispatchWriter.getDispatchTargets().size());
+-        int i = 0;
+-        for (DispatchWriter.DispatchTarget dispatchTarget : methodDispatchWriter.getDispatchTargets()) {
++        pushNewArray(staticInit, AbstractExecutableMethodsDefinition.MethodReference.class, methodDispatchWriter.getDispatchTargets(), dispatchTarget -> {
+             DispatchWriter.MethodDispatchTarget method = (DispatchWriter.MethodDispatchTarget) dispatchTarget;
+-            pushStoreInArray(staticInit, i++, methodDispatchWriter.getDispatchTargets().size(), () ->
+-                    pushNewMethodReference(
+-                            classWriter,
+-                            staticInit,
+-                            method.declaringType,
+-                            method.methodElement
+-                    )
++            pushNewMethodReference(
++                classWriter,
++                staticInit,
++                method.declaringType,
++                method.methodElement
+             );
+-        }
++        });
+         staticInit.putStatic(thisType, FIELD_METHODS_REFERENCES, methodsFieldType);
+         staticInit.returnValue();
+         staticInit.visitMaxs(DEFAULT_MAX_STACK, 1);
+diff --git a/core-processor/src/main/java/io/micronaut/inject/writer/WriterUtils.java b/core-processor/src/main/java/io/micronaut/inject/writer/WriterUtils.java
+new file mode 100644
+index 0000000000..ddba89fe37
+--- /dev/null
++++ b/core-processor/src/main/java/io/micronaut/inject/writer/WriterUtils.java
+@@ -0,0 +1,208 @@
++/*
++ * Copyright 2017-2024 original authors
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * https://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package io.micronaut.inject.writer;
++
++import io.micronaut.core.annotation.Internal;
++import io.micronaut.core.annotation.Nullable;
++import io.micronaut.core.reflect.InstantiationUtils;
++import io.micronaut.core.reflect.ReflectionUtils;
++import io.micronaut.inject.ast.ClassElement;
++import io.micronaut.inject.ast.KotlinParameterElement;
++import io.micronaut.inject.ast.MethodElement;
++import io.micronaut.inject.ast.ParameterElement;
++import io.micronaut.inject.ast.PrimitiveElement;
++import io.micronaut.inject.processing.JavaModelUtils;
++import org.objectweb.asm.Type;
++import org.objectweb.asm.commons.GeneratorAdapter;
++import org.objectweb.asm.commons.Method;
++
++import java.util.Arrays;
++import java.util.Collection;
++import java.util.List;
++import java.util.function.BiConsumer;
++import java.util.function.BiFunction;
++
++import static io.micronaut.inject.writer.AbstractClassFileWriter.getConstructorDescriptor;
++import static io.micronaut.inject.writer.AbstractClassFileWriter.getMethodDescriptor;
++import static io.micronaut.inject.writer.AbstractClassFileWriter.getTypeReference;
++import static io.micronaut.inject.writer.AbstractClassFileWriter.pushNewArray;
++import static io.micronaut.inject.writer.AbstractClassFileWriter.pushNewArrayIndexed;
++import static org.objectweb.asm.Opcodes.INVOKESTATIC;
++
++/**
++ * The writer utils.
++ *
++ * @author Denis Stepanov
++ * @since 4.3.0
++ */
++@Internal
++public final class WriterUtils {
++    private static final String METHOD_NAME_INSTANTIATE = "instantiate";
++
++    public static void invokeBeanConstructor(GeneratorAdapter writer,
++                                             MethodElement constructor,
++                                             boolean allowKotlinDefaults,
++                                             @Nullable
++                                             BiConsumer<Integer, ParameterElement> argumentsPusher) {
++        invokeBeanConstructor(writer, constructor, constructor.isReflectionRequired(), allowKotlinDefaults, argumentsPusher, null);
++    }
++
++    public static void invokeBeanConstructor(GeneratorAdapter writer,
++                                             MethodElement constructor,
++                                             boolean requiresReflection,
++                                             boolean allowKotlinDefaults,
++                                             @Nullable
++                                             BiConsumer<Integer, ParameterElement> argumentsPusher,
++                                             @Nullable
++                                             BiFunction<Integer, ParameterElement, Boolean> argumentValueIsPresentPusher) {
++        Type beanType = getTypeReference(constructor.getOwningType());
++        boolean isConstructor = constructor.getName().equals("<init>");
++        ClassElement declaringType = constructor.getOwningType();
++        boolean isCompanion = declaringType.getSimpleName().endsWith("$Companion");
++
++        List<ParameterElement> constructorArguments = Arrays.asList(constructor.getParameters());
++        Collection<Type> argumentTypes = constructorArguments.stream().map(pe ->
++            JavaModelUtils.getTypeReference(pe.getType())
++        ).toList();
++        boolean isKotlinDefault = allowKotlinDefaults && constructorArguments.stream().anyMatch(p -> p instanceof KotlinParameterElement kp && kp.hasDefault());
++
++        int maskLocal = -1;
++        if (isKotlinDefault) {
++            // Calculate the Kotlin defaults mask
++            // Every bit indicated true/false if the parameter should have the default value set
++            maskLocal = DispatchWriter.computeKotlinDefaultsMask(writer, argumentsPusher, argumentValueIsPresentPusher, constructorArguments);
++        }
++
++        if (requiresReflection && !isCompanion) { // Companion reflection not implemented
++            writer.push(beanType);
++            pushNewArray(writer, Class.class, constructorArguments, arg -> writer.push(getTypeReference(arg)));
++            pushNewArrayIndexed(writer, Object.class, constructorArguments, (i, parameter) -> {
++                pushValue(writer, argumentsPusher, parameter, i);
++                if (parameter.isPrimitive()) {
++                    writer.unbox(getTypeReference(parameter));
++                }
++            });
++            writer.invokeStatic(
++                Type.getType(InstantiationUtils.class),
++                org.objectweb.asm.commons.Method.getMethod(
++                    ReflectionUtils.getRequiredInternalMethod(
++                        InstantiationUtils.class,
++                        METHOD_NAME_INSTANTIATE,
++                        Class.class,
++                        Class[].class,
++                        Object[].class
++                    )
++                )
++            );
++            if (JavaModelUtils.isPrimitive(beanType)) {
++                writer.unbox(beanType);
++            } else {
++                writer.checkCast(beanType);
++            }
++            return;
++        }
++
++        if (!constructor.isStatic()) {
++            if (isConstructor) {
++                writer.newInstance(beanType);
++                writer.dup();
++            } else if (isCompanion) {
++                writer.getStatic(
++                    getTypeReference(constructor.getReturnType()),
++                    "Companion",
++                    JavaModelUtils.getTypeReference(declaringType)
++                );
++            }
++        }
++
++        int index = 0;
++        for (ParameterElement constructorArgument : constructorArguments) {
++            pushValue(writer, argumentsPusher, constructorArgument, index);
++            index++;
++        }
++
++        if (isConstructor) {
++            final String constructorDescriptor = getConstructorDescriptor(constructorArguments);
++            Method method = new Method("<init>", constructorDescriptor);
++            if (isKotlinDefault) {
++                method = asDefaultKotlinConstructor(method);
++                writer.loadLocal(maskLocal, Type.INT_TYPE); // Bit mask of defaults
++                writer.push((String) null); // Last parameter is just a marker and is always null
++            }
++            writer.invokeConstructor(beanType, method);
++        } else if (constructor.isStatic()) {
++            final String methodDescriptor = getMethodDescriptor(getTypeReference(constructor.getReturnType()), argumentTypes);
++            Method method = new Method(constructor.getName(), methodDescriptor);
++            boolean isInterface = constructor.getDeclaringType().isInterface();
++            writer.visitMethodInsn(INVOKESTATIC,
++                getTypeReference(declaringType).getInternalName(), method.getName(),
++                method.getDescriptor(), isInterface);
++        } else if (isCompanion) {
++            if (constructor.isStatic()) {
++                writer.invokeStatic(
++                    JavaModelUtils.getTypeReference(declaringType),
++                    new Method(constructor.getName(), getMethodDescriptor(getTypeReference(constructor.getReturnType()), argumentTypes))
++                );
++            } else {
++                writer.invokeVirtual(
++                    JavaModelUtils.getTypeReference(declaringType),
++                    new Method(constructor.getName(), getMethodDescriptor(getTypeReference(constructor.getReturnType()), argumentTypes))
++                );
++            }
++        }
++    }
++
++    private static void pushValue(GeneratorAdapter writer,
++                                  @Nullable
++                                  BiConsumer<Integer, ParameterElement> argumentsPusher,
++                                  ParameterElement parameter,
++                                  int index) {
++        if (argumentsPusher == null) {
++            pushDefaultTypeValue(writer, parameter.getType());
++        } else {
++            argumentsPusher.accept(index, parameter);
++        }
++    }
++
++    /**
++     * Pushed a default value.
++     *
++     * @param writer The writer
++     * @param type   The type
++     */
++    public static void pushDefaultTypeValue(GeneratorAdapter writer, ClassElement type) {
++        if (type.isPrimitive() && !type.isArray()) {
++            if (type.equals(PrimitiveElement.BOOLEAN)) {
++                writer.push(false);
++            } else {
++                writer.push(0);
++                writer.cast(Type.INT_TYPE, JavaModelUtils.getTypeReference(type));
++            }
++        } else {
++            writer.push((String) null);
++        }
++    }
++
++    private static Method asDefaultKotlinConstructor(Method method) {
++        Type[] argumentTypes = method.getArgumentTypes();
++        int length = argumentTypes.length;
++        Type[] newArgumentTypes = Arrays.copyOf(argumentTypes, length + 2);
++        newArgumentTypes[length] = Type.INT_TYPE;
++        newArgumentTypes[length + 1] = Type.getObjectType("kotlin/jvm/internal/DefaultConstructorMarker");
++        return new Method(method.getName(), method.getReturnType(), newArgumentTypes);
++    }
++
++}

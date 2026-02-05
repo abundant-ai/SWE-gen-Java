@@ -1,0 +1,227 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index eb2d6154..0d53d809 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -6,7 +6,8 @@
+ 
+  - First-party converters now support deferring serialization to happen when the request body is written (i.e., during HTTP execution) rather than when the HTTP request is created. In some cases this moves conversion from a calling thread to a background thread, such as in the case when using `Call.enqueue` directly.
+ 
+-   The following converters support this feature through a new `createStreaming()` factory:
++   The following converters support this feature through a new `withStreaming()` factory method:
++   - Moshi
+    - Wire
+ 
+ **Changed**
+diff --git a/retrofit-converters/moshi/build.gradle b/retrofit-converters/moshi/build.gradle
+index be2a9b70..12781a8f 100644
+--- a/retrofit-converters/moshi/build.gradle
++++ b/retrofit-converters/moshi/build.gradle
+@@ -9,6 +9,7 @@ dependencies {
+   testImplementation libs.junit
+   testImplementation libs.truth
+   testImplementation libs.okhttp.mockwebserver
++  testImplementation libs.testParameterInjector
+ }
+ 
+ jar {
+diff --git a/retrofit-converters/moshi/src/main/java/retrofit2/converter/moshi/MoshiConverterFactory.java b/retrofit-converters/moshi/src/main/java/retrofit2/converter/moshi/MoshiConverterFactory.java
+index 1a48eecb..72f09f4f 100644
+--- a/retrofit-converters/moshi/src/main/java/retrofit2/converter/moshi/MoshiConverterFactory.java
++++ b/retrofit-converters/moshi/src/main/java/retrofit2/converter/moshi/MoshiConverterFactory.java
+@@ -27,6 +27,7 @@ import java.util.LinkedHashSet;
+ import java.util.Set;
+ import okhttp3.RequestBody;
+ import okhttp3.ResponseBody;
++import retrofit2.Call;
+ import retrofit2.Converter;
+ import retrofit2.Retrofit;
+ 
+@@ -52,35 +53,51 @@ public final class MoshiConverterFactory extends Converter.Factory {
+   @SuppressWarnings("ConstantConditions") // Guarding public API nullability.
+   public static MoshiConverterFactory create(Moshi moshi) {
+     if (moshi == null) throw new NullPointerException("moshi == null");
+-    return new MoshiConverterFactory(moshi, false, false, false);
++    return new MoshiConverterFactory(moshi, false, false, false, false);
+   }
+ 
+   private final Moshi moshi;
+   private final boolean lenient;
+   private final boolean failOnUnknown;
+   private final boolean serializeNulls;
++  private final boolean streaming;
+ 
+   private MoshiConverterFactory(
+-      Moshi moshi, boolean lenient, boolean failOnUnknown, boolean serializeNulls) {
++      Moshi moshi,
++      boolean lenient,
++      boolean failOnUnknown,
++      boolean serializeNulls,
++      boolean streaming) {
+     this.moshi = moshi;
+     this.lenient = lenient;
+     this.failOnUnknown = failOnUnknown;
+     this.serializeNulls = serializeNulls;
++    this.streaming = streaming;
+   }
+ 
+   /** Return a new factory which uses {@linkplain JsonAdapter#lenient() lenient} adapters. */
+   public MoshiConverterFactory asLenient() {
+-    return new MoshiConverterFactory(moshi, true, failOnUnknown, serializeNulls);
++    return new MoshiConverterFactory(moshi, true, failOnUnknown, serializeNulls, streaming);
+   }
+ 
+   /** Return a new factory which uses {@link JsonAdapter#failOnUnknown()} adapters. */
+   public MoshiConverterFactory failOnUnknown() {
+-    return new MoshiConverterFactory(moshi, lenient, true, serializeNulls);
++    return new MoshiConverterFactory(moshi, lenient, true, serializeNulls, streaming);
+   }
+ 
+   /** Return a new factory which includes null values into the serialized JSON. */
+   public MoshiConverterFactory withNullSerialization() {
+-    return new MoshiConverterFactory(moshi, lenient, failOnUnknown, true);
++    return new MoshiConverterFactory(moshi, lenient, failOnUnknown, true, streaming);
++  }
++
++  /**
++   * Return a new factory which streams serialization of request messages to bytes on the HTTP thread
++   * This is either the calling thread for {@link Call#execute()}, or one of OkHttp's background
++   * threads for {@link Call#enqueue}. Response bytes are always converted to message instances on
++   * one of OkHttp's background threads.
++   */
++  public MoshiConverterFactory withStreaming() {
++    return new MoshiConverterFactory(moshi, lenient, failOnUnknown, serializeNulls, true);
+   }
+ 
+   @Override
+@@ -115,7 +132,7 @@ public final class MoshiConverterFactory extends Converter.Factory {
+     if (serializeNulls) {
+       adapter = adapter.serializeNulls();
+     }
+-    return new MoshiRequestBodyConverter<>(adapter);
++    return new MoshiRequestBodyConverter<>(adapter, streaming);
+   }
+ 
+   private static Set<? extends Annotation> jsonAnnotations(Annotation[] annotations) {
+diff --git a/retrofit-converters/moshi/src/main/java/retrofit2/converter/moshi/MoshiRequestBodyConverter.java b/retrofit-converters/moshi/src/main/java/retrofit2/converter/moshi/MoshiRequestBodyConverter.java
+index 39fb00e7..bd381abf 100644
+--- a/retrofit-converters/moshi/src/main/java/retrofit2/converter/moshi/MoshiRequestBodyConverter.java
++++ b/retrofit-converters/moshi/src/main/java/retrofit2/converter/moshi/MoshiRequestBodyConverter.java
+@@ -24,16 +24,22 @@ import okio.Buffer;
+ import retrofit2.Converter;
+ 
+ final class MoshiRequestBodyConverter<T> implements Converter<T, RequestBody> {
+-  private static final MediaType MEDIA_TYPE = MediaType.get("application/json; charset=UTF-8");
++  static final MediaType MEDIA_TYPE = MediaType.get("application/json; charset=UTF-8");
+ 
+   private final JsonAdapter<T> adapter;
++  private final boolean streaming;
+ 
+-  MoshiRequestBodyConverter(JsonAdapter<T> adapter) {
++  MoshiRequestBodyConverter(JsonAdapter<T> adapter, boolean streaming) {
+     this.adapter = adapter;
++    this.streaming = streaming;
+   }
+ 
+   @Override
+   public RequestBody convert(T value) throws IOException {
++    if (streaming) {
++      return new MoshiStreamingRequestBody<>(adapter, value);
++    }
++
+     Buffer buffer = new Buffer();
+     JsonWriter writer = JsonWriter.of(buffer);
+     adapter.toJson(writer, value);
+diff --git a/retrofit-converters/moshi/src/main/java/retrofit2/converter/moshi/MoshiStreamingRequestBody.java b/retrofit-converters/moshi/src/main/java/retrofit2/converter/moshi/MoshiStreamingRequestBody.java
+new file mode 100644
+index 00000000..d9796361
+--- /dev/null
++++ b/retrofit-converters/moshi/src/main/java/retrofit2/converter/moshi/MoshiStreamingRequestBody.java
+@@ -0,0 +1,44 @@
++/*
++ * Copyright (C) 2025 Square, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package retrofit2.converter.moshi;
++
++import static retrofit2.converter.moshi.MoshiRequestBodyConverter.MEDIA_TYPE;
++
++import com.squareup.moshi.JsonAdapter;
++import java.io.IOException;
++import okhttp3.MediaType;
++import okhttp3.RequestBody;
++import okio.BufferedSink;
++
++final class MoshiStreamingRequestBody<T> extends RequestBody {
++  private final JsonAdapter<T> adapter;
++  private final T value;
++
++  public MoshiStreamingRequestBody(JsonAdapter<T> adapter, T value) {
++    this.adapter = adapter;
++    this.value = value;
++  }
++
++  @Override
++  public MediaType contentType() {
++    return MEDIA_TYPE;
++  }
++
++  @Override
++  public void writeTo(BufferedSink sink) throws IOException {
++    adapter.toJson(sink, value);
++  }
++}
+diff --git a/retrofit-converters/wire/src/main/java/retrofit2/converter/wire/WireConverterFactory.java b/retrofit-converters/wire/src/main/java/retrofit2/converter/wire/WireConverterFactory.java
+index aaa4c26c..525192f8 100644
+--- a/retrofit-converters/wire/src/main/java/retrofit2/converter/wire/WireConverterFactory.java
++++ b/retrofit-converters/wire/src/main/java/retrofit2/converter/wire/WireConverterFactory.java
+@@ -35,28 +35,28 @@ public final class WireConverterFactory extends Converter.Factory {
+   /**
+    * Create an instance which serializes request messages to bytes eagerly on the caller thread
+    * when either {@link Call#execute()} or {@link Call#enqueue} is called. Response bytes are
+-   * always converted to message instances on one of OKHttp's background threads.
++   * always converted to message instances on one of OkHttp's background threads.
+    */
+   public static WireConverterFactory create() {
+     return new WireConverterFactory(false);
+   }
+ 
+-  /**
+-   * Create an instance which streams serialization of request messages to bytes on the HTTP thread
+-   * This is either the calling thread for {@link Call#execute()}, or one of OKHttp's background
+-   * threads for {@link Call#enqueue}. Response bytes are always converted to message instances on
+-   * one of OKHttp's background threads.
+-   */
+-  public static WireConverterFactory createStreaming() {
+-    return new WireConverterFactory(true);
+-  }
+-
+   private final boolean streaming;
+ 
+   private WireConverterFactory(boolean streaming) {
+     this.streaming = streaming;
+   }
+ 
++  /**
++   * Return a new factory which streams serialization of request messages to bytes on the HTTP thread
++   * This is either the calling thread for {@link Call#execute()}, or one of OkHttp's background
++   * threads for {@link Call#enqueue}. Response bytes are always converted to message instances on
++   * one of OkHttp's background threads.
++   */
++  public WireConverterFactory withStreaming() {
++    return new WireConverterFactory(true);
++  }
++
+   @Override
+   public @Nullable Converter<ResponseBody, ?> responseBodyConverter(
+       Type type, Annotation[] annotations, Retrofit retrofit) {

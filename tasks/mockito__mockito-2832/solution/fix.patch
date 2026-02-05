@@ -1,0 +1,174 @@
+diff --git a/src/main/java/org/mockito/internal/exceptions/Reporter.java b/src/main/java/org/mockito/internal/exceptions/Reporter.java
+index 9a5ea90d2..2101e7255 100644
+--- a/src/main/java/org/mockito/internal/exceptions/Reporter.java
++++ b/src/main/java/org/mockito/internal/exceptions/Reporter.java
+@@ -10,11 +10,29 @@ import static org.mockito.internal.util.StringUtil.join;
+ 
+ import java.lang.reflect.Field;
+ import java.lang.reflect.Method;
+-import java.util.*;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.Collection;
++import java.util.List;
++
+ import org.mockito.exceptions.base.MockitoAssertionError;
+ import org.mockito.exceptions.base.MockitoException;
+ import org.mockito.exceptions.base.MockitoInitializationException;
+-import org.mockito.exceptions.misusing.*;
++import org.mockito.exceptions.misusing.CannotStubVoidMethodWithReturnValue;
++import org.mockito.exceptions.misusing.CannotVerifyStubOnlyMock;
++import org.mockito.exceptions.misusing.FriendlyReminderException;
++import org.mockito.exceptions.misusing.InjectMocksException;
++import org.mockito.exceptions.misusing.InvalidUseOfMatchersException;
++import org.mockito.exceptions.misusing.MissingMethodInvocationException;
++import org.mockito.exceptions.misusing.NotAMockException;
++import org.mockito.exceptions.misusing.NullInsteadOfMockException;
++import org.mockito.exceptions.misusing.PotentialStubbingProblem;
++import org.mockito.exceptions.misusing.RedundantListenerException;
++import org.mockito.exceptions.misusing.UnfinishedMockingSessionException;
++import org.mockito.exceptions.misusing.UnfinishedStubbingException;
++import org.mockito.exceptions.misusing.UnfinishedVerificationException;
++import org.mockito.exceptions.misusing.UnnecessaryStubbingException;
++import org.mockito.exceptions.misusing.WrongTypeOfReturnValue;
+ import org.mockito.exceptions.verification.MoreThanAllowedActualInvocations;
+ import org.mockito.exceptions.verification.NeverWantedButInvoked;
+ import org.mockito.exceptions.verification.NoInteractionsWanted;
+@@ -28,10 +46,12 @@ import org.mockito.internal.exceptions.util.ScenarioPrinter;
+ import org.mockito.internal.junit.ExceptionFactory;
+ import org.mockito.internal.matchers.LocalizedMatcher;
+ import org.mockito.internal.util.MockUtil;
++import org.mockito.internal.verification.argumentmatching.ArgumentMatchingTool;
+ import org.mockito.invocation.DescribedInvocation;
+ import org.mockito.invocation.Invocation;
+ import org.mockito.invocation.InvocationOnMock;
+ import org.mockito.invocation.Location;
++import org.mockito.invocation.MatchableInvocation;
+ import org.mockito.listeners.InvocationListener;
+ import org.mockito.mock.SerializableMode;
+ 
+@@ -308,7 +328,11 @@ public class Reporter {
+     }
+ 
+     public static AssertionError argumentsAreDifferent(
+-            String wanted, List<String> actualCalls, List<Location> actualLocations) {
++            Invocation actualInvocation,
++            MatchableInvocation matchableInvocation,
++            String wanted,
++            List<String> actualCalls,
++            List<Location> actualLocations) {
+         if (actualCalls == null
+                 || actualLocations == null
+                 || actualCalls.size() != actualLocations.size()) {
+@@ -324,7 +348,11 @@ public class Reporter {
+                 .append("\n")
+                 .append(LocationFactory.create())
+                 .append("\n")
+-                .append("Actual invocations have different arguments:\n");
++                .append("Actual invocations have different arguments");
++
++        appendNotMatchingPositions(actualInvocation, matchableInvocation, messageBuilder);
++
++        messageBuilder.append(":\n");
+ 
+         for (int i = 0; i < actualCalls.size(); i++) {
+             actualBuilder.append(actualCalls.get(i)).append("\n");
+@@ -340,6 +368,30 @@ public class Reporter {
+                 messageBuilder.toString(), wanted, actualBuilder.toString());
+     }
+ 
++    /*
++     * Will append the non matching positions only if there are more than 1 arguments to the method.
++     */
++    private static void appendNotMatchingPositions(
++            Invocation actualInvocation,
++            MatchableInvocation matchableInvocation,
++            StringBuilder messageBuilder) {
++        Object[] args = actualInvocation.getArguments();
++        if (args.length <= 1) {
++            return;
++        }
++
++        List<Integer> indexes =
++                ArgumentMatchingTool.getNotMatchingArgsIndexes(
++                        matchableInvocation.getMatchers(), actualInvocation.getArguments());
++
++        if (!indexes.isEmpty()) {
++            messageBuilder
++                    .append(" at ")
++                    .append(indexes.size() == 1 ? "position " : "positions ")
++                    .append(indexes);
++        }
++    }
++
+     public static MockitoAssertionError wantedButNotInvoked(DescribedInvocation wanted) {
+         return new WantedButNotInvoked(createWantedButNotInvokedMessage(wanted));
+     }
+diff --git a/src/main/java/org/mockito/internal/verification/argumentmatching/ArgumentMatchingTool.java b/src/main/java/org/mockito/internal/verification/argumentmatching/ArgumentMatchingTool.java
+index 060ea0913..1959147fc 100644
+--- a/src/main/java/org/mockito/internal/verification/argumentmatching/ArgumentMatchingTool.java
++++ b/src/main/java/org/mockito/internal/verification/argumentmatching/ArgumentMatchingTool.java
+@@ -4,6 +4,8 @@
+  */
+ package org.mockito.internal.verification.argumentmatching;
+ 
++import java.util.ArrayList;
++import java.util.Collections;
+ import java.util.HashMap;
+ import java.util.HashSet;
+ import java.util.LinkedList;
+@@ -15,7 +17,7 @@ import java.util.stream.Collectors;
+ import org.mockito.ArgumentMatcher;
+ import org.mockito.internal.matchers.ContainsExtraTypeInfo;
+ 
+-@SuppressWarnings("unchecked")
++@SuppressWarnings("rawtypes")
+ public class ArgumentMatchingTool {
+ 
+     private ArgumentMatchingTool() {}
+@@ -42,6 +44,28 @@ public class ArgumentMatchingTool {
+         return suspicious.toArray(new Integer[0]);
+     }
+ 
++    /**
++     * Returns indexes of arguments not matching the provided matchers.
++     */
++    public static List<Integer> getNotMatchingArgsIndexes(
++            List<ArgumentMatcher> matchers, Object[] arguments) {
++        if (matchers.size() != arguments.length) {
++            return Collections.emptyList();
++        }
++
++        List<Integer> nonMatching = new ArrayList<>();
++        int i = 0;
++        for (ArgumentMatcher m : matchers) {
++            if (!safelyMatches(m, arguments[i])) {
++                nonMatching.add(i);
++            }
++
++            i++;
++        }
++
++        return nonMatching;
++    }
++
+     private static boolean safelyMatches(ArgumentMatcher m, Object arg) {
+         try {
+             return m.matches(arg);
+diff --git a/src/main/java/org/mockito/internal/verification/checkers/MissingInvocationChecker.java b/src/main/java/org/mockito/internal/verification/checkers/MissingInvocationChecker.java
+index 9ceb48300..03c3d8b46 100644
+--- a/src/main/java/org/mockito/internal/verification/checkers/MissingInvocationChecker.java
++++ b/src/main/java/org/mockito/internal/verification/checkers/MissingInvocationChecker.java
+@@ -52,7 +52,11 @@ public class MissingInvocationChecker {
+                 invocations.stream().map(Invocation::getLocation).collect(Collectors.toList());
+ 
+         throw argumentsAreDifferent(
+-                smartPrinter.getWanted(), smartPrinter.getActuals(), actualLocations);
++                similar,
++                wanted,
++                smartPrinter.getWanted(),
++                smartPrinter.getActuals(),
++                actualLocations);
+     }
+ 
+     public static void checkMissingInvocation(

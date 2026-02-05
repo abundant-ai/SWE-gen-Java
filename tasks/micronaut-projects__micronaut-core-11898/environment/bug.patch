@@ -1,0 +1,1002 @@
+diff --git a/core/src/main/java/io/micronaut/core/execution/DelayedExecutionFlow.java b/core/src/main/java/io/micronaut/core/execution/DelayedExecutionFlow.java
+index b42b1eb246..73fb04f90f 100644
+--- a/core/src/main/java/io/micronaut/core/execution/DelayedExecutionFlow.java
++++ b/core/src/main/java/io/micronaut/core/execution/DelayedExecutionFlow.java
+@@ -45,6 +45,22 @@ public sealed interface DelayedExecutionFlow<T> extends ExecutionFlow<T> permits
+      */
+     void completeExceptionally(Throwable exc);
+ 
++    /**
++     * Complete this flow normally.
++     *
++     * @param result The result value
++     * @return {@code false} if this flow has already been completed
++     */
++    boolean tryComplete(@Nullable T result);
++
++    /**
++     * Complete this flow with an exception.
++     *
++     * @param exc The exception
++     * @return {@code false} if this flow has already been completed
++     */
++    boolean tryCompleteExceptionally(Throwable exc);
++
+     /**
+      * Check for cancellation.
+      *
+diff --git a/core/src/main/java/io/micronaut/core/execution/DelayedExecutionFlowImpl.java b/core/src/main/java/io/micronaut/core/execution/DelayedExecutionFlowImpl.java
+index caf20062e3..5ce4d2bdea 100644
+--- a/core/src/main/java/io/micronaut/core/execution/DelayedExecutionFlowImpl.java
++++ b/core/src/main/java/io/micronaut/core/execution/DelayedExecutionFlowImpl.java
+@@ -21,6 +21,7 @@ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
+ import java.util.concurrent.CompletableFuture;
++import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
+ import java.util.function.BiConsumer;
+ import java.util.function.Function;
+ import java.util.function.Supplier;
+@@ -29,10 +30,13 @@ import java.util.function.Supplier;
+ final class DelayedExecutionFlowImpl<T> implements DelayedExecutionFlow<T> {
+     private static final Logger LOG = LoggerFactory.getLogger(DelayedExecutionFlowImpl.class);
+ 
++    private static final AtomicReferenceFieldUpdater<DelayedExecutionFlowImpl, DelayedExecutionFlowImpl.Head> HEAD_UPDATER =
++        AtomicReferenceFieldUpdater.newUpdater(DelayedExecutionFlowImpl.class, Head.class, "head");
++
+     /**
+      * The head of the linked list of steps in this flow.
+      */
+-    private Head head = new Head();
++    private volatile Head head = new Head();
+     /**
+      * The tail of the linked list of steps in this flow.
+      */
+@@ -62,11 +66,12 @@ final class DelayedExecutionFlowImpl<T> implements DelayedExecutionFlow<T> {
+     }
+ 
+     /**
+-     * Complete with initial execution flow.
++     * Complete with initial execution flow. Single-threaded version that does not allow completing
++     * twice.
+      *
+      * @param executionFlow The execution flow
+      */
+-    private void complete0(@NonNull ExecutionFlow<Object> executionFlow) {
++    private void completeLazy(@NonNull ExecutionFlow<Object> executionFlow) {
+         if (head == null) {
+             throw new IllegalStateException("Delayed flow has been completed");
+         }
+@@ -77,14 +82,36 @@ final class DelayedExecutionFlowImpl<T> implements DelayedExecutionFlow<T> {
+         head = null;
+     }
+ 
++    private boolean completeAtomic(@NonNull ExecutionFlow<Object> executionFlow) {
++        Head head = HEAD_UPDATER.getAndSet(this, null);
++        if (head == null) {
++            return false;
++        }
++        Step immediateStep = head.atomicSetOutput(executionFlow);
++        if (immediateStep != null) {
++            work(immediateStep, executionFlow);
++        }
++        return true;
++    }
++
+     @Override
+     public void complete(T result) {
+-        complete0(result == null ? ExecutionFlow.empty() : ExecutionFlow.just(result));
++        completeLazy(result == null ? ExecutionFlow.empty() : ExecutionFlow.just(result));
+     }
+ 
+     @Override
+     public void completeExceptionally(Throwable exc) {
+-        complete0(ExecutionFlow.error(exc));
++        completeLazy(ExecutionFlow.error(exc));
++    }
++
++    @Override
++    public boolean tryComplete(@Nullable T result) {
++        return completeAtomic(result == null ? ExecutionFlow.empty() : ExecutionFlow.just(result));
++    }
++
++    @Override
++    public boolean tryCompleteExceptionally(Throwable exc) {
++        return completeAtomic(ExecutionFlow.error(exc));
+     }
+ 
+     /**
+diff --git a/http-client/src/main/java/io/micronaut/http/client/netty/DefaultHttpClient.java b/http-client/src/main/java/io/micronaut/http/client/netty/DefaultHttpClient.java
+index 3b38b033ea..f4eb6ea0af 100644
+--- a/http-client/src/main/java/io/micronaut/http/client/netty/DefaultHttpClient.java
++++ b/http-client/src/main/java/io/micronaut/http/client/netty/DefaultHttpClient.java
+@@ -1400,6 +1400,12 @@ public class DefaultHttpClient implements
+         );
+     }
+ 
++    private void completeExceptionallySafe(DelayedExecutionFlow<?> flow, Throwable exc) {
++        if (!flow.tryCompleteExceptionally(exc)) {
++            log.debug("Client exception suppressed because response flow already completed", exc);
++        }
++    }
++
+     private ExecutionFlow<HttpResponse<?>> readBodyOnError(@Nullable Argument<?> errorType, @NonNull ExecutionFlow<HttpResponse<?>> publisher) {
+         if (errorType != null && errorType != HttpClient.DEFAULT_ERROR_TYPE) {
+             return publisher.onErrorResume(clientException -> {
+@@ -1426,7 +1432,7 @@ public class DefaultHttpClient implements
+                             @Override
+                             public void onError(Throwable t) {
+                                 buffer.release();
+-                                delayed.completeExceptionally(t);
++                                completeExceptionallySafe(delayed, t);
+                             }
+ 
+                             @Override
+@@ -1434,7 +1440,7 @@ public class DefaultHttpClient implements
+                                 try {
+                                     FullHttpResponse fullHttpResponse = new DefaultFullHttpResponse(nettyResponse.protocolVersion(), nettyResponse.status(), buffer, nettyResponse.headers(), new DefaultHttpHeaders(true));
+                                     final FullNettyClientHttpResponse<Object> fullNettyClientHttpResponse = new FullNettyClientHttpResponse<>(fullHttpResponse, handlerRegistry, (Argument<Object>) errorType, true, conversionService);
+-                                    delayed.completeExceptionally(decorate(new HttpClientResponseException(
++                                    completeExceptionallySafe(delayed, decorate(new HttpClientResponseException(
+                                         fullHttpResponse.status().reasonPhrase(),
+                                         null,
+                                         fullNettyClientHttpResponse,
+@@ -1704,7 +1710,7 @@ public class DefaultHttpClient implements
+         } else {
+             streamWriter = new StreamWriter((StreamingNettyByteBody) byteBody, e -> {
+                 poolHandle.taint();
+-                sink.completeExceptionally(e);
++                completeExceptionallySafe(sink, e);
+             });
+             pipeline.addLast(streamWriter);
+             byteBuf = null;
+@@ -1723,7 +1729,7 @@ public class DefaultHttpClient implements
+             @Override
+             public void fail(ChannelHandlerContext ctx, Throwable cause) {
+                 poolHandle.taint();
+-                sink.completeExceptionally(handleResponseError(request, cause));
++                completeExceptionallySafe(sink, handleResponseError(request, cause));
+             }
+ 
+             @Override
+diff --git a/http-client/src/main/java/io/micronaut/http/client/netty/Http1ResponseHandler.java b/http-client/src/main/java/io/micronaut/http/client/netty/Http1ResponseHandler.java
+index fc0d001b41..5be3d856f5 100644
+--- a/http-client/src/main/java/io/micronaut/http/client/netty/Http1ResponseHandler.java
++++ b/http-client/src/main/java/io/micronaut/http/client/netty/Http1ResponseHandler.java
+@@ -145,8 +145,6 @@ final class Http1ResponseHandler extends SimpleChannelInboundHandlerInstrumented
+         @Override
+         void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
+             listener.fail(ctx, cause);
+-            transitionToState(ctx, this, AfterContent.INSTANCE);
+-            listener.finish(ctx);
+         }
+     }
+ 
+@@ -280,8 +278,6 @@ final class Http1ResponseHandler extends SimpleChannelInboundHandlerInstrumented
+         @Override
+         void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
+             streaming.error(cause);
+-            transitionToState(ctx, this, AfterContent.INSTANCE);
+-            listener.finish(ctx);
+         }
+ 
+         @Override
+@@ -382,8 +378,6 @@ final class Http1ResponseHandler extends SimpleChannelInboundHandlerInstrumented
+         @Override
+         void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
+             streaming.error(cause);
+-            transitionToState(ctx, this, AfterContent.INSTANCE);
+-            listener.finish(ctx);
+         }
+     }
+ 
+diff --git a/http-server-netty/build.gradle.kts b/http-server-netty/build.gradle.kts
+index d22ceae40d..03500980c2 100644
+--- a/http-server-netty/build.gradle.kts
++++ b/http-server-netty/build.gradle.kts
+@@ -13,6 +13,9 @@ import org . apache . tools . ant . taskdefs . condition . Os
+ 
+ tasks {
+     test {
++        systemProperty("io.netty.leakDetection.level", "paranoid")
++        systemProperty("io.netty.customResourceLeakDetector", "io.micronaut.http.server.netty.fuzzing.BufferLeakDetection")
++        systemProperty("io.netty.leakDetection.targetRecords", "100")
+         maxHeapSize = "1G"
+     }
+ }
+@@ -60,7 +63,6 @@ dependencies {
+     testImplementation(libs.managed.netty.incubator.codec.http3)
+     testImplementation(libs.bcpkix)
+     testImplementation(projects.micronautJacksonDatabind)
+-    testImplementation(projects.micronautHttpTck)
+ // Add Micronaut Jackson XML after v4 Migration
+ //    testImplementation(libs.managed.micronaut.xml) {
+ //        exclude module:'micronaut-inject'
+diff --git a/http-server-netty/src/main/java/io/micronaut/http/server/netty/multipart/NettyStreamingFileUpload.java b/http-server-netty/src/main/java/io/micronaut/http/server/netty/multipart/NettyStreamingFileUpload.java
+index deb2f08f1c..e566accc0b 100644
+--- a/http-server-netty/src/main/java/io/micronaut/http/server/netty/multipart/NettyStreamingFileUpload.java
++++ b/http-server-netty/src/main/java/io/micronaut/http/server/netty/multipart/NettyStreamingFileUpload.java
+@@ -44,7 +44,6 @@ import java.io.OutputStream;
+ import java.nio.file.Files;
+ import java.util.Optional;
+ import java.util.concurrent.ExecutorService;
+-import java.util.concurrent.atomic.AtomicBoolean;
+ 
+ /**
+  * An implementation of the {@link StreamingFileUpload} interface for Netty.
+@@ -56,8 +55,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
+ public final class NettyStreamingFileUpload implements StreamingFileUpload {
+ 
+     private static final Logger LOG = LoggerFactory.getLogger(NettyStreamingFileUpload.class);
+-    private final io.netty.handler.codec.http.multipart.FileUpload fileUpload;
+-    private final AtomicBoolean released = new AtomicBoolean(false);
++    private io.netty.handler.codec.http.multipart.FileUpload fileUpload;
+     private final ExecutorService ioExecutor;
+     private final HttpServerConfiguration.MultipartConfiguration configuration;
+     private final Flux<PartData> subject;
+@@ -71,7 +69,7 @@ public final class NettyStreamingFileUpload implements StreamingFileUpload {
+         this.configuration = multipartConfiguration;
+         this.fileUpload = httpData;
+         this.ioExecutor = ioExecutor;
+-        this.subject = subject.doOnTerminate(this::discard);
++        this.subject = subject;
+     }
+ 
+     @Override
+@@ -160,9 +158,7 @@ public final class NettyStreamingFileUpload implements StreamingFileUpload {
+ 
+     @Override
+     public void discard() {
+-        if (released.compareAndSet(false, true)) {
+-            fileUpload.release();
+-        }
++        fileUpload.release();
+     }
+ 
+     private Publisher<Boolean> transferTo(ThrowingSupplier<OutputStream, IOException> outputStreamSupplier) {
+diff --git a/http-server-netty/src/test/groovy/io/micronaut/http/server/netty/BufferLeakDetectionExtension.java b/http-server-netty/src/test/groovy/io/micronaut/http/server/netty/BufferLeakDetectionExtension.java
+index a74c2b6bea..07e54170f9 100644
+--- a/http-server-netty/src/test/groovy/io/micronaut/http/server/netty/BufferLeakDetectionExtension.java
++++ b/http-server-netty/src/test/groovy/io/micronaut/http/server/netty/BufferLeakDetectionExtension.java
+@@ -1,23 +1,20 @@
+ package io.micronaut.http.server.netty;
+ 
+-import io.micronaut.http.tck.netty.TestLeakDetector;
++import io.micronaut.http.server.netty.fuzzing.BufferLeakDetection;
+ import org.spockframework.runtime.extension.IGlobalExtension;
+ import org.spockframework.runtime.model.SpecInfo;
+ 
+ public class BufferLeakDetectionExtension implements IGlobalExtension {
+-    static {
+-        TestLeakDetector.init();
+-    }
+ 
+     @Override
+     public void visitSpec(SpecInfo spec) {
+         spec.addSetupInterceptor(invocation -> {
+-            TestLeakDetector.startTracking(invocation.getFeature().getName());
++            BufferLeakDetection.startTracking(invocation.getFeature().getName());
+             invocation.proceed();
+         });
+         spec.addCleanupInterceptor(invocation -> {
+             invocation.proceed();
+-            TestLeakDetector.stopTrackingAndReportLeaks();
++            BufferLeakDetection.stopTrackingAndReportLeaks();
+         });
+     }
+ }
+diff --git a/http-server-netty/src/test/groovy/io/micronaut/http/server/netty/binding/FormDataDiskSpec.groovy b/http-server-netty/src/test/groovy/io/micronaut/http/server/netty/binding/FormDataDiskSpec.groovy
+index aa462e1145..c290026497 100644
+--- a/http-server-netty/src/test/groovy/io/micronaut/http/server/netty/binding/FormDataDiskSpec.groovy
++++ b/http-server-netty/src/test/groovy/io/micronaut/http/server/netty/binding/FormDataDiskSpec.groovy
+@@ -23,6 +23,7 @@ class FormDataDiskSpec extends Specification {
+                 'micronaut.server.multipart.disk': true,
+                 'micronaut.server.multipart.mixed': true,
+                 'micronaut.server.thread-selection': 'IO',
++                'netty.resource-leak-detector-level': 'paranoid',
+                 "spec.name": "FormDataDiskSpec"
+         ])
+         def client = server.applicationContext.createBean(HttpClient, server.URI)
+@@ -48,6 +49,7 @@ class FormDataDiskSpec extends Specification {
+         def server = (EmbeddedServer) ApplicationContext.run(EmbeddedServer, [
+                 'micronaut.server.multipart.mixed': true,
+                 'micronaut.server.thread-selection': 'IO',
++                'netty.resource-leak-detector-level': 'paranoid',
+                 "spec.name": "FormDataDiskSpec"
+         ])
+         def client = server.applicationContext.createBean(HttpClient, server.URI)
+diff --git a/http-server-netty/src/test/groovy/io/micronaut/http/server/netty/fuzzing/BufferLeakDetection.groovy b/http-server-netty/src/test/groovy/io/micronaut/http/server/netty/fuzzing/BufferLeakDetection.groovy
+new file mode 100644
+index 0000000000..6c42b1c648
+--- /dev/null
++++ b/http-server-netty/src/test/groovy/io/micronaut/http/server/netty/fuzzing/BufferLeakDetection.groovy
+@@ -0,0 +1,132 @@
++package io.micronaut.http.server.netty.fuzzing
++
++import io.netty.buffer.ByteBuf
++import io.netty.buffer.ByteBufAllocator
++import io.netty.util.ResourceLeakDetector
++import org.slf4j.Logger
++import org.slf4j.LoggerFactory
++
++import java.util.concurrent.CopyOnWriteArrayList
++
++/**
++ * Hook into netty resource leak detection that allows test cases to check for resource leaks.
++ */
++class BufferLeakDetection<T> extends ResourceLeakDetector<T> {
++    private static final Logger LOG = LoggerFactory.getLogger(BufferLeakDetection)
++
++    private static final List<ResourceLeakDetector<?>> allDetectors = new CopyOnWriteArrayList<>()
++
++    private static final String BASE_CANARY_STRING = "canary-" + UUID.randomUUID() + "-"
++    private static volatile String canaryString = null
++
++    private static volatile String currentTest = null
++    private static volatile boolean leakDetected = false
++    private static volatile boolean canaryDetected = false
++
++    @SuppressWarnings("unused")
++    private static volatile int sink
++
++    static void startTracking(String testName) {
++        triggerGc()
++
++        leakDetected = false
++        currentTest = testName
++
++        LOG.debug("Starting resource leak tracking")
++        if (level != Level.PARANOID) {
++            LOG.warn("Resource leaks can't be detected properly below leak detection level 'paranoid'")
++        }
++    }
++
++    static void stopTrackingAndReportLeaks() {
++        triggerGc()
++
++        if (leakDetected) {
++            throw new RuntimeException("Detected a resource leak. Please check logs")
++        } else {
++            LOG.debug("No resource leak detected")
++        }
++    }
++
++    private static void leakCanary() {
++        ByteBuf resource = ByteBufAllocator.DEFAULT.directBuffer()
++        resource.touch(canaryString)
++    }
++
++    // adapted from https://github.com/netty/netty/blob/86603872776e3ff5a60dea3c104358e486eed588/common/src/test/java/io/netty/util/ResourceLeakDetectorTest.java
++    private static synchronized void triggerGc() {
++        // timeout of last resort for the loop below. use nanoTime because it's monotonic
++        long startTime = System.nanoTime()
++
++        // need to randomize this every time, since ResourceLeakDetector will deduplicate leaks
++        canaryString = BASE_CANARY_STRING + UUID.randomUUID()
++        canaryDetected = false
++
++        leakCanary()
++
++        do {
++            if (System.nanoTime() - startTime > 30_000_000_000L) {
++                LOG.warn("Canary leak detection failed.")
++                break
++            }
++
++            // Trigger GC.
++            System.gc();
++
++            // trigger detectors – ref queue collection is only done on track()
++            for (ResourceLeakDetector<?> detector : allDetectors) {
++                def obj = new Object()
++                detector.track(obj).close(obj)
++            }
++
++            // Give the GC something to work on.
++            for (int i = 0; i < 1000; i++) {
++                sink = System.identityHashCode(new byte[10000]);
++            }
++        } while (!canaryDetected && !Thread.interrupted());
++    }
++
++    @SuppressWarnings('unused')
++    BufferLeakDetection(Class<?> resourceType, int samplingInterval) {
++        super(resourceType, samplingInterval)
++        allDetectors.add(this)
++    }
++
++    @SuppressWarnings('unused')
++    BufferLeakDetection(Class<?> resourceType, int samplingInterval, long maxActive) {
++        // maxActive ignored by superclass
++        this(resourceType, samplingInterval)
++    }
++
++    @Override
++    protected boolean needReport() {
++        return true
++    }
++
++    @Override
++    protected void reportTracedLeak(String resourceType, String records) {
++        def canary = canaryString
++        if (canary != null && records.contains(canary)) {
++            canaryDetected = true
++            return
++        }
++        if (records.contains(BASE_CANARY_STRING)) {
++            // probably a canary from another run that ran into a timeout, drop
++            return
++        }
++
++        leakDetected = true
++        super.reportTracedLeak(resourceType, records)
++    }
++
++    @Override
++    protected void reportUntracedLeak(String resourceType) {
++        leakDetected = true
++        super.reportUntracedLeak(resourceType)
++    }
++
++    //@Override only available for override in netty 4.1.75+
++    protected Object getInitialHint(String resourceType) {
++        return currentTest
++    }
++}
+diff --git a/http-server-netty/src/test/groovy/io/micronaut/http/server/netty/fuzzing/FlagAppender.java b/http-server-netty/src/test/groovy/io/micronaut/http/server/netty/fuzzing/FlagAppender.java
+index 533b6e6f0e..df26d656a7 100644
+--- a/http-server-netty/src/test/groovy/io/micronaut/http/server/netty/fuzzing/FlagAppender.java
++++ b/http-server-netty/src/test/groovy/io/micronaut/http/server/netty/fuzzing/FlagAppender.java
+@@ -2,7 +2,6 @@ package io.micronaut.http.server.netty.fuzzing;
+ 
+ import ch.qos.logback.classic.spi.ILoggingEvent;
+ import ch.qos.logback.core.AppenderBase;
+-import io.micronaut.http.tck.netty.TestLeakDetector;
+ 
+ public class FlagAppender extends AppenderBase<ILoggingEvent> {
+     private static volatile boolean triggered = false;
+@@ -20,7 +19,7 @@ public class FlagAppender extends AppenderBase<ILoggingEvent> {
+ 
+     @Override
+     protected void append(ILoggingEvent eventObject) {
+-        if (eventObject.getLoggerName().equals(TestLeakDetector.class.getName())) {
++        if (eventObject.getLoggerName().equals(BufferLeakDetection.class.getName())) {
+             // ignore 'Canary leak detection failed.' messages
+             return;
+         }
+diff --git a/http-server-netty/src/test/groovy/io/micronaut/http/server/netty/fuzzing/FuzzyInputSpec.groovy b/http-server-netty/src/test/groovy/io/micronaut/http/server/netty/fuzzing/FuzzyInputSpec.groovy
+index 0672080d47..21192720f6 100644
+--- a/http-server-netty/src/test/groovy/io/micronaut/http/server/netty/fuzzing/FuzzyInputSpec.groovy
++++ b/http-server-netty/src/test/groovy/io/micronaut/http/server/netty/fuzzing/FuzzyInputSpec.groovy
+@@ -9,7 +9,6 @@ import io.micronaut.http.annotation.Post
+ import io.micronaut.http.netty.channel.EventLoopGroupConfiguration
+ import io.micronaut.http.netty.channel.EventLoopGroupRegistry
+ import io.micronaut.http.server.netty.NettyHttpServer
+-import io.micronaut.http.tck.netty.TestLeakDetector
+ import io.micronaut.runtime.server.EmbeddedServer
+ import io.netty.bootstrap.Bootstrap
+ import io.netty.buffer.Unpooled
+@@ -30,7 +29,7 @@ class FuzzyInputSpec extends Specification {
+ 
+     def 'http1 cleartext buffer leaks'() {
+         given:
+-        TestLeakDetector.startTracking("")
++        BufferLeakDetection.startTracking()
+ 
+         ApplicationContext ctx = ApplicationContext.run([
+                 'spec.name': 'FuzzyInputSpec',
+@@ -61,7 +60,7 @@ class FuzzyInputSpec extends Specification {
+         channel.closeFuture().sync()
+ 
+         then:
+-        TestLeakDetector.stopTrackingAndReportLeaks()
++        BufferLeakDetection.stopTrackingAndReportLeaks()
+ 
+         cleanup:
+         embeddedServer.stop()
+@@ -76,7 +75,7 @@ class FuzzyInputSpec extends Specification {
+     def 'http1 cleartext embedded channel'() {
+         given:
+         FlagAppender.clear()
+-        TestLeakDetector.startTracking("")
++        BufferLeakDetection.startTracking()
+ 
+         ApplicationContext ctx = ApplicationContext.run([
+                 'spec.name': 'FuzzyInputSpec',
+@@ -101,7 +100,7 @@ class FuzzyInputSpec extends Specification {
+         then:
+         embeddedChannel.checkException()
+ 
+-        TestLeakDetector.stopTrackingAndReportLeaks()
++        BufferLeakDetection.stopTrackingAndReportLeaks()
+         FlagAppender.checkTriggered()
+ 
+         where:
+@@ -123,7 +122,7 @@ class FuzzyInputSpec extends Specification {
+     def 'http2 cleartext embedded channel'() {
+         given:
+         FlagAppender.clear()
+-        TestLeakDetector.startTracking("")
++        BufferLeakDetection.startTracking()
+ 
+         ApplicationContext ctx = ApplicationContext.run([
+                 'spec.name': 'FuzzyInputSpec',
+@@ -149,7 +148,7 @@ class FuzzyInputSpec extends Specification {
+         then:
+         embeddedChannel.checkException()
+ 
+-        TestLeakDetector.stopTrackingAndReportLeaks()
++        BufferLeakDetection.stopTrackingAndReportLeaks()
+         FlagAppender.checkTriggered()
+ 
+         where:
+diff --git a/http-server-netty/src/test/groovy/io/micronaut/http/server/netty/resources/StaticResourceResolutionSpec2.groovy b/http-server-netty/src/test/groovy/io/micronaut/http/server/netty/resources/StaticResourceResolutionSpec2.groovy
+index fd349ff162..116531eb02 100644
+--- a/http-server-netty/src/test/groovy/io/micronaut/http/server/netty/resources/StaticResourceResolutionSpec2.groovy
++++ b/http-server-netty/src/test/groovy/io/micronaut/http/server/netty/resources/StaticResourceResolutionSpec2.groovy
+@@ -9,6 +9,7 @@ import io.micronaut.http.annotation.Filter
+ import io.micronaut.http.client.HttpClient
+ import io.micronaut.http.filter.FilterChain
+ import io.micronaut.http.filter.HttpFilter
++import io.micronaut.http.server.netty.fuzzing.BufferLeakDetection
+ import io.micronaut.runtime.server.EmbeddedServer
+ import jakarta.inject.Singleton
+ import org.reactivestreams.Publisher
+@@ -21,6 +22,8 @@ class StaticResourceResolutionSpec2 extends Specification {
+ 
+     void 'filter does not cause resource leak when used for file system resource'() {
+         given:
++        BufferLeakDetection.startTracking()
++
+         def context = ApplicationContext.run(
+                 [
+                         'micronaut.router.static-resources.default.paths': [
+@@ -48,6 +51,9 @@ class StaticResourceResolutionSpec2 extends Specification {
+         cleanup:
+         client.close()
+         server.stop()
++
++        BufferLeakDetection.stopTrackingAndReportLeaks()
++
+     }
+ 
+     @Requires(property = 'spec.name', value = 'StaticResourceResolutionSpec2')
+diff --git a/http-server-tck/src/main/java/io/micronaut/http/server/tck/tests/forms/UploadTest.java b/http-server-tck/src/main/java/io/micronaut/http/server/tck/tests/forms/UploadTest.java
+deleted file mode 100644
+index 5f255e54a2..0000000000
+--- a/http-server-tck/src/main/java/io/micronaut/http/server/tck/tests/forms/UploadTest.java
++++ /dev/null
+@@ -1,85 +0,0 @@
+-/*
+- * Copyright 2017-2025 original authors
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- * https://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-package io.micronaut.http.server.tck.tests.forms;
+-
+-import io.micronaut.context.annotation.Requires;
+-import io.micronaut.http.HttpRequest;
+-import io.micronaut.http.HttpStatus;
+-import io.micronaut.http.MediaType;
+-import io.micronaut.http.annotation.Consumes;
+-import io.micronaut.http.annotation.Controller;
+-import io.micronaut.http.annotation.Post;
+-import io.micronaut.http.client.multipart.MultipartBody;
+-import io.micronaut.http.multipart.StreamingFileUpload;
+-import io.micronaut.http.tck.AssertionUtils;
+-import io.micronaut.http.tck.HttpResponseAssertion;
+-import io.micronaut.http.tck.TestScenario;
+-import io.micronaut.scheduling.TaskExecutors;
+-import io.micronaut.scheduling.annotation.ExecuteOn;
+-import org.junit.jupiter.api.Test;
+-
+-import java.io.InputStream;
+-import java.nio.file.Files;
+-import java.nio.file.Path;
+-import java.util.Optional;
+-
+-import static org.junit.jupiter.api.Assertions.assertEquals;
+-import static org.junit.jupiter.api.Assertions.assertTrue;
+-
+-@SuppressWarnings({
+-    "java:S5960", // We're allowed assertions, as these are used in tests only
+-    "checkstyle:MissingJavadocType",
+-    "checkstyle:DesignForExtension"
+-})
+-public class UploadTest {
+-    private static final String SPEC_NAME = "UploadTest";
+-
+-    @Test
+-    public void inputStream() throws Exception {
+-        Path tmp = Files.createTempFile("UploadTest", ".txt");
+-        try {
+-            Files.writeString(tmp, "foo");
+-            TestScenario.builder()
+-                .specName(SPEC_NAME)
+-                .request(HttpRequest.POST("/upload/input-stream", MultipartBody.builder().addPart("file", tmp.toFile()).build()).contentType(MediaType.MULTIPART_FORM_DATA))
+-                .assertion((server, request) ->
+-                    AssertionUtils.assertDoesNotThrow(server, request, HttpResponseAssertion.builder()
+-                        .status(HttpStatus.OK)
+-                        .assertResponse(httpResponse -> {
+-                            Optional<String> bodyOptional = httpResponse.getBody(String.class);
+-                            assertTrue(bodyOptional.isPresent());
+-                            assertEquals("foo", bodyOptional.get());
+-                        })
+-                        .build()))
+-                .run();
+-        } finally {
+-            Files.deleteIfExists(tmp);
+-        }
+-    }
+-
+-    @Controller("/upload")
+-    @Requires(property = "spec.name", value = SPEC_NAME)
+-    public static class UploadController {
+-        @Consumes(MediaType.MULTIPART_FORM_DATA)
+-        @Post("/input-stream")
+-        @ExecuteOn(TaskExecutors.BLOCKING)
+-        byte[] inputStream(StreamingFileUpload file) throws Exception {
+-            try (InputStream stream = file.asInputStream()) {
+-                return stream.readAllBytes();
+-            }
+-        }
+-    }
+-}
+diff --git a/http-tck/build.gradle.kts b/http-tck/build.gradle.kts
+index caf56fdfed..f7c99ae335 100644
+--- a/http-tck/build.gradle.kts
++++ b/http-tck/build.gradle.kts
+@@ -10,7 +10,6 @@ dependencies {
+     annotationProcessor(projects.micronautHttpValidation)
+ 
+     compileOnly(platform(libs.test.boms.micronaut.validation))
+-    compileOnly(projects.micronautHttpNetty)
+     compileOnly(libs.micronaut.validation) {
+         exclude(group = "io.micronaut")
+     }
+diff --git a/http-tck/src/main/java/io/micronaut/http/tck/netty/LeakDetectionExtension.java b/http-tck/src/main/java/io/micronaut/http/tck/netty/LeakDetectionExtension.java
+deleted file mode 100644
+index 18094504e3..0000000000
+--- a/http-tck/src/main/java/io/micronaut/http/tck/netty/LeakDetectionExtension.java
++++ /dev/null
+@@ -1,54 +0,0 @@
+-/*
+- * Copyright 2017-2025 original authors
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- * https://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-package io.micronaut.http.tck.netty;
+-
+-import io.netty.util.ResourceLeakDetector;
+-import org.junit.jupiter.api.extension.AfterEachCallback;
+-import org.junit.jupiter.api.extension.BeforeEachCallback;
+-import org.junit.jupiter.api.extension.ExtensionContext;
+-
+-public final class LeakDetectionExtension implements BeforeEachCallback, AfterEachCallback {
+-    private static final boolean NETTY_AVAILABLE;
+-
+-    static {
+-        boolean available;
+-        try {
+-            //noinspection ResultOfMethodCallIgnored
+-            ResourceLeakDetector.getLevel();
+-            available = true;
+-        } catch (NoClassDefFoundError e) {
+-            available = false;
+-        }
+-        NETTY_AVAILABLE = available;
+-        if (NETTY_AVAILABLE) {
+-            TestLeakDetector.init();
+-        }
+-    }
+-
+-    @Override
+-    public void beforeEach(ExtensionContext context) throws Exception {
+-        if (NETTY_AVAILABLE) {
+-            TestLeakDetector.startTracking(context.getDisplayName());
+-        }
+-    }
+-
+-    @Override
+-    public void afterEach(ExtensionContext context) throws Exception {
+-        if (NETTY_AVAILABLE) {
+-            TestLeakDetector.stopTrackingAndReportLeaks();
+-        }
+-    }
+-}
+diff --git a/http-tck/src/main/java/io/micronaut/http/tck/netty/TestLeakDetector.java b/http-tck/src/main/java/io/micronaut/http/tck/netty/TestLeakDetector.java
+deleted file mode 100644
+index 236ebccb6f..0000000000
+--- a/http-tck/src/main/java/io/micronaut/http/tck/netty/TestLeakDetector.java
++++ /dev/null
+@@ -1,180 +0,0 @@
+-/*
+- * Copyright 2017-2025 original authors
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- * https://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-package io.micronaut.http.tck.netty;
+-
+-import io.netty.buffer.ByteBuf;
+-import io.netty.buffer.ByteBufAllocator;
+-import io.netty.util.ResourceLeakDetector;
+-import io.netty.util.ResourceLeakDetectorFactory;
+-import io.netty.util.ResourceLeakTracker;
+-import org.slf4j.Logger;
+-import org.slf4j.LoggerFactory;
+-
+-import java.util.List;
+-import java.util.UUID;
+-import java.util.concurrent.CopyOnWriteArrayList;
+-
+-/**
+- * Utility for testing for netty buffer leaks.
+- *
+- * @since 4.8.19
+- * @author Jonas Konrad
+- */
+-public final class TestLeakDetector {
+-    private static final Logger LOG = LoggerFactory.getLogger(TestLeakDetector.class);
+-    private static final String BASE_CANARY_STRING = "canary-" + UUID.randomUUID() + "-";
+-
+-    private static final List<ResourceLeakDetector<?>> ALL_DETECTORS = new CopyOnWriteArrayList<>();
+-
+-    private static volatile boolean leakDetected;
+-    private static volatile boolean canaryDetected;
+-    private static volatile String canaryString;
+-
+-    private static volatile long sink;
+-
+-    static {
+-        System.setProperty("io.netty.leakDetection.level", "paranoid"); // this prevents vertx from resetting it
+-        ResourceLeakDetectorFactory.setResourceLeakDetectorFactory(new ResourceLeakDetectorFactory() {
+-            @Override
+-            public <T> ResourceLeakDetector<T> newResourceLeakDetector(Class<T> resource, int samplingInterval, long maxActive) {
+-                return new TestResourceLeakDetector<>(resource, samplingInterval);
+-            }
+-
+-            @Override
+-            public <T> ResourceLeakDetector<T> newResourceLeakDetector(Class<T> resource, int samplingInterval) {
+-                return new TestResourceLeakDetector<>(resource, samplingInterval);
+-            }
+-        });
+-        ResourceLeakDetector.setLevel(ResourceLeakDetector.Level.PARANOID);
+-    }
+-
+-    private TestLeakDetector() {
+-    }
+-
+-    /**
+-     * Initialize the leak detector.
+-     */
+-    public static void init() {
+-        // run static initializer
+-    }
+-
+-    /**
+-     * Start tracking leaks.
+-     *
+-     * @param testName The current test name
+-     */
+-    public static void startTracking(String testName) {
+-        ResourceLeakDetector.setLevel(ResourceLeakDetector.Level.PARANOID);
+-
+-        triggerGc();
+-
+-        leakDetected = false;
+-
+-        LOG.debug("Starting resource leak tracking");
+-    }
+-
+-    /**
+-     * Stop tracking leaks.
+-     *
+-     * @throws RuntimeException If there was a leak since the last {@link #startTracking(String)}
+-     */
+-    public static void stopTrackingAndReportLeaks() {
+-        triggerGc();
+-
+-        if (leakDetected) {
+-            throw new RuntimeException("Detected a resource leak. Please check logs");
+-        } else {
+-            LOG.debug("No resource leak detected");
+-        }
+-    }
+-
+-    private static void leakCanary() {
+-        ByteBuf resource = ByteBufAllocator.DEFAULT.directBuffer();
+-        resource.touch(canaryString);
+-    }
+-
+-    private static void triggerGc() {
+-        // timeout of last resort for the loop below. use nanoTime because it's monotonic
+-        long startTime = System.nanoTime();
+-
+-        // need to randomize this every time, since ResourceLeakDetector will deduplicate leaks
+-        canaryString = BASE_CANARY_STRING + UUID.randomUUID();
+-        canaryDetected = false;
+-
+-        leakCanary();
+-
+-        do {
+-            if (System.nanoTime() - startTime > 30_000_000_000L) {
+-                LOG.warn("Canary leak detection failed.");
+-                break;
+-            }
+-
+-            // Trigger GC.
+-            System.gc();
+-
+-            // trigger detectors – ref queue collection is only done on track()
+-            //noinspection rawtypes
+-            for (ResourceLeakDetector detector : ALL_DETECTORS) {
+-                Object obj = new Object();
+-                //noinspection unchecked
+-                ResourceLeakTracker track = detector.track(obj);
+-                if (track == null) {
+-                    throw new RuntimeException("getLevel: " + ResourceLeakDetector.getLevel() + " detector: " + detector);
+-                }
+-                track.close(obj);
+-            }
+-
+-            // Give the GC something to work on.
+-            for (int i = 0; i < 1000; i++) {
+-                sink = System.identityHashCode(new byte[10000]);
+-            }
+-        } while (!canaryDetected && !Thread.interrupted());
+-    }
+-
+-    private static final class TestResourceLeakDetector<T> extends ResourceLeakDetector<T> {
+-        public TestResourceLeakDetector(Class<?> resourceType, int samplingInterval) {
+-            super(resourceType, samplingInterval);
+-            ALL_DETECTORS.add(this);
+-        }
+-
+-        @Override
+-        protected boolean needReport() {
+-            return true;
+-        }
+-
+-        @Override
+-        protected void reportTracedLeak(String resourceType, String records) {
+-            String canary = canaryString;
+-            if (canary != null && records.contains(canary)) {
+-                canaryDetected = true;
+-                return;
+-            }
+-            if (records.contains(BASE_CANARY_STRING)) {
+-                // probably a canary from another run that ran into a timeout, drop
+-                return;
+-            }
+-
+-            leakDetected = true;
+-            super.reportTracedLeak(resourceType, records);
+-        }
+-
+-        @Override
+-        protected void reportUntracedLeak(String resourceType) {
+-            leakDetected = true;
+-            super.reportUntracedLeak(resourceType);
+-        }
+-    }
+-}
+diff --git a/http-tck/src/main/resources/META-INF/services/org.junit.jupiter.api.extension.Extension b/http-tck/src/main/resources/META-INF/services/org.junit.jupiter.api.extension.Extension
+deleted file mode 100644
+index b2b16910a7..0000000000
+--- a/http-tck/src/main/resources/META-INF/services/org.junit.jupiter.api.extension.Extension
++++ /dev/null
+@@ -1 +0,0 @@
+-io.micronaut.http.tck.netty.LeakDetectionExtension
+diff --git a/http/src/main/java/io/micronaut/http/body/stream/PublisherAsBlocking.java b/http/src/main/java/io/micronaut/http/body/stream/PublisherAsBlocking.java
+index 5e62d4b57c..18139f81ea 100644
+--- a/http/src/main/java/io/micronaut/http/body/stream/PublisherAsBlocking.java
++++ b/http/src/main/java/io/micronaut/http/body/stream/PublisherAsBlocking.java
+@@ -82,18 +82,14 @@ public class PublisherAsBlocking<T> implements Subscriber<T>, Closeable {
+     @Override
+     public void onSubscribe(Subscription s) {
+         boolean pendingDemand;
+-        boolean closed;
+         lock.lock();
+         try {
+             this.subscription = s;
+             pendingDemand = this.pendingDemand;
+-            closed = this.closed;
+         } finally {
+             lock.unlock();
+         }
+-        if (closed) {
+-            s.cancel();
+-        } else if (pendingDemand) {
++        if (pendingDemand) {
+             s.request(1);
+         }
+     }
+@@ -184,11 +180,9 @@ public class PublisherAsBlocking<T> implements Subscriber<T>, Closeable {
+ 
+     @Override
+     public void close() {
+-        Subscription subscription;
+         lock.lock();
+         try {
+             closed = true;
+-            subscription = this.subscription;
+             if (swap != null) {
+                 release(swap);
+                 swap = null;
+@@ -196,8 +190,5 @@ public class PublisherAsBlocking<T> implements Subscriber<T>, Closeable {
+         } finally {
+             lock.unlock();
+         }
+-        if (subscription != null) {
+-            subscription.cancel();
+-        }
+     }
+ }
+diff --git a/test-suite-http-server-tck-jdk/src/test/java/io/micronaut/http/server/tck/netty/tests/JdkHttpServerTestSuite.java b/test-suite-http-server-tck-jdk/src/test/java/io/micronaut/http/server/tck/netty/tests/JdkHttpServerTestSuite.java
+index d41ee9a30f..f94e1a8b0a 100644
+--- a/test-suite-http-server-tck-jdk/src/test/java/io/micronaut/http/server/tck/netty/tests/JdkHttpServerTestSuite.java
++++ b/test-suite-http-server-tck-jdk/src/test/java/io/micronaut/http/server/tck/netty/tests/JdkHttpServerTestSuite.java
+@@ -11,8 +11,7 @@ import org.junit.platform.suite.api.SuiteDisplayName;
+ @SuiteDisplayName("HTTP Server TCK for Javanet client")
+ @ExcludeClassNamePatterns({
+     "io.micronaut.http.server.tck.tests.FilterProxyTest", // There's no proxy client for the JDK client
+-    "io.micronaut.http.server.tck.tests.forms.FormsJacksonAnnotationsTest", // it seems application/x-www-form-urlencoded is not yet supported by the JDK client
+-    "io.micronaut.http.server.tck.tests.forms.UploadTest" // multipart
++    "io.micronaut.http.server.tck.tests.forms.FormsJacksonAnnotationsTest" // it seems application/x-www-form-urlencoded is not yet supported by the JDK client
+ })
+ @ExcludeTags("multipart") // Multipart not supported by HttpClient
+ public class JdkHttpServerTestSuite {
+diff --git a/test-suite-http-server-tck-netty/build.gradle.kts b/test-suite-http-server-tck-netty/build.gradle.kts
+index 66c8872b6e..fb587b02e1 100644
+--- a/test-suite-http-server-tck-netty/build.gradle.kts
++++ b/test-suite-http-server-tck-netty/build.gradle.kts
+@@ -25,7 +25,6 @@ configurations {
+ tasks {
+     test {
+         useJUnitPlatform()
+-        systemProperty("junit.jupiter.extensions.autodetection.enabled", "true")
+     }
+ }
+ 
+diff --git a/test-suite-http2-server-tck-netty/build.gradle.kts b/test-suite-http2-server-tck-netty/build.gradle.kts
+index e8e7ad09c3..26d867cbf7 100644
+--- a/test-suite-http2-server-tck-netty/build.gradle.kts
++++ b/test-suite-http2-server-tck-netty/build.gradle.kts
+@@ -26,7 +26,6 @@ configurations {
+ tasks {
+     test {
+         useJUnitPlatform()
+-        systemProperty("junit.jupiter.extensions.autodetection.enabled", "true")
+     }
+ }
+ 

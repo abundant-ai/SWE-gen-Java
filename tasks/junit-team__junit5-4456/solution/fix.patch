@@ -1,0 +1,336 @@
+diff --git a/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/descriptor/ClassBasedTestDescriptor.java b/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/descriptor/ClassBasedTestDescriptor.java
+index bad5573bf..89fee9e51 100644
+--- a/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/descriptor/ClassBasedTestDescriptor.java
++++ b/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/descriptor/ClassBasedTestDescriptor.java
+@@ -136,18 +136,21 @@ public abstract class ClassBasedTestDescriptor extends JupiterTestDescriptor
+ 	public final void validate(DiscoveryIssueReporter reporter) {
+ 		validateCoreLifecycleMethods(reporter);
+ 		validateClassTemplateInvocationLifecycleMethods(reporter);
++		validateTags(reporter);
+ 	}
+ 
+ 	protected void validateCoreLifecycleMethods(DiscoveryIssueReporter reporter) {
+-		List<DiscoveryIssue> discoveryIssues = this.lifecycleMethods.discoveryIssues;
+-		discoveryIssues.forEach(reporter::reportIssue);
+-		discoveryIssues.clear();
++		Validatable.reportAndClear(this.lifecycleMethods.discoveryIssues, reporter);
+ 	}
+ 
+ 	protected void validateClassTemplateInvocationLifecycleMethods(DiscoveryIssueReporter reporter) {
+ 		LifecycleMethodUtils.validateNoClassTemplateInvocationLifecycleMethodsAreDeclared(getTestClass(), reporter);
+ 	}
+ 
++	private void validateTags(DiscoveryIssueReporter reporter) {
++		Validatable.reportAndClear(this.classInfo.discoveryIssues, reporter);
++	}
++
+ 	// --- Node ----------------------------------------------------------------
+ 
+ 	@Override
+@@ -539,6 +542,8 @@ public abstract class ClassBasedTestDescriptor extends JupiterTestDescriptor
+ 
+ 	protected static class ClassInfo {
+ 
++		private final List<DiscoveryIssue> discoveryIssues = new ArrayList<>();
++
+ 		final Class<?> testClass;
+ 		final Set<TestTag> tags;
+ 		final Lifecycle lifecycle;
+@@ -547,7 +552,10 @@ public abstract class ClassBasedTestDescriptor extends JupiterTestDescriptor
+ 
+ 		ClassInfo(Class<?> testClass, JupiterConfiguration configuration) {
+ 			this.testClass = testClass;
+-			this.tags = getTags(testClass);
++			this.tags = getTags(testClass, //
++				() -> String.format("class '%s'", testClass.getName()), //
++				() -> ClassSource.from(testClass), //
++				discoveryIssues::add);
+ 			this.lifecycle = getTestInstanceLifecycle(testClass, configuration);
+ 			this.defaultChildExecutionMode = (this.lifecycle == Lifecycle.PER_CLASS ? ExecutionMode.SAME_THREAD : null);
+ 			this.exclusiveResourceCollector = ExclusiveResourceCollector.from(testClass);
+diff --git a/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/descriptor/JupiterTestDescriptor.java b/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/descriptor/JupiterTestDescriptor.java
+index 914971a37..b9e737463 100644
+--- a/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/descriptor/JupiterTestDescriptor.java
++++ b/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/descriptor/JupiterTestDescriptor.java
+@@ -25,6 +25,8 @@ import java.util.LinkedHashSet;
+ import java.util.List;
+ import java.util.Optional;
+ import java.util.Set;
++import java.util.concurrent.atomic.AtomicReference;
++import java.util.function.Consumer;
+ import java.util.function.Supplier;
+ import java.util.function.UnaryOperator;
+ 
+@@ -39,10 +41,10 @@ import org.junit.jupiter.engine.execution.ConditionEvaluator;
+ import org.junit.jupiter.engine.execution.JupiterEngineExecutionContext;
+ import org.junit.jupiter.engine.extension.ExtensionRegistry;
+ import org.junit.platform.commons.JUnitException;
+-import org.junit.platform.commons.logging.Logger;
+-import org.junit.platform.commons.logging.LoggerFactory;
+ import org.junit.platform.commons.util.ExceptionUtils;
+ import org.junit.platform.commons.util.UnrecoverableExceptions;
++import org.junit.platform.engine.DiscoveryIssue;
++import org.junit.platform.engine.DiscoveryIssue.Severity;
+ import org.junit.platform.engine.TestDescriptor;
+ import org.junit.platform.engine.TestSource;
+ import org.junit.platform.engine.TestTag;
+@@ -58,8 +60,6 @@ import org.junit.platform.engine.support.hierarchical.Node;
+ public abstract class JupiterTestDescriptor extends AbstractTestDescriptor
+ 		implements Node<JupiterEngineExecutionContext> {
+ 
+-	private static final Logger logger = LoggerFactory.getLogger(JupiterTestDescriptor.class);
+-
+ 	private static final ConditionEvaluator conditionEvaluator = new ConditionEvaluator();
+ 
+ 	final JupiterConfiguration configuration;
+@@ -77,27 +77,27 @@ public abstract class JupiterTestDescriptor extends AbstractTestDescriptor
+ 
+ 	// --- TestDescriptor ------------------------------------------------------
+ 
+-	static Set<TestTag> getTags(AnnotatedElement element) {
+-		// @formatter:off
+-		return findRepeatableAnnotations(element, Tag.class).stream()
+-				.map(Tag::value)
++	static Set<TestTag> getTags(AnnotatedElement element, Supplier<String> elementDescription,
++			Supplier<TestSource> sourceProvider, Consumer<DiscoveryIssue> issueCollector) {
++		AtomicReference<TestSource> source = new AtomicReference<>();
++		return findRepeatableAnnotations(element, Tag.class).stream() //
++				.map(Tag::value) //
+ 				.filter(tag -> {
+ 					boolean isValid = TestTag.isValid(tag);
+ 					if (!isValid) {
+-						// TODO [#242] Replace logging with precondition check once we have a proper mechanism for
+-						// handling validation exceptions during the TestEngine discovery phase.
+-						//
+-						// As an alternative to a precondition check here, we could catch any
+-						// PreconditionViolationException thrown by TestTag::create.
+-						logger.warn(() -> String.format(
+-							"Configuration error: invalid tag syntax in @Tag(\"%s\") declaration on [%s]. Tag will be ignored.",
+-							tag, element));
++						String message = String.format(
++							"Invalid tag syntax in @Tag(\"%s\") declaration on %s. Tag will be ignored.", tag,
++							elementDescription.get());
++						if (source.get() == null) {
++							source.set(sourceProvider.get());
++						}
++						issueCollector.accept(
++							DiscoveryIssue.builder(Severity.WARNING, message).source(source.get()).build());
+ 					}
+ 					return isValid;
+-				})
+-				.map(TestTag::create)
++				}) //
++				.map(TestTag::create) //
+ 				.collect(collectingAndThen(toCollection(LinkedHashSet::new), Collections::unmodifiableSet));
+-		// @formatter:on
+ 	}
+ 
+ 	/**
+diff --git a/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/descriptor/MethodBasedTestDescriptor.java b/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/descriptor/MethodBasedTestDescriptor.java
+index 7fc96c4cf..0b1042923 100644
+--- a/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/descriptor/MethodBasedTestDescriptor.java
++++ b/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/descriptor/MethodBasedTestDescriptor.java
+@@ -17,6 +17,7 @@ import static org.junit.jupiter.engine.descriptor.ResourceLockAware.enclosingIns
+ import static org.junit.platform.commons.util.CollectionUtils.forEachInReverseOrder;
+ 
+ import java.lang.reflect.Method;
++import java.util.ArrayList;
+ import java.util.Collections;
+ import java.util.LinkedHashSet;
+ import java.util.List;
+@@ -39,10 +40,12 @@ import org.junit.platform.commons.util.ClassUtils;
+ import org.junit.platform.commons.util.Preconditions;
+ import org.junit.platform.commons.util.ReflectionUtils;
+ import org.junit.platform.commons.util.UnrecoverableExceptions;
++import org.junit.platform.engine.DiscoveryIssue;
+ import org.junit.platform.engine.TestDescriptor;
+ import org.junit.platform.engine.TestTag;
+ import org.junit.platform.engine.UniqueId;
+ import org.junit.platform.engine.support.descriptor.MethodSource;
++import org.junit.platform.engine.support.discovery.DiscoveryIssueReporter;
+ 
+ /**
+  * Base class for {@link TestDescriptor TestDescriptors} based on Java methods.
+@@ -51,17 +54,11 @@ import org.junit.platform.engine.support.descriptor.MethodSource;
+  */
+ @API(status = INTERNAL, since = "5.0")
+ public abstract class MethodBasedTestDescriptor extends JupiterTestDescriptor
+-		implements ResourceLockAware, TestClassAware {
++		implements ResourceLockAware, TestClassAware, Validatable {
+ 
+ 	private static final Logger logger = LoggerFactory.getLogger(MethodBasedTestDescriptor.class);
+ 
+-	private final Class<?> testClass;
+-	private final Method testMethod;
+-
+-	/**
+-	 * Set of method-level tags; does not contain tags from parent.
+-	 */
+-	private final Set<TestTag> tags;
++	private final MethodInfo methodInfo;
+ 
+ 	MethodBasedTestDescriptor(UniqueId uniqueId, Class<?> testClass, Method testMethod,
+ 			Supplier<List<Class<?>>> enclosingInstanceTypes, JupiterConfiguration configuration) {
+@@ -72,20 +69,54 @@ public abstract class MethodBasedTestDescriptor extends JupiterTestDescriptor
+ 	MethodBasedTestDescriptor(UniqueId uniqueId, String displayName, Class<?> testClass, Method testMethod,
+ 			JupiterConfiguration configuration) {
+ 		super(uniqueId, displayName, MethodSource.from(testClass, testMethod), configuration);
++		this.methodInfo = new MethodInfo(testClass, testMethod);
++	}
+ 
+-		this.testClass = Preconditions.notNull(testClass, "Class must not be null");
+-		this.testMethod = testMethod;
+-		this.tags = getTags(testMethod);
++	public final Method getTestMethod() {
++		return this.methodInfo.testMethod;
+ 	}
+ 
++	// --- TestDescriptor ------------------------------------------------------
++
+ 	@Override
+ 	public final Set<TestTag> getTags() {
+ 		// return modifiable copy
+-		Set<TestTag> allTags = new LinkedHashSet<>(this.tags);
++		Set<TestTag> allTags = new LinkedHashSet<>(this.methodInfo.tags);
+ 		getParent().ifPresent(parentDescriptor -> allTags.addAll(parentDescriptor.getTags()));
+ 		return allTags;
+ 	}
+ 
++	@Override
++	public String getLegacyReportingName() {
++		return String.format("%s(%s)", getTestMethod().getName(),
++			ClassUtils.nullSafeToString(Class::getSimpleName, getTestMethod().getParameterTypes()));
++	}
++
++	// --- TestClassAware ------------------------------------------------------
++
++	@Override
++	public final Class<?> getTestClass() {
++		return this.methodInfo.testClass;
++	}
++
++	@Override
++	public List<Class<?>> getEnclosingTestClasses() {
++		return getParent() //
++				.filter(TestClassAware.class::isInstance) //
++				.map(TestClassAware.class::cast) //
++				.map(TestClassAware::getEnclosingTestClasses) //
++				.orElseGet(Collections::emptyList);
++	}
++
++	// --- Validatable ---------------------------------------------------------
++
++	@Override
++	public void validate(DiscoveryIssueReporter reporter) {
++		Validatable.reportAndClear(this.methodInfo.discoveryIssues, reporter);
++	}
++
++	// --- Node ----------------------------------------------------------------
++
+ 	@Override
+ 	public ExclusiveResourceCollector getExclusiveResourceCollector() {
+ 		// There's no need to cache this as this method should only be called once
+@@ -107,34 +138,11 @@ public abstract class MethodBasedTestDescriptor extends JupiterTestDescriptor
+ 				getTestMethod()));
+ 	}
+ 
+-	@Override
+-	public List<Class<?>> getEnclosingTestClasses() {
+-		return getParent() //
+-				.filter(TestClassAware.class::isInstance) //
+-				.map(TestClassAware.class::cast) //
+-				.map(TestClassAware::getEnclosingTestClasses) //
+-				.orElseGet(Collections::emptyList);
+-	}
+-
+ 	@Override
+ 	protected Optional<ExecutionMode> getExplicitExecutionMode() {
+ 		return getExecutionModeFromAnnotation(getTestMethod());
+ 	}
+ 
+-	public final Class<?> getTestClass() {
+-		return this.testClass;
+-	}
+-
+-	public final Method getTestMethod() {
+-		return this.testMethod;
+-	}
+-
+-	@Override
+-	public String getLegacyReportingName() {
+-		return String.format("%s(%s)", testMethod.getName(),
+-			ClassUtils.nullSafeToString(Class::getSimpleName, testMethod.getParameterTypes()));
+-	}
+-
+ 	/**
+ 	 * Invoke {@link TestWatcher#testDisabled(ExtensionContext, Optional)} on each
+ 	 * registered {@link TestWatcher}, in registration order.
+@@ -180,4 +188,27 @@ public abstract class MethodBasedTestDescriptor extends JupiterTestDescriptor
+ 		}
+ 	}
+ 
++	private static class MethodInfo {
++
++		private final List<DiscoveryIssue> discoveryIssues = new ArrayList<>();
++
++		private final Class<?> testClass;
++		private final Method testMethod;
++
++		/**
++		 * Set of method-level tags; does not contain tags from parent.
++		 */
++		private final Set<TestTag> tags;
++
++		MethodInfo(Class<?> testClass, Method testMethod) {
++			this.testClass = Preconditions.notNull(testClass, "Class must not be null");
++			this.testMethod = testMethod;
++			this.tags = getTags(testMethod, //
++				() -> String.format("method '%s'", testMethod.toGenericString()), //
++				// Use _declaring_ class here because that's where the `@Tag` annotation is declared
++				() -> MethodSource.from(testMethod.getDeclaringClass(), testMethod), //
++				discoveryIssues::add);
++		}
++	}
++
+ }
+diff --git a/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/descriptor/Validatable.java b/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/descriptor/Validatable.java
+index b4c83e194..85a0aaa5d 100644
+--- a/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/descriptor/Validatable.java
++++ b/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/descriptor/Validatable.java
+@@ -12,7 +12,10 @@ package org.junit.jupiter.engine.descriptor;
+ 
+ import static org.apiguardian.api.API.Status.INTERNAL;
+ 
++import java.util.List;
++
+ import org.apiguardian.api.API;
++import org.junit.platform.engine.DiscoveryIssue;
+ import org.junit.platform.engine.support.discovery.DiscoveryIssueReporter;
+ 
+ /**
+@@ -29,4 +32,13 @@ public interface Validatable {
+ 	 */
+ 	void validate(DiscoveryIssueReporter reporter);
+ 
++	/**
++	 * Report and clear the given list of {@link DiscoveryIssue}s using the
++	 * supplied {@link DiscoveryIssueReporter}.
++	 */
++	static void reportAndClear(List<DiscoveryIssue> issues, DiscoveryIssueReporter reporter) {
++		issues.forEach(reporter::reportIssue);
++		issues.clear();
++	}
++
+ }
+diff --git a/junit-jupiter-engine/src/nativeImage/initialize-at-build-time b/junit-jupiter-engine/src/nativeImage/initialize-at-build-time
+index 56822333e..c62bba6bc 100644
+--- a/junit-jupiter-engine/src/nativeImage/initialize-at-build-time
++++ b/junit-jupiter-engine/src/nativeImage/initialize-at-build-time
+@@ -16,6 +16,7 @@ org.junit.jupiter.engine.descriptor.JupiterEngineDescriptor
+ org.junit.jupiter.engine.descriptor.JupiterTestDescriptor
+ org.junit.jupiter.engine.descriptor.JupiterTestDescriptor$1
+ org.junit.jupiter.engine.descriptor.MethodBasedTestDescriptor
++org.junit.jupiter.engine.descriptor.MethodBasedTestDescriptor$MethodInfo
+ org.junit.jupiter.engine.descriptor.NestedClassTestDescriptor
+ org.junit.jupiter.engine.descriptor.TestFactoryTestDescriptor
+ org.junit.jupiter.engine.descriptor.TestMethodTestDescriptor

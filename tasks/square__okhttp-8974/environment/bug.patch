@@ -1,0 +1,744 @@
+diff --git a/mockwebserver/src/main/kotlin/mockwebserver3/MockWebServer.kt b/mockwebserver/src/main/kotlin/mockwebserver3/MockWebServer.kt
+index 0a7a27920..fcd3d4fc8 100644
+--- a/mockwebserver/src/main/kotlin/mockwebserver3/MockWebServer.kt
++++ b/mockwebserver/src/main/kotlin/mockwebserver3/MockWebServer.kt
+@@ -819,6 +819,17 @@ public class MockWebServer : Closeable {
+         .protocol(Protocol.HTTP_1_1)
+         .build()
+ 
++    val streams =
++      object : RealWebSocket.Streams(false, socket.source, socket.sink) {
++        override fun close() {
++          socket.source.closeQuietly()
++          socket.sink.closeQuietly()
++        }
++
++        override fun cancel() {
++          socket.cancel()
++        }
++      }
+     val webSocket =
+       RealWebSocket(
+         taskRunner = taskRunner,
+@@ -832,19 +843,15 @@ public class MockWebServer : Closeable {
+         webSocketCloseTimeout = RealWebSocket.CANCEL_AFTER_CLOSE_MILLIS,
+       )
+     val name = "MockWebServer WebSocket ${request.url.encodedPath}"
++    webSocket.initReaderAndWriter(name, streams)
++    try {
++      webSocket.loopReader(fancyResponse)
+ 
+-    webSocket.initReaderAndWriter(
+-      name = name,
+-      socket = socket,
+-      socketSource = socket.source,
+-      socketSink = socket.sink,
+-      client = false,
+-    )
+-
+-    webSocket.loopReader(fancyResponse)
+-
+-    // Even if messages are no longer being read we need to wait for the connection close signal.
+-    socket.awaitClosed()
++      // Even if messages are no longer being read we need to wait for the connection close signal.
++      socket.awaitClosed()
++    } finally {
++      socket.source.closeQuietly()
++    }
+   }
+ 
+   @Throws(IOException::class)
+diff --git a/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/connection/Exchange.kt b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/connection/Exchange.kt
+index 39ee4a629..68a644767 100644
+--- a/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/connection/Exchange.kt
++++ b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/connection/Exchange.kt
+@@ -17,6 +17,7 @@ package okhttp3.internal.connection
+ 
+ import java.io.IOException
+ import java.net.ProtocolException
++import java.net.SocketException
+ import okhttp3.EventListener
+ import okhttp3.Headers
+ import okhttp3.Request
+@@ -24,6 +25,7 @@ import okhttp3.Response
+ import okhttp3.ResponseBody
+ import okhttp3.internal.http.ExchangeCodec
+ import okhttp3.internal.http.RealResponseBody
++import okhttp3.internal.ws.RealWebSocket
+ import okio.Buffer
+ import okio.ForwardingSink
+ import okio.ForwardingSource
+@@ -142,6 +144,20 @@ class Exchange(
+   @Throws(IOException::class)
+   fun peekTrailers(): Headers? = codec.peekTrailers()
+ 
++  @Throws(SocketException::class)
++  fun newWebSocketStreams(): RealWebSocket.Streams {
++    call.timeoutEarlyExit()
++    return (codec.carrier as RealConnection).newWebSocketStreams(this)
++  }
++
++  fun webSocketUpgradeFailed() {
++    bodyComplete(
++      responseDone = true,
++      requestDone = true,
++      e = null,
++    )
++  }
++
+   fun upgradeToSocket(): Socket {
+     call.timeoutEarlyExit()
+     (codec.carrier as RealConnection).useAsSocket()
+diff --git a/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/connection/RealCall.kt b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/connection/RealCall.kt
+index c2dcc523c..9156c6452 100644
+--- a/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/connection/RealCall.kt
++++ b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/connection/RealCall.kt
+@@ -189,7 +189,7 @@ class RealCall(
+     if (!forWebSocket) {
+       interceptors += client.networkInterceptors
+     }
+-    interceptors += CallServerInterceptor
++    interceptors += CallServerInterceptor(forWebSocket)
+ 
+     val chain =
+       RealInterceptorChain(
+diff --git a/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/connection/RealConnection.kt b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/connection/RealConnection.kt
+index 520a617f0..83a50683f 100644
+--- a/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/connection/RealConnection.kt
++++ b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/connection/RealConnection.kt
+@@ -51,6 +51,7 @@ import okhttp3.internal.http2.Settings
+ import okhttp3.internal.http2.StreamResetException
+ import okhttp3.internal.isHealthy
+ import okhttp3.internal.tls.OkHostnameVerifier
++import okhttp3.internal.ws.RealWebSocket
+ import okio.Buffer
+ import okio.BufferedSink
+ import okio.BufferedSource
+@@ -292,6 +293,25 @@ class RealConnection internal constructor(
+     }
+   }
+ 
++  @Throws(SocketException::class)
++  internal fun newWebSocketStreams(exchange: Exchange): RealWebSocket.Streams {
++    useAsSocket()
++    return object : RealWebSocket.Streams(true, source, sink) {
++      override fun close() {
++        exchange.bodyComplete(
++          bytesRead = -1L,
++          responseDone = true,
++          requestDone = true,
++          e = null,
++        )
++      }
++
++      override fun cancel() {
++        exchange.cancel()
++      }
++    }
++  }
++
+   internal fun useAsSocket() {
+     socket.soTimeout = 0
+     noNewExchanges()
+diff --git a/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/http/CallServerInterceptor.kt b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/http/CallServerInterceptor.kt
+index da5a00adc..4822d77d4 100644
+--- a/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/http/CallServerInterceptor.kt
++++ b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/http/CallServerInterceptor.kt
+@@ -22,12 +22,15 @@ import okhttp3.Interceptor
+ import okhttp3.Response
+ import okhttp3.TrailersSource
+ import okhttp3.internal.UnreadableResponseBody
++import okhttp3.internal.connection.Exchange
+ import okhttp3.internal.http2.ConnectionShutdownException
+ import okhttp3.internal.skipAll
+ import okio.buffer
+ 
+ /** This is the last interceptor in the chain. It makes a network call to the server. */
+-object CallServerInterceptor : Interceptor {
++class CallServerInterceptor(
++  private val forWebSocket: Boolean,
++) : Interceptor {
+   @Throws(IOException::class)
+   override fun intercept(chain: Interceptor.Chain): Response {
+     val realChain = chain as RealInterceptorChain
+@@ -111,7 +114,7 @@ object CallServerInterceptor : Interceptor {
+           .build()
+       var code = response.code
+ 
+-      while (shouldIgnoreAndWaitForRealResponse(code)) {
++      while (shouldIgnoreAndWaitForRealResponse(code, exchange)) {
+         responseBuilder = exchange.readResponseHeaders(expectContinue = false)!!
+         if (invokeStartEvent) {
+           exchange.responseHeadersStart()
+@@ -148,8 +151,11 @@ object CallServerInterceptor : Interceptor {
+                   response.body.contentType(),
+                   response.body.contentLength(),
+                 ),
+-              ).socket(exchange.upgradeToSocket())
+-              .build()
++              ).apply {
++                if (!forWebSocket) {
++                  socket(exchange.upgradeToSocket())
++                }
++              }.build()
+           }
+ 
+           // This is not an upgrade response.
+@@ -196,7 +202,10 @@ object CallServerInterceptor : Interceptor {
+     }
+   }
+ 
+-  private fun shouldIgnoreAndWaitForRealResponse(code: Int): Boolean =
++  private fun shouldIgnoreAndWaitForRealResponse(
++    code: Int,
++    exchange: Exchange,
++  ): Boolean =
+     when {
+       // Server sent a 100-continue even though we did not request one. Try again to read the
+       // actual response status.
+diff --git a/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/ws/RealWebSocket.kt b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/ws/RealWebSocket.kt
+index 1674f8b85..4d5cccdff 100644
+--- a/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/ws/RealWebSocket.kt
++++ b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/ws/RealWebSocket.kt
+@@ -15,6 +15,7 @@
+  */
+ package okhttp3.internal.ws
+ 
++import java.io.Closeable
+ import java.io.IOException
+ import java.net.ProtocolException
+ import java.net.SocketTimeoutException
+@@ -36,6 +37,7 @@ import okhttp3.internal.concurrent.Lockable
+ import okhttp3.internal.concurrent.Task
+ import okhttp3.internal.concurrent.TaskRunner
+ import okhttp3.internal.concurrent.assertLockHeld
++import okhttp3.internal.connection.Exchange
+ import okhttp3.internal.connection.RealCall
+ import okhttp3.internal.okHttpName
+ import okhttp3.internal.ws.WebSocketProtocol.CLOSE_CLIENT_GOING_AWAY
+@@ -48,8 +50,6 @@ import okio.BufferedSource
+ import okio.ByteString
+ import okio.ByteString.Companion.encodeUtf8
+ import okio.ByteString.Companion.toByteString
+-import okio.Socket
+-import okio.buffer
+ 
+ class RealWebSocket(
+   taskRunner: TaskRunner,
+@@ -60,7 +60,7 @@ class RealWebSocket(
+   private val pingIntervalMillis: Long,
+   /**
+    * For clients this is initially null, and will be assigned to the agreed-upon extensions. For
+-   * servers, it should be the agreed-upon extensions immediately.
++   * servers it should be the agreed-upon extensions immediately.
+    */
+   private var extensions: WebSocketExtensions?,
+   /** If compression is negotiated, outbound messages of this size and larger will be compressed. */
+@@ -91,8 +91,8 @@ class RealWebSocket(
+   /** Names this web socket for observability and debugging. */
+   private var name: String? = null
+ 
+-  /** The socket that carries this web socket. This is canceled when the web socket fails. */
+-  private var socket: Socket? = null
++  /** The streams held by this web socket. This is closed when both reader and writer are closed. */
++  private var streams: Streams? = null
+ 
+   /** Outgoing pongs in the order they should be written. */
+   private val pongQueue = ArrayDeque<ByteString>()
+@@ -171,16 +171,17 @@ class RealWebSocket(
+           call: Call,
+           response: Response,
+         ) {
+-          val socket =
+-            try {
+-              checkUpgradeSuccess(response)
+-            } catch (e: IOException) {
+-              failWebSocket(e, response)
+-              response.closeQuietly()
+-              response.socket?.sink?.closeQuietly()
+-              response.socket?.source?.closeQuietly()
+-              return
+-            }
++          val exchange = response.exchange
++          val streams: Streams
++          try {
++            checkUpgradeSuccess(response, exchange)
++            streams = exchange!!.newWebSocketStreams()
++          } catch (e: IOException) {
++            failWebSocket(e, response)
++            response.closeQuietly()
++            exchange?.webSocketUpgradeFailed()
++            return
++          }
+ 
+           // Apply the extensions. If they're unacceptable initiate a graceful shut down.
+           // TODO(jwilson): Listeners should get onFailure() instead of onClosing() + onClosed(1010).
+@@ -195,13 +196,7 @@ class RealWebSocket(
+ 
+           // Process all web socket messages.
+           val name = "$okHttpName WebSocket ${request.url.redact()}"
+-          initReaderAndWriter(
+-            name = name,
+-            socket = socket,
+-            socketSource = socket.source.buffer(),
+-            socketSink = socket.sink.buffer(),
+-            client = true,
+-          )
++          initReaderAndWriter(name, streams)
+           loopReader(response)
+         }
+ 
+@@ -230,7 +225,10 @@ class RealWebSocket(
+   }
+ 
+   @Throws(IOException::class)
+-  internal fun checkUpgradeSuccess(response: Response): Socket {
++  internal fun checkUpgradeSuccess(
++    response: Response,
++    exchange: Exchange?,
++  ) {
+     if (response.code != 101) {
+       throw ProtocolException(
+         "Expected HTTP 101 response but was '${response.code} ${response.message}'",
+@@ -259,32 +257,26 @@ class RealWebSocket(
+       )
+     }
+ 
+-    return response.socket
+-      ?: throw ProtocolException("Web Socket socket missing: bad interceptor?")
++    if (exchange == null) {
++      throw ProtocolException("Web Socket exchange missing: bad interceptor?")
++    }
+   }
+ 
+-  /**
+-   * This accepts a [BufferedSource] instead of using [Socket.source], just in case we've already
+-   * received data from the peer. This accepts a [BufferedSink] for symmetry with the source.
+-   */
+   fun initReaderAndWriter(
+     name: String,
+-    socket: Socket,
+-    socketSource: BufferedSource,
+-    socketSink: BufferedSink,
+-    client: Boolean,
++    streams: Streams,
+   ) {
+     val extensions = this.extensions!!
+     synchronized(this) {
+       this.name = name
+-      this.socket = socket
++      this.streams = streams
+       this.writer =
+         WebSocketWriter(
+-          isClient = client,
+-          sink = socketSink,
++          isClient = streams.client,
++          sink = streams.sink,
+           random = random,
+           perMessageDeflate = extensions.perMessageDeflate,
+-          noContextTakeover = extensions.noContextTakeover(client),
++          noContextTakeover = extensions.noContextTakeover(streams.client),
+           minimumDeflateSize = minimumDeflateSize,
+         )
+       this.writerTask = WriterTask()
+@@ -302,11 +294,11 @@ class RealWebSocket(
+ 
+     reader =
+       WebSocketReader(
+-        isClient = client,
+-        source = socketSource,
++        isClient = streams.client,
++        source = streams.source,
+         frameCallback = this,
+         perMessageDeflate = extensions.perMessageDeflate,
+-        noContextTakeover = extensions.noContextTakeover(!client),
++        noContextTakeover = extensions.noContextTakeover(!streams.client),
+       )
+   }
+ 
+@@ -345,11 +337,13 @@ class RealWebSocket(
+    * thread.
+    */
+   fun finishReader() {
++    val failed: Boolean
+     val code: Int
+     val reason: String?
+-    val sendOnClosed: Boolean
++    var streamsToClose: Streams?
+     var readerToClose: WebSocketReader?
+     synchronized(this) {
++      failed = this.failed
+       code = receivedCloseCode
+       reason = receivedCloseReason
+ 
+@@ -369,14 +363,19 @@ class RealWebSocket(
+         this.taskQueue.shutdown()
+       }
+ 
+-      sendOnClosed = !failed && writer == null && receivedCloseCode != -1
++      streamsToClose =
++        when {
++          writer == null -> streams
++          else -> null
++        }
+     }
+ 
+-    if (sendOnClosed) {
++    if (!failed && streamsToClose != null && receivedCloseCode != -1) {
+       listener.onClosed(this, code, reason!!)
+     }
+ 
+     readerToClose?.closeQuietly()
++    streamsToClose?.closeQuietly()
+   }
+ 
+   /** For testing: force this web socket to release its threads. */
+@@ -509,12 +508,12 @@ class RealWebSocket(
+ 
+   /**
+    * Attempts to remove a single frame from a queue and send it. This prefers to write urgent pongs
+-   * before less urgent messages and close frames. For example, it's possible that a caller will
++   * before less urgent messages and close frames. For example it's possible that a caller will
+    * enqueue messages followed by pongs, but this sends pongs followed by messages. Pongs are always
+    * written in the order they were enqueued.
+    *
+    * If a frame cannot be sent - because there are none enqueued or because the web socket is not
+-   * connected - this does nothing and returns false. Otherwise, this returns true and the caller
++   * connected - this does nothing and returns false. Otherwise this returns true and the caller
+    * should immediately invoke this method again until it returns false.
+    *
+    * This method may only be invoked by the writer thread. There may be only thread invoking this
+@@ -527,7 +526,7 @@ class RealWebSocket(
+     var messageOrClose: Any? = null
+     var receivedCloseCode = -1
+     var receivedCloseReason: String? = null
+-    var sendOnClosed = false
++    var streamsToClose: Streams? = null
+     var writerToClose: WebSocketWriter? = null
+ 
+     synchronized(this@RealWebSocket) {
+@@ -545,11 +544,15 @@ class RealWebSocket(
+           if (receivedCloseCode != -1) {
+             writerToClose = this.writer
+             this.writer = null
+-            sendOnClosed = writerToClose != null && reader == null
++            streamsToClose =
++              when {
++                writerToClose != null && reader == null -> this.streams
++                else -> null
++              }
+             this.taskQueue.shutdown()
+           } else {
+             // When we request a graceful close also schedule a cancel of the web socket.
+-            val cancelAfterCloseMillis = messageOrClose.cancelAfterCloseMillis
++            val cancelAfterCloseMillis = (messageOrClose as Close).cancelAfterCloseMillis
+             taskQueue.execute("$name cancel", MILLISECONDS.toNanos(cancelAfterCloseMillis)) {
+               cancel()
+             }
+@@ -564,17 +567,17 @@ class RealWebSocket(
+       if (pong != null) {
+         writer!!.writePong(pong)
+       } else if (messageOrClose is Message) {
+-        val message = messageOrClose
++        val message = messageOrClose as Message
+         writer!!.writeMessageFrame(message.formatOpcode, message.data)
+         synchronized(this) {
+           queueSize -= message.data.size.toLong()
+         }
+       } else if (messageOrClose is Close) {
+-        val close = messageOrClose
++        val close = messageOrClose as Close
+         writer!!.writeClose(close.code, close.reason)
+ 
+         // We closed the writer: now both reader and writer are closed.
+-        if (sendOnClosed) {
++        if (streamsToClose != null) {
+           listener.onClosed(this, receivedCloseCode, receivedCloseReason!!)
+         }
+       } else {
+@@ -584,6 +587,7 @@ class RealWebSocket(
+       return true
+     } finally {
+       writerToClose?.closeQuietly()
++      streamsToClose?.closeQuietly()
+     }
+   }
+ 
+@@ -622,21 +626,29 @@ class RealWebSocket(
+     response: Response? = null,
+     isWriter: Boolean = false,
+   ) {
+-    val socketToCancel: Socket?
++    val streamsToCancel: Streams?
++    val streamsToClose: Streams?
+     val writerToClose: WebSocketWriter?
+     synchronized(this) {
+       if (failed) return // Already failed.
+       failed = true
+ 
+-      socketToCancel = this.socket
++      streamsToCancel = this.streams
+ 
+       writerToClose = this.writer
+       this.writer = null
+ 
++      streamsToClose =
++        when {
++          writerToClose != null && reader == null -> this.streams
++          else -> null
++        }
++
+       if (!isWriter && writerToClose != null) {
+         // If the caller isn't the writer thread, get that thread to close the writer.
+         taskQueue.execute("$name writer close", cancelable = false) {
+           writerToClose.closeQuietly()
++          streamsToClose?.closeQuietly()
+         }
+       }
+ 
+@@ -646,11 +658,12 @@ class RealWebSocket(
+     try {
+       listener.onFailure(this, e, response)
+     } finally {
+-      socketToCancel?.cancel()
++      streamsToCancel?.cancel()
+ 
+       // If the caller is the writer thread, close it on this thread.
+       if (isWriter) {
+         writerToClose?.closeQuietly()
++        streamsToClose?.closeQuietly()
+       }
+     }
+   }
+@@ -666,6 +679,14 @@ class RealWebSocket(
+     val cancelAfterCloseMillis: Long,
+   )
+ 
++  abstract class Streams(
++    val client: Boolean,
++    val source: BufferedSource,
++    val sink: BufferedSink,
++  ) : Closeable {
++    abstract fun cancel()
++  }
++
+   private inner class WriterTask : Task("$name writer") {
+     override fun runOnce(): Long {
+       try {
+diff --git a/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/ws/WebSocketReader.kt b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/ws/WebSocketReader.kt
+index ae0faf593..42fa7d803 100644
+--- a/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/ws/WebSocketReader.kt
++++ b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/ws/WebSocketReader.kt
+@@ -20,7 +20,6 @@ import java.io.IOException
+ import java.net.ProtocolException
+ import java.util.concurrent.TimeUnit
+ import okhttp3.internal.and
+-import okhttp3.internal.closeQuietly
+ import okhttp3.internal.toHexString
+ import okhttp3.internal.ws.WebSocketProtocol.B0_FLAG_FIN
+ import okhttp3.internal.ws.WebSocketProtocol.B0_FLAG_RSV1
+@@ -303,7 +302,6 @@ class WebSocketReader(
+ 
+   @Throws(IOException::class)
+   override fun close() {
+-    messageInflater?.closeQuietly()
+-    source.closeQuietly()
++    messageInflater?.close()
+   }
+ }
+diff --git a/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/ws/WebSocketWriter.kt b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/ws/WebSocketWriter.kt
+index f6c594045..29a3b501f 100644
+--- a/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/ws/WebSocketWriter.kt
++++ b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/ws/WebSocketWriter.kt
+@@ -18,7 +18,6 @@ package okhttp3.internal.ws
+ import java.io.Closeable
+ import java.io.IOException
+ import java.util.Random
+-import okhttp3.internal.closeQuietly
+ import okhttp3.internal.ws.WebSocketProtocol.B0_FLAG_FIN
+ import okhttp3.internal.ws.WebSocketProtocol.B0_FLAG_RSV1
+ import okhttp3.internal.ws.WebSocketProtocol.B1_FLAG_MASK
+@@ -208,7 +207,6 @@ class WebSocketWriter(
+   }
+ 
+   override fun close() {
+-    messageDeflater?.closeQuietly()
+-    sink.closeQuietly()
++    messageDeflater?.close()
+   }
+ }
+diff --git a/okhttp/src/jvmTest/kotlin/okhttp3/internal/http/HttpUpgradesTest.kt b/okhttp/src/jvmTest/kotlin/okhttp3/internal/http/HttpUpgradesTest.kt
+index 337d9791f..a9666fc39 100644
+--- a/okhttp/src/jvmTest/kotlin/okhttp3/internal/http/HttpUpgradesTest.kt
++++ b/okhttp/src/jvmTest/kotlin/okhttp3/internal/http/HttpUpgradesTest.kt
+@@ -82,12 +82,12 @@ class HttpUpgradesTest {
+         socket.sink.buffer().use { sink ->
+           socket.source.buffer().use { source ->
+             sink.writeUtf8("client says hello\n")
+-            sink.emit()
++            sink.flush()
+ 
+             assertThat(source.readUtf8Line()).isEqualTo("server says hello")
+ 
+             sink.writeUtf8("client says goodbye\n")
+-            sink.emit()
++            sink.flush()
+ 
+             assertThat(source.readUtf8Line()).isEqualTo("server says goodbye")
+ 
+diff --git a/okhttp/src/jvmTest/kotlin/okhttp3/internal/ws/RealWebSocketTest.kt b/okhttp/src/jvmTest/kotlin/okhttp3/internal/ws/RealWebSocketTest.kt
+index 155c6b2cf..bd21dbe10 100644
+--- a/okhttp/src/jvmTest/kotlin/okhttp3/internal/ws/RealWebSocketTest.kt
++++ b/okhttp/src/jvmTest/kotlin/okhttp3/internal/ws/RealWebSocketTest.kt
+@@ -36,15 +36,10 @@ import okhttp3.Response
+ import okhttp3.TestUtil.repeat
+ import okhttp3.internal.concurrent.TaskFaker
+ import okhttp3.internal.ws.WebSocketExtensions.Companion.parse
+-import okio.BufferedSink
+-import okio.BufferedSource
+ import okio.ByteString.Companion.decodeHex
+ import okio.ByteString.Companion.encodeUtf8
+-import okio.ForwardingSink
+-import okio.ForwardingSource
+-import okio.Socket
++import okio.Pipe
+ import okio.buffer
+-import okio.inMemorySocketPair
+ import org.junit.jupiter.api.AfterEach
+ import org.junit.jupiter.api.BeforeEach
+ import org.junit.jupiter.api.Tag
+@@ -56,10 +51,11 @@ class RealWebSocketTest {
+   // zero effect on the behavior of the WebSocket API which is why tests are only written once
+   // from the perspective of a single peer.
+   private val random = Random(0)
++  private val client2Server = Pipe(8192L)
++  private val server2client = Pipe(8192L)
+   private val taskFaker = TaskFaker()
+-  private val sockets = inMemorySocketPair(8192L)
+-  private val client = TestStreams(taskFaker, sockets[0], client = true)
+-  private val server = TestStreams(taskFaker, sockets[1], client = false)
++  private val client = TestStreams(true, taskFaker, server2client, client2Server)
++  private val server = TestStreams(false, taskFaker, client2Server, server2client)
+ 
+   @BeforeEach
+   fun setUp() {
+@@ -114,7 +110,7 @@ class RealWebSocketTest {
+ 
+   @Test
+   fun afterSocketClosedPingFailsWebSocket() {
+-    server.source.close()
++    client2Server.source.close()
+     client.webSocket!!.pong("Ping!".encodeUtf8())
+     taskFaker.runTasks()
+     client.listener.assertFailure(IOException::class.java, "source is closed")
+@@ -123,7 +119,7 @@ class RealWebSocketTest {
+ 
+   @Test
+   fun socketClosedDuringMessageKillsWebSocket() {
+-    server.source.close()
++    client2Server.source.close()
+     assertThat(client.webSocket!!.send("Hello!")).isTrue()
+     taskFaker.runTasks()
+     client.listener.assertFailure(IOException::class.java, "source is closed")
+@@ -192,7 +188,6 @@ class RealWebSocketTest {
+     taskFaker.runTasks()
+     client.listener.assertClosing(1000, "Goodbye!")
+     client.webSocket!!.finishReader()
+-    taskFaker.runTasks()
+     assertThat(client.closed).isTrue()
+ 
+     // Server and client both finished closing, connection is closed.
+@@ -310,7 +305,6 @@ class RealWebSocketTest {
+     server.sink.write("888760b420bb635c68de0cd84f".decodeHex()).emit()
+     client.processNextFrame() // Detects error, disconnects immediately since close already sent.
+     client.webSocket!!.finishReader()
+-    taskFaker.runTasks()
+     assertThat(client.closed).isTrue()
+     client.listener.assertFailure(
+       ProtocolException::class.java,
+@@ -350,7 +344,7 @@ class RealWebSocketTest {
+ 
+   @Test
+   fun closeThrowingFailsConnection() {
+-    server.source.close()
++    client2Server.source.close()
+     client.webSocket!!.close(1000, null)
+     taskFaker.runTasks()
+     client.listener.assertFailure(IOException::class.java, "source is closed")
+@@ -463,35 +457,17 @@ class RealWebSocketTest {
+ 
+   /** One peer's streams, listener, and web socket in the test.  */
+   private class TestStreams(
++    client: Boolean,
+     private val taskFaker: TaskFaker,
+-    private val delegate: Socket,
+-    private val client: Boolean,
+-  ) : Socket {
++    private val sourcePipe: Pipe,
++    private val sinkPipe: Pipe,
++  ) : RealWebSocket.Streams(client, sourcePipe.source.buffer(), sinkPipe.sink.buffer()) {
+     private val name = if (client) "client" else "server"
+     val listener = WebSocketRecorder(name)
+     var webSocket: RealWebSocket? = null
+-    var sourceClosed = false
+-    var sinkClosed = false
+-    val closed: Boolean
+-      get() = sourceClosed && sinkClosed
++    var closed = false
+     var canceled = false
+ 
+-    override val source: BufferedSource =
+-      object : ForwardingSource(delegate.source) {
+-        override fun close() {
+-          sourceClosed = true
+-          super.close()
+-        }
+-      }.buffer()
+-
+-    override val sink: BufferedSink =
+-      object : ForwardingSink(delegate.sink) {
+-        override fun close() {
+-          sinkClosed = true
+-          super.close()
+-        }
+-      }.buffer()
+-
+     fun initWebSocket(
+       random: Random?,
+       pingIntervalMillis: Int = 0,
+@@ -530,7 +506,7 @@ class RealWebSocketTest {
+               }
+           }
+         }
+-      webSocket!!.initReaderAndWriter(name, this, source, sink, client)
++      webSocket!!.initReaderAndWriter(name, this)
+     }
+ 
+     /**
+@@ -547,9 +523,25 @@ class RealWebSocketTest {
+       return webSocket!!.processNextFrame()
+     }
+ 
++    override fun close() {
++      if (closed) {
++        throw AssertionError("Already closed")
++      }
++      try {
++        source.close()
++      } catch (ignored: IOException) {
++      }
++      try {
++        sink.close()
++      } catch (ignored: IOException) {
++      }
++      closed = true
++    }
++
+     override fun cancel() {
+       canceled = true
+-      delegate.cancel()
++      sourcePipe.cancel()
++      sinkPipe.cancel()
+     }
+   }
+ 

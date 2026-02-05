@@ -1,0 +1,459 @@
+diff --git a/pom.xml b/pom.xml
+index e39358bb..57e297bc 100644
+--- a/pom.xml
++++ b/pom.xml
+@@ -46,11 +46,12 @@
+ 
+     <!-- Compilation -->
+     <java.version>1.7</java.version>
+-    <kotlin.version>1.2.60</kotlin.version>
++    <kotlin.version>1.3.10</kotlin.version>
+ 
+     <!-- Dependencies -->
+     <android.version>4.1.1.4</android.version>
+     <okhttp.version>3.12.0</okhttp.version>
++    <kotlinx.coroutines.version>1.1.0</kotlinx.coroutines.version>
+     <animal.sniffer.version>1.14</animal.sniffer.version>
+ 
+     <!-- Adapter Dependencies -->
+@@ -114,6 +115,11 @@
+         <artifactId>kotlin-stdlib</artifactId>
+         <version>${kotlin.version}</version>
+       </dependency>
++      <dependency>
++        <groupId>org.jetbrains.kotlinx</groupId>
++        <artifactId>kotlinx-coroutines-core</artifactId>
++        <version>${kotlinx.coroutines.version}</version>
++      </dependency>
+       <dependency>
+         <groupId>org.codehaus.mojo</groupId>
+         <artifactId>animal-sniffer-annotations</artifactId>
+@@ -215,6 +221,11 @@
+   <build>
+     <pluginManagement>
+       <plugins>
++        <plugin>
++          <groupId>org.jetbrains.kotlin</groupId>
++          <artifactId>kotlin-maven-plugin</artifactId>
++          <version>${kotlin.version}</version>
++        </plugin>
+         <plugin>
+           <groupId>org.apache.maven.plugins</groupId>
+           <artifactId>maven-compiler-plugin</artifactId>
+diff --git a/retrofit/pom.xml b/retrofit/pom.xml
+index f2e330c6..16808f39 100644
+--- a/retrofit/pom.xml
++++ b/retrofit/pom.xml
+@@ -29,6 +29,11 @@
+       <artifactId>kotlin-stdlib</artifactId>
+       <optional>true</optional>
+     </dependency>
++    <dependency>
++      <groupId>org.jetbrains.kotlinx</groupId>
++      <artifactId>kotlinx-coroutines-core</artifactId>
++      <optional>true</optional>
++    </dependency>
+ 
+     <dependency>
+       <groupId>org.codehaus.mojo</groupId>
+diff --git a/retrofit/src/main/java/retrofit2/HttpServiceMethod.java b/retrofit/src/main/java/retrofit2/HttpServiceMethod.java
+index d149df56..34f93af3 100644
+--- a/retrofit/src/main/java/retrofit2/HttpServiceMethod.java
++++ b/retrofit/src/main/java/retrofit2/HttpServiceMethod.java
+@@ -17,13 +17,18 @@ package retrofit2;
+ 
+ import java.lang.annotation.Annotation;
+ import java.lang.reflect.Method;
++import java.lang.reflect.ParameterizedType;
+ import java.lang.reflect.Type;
++import javax.annotation.Nullable;
++import kotlin.coroutines.Continuation;
++import okhttp3.Call;
+ import okhttp3.ResponseBody;
+ 
++import static retrofit2.Utils.getRawType;
+ import static retrofit2.Utils.methodError;
+ 
+ /** Adapts an invocation of an interface method into an HTTP call. */
+-final class HttpServiceMethod<ResponseT, ReturnT> extends ServiceMethod<ReturnT> {
++abstract class HttpServiceMethod<ResponseT, ReturnT> extends ServiceMethod<ReturnT> {
+   /**
+    * Inspects the annotations on an interface method to construct a reusable service method that
+    * speaks HTTP. This requires potentially-expensive reflection so it is best to build each service
+@@ -31,13 +36,38 @@ final class HttpServiceMethod<ResponseT, ReturnT> extends ServiceMethod<ReturnT>
+    */
+   static <ResponseT, ReturnT> HttpServiceMethod<ResponseT, ReturnT> parseAnnotations(
+       Retrofit retrofit, Method method, RequestFactory requestFactory) {
+-    CallAdapter<ResponseT, ReturnT> callAdapter = createCallAdapter(retrofit, method);
+-    Type responseType = callAdapter.responseType();
+-    if (responseType == Response.class || responseType == okhttp3.Response.class) {
++    CallAdapter<ResponseT, ReturnT> callAdapter = null;
++    boolean continuationWantsResponse = false;
++    boolean continuationBodyNullable = false;
++    Type responseType;
++    if (requestFactory.isKotlinSuspendFunction) {
++      Type[] parameterTypes = method.getGenericParameterTypes();
++      Type continuationType = parameterTypes[parameterTypes.length - 1];
++      responseType = Utils.getParameterLowerBound(0, (ParameterizedType) continuationType);
++      if (getRawType(responseType) == Response.class && responseType instanceof ParameterizedType) {
++        // Unwrap the actual body type from Response<T>.
++        responseType = Utils.getParameterUpperBound(0, (ParameterizedType) responseType);
++        continuationWantsResponse = true;
++      } else {
++        // TODO figure out if type is nullable or not
++        // Metadata metadata = method.getDeclaringClass().getAnnotation(Metadata.class)
++        // Find the entry for method
++        // Determine if return type is nullable or not
++      }
++    } else {
++      callAdapter = createCallAdapter(retrofit, method);
++      responseType = callAdapter.responseType();
++    }
++
++    if (responseType == okhttp3.Response.class) {
+       throw methodError(method, "'"
+-          + Utils.getRawType(responseType).getName()
++          + getRawType(responseType).getName()
+           + "' is not a valid response body type. Did you mean ResponseBody?");
+     }
++    if (responseType == Response.class) {
++      throw methodError(method, "Response must include generic type (e.g., Response<String>)");
++    }
++    // TODO support Unit for Kotlin?
+     if (requestFactory.httpMethod.equals("HEAD") && !Void.class.equals(responseType)) {
+       throw methodError(method, "HEAD method must use Void as response type.");
+     }
+@@ -46,7 +76,17 @@ final class HttpServiceMethod<ResponseT, ReturnT> extends ServiceMethod<ReturnT>
+         createResponseConverter(retrofit, method, responseType);
+ 
+     okhttp3.Call.Factory callFactory = retrofit.callFactory;
+-    return new HttpServiceMethod<>(requestFactory, callFactory, callAdapter, responseConverter);
++    if (callAdapter != null) {
++      return new CallAdapted<>(requestFactory, callFactory, callAdapter, responseConverter);
++    } else if (continuationWantsResponse) {
++      //noinspection unchecked Kotlin compiler guarantees ReturnT to be Object.
++      return (HttpServiceMethod<ResponseT, ReturnT>) new SuspendForResponse<>(requestFactory,
++          callFactory, responseConverter);
++    } else {
++      //noinspection unchecked Kotlin compiler guarantees ReturnT to be Object.
++      return (HttpServiceMethod<ResponseT, ReturnT>) new SuspendForBody<>(requestFactory,
++          callFactory, responseConverter, continuationBodyNullable);
++    }
+   }
+ 
+   private static <ResponseT, ReturnT> CallAdapter<ResponseT, ReturnT> createCallAdapter(
+@@ -73,20 +113,63 @@ final class HttpServiceMethod<ResponseT, ReturnT> extends ServiceMethod<ReturnT>
+ 
+   private final RequestFactory requestFactory;
+   private final okhttp3.Call.Factory callFactory;
+-  private final CallAdapter<ResponseT, ReturnT> callAdapter;
+   private final Converter<ResponseBody, ResponseT> responseConverter;
+ 
+-  private HttpServiceMethod(RequestFactory requestFactory, okhttp3.Call.Factory callFactory,
+-      CallAdapter<ResponseT, ReturnT> callAdapter,
++  HttpServiceMethod(RequestFactory requestFactory, Call.Factory callFactory,
+       Converter<ResponseBody, ResponseT> responseConverter) {
+     this.requestFactory = requestFactory;
+     this.callFactory = callFactory;
+-    this.callAdapter = callAdapter;
+     this.responseConverter = responseConverter;
+   }
+ 
+-  @Override ReturnT invoke(Object[] args) {
+-    return callAdapter.adapt(
+-        new OkHttpCall<>(requestFactory, args, callFactory, responseConverter));
++  @Override final @Nullable ReturnT invoke(Object[] args) {
++    return adapt(new OkHttpCall<>(requestFactory, args, callFactory, responseConverter), args);
++  }
++
++  protected abstract @Nullable ReturnT adapt(OkHttpCall<ResponseT> call, Object[] args);
++
++  static final class CallAdapted<ResponseT, ReturnT> extends HttpServiceMethod<ResponseT, ReturnT> {
++    private final CallAdapter<ResponseT, ReturnT> callAdapter;
++
++    CallAdapted(RequestFactory requestFactory, Call.Factory callFactory,
++        CallAdapter<ResponseT, ReturnT> callAdapter,
++        Converter<ResponseBody, ResponseT> responseConverter) {
++      super(requestFactory, callFactory, responseConverter);
++      this.callAdapter = callAdapter;
++    }
++
++    @Override protected ReturnT adapt(OkHttpCall<ResponseT> call, Object[] args) {
++      return callAdapter.adapt(call);
++    }
++  }
++
++  static final class SuspendForResponse<ResponseT> extends HttpServiceMethod<ResponseT, Object> {
++    SuspendForResponse(RequestFactory requestFactory, Call.Factory callFactory,
++        Converter<ResponseBody, ResponseT> responseConverter) {
++      super(requestFactory, callFactory, responseConverter);
++    }
++
++    @Override protected Object adapt(OkHttpCall<ResponseT> call, Object[] args) {
++      Continuation<Response<ResponseT>> continuation =
++          (Continuation<Response<ResponseT>>) args[args.length - 1];
++      return KotlinExtensions.awaitResponse(call, continuation);
++    }
++  }
++
++  static final class SuspendForBody<ResponseT> extends HttpServiceMethod<ResponseT, Object> {
++    private final boolean isNullable;
++
++    SuspendForBody(RequestFactory requestFactory, Call.Factory callFactory,
++        Converter<ResponseBody, ResponseT> responseConverter, boolean isNullable) {
++      super(requestFactory, callFactory, responseConverter);
++      this.isNullable = isNullable;
++    }
++
++    @Override protected Object adapt(OkHttpCall<ResponseT> call, Object[] args) {
++      Continuation<ResponseT> continuation = (Continuation<ResponseT>) args[args.length - 1];
++      return isNullable
++          ? KotlinExtensions.awaitNullable(call, continuation)
++          : KotlinExtensions.await(call, continuation);
++    }
+   }
+ }
+diff --git a/retrofit/src/main/java/retrofit2/KotlinExtensions.kt b/retrofit/src/main/java/retrofit2/KotlinExtensions.kt
+index 8b599cfb..b24212e0 100644
+--- a/retrofit/src/main/java/retrofit2/KotlinExtensions.kt
++++ b/retrofit/src/main/java/retrofit2/KotlinExtensions.kt
+@@ -14,9 +14,84 @@
+  * limitations under the License.
+  */
+ 
+-// Hide the class from Java consumers.
+-@file:JvmName("-KotlinExtensions")
++@file:JvmName("KotlinExtensions")
+ 
+ package retrofit2
+ 
++import kotlinx.coroutines.suspendCancellableCoroutine
++import kotlin.coroutines.resume
++import kotlin.coroutines.resumeWithException
++
+ inline fun <reified T> Retrofit.create(): T = create(T::class.java)
++
++suspend fun <T : Any> Call<T>.await(): T {
++  return suspendCancellableCoroutine { continuation ->
++    continuation.invokeOnCancellation {
++      cancel()
++    }
++    enqueue(object : Callback<T> {
++      override fun onResponse(call: Call<T>, response: Response<T>) {
++        if (response.isSuccessful) {
++          val body = response.body()
++          if (body == null) {
++            val invocation = call.request().tag(Invocation::class.java)!!
++            val method = invocation.method()
++            val e = KotlinNullPointerException("Response from " +
++                method.declaringClass.name +
++                '.' +
++                method.name +
++                " was null but response body type was declared as non-null")
++            continuation.resumeWithException(e)
++          } else {
++            continuation.resume(body)
++          }
++        } else {
++          continuation.resumeWithException(HttpException(response))
++        }
++      }
++
++      override fun onFailure(call: Call<T>, t: Throwable) {
++        continuation.resumeWithException(t)
++      }
++    })
++  }
++}
++
++@JvmName("awaitNullable")
++suspend fun <T : Any> Call<T?>.await(): T? {
++  return suspendCancellableCoroutine { continuation ->
++    continuation.invokeOnCancellation {
++      cancel()
++    }
++    enqueue(object : Callback<T?> {
++      override fun onResponse(call: Call<T?>, response: Response<T?>) {
++        if (response.isSuccessful) {
++          continuation.resume(response.body())
++        } else {
++          continuation.resumeWithException(HttpException(response))
++        }
++      }
++
++      override fun onFailure(call: Call<T?>, t: Throwable) {
++        continuation.resumeWithException(t)
++      }
++    })
++  }
++}
++
++suspend fun <T : Any> Call<T>.awaitResponse(): Response<T> {
++  return suspendCancellableCoroutine { continuation ->
++    continuation.invokeOnCancellation {
++      cancel()
++    }
++    enqueue(object : Callback<T> {
++      override fun onResponse(call: Call<T>, response: Response<T>) {
++        continuation.resume(response)
++      }
++
++      override fun onFailure(call: Call<T>, t: Throwable) {
++        continuation.resumeWithException(t)
++      }
++    })
++  }
++}
+diff --git a/retrofit/src/main/java/retrofit2/RequestFactory.java b/retrofit/src/main/java/retrofit2/RequestFactory.java
+index 78c6dd84..e04cec59 100644
+--- a/retrofit/src/main/java/retrofit2/RequestFactory.java
++++ b/retrofit/src/main/java/retrofit2/RequestFactory.java
+@@ -29,6 +29,7 @@ import java.util.Set;
+ import java.util.regex.Matcher;
+ import java.util.regex.Pattern;
+ import javax.annotation.Nullable;
++import kotlin.coroutines.Continuation;
+ import okhttp3.Headers;
+ import okhttp3.HttpUrl;
+ import okhttp3.MediaType;
+@@ -75,6 +76,7 @@ final class RequestFactory {
+   private final boolean isFormEncoded;
+   private final boolean isMultipart;
+   private final ParameterHandler<?>[] parameterHandlers;
++  final boolean isKotlinSuspendFunction;
+ 
+   RequestFactory(Builder builder) {
+     method = builder.method;
+@@ -87,6 +89,7 @@ final class RequestFactory {
+     isFormEncoded = builder.isFormEncoded;
+     isMultipart = builder.isMultipart;
+     parameterHandlers = builder.parameterHandlers;
++    isKotlinSuspendFunction = builder.isKotlinSuspendFunction;
+   }
+ 
+   okhttp3.Request create(Object[] args) throws IOException {
+@@ -102,6 +105,11 @@ final class RequestFactory {
+     RequestBuilder requestBuilder = new RequestBuilder(httpMethod, baseUrl, relativeUrl,
+         headers, contentType, hasBody, isFormEncoded, isMultipart);
+ 
++    if (isKotlinSuspendFunction) {
++      // The Continuation is the last parameter and the handlers array contains null at that index.
++      argumentCount--;
++    }
++
+     List<Object> argumentList = new ArrayList<>(argumentCount);
+     for (int p = 0; p < argumentCount; p++) {
+       argumentList.add(args[p]);
+@@ -147,6 +155,7 @@ final class RequestFactory {
+     @Nullable MediaType contentType;
+     @Nullable Set<String> relativeUrlParamNames;
+     @Nullable ParameterHandler<?>[] parameterHandlers;
++    boolean isKotlinSuspendFunction;
+ 
+     Builder(Retrofit retrofit, Method method) {
+       this.retrofit = retrofit;
+@@ -178,8 +187,9 @@ final class RequestFactory {
+ 
+       int parameterCount = parameterAnnotationsArray.length;
+       parameterHandlers = new ParameterHandler<?>[parameterCount];
+-      for (int p = 0; p < parameterCount; p++) {
+-        parameterHandlers[p] = parseParameter(p, parameterTypes[p], parameterAnnotationsArray[p]);
++      for (int p = 0, lastParameter = parameterCount - 1; p < parameterCount; p++) {
++        parameterHandlers[p] =
++            parseParameter(p, parameterTypes[p], parameterAnnotationsArray[p], p == lastParameter);
+       }
+ 
+       if (relativeUrl == null && !gotUrl) {
+@@ -286,8 +296,8 @@ final class RequestFactory {
+       return builder.build();
+     }
+ 
+-    private ParameterHandler<?> parseParameter(
+-        int p, Type parameterType, @Nullable Annotation[] annotations) {
++    private @Nullable ParameterHandler<?> parseParameter(
++        int p, Type parameterType, @Nullable Annotation[] annotations, boolean allowContinuation) {
+       ParameterHandler<?> result = null;
+       if (annotations != null) {
+         for (Annotation annotation : annotations) {
+@@ -308,6 +318,15 @@ final class RequestFactory {
+       }
+ 
+       if (result == null) {
++        if (allowContinuation) {
++          try {
++            if (Utils.getRawType(parameterType) == Continuation.class) {
++              isKotlinSuspendFunction = true;
++              return null;
++            }
++          } catch (NoClassDefFoundError ignored) {
++          }
++        }
+         throw parameterError(method, p, "No Retrofit annotation found.");
+       }
+ 
+diff --git a/retrofit/src/main/java/retrofit2/Retrofit.java b/retrofit/src/main/java/retrofit2/Retrofit.java
+index 5d0ad895..a0cc5692 100644
+--- a/retrofit/src/main/java/retrofit2/Retrofit.java
++++ b/retrofit/src/main/java/retrofit2/Retrofit.java
+@@ -136,8 +136,8 @@ public final class Retrofit {
+           private final Platform platform = Platform.get();
+           private final Object[] emptyArgs = new Object[0];
+ 
+-          @Override public Object invoke(Object proxy, Method method, @Nullable Object[] args)
+-              throws Throwable {
++          @Override public @Nullable Object invoke(Object proxy, Method method,
++              @Nullable Object[] args) throws Throwable {
+             // If the method is a method from Object then defer to normal invocation.
+             if (method.getDeclaringClass() == Object.class) {
+               return method.invoke(this, args);
+diff --git a/retrofit/src/main/java/retrofit2/ServiceMethod.java b/retrofit/src/main/java/retrofit2/ServiceMethod.java
+index 8ddd4225..758511f5 100644
+--- a/retrofit/src/main/java/retrofit2/ServiceMethod.java
++++ b/retrofit/src/main/java/retrofit2/ServiceMethod.java
+@@ -17,6 +17,7 @@ package retrofit2;
+ 
+ import java.lang.reflect.Method;
+ import java.lang.reflect.Type;
++import javax.annotation.Nullable;
+ 
+ import static retrofit2.Utils.methodError;
+ 
+@@ -36,5 +37,5 @@ abstract class ServiceMethod<T> {
+     return HttpServiceMethod.parseAnnotations(retrofit, method, requestFactory);
+   }
+ 
+-  abstract T invoke(Object[] args);
++  abstract @Nullable T invoke(Object[] args);
+ }
+diff --git a/retrofit/src/main/java/retrofit2/Utils.java b/retrofit/src/main/java/retrofit2/Utils.java
+index 85258222..3ecb34df 100644
+--- a/retrofit/src/main/java/retrofit2/Utils.java
++++ b/retrofit/src/main/java/retrofit2/Utils.java
+@@ -348,6 +348,14 @@ final class Utils {
+     return paramType;
+   }
+ 
++  static Type getParameterLowerBound(int index, ParameterizedType type) {
++    Type paramType = type.getActualTypeArguments()[index];
++    if (paramType instanceof WildcardType) {
++      return ((WildcardType) paramType).getLowerBounds()[0];
++    }
++    return paramType;
++  }
++
+   static boolean hasUnresolvableType(@Nullable Type type) {
+     if (type instanceof Class<?>) {
+       return false;
+diff --git a/retrofit/src/main/resources/META-INF/proguard/retrofit2.pro b/retrofit/src/main/resources/META-INF/proguard/retrofit2.pro
+index 8f835709..67a4d45f 100644
+--- a/retrofit/src/main/resources/META-INF/proguard/retrofit2.pro
++++ b/retrofit/src/main/resources/META-INF/proguard/retrofit2.pro
+@@ -20,7 +20,7 @@
+ -dontwarn kotlin.Unit
+ 
+ # Top-level functions that can only be used by Kotlin.
+--dontwarn retrofit2.-KotlinExtensions
++-dontwarn retrofit2.KotlinExtensions
+ 
+ # With R8 full mode, it sees no subtypes of Retrofit interfaces since they are created with a Proxy
+ # and replaces all potential values with null. Explicitly keeping the interfaces prevents this.

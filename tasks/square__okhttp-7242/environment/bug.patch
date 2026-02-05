@@ -1,0 +1,685 @@
+diff --git a/okhttp/api/okhttp.api b/okhttp/api/okhttp.api
+index e7ccc19a4..3a18a38a3 100644
+--- a/okhttp/api/okhttp.api
++++ b/okhttp/api/okhttp.api
+@@ -1151,7 +1151,6 @@ public class okhttp3/Response$Builder {
+ 	public fun removeHeader (Ljava/lang/String;)Lokhttp3/Response$Builder;
+ 	public fun request (Lokhttp3/Request;)Lokhttp3/Response$Builder;
+ 	public fun sentRequestAtMillis (J)Lokhttp3/Response$Builder;
+-	public fun trailers (Lkotlin/jvm/functions/Function0;)Lokhttp3/Response$Builder;
+ }
+ 
+ public abstract class okhttp3/ResponseBody : java/io/Closeable {
+diff --git a/okhttp/src/commonMain/kotlin/okhttp3/Response.kt b/okhttp/src/commonMain/kotlin/okhttp3/Response.kt
+index 8d724a4d6..20938ba21 100644
+--- a/okhttp/src/commonMain/kotlin/okhttp3/Response.kt
++++ b/okhttp/src/commonMain/kotlin/okhttp3/Response.kt
+@@ -104,12 +104,12 @@ expect class Response : Closeable {
+ 
+   fun header(name: String, defaultValue: String? = null): String?
+ 
+-  /**
+-   * Returns the trailers after the HTTP response, which may be empty. It is an error to call this
+-   * before the entire HTTP response body has been consumed.
+-   */
+-  @Throws(IOException::class)
+-  fun trailers(): Headers
++  // /**
++  //  * Returns the trailers after the HTTP response, which may be empty. It is an error to call this
++  //  * before the entire HTTP response body has been consumed.
++  //  */
++  // @Throws(IOException::class)
++  // fun trailers(): Headers
+ 
+   /**
+    * Peeks up to [byteCount] bytes from the response body and returns them as a new response
+@@ -164,13 +164,13 @@ expect class Response : Closeable {
+     internal var protocol: Protocol?
+     internal var code: Int
+     internal var message: String?
+-    // internal var handshake: Handshake?
++    // internal var handshake: Handshake? = null
+     internal var headers: Headers.Builder
+     internal var body: ResponseBody
+     internal var networkResponse: Response?
+     internal var cacheResponse: Response?
+     internal var priorResponse: Response?
+-    internal var trailersFn: (() -> Headers)
++    // internal var exchange: Exchange? = null
+ 
+     constructor()
+ 
+@@ -204,8 +204,6 @@ expect class Response : Closeable {
+     /** Removes all headers on this builder and adds [headers]. */
+     open fun headers(headers: Headers): Builder
+ 
+-    open fun trailers(trailersFn: (() -> Headers)): Builder
+-
+     open fun body(body: ResponseBody): Builder
+ 
+     open fun networkResponse(networkResponse: Response?): Builder
+diff --git a/okhttp/src/commonMain/kotlin/okhttp3/internal/-ResponseCommon.kt b/okhttp/src/commonMain/kotlin/okhttp3/internal/-ResponseCommon.kt
+index 9899dfea5..541b2b1f3 100644
+--- a/okhttp/src/commonMain/kotlin/okhttp3/internal/-ResponseCommon.kt
++++ b/okhttp/src/commonMain/kotlin/okhttp3/internal/-ResponseCommon.kt
+@@ -144,10 +144,6 @@ fun Response.Builder.commonHeaders(headers: Headers) = apply {
+   this.headers = headers.newBuilder()
+ }
+ 
+-fun Response.Builder.commonTrailers(trailersFn: (() -> Headers)) = apply {
+-  this.trailersFn = trailersFn
+-}
+-
+ fun Response.Builder.commonBody(body: ResponseBody) = apply {
+   this.body = body
+ }
+diff --git a/okhttp/src/commonTest/kotlin/okhttp3/ResponseCommonTest.kt b/okhttp/src/commonTest/kotlin/okhttp3/ResponseCommonTest.kt
+deleted file mode 100644
+index 0f2b2c04a..000000000
+--- a/okhttp/src/commonTest/kotlin/okhttp3/ResponseCommonTest.kt
++++ /dev/null
+@@ -1,118 +0,0 @@
+-/*
+- * Copyright (C) 2016 Square, Inc.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-package okhttp3
+-
+-import assertk.assertThat
+-import assertk.assertions.isEqualTo
+-import assertk.assertions.isNull
+-import kotlin.test.Test
+-import kotlin.test.assertFailsWith
+-import okhttp3.ResponseBody.Companion.asResponseBody
+-import okio.Buffer
+-import okio.ByteString.Companion.EMPTY
+-import okio.Source
+-import okio.Timeout
+-import okio.buffer
+-
+-class ResponseCommonTest {
+-  @Test fun peekShorterThanResponse() {
+-    val response = newResponse(responseBody("abcdef"))
+-    val peekedBody = response.peekBody(3)
+-    assertThat(peekedBody.string()).isEqualTo("abc")
+-    assertThat(response.body.string()).isEqualTo("abcdef")
+-  }
+-
+-  @Test fun peekLongerThanResponse() {
+-    val response = newResponse(responseBody("abc"))
+-    val peekedBody = response.peekBody(6)
+-    assertThat(peekedBody.string()).isEqualTo("abc")
+-    assertThat(response.body.string()).isEqualTo("abc")
+-  }
+-
+-  @Test fun eachPeakIsIndependent() {
+-    val response = newResponse(responseBody("abcdef"))
+-    val p1 = response.peekBody(4)
+-    val p2 = response.peekBody(2)
+-    assertThat(response.body.string()).isEqualTo("abcdef")
+-    assertThat(p1.string()).isEqualTo("abcd")
+-    assertThat(p2.string()).isEqualTo("ab")
+-  }
+-
+-  @Test fun negativeStatusCodeThrowsIllegalStateException() {
+-    assertFailsWith<IllegalStateException> {
+-      newResponse(responseBody("set status code -1"), -1)
+-    }
+-  }
+-
+-  @Test fun zeroStatusCodeIsValid() {
+-    val response = newResponse(responseBody("set status code 0"), 0)
+-    assertThat(response.code).isEqualTo(0)
+-  }
+-
+-  @Test fun defaultResponseBodyIsEmpty() {
+-    val response = Response.Builder()
+-      .request(
+-        Request.Builder()
+-          .url("https://example.com/")
+-          .build()
+-      )
+-      .protocol(Protocol.HTTP_1_1)
+-      .code(200)
+-      .message("OK")
+-      .build()
+-    assertThat(response.body.contentType()).isNull()
+-    assertThat(response.body.contentLength()).isEqualTo(0L)
+-    assertThat(response.body.byteString()).isEqualTo(EMPTY)
+-  }
+-
+-  /**
+-   * Returns a new response body that refuses to be read once it has been closed. This is true of
+-   * most [BufferedSource] instances, but not of [Buffer].
+-   */
+-  private fun responseBody(content: String): ResponseBody {
+-    val data = Buffer().writeUtf8(content)
+-    val source: Source = object : Source {
+-      var closed = false
+-      override fun close() {
+-        closed = true
+-      }
+-
+-      override fun read(sink: Buffer, byteCount: Long): Long {
+-        check(!closed)
+-        return data.read(sink, byteCount)
+-      }
+-
+-      override fun timeout(): Timeout {
+-        return Timeout.NONE
+-      }
+-    }
+-    return source.buffer().asResponseBody(null, -1)
+-  }
+-
+-  private fun newResponse(responseBody: ResponseBody, code: Int = 200): Response {
+-    return Response.Builder()
+-      .request(
+-        Request.Builder()
+-          .url("https://example.com/")
+-          .build()
+-      )
+-      .protocol(Protocol.HTTP_1_1)
+-      .code(code)
+-      .message("OK")
+-      .body(responseBody)
+-      .build()
+-  }
+-}
+diff --git a/okhttp/src/jvmMain/kotlin/okhttp3/Response.kt b/okhttp/src/jvmMain/kotlin/okhttp3/Response.kt
+index 2805a4068..99d0b4931 100644
+--- a/okhttp/src/jvmMain/kotlin/okhttp3/Response.kt
++++ b/okhttp/src/jvmMain/kotlin/okhttp3/Response.kt
+@@ -39,7 +39,6 @@ import okhttp3.internal.commonProtocol
+ import okhttp3.internal.commonRemoveHeader
+ import okhttp3.internal.commonRequest
+ import okhttp3.internal.commonToString
+-import okhttp3.internal.commonTrailers
+ import okhttp3.internal.connection.Exchange
+ import okhttp3.internal.http.parseChallenges
+ import okio.Buffer
+@@ -84,9 +83,7 @@ actual class Response internal constructor(
+    */
+   @get:JvmName("receivedResponseAtMillis") val receivedResponseAtMillis: Long,
+ 
+-  @get:JvmName("exchange") internal val exchange: Exchange?,
+-
+-  private var trailersFn: (() -> Headers)
++  @get:JvmName("exchange") internal val exchange: Exchange?
+ ) : Closeable {
+ 
+   internal actual var lazyCacheControl: CacheControl? = null
+@@ -145,7 +142,7 @@ actual class Response internal constructor(
+    * before the entire HTTP response body has been consumed.
+    */
+   @Throws(IOException::class)
+-  actual fun trailers(): Headers = trailersFn()
++  fun trailers(): Headers = checkNotNull(exchange) { "trailers not available" }.trailers()
+ 
+   @Throws(IOException::class)
+   actual fun peekBody(byteCount: Long): ResponseBody {
+@@ -252,7 +249,6 @@ actual class Response internal constructor(
+     internal var sentRequestAtMillis: Long = 0
+     internal var receivedResponseAtMillis: Long = 0
+     internal var exchange: Exchange? = null
+-    internal actual var trailersFn: (() -> Headers) = { Headers.headersOf() }
+ 
+     actual constructor() {
+       headers = Headers.Builder()
+@@ -272,7 +268,6 @@ actual class Response internal constructor(
+       this.sentRequestAtMillis = response.sentRequestAtMillis
+       this.receivedResponseAtMillis = response.receivedResponseAtMillis
+       this.exchange = response.exchange
+-      this.trailersFn = response.trailersFn
+     }
+ 
+     actual open fun request(request: Request) = commonRequest(request)
+@@ -303,8 +298,6 @@ actual class Response internal constructor(
+ 
+     actual open fun priorResponse(priorResponse: Response?) = commonPriorResponse(priorResponse)
+ 
+-    actual open fun trailers(trailersFn: (() -> Headers)): Builder = commonTrailers(trailersFn)
+-
+     open fun sentRequestAtMillis(sentRequestAtMillis: Long) = apply {
+       this.sentRequestAtMillis = sentRequestAtMillis
+     }
+@@ -313,9 +306,8 @@ actual class Response internal constructor(
+       this.receivedResponseAtMillis = receivedResponseAtMillis
+     }
+ 
+-    internal fun initExchange(exchange: Exchange) {
+-      this.exchange = exchange
+-      this.trailersFn = { exchange.trailers() }
++    internal fun initExchange(deferredTrailers: Exchange) {
++      this.exchange = deferredTrailers
+     }
+ 
+     actual open fun build(): Response {
+@@ -333,8 +325,7 @@ actual class Response internal constructor(
+           priorResponse,
+           sentRequestAtMillis,
+           receivedResponseAtMillis,
+-          exchange,
+-          trailersFn
++          exchange
+       )
+     }
+   }
+diff --git a/okhttp/src/jvmMain/kotlin/okhttp3/internal/http1/Http1ExchangeCodec.kt b/okhttp/src/jvmMain/kotlin/okhttp3/internal/http1/Http1ExchangeCodec.kt
+index 7d307d19f..694173287 100644
+--- a/okhttp/src/jvmMain/kotlin/okhttp3/internal/http1/Http1ExchangeCodec.kt
++++ b/okhttp/src/jvmMain/kotlin/okhttp3/internal/http1/Http1ExchangeCodec.kt
+@@ -182,7 +182,6 @@ class Http1ExchangeCodec(
+           .code(statusLine.code)
+           .message(statusLine.message)
+           .headers(headersReader.readHeaders())
+-          .trailers { error("trailers not available") }
+ 
+       return when {
+         expectContinue && statusLine.code == HTTP_CONTINUE -> {
+diff --git a/okhttp/src/jvmMain/kotlin/okhttp3/internal/http2/Http2ExchangeCodec.kt b/okhttp/src/jvmMain/kotlin/okhttp3/internal/http2/Http2ExchangeCodec.kt
+index 2a9b7c008..5af7bfa40 100644
+--- a/okhttp/src/jvmMain/kotlin/okhttp3/internal/http2/Http2ExchangeCodec.kt
++++ b/okhttp/src/jvmMain/kotlin/okhttp3/internal/http2/Http2ExchangeCodec.kt
+@@ -198,7 +198,6 @@ class Http2ExchangeCodec(
+           .code(statusLine.code)
+           .message(statusLine.message)
+           .headers(headersBuilder.build())
+-          .trailers { error("trailers not available") }
+     }
+   }
+ }
+diff --git a/okhttp/src/jvmTest/java/okhttp3/ResponseJvmTest.kt b/okhttp/src/jvmTest/java/okhttp3/ResponseJvmTest.kt
+deleted file mode 100644
+index 5b19dee21..000000000
+--- a/okhttp/src/jvmTest/java/okhttp3/ResponseJvmTest.kt
++++ /dev/null
+@@ -1,113 +0,0 @@
+-/*
+- * Copyright (C) 2016 Square, Inc.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-package okhttp3
+-
+-import assertk.assertThat
+-import assertk.assertions.isEmpty
+-import assertk.assertions.isEqualTo
+-import kotlin.test.assertFailsWith
+-import okhttp3.ResponseBody.Companion.asResponseBody
+-import okhttp3.ResponseBody.Companion.toResponseBody
+-import okio.Buffer
+-import okio.BufferedSource
+-import okio.Source
+-import okio.Timeout
+-import okio.buffer
+-import org.junit.jupiter.api.Test
+-
+-class ResponseJvmTest {
+-  @Test
+-  fun testEmptyByDefaultIfTrailersNotSet() {
+-    val response = newResponse("".toResponseBody())
+-
+-    assertThat(response.trailers()).isEmpty()
+-  }
+-
+-  @Test
+-  fun testFailsIfTrailersNotSet() {
+-    val response = newResponse("".toResponseBody()) {
+-      // All live paths (Http1, Http2) in OkHttp do this
+-      trailers { error("trailers not available") }
+-    }
+-
+-    assertFailsWith<IllegalStateException>(message = "trailers not available") {
+-      response.trailers()
+-    }
+-  }
+-
+-  @Test
+-  fun worksIfTrailersSet() {
+-    val response = newResponse("".toResponseBody()) {
+-      trailers {
+-        Headers.headersOf("a", "b")
+-      }
+-    }
+-
+-    assertThat(response.trailers()["a"]).isEqualTo("b")
+-  }
+-
+-  @Test fun peekAfterReadingResponse() {
+-    val response = newResponse(responseBody("abc"))
+-    assertThat(response.body.string()).isEqualTo("abc")
+-
+-    assertFailsWith<IllegalStateException> {
+-      response.peekBody(3)
+-    }
+-  }
+-
+-  /**
+-   * Returns a new response body that refuses to be read once it has been closed. This is true of
+-   * most [BufferedSource] instances, but not of [Buffer].
+-   */
+-  private fun responseBody(content: String): ResponseBody {
+-    val data = Buffer().writeUtf8(content)
+-    val source: Source = object : Source {
+-      var closed = false
+-      override fun close() {
+-        closed = true
+-      }
+-
+-      override fun read(sink: Buffer, byteCount: Long): Long {
+-        check(!closed)
+-        return data.read(sink, byteCount)
+-      }
+-
+-      override fun timeout(): Timeout {
+-        return Timeout.NONE
+-      }
+-    }
+-    return source.buffer().asResponseBody(null, -1)
+-  }
+-
+-  private fun newResponse(
+-    responseBody: ResponseBody,
+-    code: Int = 200,
+-    fn: Response.Builder.() -> Unit = {}
+-  ): Response {
+-    return Response.Builder()
+-      .request(
+-        Request.Builder()
+-          .url("https://example.com/")
+-          .build()
+-      )
+-      .protocol(Protocol.HTTP_1_1)
+-      .code(code)
+-      .message("OK")
+-      .body(responseBody)
+-      .apply { fn() }
+-      .build()
+-  }
+-}
+diff --git a/okhttp/src/jvmTest/java/okhttp3/ResponseTest.java b/okhttp/src/jvmTest/java/okhttp3/ResponseTest.java
+new file mode 100644
+index 000000000..5ee2a5fd2
+--- /dev/null
++++ b/okhttp/src/jvmTest/java/okhttp3/ResponseTest.java
+@@ -0,0 +1,136 @@
++/*
++ * Copyright (C) 2016 Square, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package okhttp3;
++
++import java.io.IOException;
++import okio.Buffer;
++import okio.BufferedSource;
++import okio.ByteString;
++import okio.Okio;
++import okio.Source;
++import okio.Timeout;
++import org.junit.jupiter.api.Test;
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.assertj.core.api.Assertions.assertThatThrownBy;
++import static org.junit.jupiter.api.Assertions.fail;
++
++public final class ResponseTest {
++  @Test public void peekShorterThanResponse() throws Exception {
++    Response response = newResponse(responseBody("abcdef"));
++    ResponseBody peekedBody = response.peekBody(3);
++    assertThat(peekedBody.string()).isEqualTo("abc");
++    assertThat(response.body().string()).isEqualTo("abcdef");
++  }
++
++  @Test public void peekLongerThanResponse() throws Exception {
++    Response response = newResponse(responseBody("abc"));
++    ResponseBody peekedBody = response.peekBody(6);
++    assertThat(peekedBody.string()).isEqualTo("abc");
++    assertThat(response.body().string()).isEqualTo("abc");
++  }
++
++  @Test public void peekAfterReadingResponse() throws Exception {
++    Response response = newResponse(responseBody("abc"));
++    assertThat(response.body().string()).isEqualTo("abc");
++
++    try {
++      response.peekBody(3);
++      fail();
++    } catch (IllegalStateException expected) {
++    }
++  }
++
++  @Test public void eachPeakIsIndependent() throws Exception {
++    Response response = newResponse(responseBody("abcdef"));
++    ResponseBody p1 = response.peekBody(4);
++    ResponseBody p2 = response.peekBody(2);
++    assertThat(response.body().string()).isEqualTo("abcdef");
++    assertThat(p1.string()).isEqualTo("abcd");
++    assertThat(p2.string()).isEqualTo("ab");
++  }
++
++  @Test public void negativeStatusCodeThrowsIllegalStateException() {
++    assertThatThrownBy(() -> newResponse(responseBody("set status code -1"), -1))
++        .isInstanceOf(IllegalStateException.class);
++  }
++
++  @Test public void zeroStatusCodeIsValid() {
++    Response response = newResponse(responseBody("set status code 0"), 0);
++    assertThat(response.code()).isEqualTo(0);
++  }
++
++  @Test public void defaultResponseBodyIsEmpty() throws Exception {
++    Response response = new Response.Builder()
++      .request(new Request.Builder()
++        .url("https://example.com/")
++        .build())
++      .protocol(Protocol.HTTP_1_1)
++      .code(200)
++      .message("OK")
++      .build();
++    assertThat(response.body().contentType()).isNull();
++    assertThat(response.body().contentLength()).isEqualTo(0L);
++    assertThat(response.body().byteString()).isEqualTo(ByteString.EMPTY);
++  }
++
++  @Test public void nullResponseBody() {
++    assertThatThrownBy(() -> new Response.Builder().body(null))
++      .isInstanceOf(NullPointerException.class);
++  }
++
++  /**
++   * Returns a new response body that refuses to be read once it has been closed. This is true of
++   * most {@link BufferedSource} instances, but not of {@link Buffer}.
++   */
++  private ResponseBody responseBody(String content) {
++    final Buffer data = new Buffer().writeUtf8(content);
++
++    Source source = new Source() {
++      boolean closed;
++
++      @Override public void close() throws IOException {
++        closed = true;
++      }
++
++      @Override public long read(Buffer sink, long byteCount) throws IOException {
++        if (closed) throw new IllegalStateException();
++        return data.read(sink, byteCount);
++      }
++
++      @Override public Timeout timeout() {
++        return Timeout.NONE;
++      }
++    };
++
++    return ResponseBody.create(Okio.buffer(source), null, -1);
++  }
++
++  private Response newResponse(ResponseBody responseBody) {
++    return newResponse(responseBody, 200);
++  }
++
++  private Response newResponse(ResponseBody responseBody, int code) {
++    return new Response.Builder()
++        .request(new Request.Builder()
++            .url("https://example.com/")
++            .build())
++        .protocol(Protocol.HTTP_1_1)
++        .code(code)
++        .message("OK")
++        .body(responseBody)
++        .build();
++  }
++}
+diff --git a/okhttp/src/nonJvmMain/kotlin/okhttp3/Response.kt b/okhttp/src/nonJvmMain/kotlin/okhttp3/Response.kt
+index a2175f61a..2a333606c 100644
+--- a/okhttp/src/nonJvmMain/kotlin/okhttp3/Response.kt
++++ b/okhttp/src/nonJvmMain/kotlin/okhttp3/Response.kt
+@@ -33,7 +33,6 @@ import okhttp3.internal.commonPriorResponse
+ import okhttp3.internal.commonProtocol
+ import okhttp3.internal.commonRemoveHeader
+ import okhttp3.internal.commonRequest
+-import okhttp3.internal.commonTrailers
+ import okio.Closeable
+ 
+ /**
+@@ -102,8 +101,6 @@ actual class Response internal constructor(
+    * client.
+    */
+   actual val priorResponse: Response?,
+-
+-  private var trailersFn: (() -> Headers) = { Headers.headersOf() }
+ ) : Closeable {
+ 
+   internal actual var lazyCacheControl: CacheControl? = null
+@@ -118,8 +115,6 @@ actual class Response internal constructor(
+ 
+   actual fun header(name: String, defaultValue: String?): String? = commonHeader(name, defaultValue)
+ 
+-  actual fun trailers(): Headers = trailersFn.invoke()
+-
+   /**
+    * Peeks up to [byteCount] bytes from the response body and returns them as a new response
+    * body. If fewer than [byteCount] bytes are in the response body, the full response body is
+@@ -169,7 +164,6 @@ actual class Response internal constructor(
+     internal actual var networkResponse: Response? = null
+     internal actual var cacheResponse: Response? = null
+     internal actual var priorResponse: Response? = null
+-    internal actual var trailersFn: (() -> Headers) = { Headers.headersOf() }
+ 
+     actual constructor() {
+       headers = Headers.Builder()
+@@ -213,8 +207,6 @@ actual class Response internal constructor(
+     /** Removes all headers on this builder and adds [headers]. */
+     actual open fun headers(headers: Headers) = commonHeaders(headers)
+ 
+-    actual open fun trailers(trailersFn: (() -> Headers)): Builder = commonTrailers(trailersFn)
+-
+     actual open fun body(body: ResponseBody) = commonBody(body)
+ 
+     actual open fun networkResponse(networkResponse: Response?) = commonNetworkResponse(networkResponse)
+@@ -235,7 +227,6 @@ actual class Response internal constructor(
+           networkResponse,
+           cacheResponse,
+           priorResponse,
+-          trailersFn
+       )
+     }
+   }
+diff --git a/okhttp/src/nonJvmTest/kotlin/okhttp3/ResponseNonJvmTest.kt b/okhttp/src/nonJvmTest/kotlin/okhttp3/ResponseNonJvmTest.kt
+deleted file mode 100644
+index 9bce94526..000000000
+--- a/okhttp/src/nonJvmTest/kotlin/okhttp3/ResponseNonJvmTest.kt
++++ /dev/null
+@@ -1,61 +0,0 @@
+-/*
+- * Copyright (C) 2016 Square, Inc.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-package okhttp3
+-
+-import assertk.assertThat
+-import assertk.assertions.isEmpty
+-import assertk.assertions.isEqualTo
+-import kotlin.test.Test
+-import okhttp3.ResponseBody.Companion.toResponseBody
+-
+-class ResponseNonJvmTest {
+-  @Test
+-  fun testEmptyIfTrailersNotSet() {
+-    val response = newResponse("".toResponseBody())
+-
+-    assertThat(response.trailers()).isEmpty()
+-  }
+-
+-  @Test
+-  fun worksIfTrailersSet() {
+-    val response = newResponse("".toResponseBody()) {
+-      trailers {
+-        Headers.headersOf("a", "b")
+-      }
+-    }
+-
+-    assertThat(response.trailers()["a"]).isEqualTo("b")
+-  }
+-
+-  private fun newResponse(
+-    responseBody: ResponseBody,
+-    code: Int = 200,
+-    fn: Response.Builder.() -> Unit = {}
+-  ): Response {
+-    return Response.Builder()
+-      .request(
+-        Request.Builder()
+-          .url("https://example.com/")
+-          .build()
+-      )
+-      .protocol(Protocol.HTTP_1_1)
+-      .code(code)
+-      .message("OK")
+-      .body(responseBody)
+-      .apply { fn() }
+-      .build()
+-  }
+-}

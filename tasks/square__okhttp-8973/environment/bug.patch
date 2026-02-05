@@ -1,0 +1,493 @@
+diff --git a/mockwebserver/src/main/kotlin/mockwebserver3/MockWebServer.kt b/mockwebserver/src/main/kotlin/mockwebserver3/MockWebServer.kt
+index fcd3d4fc8..46556c4f9 100644
+--- a/mockwebserver/src/main/kotlin/mockwebserver3/MockWebServer.kt
++++ b/mockwebserver/src/main/kotlin/mockwebserver3/MockWebServer.kt
+@@ -38,6 +38,7 @@ import java.security.cert.X509Certificate
+ import java.util.Collections
+ import java.util.Locale
+ import java.util.concurrent.ConcurrentHashMap
++import java.util.concurrent.CountDownLatch
+ import java.util.concurrent.LinkedBlockingQueue
+ import java.util.concurrent.TimeUnit
+ import java.util.concurrent.atomic.AtomicInteger
+@@ -819,15 +820,13 @@ public class MockWebServer : Closeable {
+         .protocol(Protocol.HTTP_1_1)
+         .build()
+ 
++    val connectionClose = CountDownLatch(1)
+     val streams =
+       object : RealWebSocket.Streams(false, socket.source, socket.sink) {
+-        override fun close() {
+-          socket.source.closeQuietly()
+-          socket.sink.closeQuietly()
+-        }
++        override fun close() = connectionClose.countDown()
+ 
+         override fun cancel() {
+-          socket.cancel()
++          socket.closeQuietly()
+         }
+       }
+     val webSocket =
+@@ -848,7 +847,7 @@ public class MockWebServer : Closeable {
+       webSocket.loopReader(fancyResponse)
+ 
+       // Even if messages are no longer being read we need to wait for the connection close signal.
+-      socket.awaitClosed()
++      connectionClose.await()
+     } finally {
+       socket.source.closeQuietly()
+     }
+diff --git a/mockwebserver/src/main/kotlin/mockwebserver3/internal/MockWebServerSocket.kt b/mockwebserver/src/main/kotlin/mockwebserver3/internal/MockWebServerSocket.kt
+index 8bd1d8ab9..3df964c7d 100644
+--- a/mockwebserver/src/main/kotlin/mockwebserver3/internal/MockWebServerSocket.kt
++++ b/mockwebserver/src/main/kotlin/mockwebserver3/internal/MockWebServerSocket.kt
+@@ -19,15 +19,12 @@ import java.io.Closeable
+ import java.io.InterruptedIOException
+ import java.net.InetAddress
+ import java.net.Socket
+-import java.util.concurrent.CountDownLatch
+ import javax.net.ssl.SSLSocket
+ import okhttp3.Handshake
+ import okhttp3.Handshake.Companion.handshake
+ import okhttp3.internal.platform.Platform
+ import okio.BufferedSink
+ import okio.BufferedSource
+-import okio.ForwardingSink
+-import okio.ForwardingSource
+ import okio.asOkioSocket
+ import okio.buffer
+ 
+@@ -42,35 +39,9 @@ internal class MockWebServerSocket(
+ ) : Closeable,
+   okio.Socket {
+   private val delegate = javaNetSocket.asOkioSocket()
+-  private val closedLatch = CountDownLatch(2)
+ 
+-  override val source: BufferedSource =
+-    object : ForwardingSource(delegate.source) {
+-      private var closed = false
+-
+-      override fun close() {
+-        if (closed) return
+-        try {
+-          super.close()
+-        } finally {
+-          closedLatch.countDown()
+-        }
+-      }
+-    }.buffer()
+-
+-  override val sink: BufferedSink =
+-    object : ForwardingSink(delegate.sink) {
+-      private var closed = false
+-
+-      override fun close() {
+-        if (closed) return
+-        try {
+-          super.close()
+-        } finally {
+-          closedLatch.countDown()
+-        }
+-      }
+-    }.buffer()
++  override val source: BufferedSource = delegate.source.buffer()
++  override val sink: BufferedSink = delegate.sink.buffer()
+ 
+   val localAddress: InetAddress
+     get() = javaNetSocket.localAddress
+@@ -125,8 +96,4 @@ internal class MockWebServerSocket(
+   override fun close() {
+     javaNetSocket.close()
+   }
+-
+-  fun awaitClosed() {
+-    closedLatch.await()
+-  }
+ }
+diff --git a/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/connection/ConnectPlan.kt b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/connection/ConnectPlan.kt
+index a049db130..9d4b19627 100644
+--- a/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/connection/ConnectPlan.kt
++++ b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/connection/ConnectPlan.kt
+@@ -20,7 +20,7 @@ import java.net.ConnectException
+ import java.net.HttpURLConnection
+ import java.net.ProtocolException
+ import java.net.Proxy
+-import java.net.Socket as JavaNetSocket
++import java.net.Socket
+ import java.net.UnknownServiceException
+ import java.security.cert.X509Certificate
+ import java.util.concurrent.TimeUnit
+@@ -44,9 +44,9 @@ import okhttp3.internal.tls.OkHostnameVerifier
+ import okhttp3.internal.toHostHeader
+ import okio.BufferedSink
+ import okio.BufferedSource
+-import okio.Socket as OkioSocket
+-import okio.asOkioSocket
+ import okio.buffer
++import okio.sink
++import okio.source
+ 
+ /**
+  * A single attempt to connect to a remote server, including these steps:
+@@ -85,16 +85,15 @@ class ConnectPlan(
+   // These properties are initialized by connect() and never reassigned.
+ 
+   /** The low-level TCP socket. */
+-  private var rawSocket: JavaNetSocket? = null
++  private var rawSocket: Socket? = null
+ 
+   /**
+    * The application layer socket. Either an [SSLSocket] layered over [rawSocket], or [rawSocket]
+    * itself if this connection does not use SSL.
+    */
+-  internal var javaNetSocket: JavaNetSocket? = null
++  internal var socket: Socket? = null
+   private var handshake: Handshake? = null
+   private var protocol: Protocol? = null
+-  private lateinit var okioSocket: OkioSocket
+   private lateinit var source: BufferedSource
+   private lateinit var sink: BufferedSink
+   private var connection: RealConnection? = null
+@@ -211,7 +210,7 @@ class ConnectPlan(
+         connectTls(sslSocket, connectionSpec)
+         user.secureConnectEnd(handshake)
+       } else {
+-        javaNetSocket = rawSocket
++        socket = rawSocket
+         protocol =
+           when {
+             Protocol.H2_PRIOR_KNOWLEDGE in route.address.protocols -> Protocol.H2_PRIOR_KNOWLEDGE
+@@ -225,10 +224,9 @@ class ConnectPlan(
+           connectionPool = connectionPool,
+           route = route,
+           rawSocket = rawSocket,
+-          socket = javaNetSocket!!,
++          socket = socket!!,
+           handshake = handshake,
+           protocol = protocol!!,
+-          okioSocket = okioSocket,
+           source = source,
+           sink = sink,
+           pingIntervalMillis = pingIntervalMillis,
+@@ -256,7 +254,7 @@ class ConnectPlan(
+     } finally {
+       user.removePlanToCancel(this)
+       if (!success) {
+-        javaNetSocket?.closeQuietly()
++        socket?.closeQuietly()
+         rawSocket.closeQuietly()
+       }
+     }
+@@ -268,7 +266,7 @@ class ConnectPlan(
+     val rawSocket =
+       when (route.proxy.type()) {
+         Proxy.Type.DIRECT, Proxy.Type.HTTP -> route.address.socketFactory.createSocket()!!
+-        else -> JavaNetSocket(route.proxy)
++        else -> Socket(route.proxy)
+       }
+     this.rawSocket = rawSocket
+ 
+@@ -291,9 +289,8 @@ class ConnectPlan(
+     // https://github.com/square/okhttp/issues/3245
+     // https://android-review.googlesource.com/#/c/271775/
+     try {
+-      okioSocket = rawSocket.asOkioSocket()
+-      source = okioSocket.source.buffer()
+-      sink = okioSocket.sink.buffer()
++      source = rawSocket.source().buffer()
++      sink = rawSocket.sink().buffer()
+     } catch (npe: NullPointerException) {
+       if (npe.message == NPE_THROW_WITH_NULL) {
+         throw IOException(npe)
+@@ -407,10 +404,9 @@ class ConnectPlan(
+         } else {
+           null
+         }
+-      javaNetSocket = sslSocket
+-      okioSocket = sslSocket.asOkioSocket()
+-      source = okioSocket.source.buffer()
+-      sink = okioSocket.sink.buffer()
++      socket = sslSocket
++      source = sslSocket.source().buffer()
++      sink = sslSocket.sink().buffer()
+       protocol = if (maybeProtocol != null) Protocol.get(maybeProtocol) else Protocol.HTTP_1_1
+       success = true
+     } finally {
+@@ -437,7 +433,6 @@ class ConnectPlan(
+           // No client for CONNECT tunnels:
+           client = null,
+           carrier = this,
+-          socket = okioSocket,
+           source = source,
+           sink = sink,
+         )
+@@ -564,7 +559,7 @@ class ConnectPlan(
+     )
+ 
+   fun closeQuietly() {
+-    javaNetSocket?.closeQuietly()
++    socket?.closeQuietly()
+   }
+ 
+   companion object {
+diff --git a/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/connection/Exchange.kt b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/connection/Exchange.kt
+index 68a644767..89d30f22d 100644
+--- a/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/connection/Exchange.kt
++++ b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/connection/Exchange.kt
+@@ -169,8 +169,8 @@ class Exchange(
+         this@Exchange.cancel()
+       }
+ 
+-      override val sink = RequestBodySink(codec.socket.sink, -1L)
+-      override val source = ResponseBodySource(codec.socket.source, -1L)
++      override val sink = RequestBodySink(codec.socketSink, -1L)
++      override val source = ResponseBodySource(codec.socketSource, -1L)
+     }
+   }
+ 
+diff --git a/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/connection/RealConnection.kt b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/connection/RealConnection.kt
+index 83a50683f..f00dda510 100644
+--- a/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/connection/RealConnection.kt
++++ b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/connection/RealConnection.kt
+@@ -19,7 +19,7 @@ package okhttp3.internal.connection
+ import java.io.IOException
+ import java.lang.ref.Reference
+ import java.net.Proxy
+-import java.net.Socket as JavaNetSocket
++import java.net.Socket
+ import java.net.SocketException
+ import java.security.cert.X509Certificate
+ import java.util.concurrent.TimeUnit.MILLISECONDS
+@@ -71,15 +71,14 @@ class RealConnection internal constructor(
+   val connectionPool: RealConnectionPool,
+   override val route: Route,
+   /** The low-level TCP socket. */
+-  private val rawSocket: JavaNetSocket,
++  private val rawSocket: Socket,
+   /**
+    * The application layer socket. Either an [SSLSocket] layered over [rawSocket], or [rawSocket]
+    * itself if this connection does not use SSL.
+    */
+-  private val socket: JavaNetSocket,
++  private val socket: Socket,
+   private val handshake: Handshake?,
+   private val protocol: Protocol,
+-  private val okioSocket: okio.Socket,
+   private val source: BufferedSource,
+   private val sink: BufferedSink,
+   private val pingIntervalMillis: Int,
+@@ -289,7 +288,7 @@ class RealConnection internal constructor(
+       socket.soTimeout = chain.readTimeoutMillis()
+       source.timeout().timeout(chain.readTimeoutMillis.toLong(), MILLISECONDS)
+       sink.timeout().timeout(chain.writeTimeoutMillis.toLong(), MILLISECONDS)
+-      Http1ExchangeCodec(client, this, okioSocket, source, sink)
++      Http1ExchangeCodec(client, this, source, sink)
+     }
+   }
+ 
+@@ -324,7 +323,7 @@ class RealConnection internal constructor(
+     rawSocket.closeQuietly()
+   }
+ 
+-  override fun socket(): JavaNetSocket = socket
++  override fun socket(): Socket = socket
+ 
+   /** Returns true if this connection is ready to host new streams. */
+   fun isHealthy(doExtensiveChecks: Boolean): Boolean {
+@@ -469,26 +468,19 @@ class RealConnection internal constructor(
+       taskRunner: TaskRunner,
+       connectionPool: RealConnectionPool,
+       route: Route,
+-      socket: JavaNetSocket,
++      socket: Socket,
+       idleAtNs: Long,
+     ): RealConnection {
+-      val okioSocket =
+-        object : okio.Socket {
+-          override val sink: Sink =
+-            object : Sink {
+-              override fun close() = Unit
+-
+-              override fun flush() = Unit
+-
+-              override fun timeout(): Timeout = Timeout.NONE
+-
+-              override fun write(
+-                source: Buffer,
+-                byteCount: Long,
+-              ): Unit = throw UnsupportedOperationException()
+-            }
+-
+-          override val source: Source =
++      val result =
++        RealConnection(
++          taskRunner = taskRunner,
++          connectionPool = connectionPool,
++          route = route,
++          rawSocket = Socket(),
++          socket = socket,
++          handshake = null,
++          protocol = Protocol.HTTP_2,
++          source =
+             object : Source {
+               override fun close() = Unit
+ 
+@@ -498,26 +490,22 @@ class RealConnection internal constructor(
+               ): Long = throw UnsupportedOperationException()
+ 
+               override fun timeout(): Timeout = Timeout.NONE
+-            }
++            }.buffer(),
++          sink =
++            object : Sink {
++              override fun close() = Unit
+ 
+-          override fun cancel() {
+-          }
+-        }
++              override fun flush() = Unit
+ 
+-      val result =
+-        RealConnection(
+-          taskRunner = taskRunner,
+-          connectionPool = connectionPool,
+-          route = route,
+-          rawSocket = JavaNetSocket(),
+-          socket = socket,
+-          handshake = null,
+-          protocol = Protocol.HTTP_2,
+-          okioSocket = okioSocket,
+-          source = okioSocket.source.buffer(),
+-          sink = okioSocket.sink.buffer(),
++              override fun timeout(): Timeout = Timeout.NONE
++
++              override fun write(
++                source: Buffer,
++                byteCount: Long,
++              ): Unit = throw UnsupportedOperationException()
++            }.buffer(),
+           pingIntervalMillis = 0,
+-          connectionListener = ConnectionListener.NONE,
++          ConnectionListener.NONE,
+         )
+       result.idleAtNs = idleAtNs
+       return result
+diff --git a/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/http/ExchangeCodec.kt b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/http/ExchangeCodec.kt
+index f9273fcb4..f1edb8565 100644
+--- a/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/http/ExchangeCodec.kt
++++ b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/http/ExchangeCodec.kt
+@@ -22,7 +22,6 @@ import okhttp3.Response
+ import okhttp3.Route
+ import okhttp3.internal.connection.RealCall
+ import okio.Sink
+-import okio.Socket
+ import okio.Source
+ 
+ /** Encodes HTTP requests and decodes HTTP responses. */
+@@ -33,8 +32,11 @@ interface ExchangeCodec {
+   /** Returns true if the response body and (possibly empty) trailers have been received. */
+   val isResponseComplete: Boolean
+ 
+-  /** The socket that carries this exchange. */
+-  val socket: Socket
++  /** The source when this is the subject of a protocol upgrade or CONNECT. */
++  val socketSink: Sink
++
++  /** The sink when this is the subject of a protocol upgrade or CONNECT. */
++  val socketSource: Source
+ 
+   /** Returns an output stream where the request body can be streamed. */
+   @Throws(IOException::class)
+diff --git a/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/http1/Http1ExchangeCodec.kt b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/http1/Http1ExchangeCodec.kt
+index 185b0f7f8..bddeac9a5 100644
+--- a/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/http1/Http1ExchangeCodec.kt
++++ b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/http1/Http1ExchangeCodec.kt
+@@ -41,7 +41,6 @@ import okio.BufferedSink
+ import okio.BufferedSource
+ import okio.ForwardingTimeout
+ import okio.Sink
+-import okio.Socket
+ import okio.Source
+ import okio.Timeout
+ 
+@@ -66,7 +65,6 @@ class Http1ExchangeCodec(
+   /** The client that configures this stream. May be null for HTTPS proxy tunnels. */
+   private val client: OkHttpClient?,
+   override val carrier: ExchangeCodec.Carrier,
+-  override val socket: Socket,
+   private val source: BufferedSource,
+   private val sink: BufferedSink,
+ ) : ExchangeCodec {
+@@ -94,6 +92,12 @@ class Http1ExchangeCodec(
+   override val isResponseComplete: Boolean
+     get() = state == STATE_CLOSED
+ 
++  override val socketSink
++    get() = sink
++
++  override val socketSource
++    get() = source
++
+   override fun createRequestBody(
+     request: Request,
+     contentLength: Long,
+diff --git a/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/http2/Http2ExchangeCodec.kt b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/http2/Http2ExchangeCodec.kt
+index 019c0b604..b3a217df8 100644
+--- a/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/http2/Http2ExchangeCodec.kt
++++ b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/http2/Http2ExchangeCodec.kt
+@@ -43,7 +43,6 @@ import okhttp3.internal.http2.Header.Companion.TARGET_SCHEME
+ import okhttp3.internal.http2.Header.Companion.TARGET_SCHEME_UTF8
+ import okhttp3.internal.immutableListOf
+ import okio.Sink
+-import okio.Socket
+ import okio.Source
+ 
+ /** Encode requests and responses using HTTP/2 frames. */
+@@ -68,8 +67,11 @@ class Http2ExchangeCodec(
+   override val isResponseComplete: Boolean
+     get() = stream?.isSourceComplete == true
+ 
+-  override val socket: Socket
+-    get() = stream!!
++  override val socketSink
++    get() = stream!!.sink
++
++  override val socketSource
++    get() = stream!!.source
+ 
+   override fun createRequestBody(
+     request: Request,
+diff --git a/okhttp/src/jvmTest/kotlin/okhttp3/CallTest.kt b/okhttp/src/jvmTest/kotlin/okhttp3/CallTest.kt
+index f9a5a5654..c5db8fd55 100644
+--- a/okhttp/src/jvmTest/kotlin/okhttp3/CallTest.kt
++++ b/okhttp/src/jvmTest/kotlin/okhttp3/CallTest.kt
+@@ -2974,7 +2974,6 @@ open class CallTest {
+       "Canceled",
+       "stream was reset: CANCEL",
+       "Socket closed",
+-      "Socket is closed",
+     )
+   }
+ 
+diff --git a/okhttp/src/jvmTest/kotlin/okhttp3/internal/http/SocketFailureTest.kt b/okhttp/src/jvmTest/kotlin/okhttp3/internal/http/SocketFailureTest.kt
+index c1fb2e0ad..6b3d7b6fb 100644
+--- a/okhttp/src/jvmTest/kotlin/okhttp3/internal/http/SocketFailureTest.kt
++++ b/okhttp/src/jvmTest/kotlin/okhttp3/internal/http/SocketFailureTest.kt
+@@ -16,7 +16,7 @@
+ package okhttp3.internal.http
+ 
+ import assertk.assertThat
+-import assertk.assertions.isIn
++import assertk.assertions.isEqualTo
+ import java.net.Socket
+ import kotlin.test.assertFailsWith
+ import mockwebserver3.MockResponse
+@@ -111,6 +111,6 @@ class SocketFailureTest {
+       assertFailsWith<IOException> {
+         call2.execute()
+       }
+-    assertThat(exception.message).isIn("Socket closed", "Socket is closed")
++    assertThat(exception.message).isEqualTo("Socket closed")
+   }
+ }

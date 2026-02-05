@@ -1,0 +1,817 @@
+diff --git a/gradle/libs.versions.toml b/gradle/libs.versions.toml
+index 8f0c55810b..e17fea2279 100644
+--- a/gradle/libs.versions.toml
++++ b/gradle/libs.versions.toml
+@@ -64,6 +64,7 @@ vertx = "4.5.14"
+ wiremock = "2.33.2"
+ mimepull = "1.10.0"
+ micronaut-sourcegen = "1.6.2"
++icu4j = "76.1"
+ 
+ #
+ # Versions which start with managed- are managed by Micronaut in the sense
+@@ -201,6 +202,8 @@ hibernate = { module = "org.hibernate:hibernate-core", version.ref = "hibernate"
+ htmlunit = { module = "net.sourceforge.htmlunit:htmlunit", version.ref = "htmlunit" }
+ htmlsanitycheck = { module = "org.aim42:htmlSanityCheck", version.ref = "htmlsanitycheck"}
+ 
++icu4j = { module = "com.ibm.icu:icu4j", version.ref = "icu4j" }
++
+ jakarta-inject-api = { module = "jakarta.inject:jakarta.inject-api", version.ref = "jakarta-inject-api" }
+ jakarta-inject-tck = { module = "jakarta.inject:jakarta.inject-tck", version.ref = "jakarta-inject-tck" }
+ 
+diff --git a/http-server-netty/src/main/java/io/micronaut/http/server/netty/AbstractNettyHttpRequest.java b/http-server-netty/src/main/java/io/micronaut/http/server/netty/AbstractNettyHttpRequest.java
+new file mode 100644
+index 0000000000..03a06d0893
+--- /dev/null
++++ b/http-server-netty/src/main/java/io/micronaut/http/server/netty/AbstractNettyHttpRequest.java
+@@ -0,0 +1,282 @@
++/*
++ * Copyright 2017-2020 original authors
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * https://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package io.micronaut.http.server.netty;
++
++import io.micronaut.core.annotation.Internal;
++import io.micronaut.core.annotation.NonNull;
++import io.micronaut.core.async.publisher.Publishers;
++import io.micronaut.core.convert.ConversionService;
++import io.micronaut.http.HttpMethod;
++import io.micronaut.http.HttpParameters;
++import io.micronaut.http.HttpRequest;
++import io.micronaut.http.netty.NettyHttpParameters;
++import io.micronaut.http.netty.NettyHttpRequestBuilder;
++import io.micronaut.http.netty.stream.DefaultStreamedHttpRequest;
++import io.micronaut.http.netty.stream.StreamedHttpRequest;
++import io.micronaut.http.server.HttpServerConfiguration;
++import io.micronaut.web.router.uri.UriUtil;
++import io.netty.handler.codec.http.DefaultFullHttpRequest;
++import io.netty.handler.codec.http.DefaultLastHttpContent;
++import io.netty.handler.codec.http.HttpConstants;
++import io.netty.handler.codec.http.LastHttpContent;
++import io.netty.handler.codec.http.QueryStringDecoder;
++import io.netty.util.DefaultAttributeMap;
++
++import java.net.URI;
++import java.net.URISyntaxException;
++import java.nio.charset.Charset;
++
++/**
++ * Abstract implementation of {@link HttpRequest} for Netty.
++ *
++ * @param <B> The body
++ * @author Graeme Rocher
++ * @since 1.0
++ */
++@Internal
++public abstract class AbstractNettyHttpRequest<B> extends DefaultAttributeMap implements HttpRequest<B>, NettyHttpRequestBuilder {
++
++    protected final io.netty.handler.codec.http.HttpRequest nettyRequest;
++    protected final ConversionService conversionService;
++    protected final HttpMethod httpMethod;
++    protected final String unvalidatedUrl;
++    protected final String httpMethodName;
++
++    private volatile URI uri;
++    private volatile NettyHttpParameters httpParameters;
++    private volatile Charset charset;
++    private volatile String path;
++
++    /**
++     * @param nettyRequest      The Http netty request
++     * @param conversionService The conversion service
++     * @param escapeHtmlUrl     {@link HttpServerConfiguration#isEscapeHtmlUrl()}
++     */
++    public AbstractNettyHttpRequest(io.netty.handler.codec.http.HttpRequest nettyRequest, ConversionService conversionService, boolean escapeHtmlUrl) {
++        this.nettyRequest = nettyRequest;
++        this.conversionService = conversionService;
++        String uri = nettyRequest.uri();
++        if (!UriUtil.isValidPath(uri)) {
++            if (escapeHtmlUrl && UriUtil.isRelative(uri)) {
++                uri = UriUtil.toValidPath(uri);
++            }
++            this.uri = createURI(uri);
++        }
++        this.unvalidatedUrl = uri;
++        this.httpMethodName = nettyRequest.method().name();
++        this.httpMethod = HttpMethod.parse(httpMethodName);
++    }
++
++    @NonNull
++    @Override
++    public io.netty.handler.codec.http.HttpRequest toHttpRequest() {
++        return this.nettyRequest;
++    }
++
++    @NonNull
++    @Override
++    public io.netty.handler.codec.http.FullHttpRequest toFullHttpRequest() {
++        if (this.nettyRequest instanceof io.netty.handler.codec.http.FullHttpRequest request) {
++            return request;
++        }
++        DefaultFullHttpRequest httpRequest = new DefaultFullHttpRequest(
++                this.nettyRequest.protocolVersion(),
++                this.nettyRequest.method(),
++                this.nettyRequest.uri()
++        );
++        httpRequest.headers().setAll(this.nettyRequest.headers());
++        return httpRequest;
++    }
++
++    @NonNull
++    @Override
++    public StreamedHttpRequest toStreamHttpRequest() {
++        if (isStream()) {
++            return (StreamedHttpRequest) this.nettyRequest;
++        } else {
++            if (this.nettyRequest instanceof io.netty.handler.codec.http.FullHttpRequest request) {
++
++                return new DefaultStreamedHttpRequest(
++                        io.netty.handler.codec.http.HttpVersion.HTTP_1_1,
++                        this.nettyRequest.method(),
++                        this.nettyRequest.uri(),
++                        true,
++                        Publishers.just(new DefaultLastHttpContent(request.content()))
++                        );
++            } else {
++                return new DefaultStreamedHttpRequest(
++                        io.netty.handler.codec.http.HttpVersion.HTTP_1_1,
++                        this.nettyRequest.method(),
++                        this.nettyRequest.uri(),
++                        true,
++                        Publishers.just(LastHttpContent.EMPTY_LAST_CONTENT)
++                );
++            }
++        }
++    }
++
++    @Override
++    public boolean isStream() {
++        return this.nettyRequest instanceof StreamedHttpRequest;
++    }
++
++    /**
++     * @return The native netty request
++     */
++    public io.netty.handler.codec.http.HttpRequest getNettyRequest() {
++        return nettyRequest;
++    }
++
++    @Override
++    public HttpParameters getParameters() {
++        NettyHttpParameters params = this.httpParameters;
++        if (params == null) {
++            synchronized (this) { // double check
++                params = this.httpParameters;
++                if (params == null) {
++                    params = decodeParameters();
++                    this.httpParameters = params;
++                }
++            }
++        }
++        return params;
++    }
++
++    @Override
++    public Charset getCharacterEncoding() {
++        if (charset == null) {
++            charset = initCharset(HttpRequest.super.getCharacterEncoding());
++        }
++        return charset;
++    }
++
++    @Override
++    public HttpMethod getMethod() {
++        return httpMethod;
++    }
++
++    @Override
++    public URI getUri() {
++        URI u = this.uri;
++        if (u == null) {
++            u = createURI(unvalidatedUrl);
++            this.uri = u;
++        }
++        return u;
++    }
++
++    @Override
++    public String getPath() {
++        String p = this.path;
++        if (p == null) {
++            p = parsePath(unvalidatedUrl);
++            this.path = p;
++        }
++        return p;
++    }
++
++    /**
++     * @param characterEncoding The character encoding
++     * @return The Charset
++     */
++    protected abstract Charset initCharset(Charset characterEncoding);
++
++    /**
++     * @return the maximum number of parameters.
++     */
++    protected abstract int getMaxParams();
++
++    /**
++     * @return {@code true} if yes, {@code false} otherwise.
++     */
++    protected abstract boolean isSemicolonIsNormalChar();
++
++    /**
++     * @param uri The URI
++     * @return The query string decoder
++     */
++    @SuppressWarnings("ConstantConditions")
++    protected final QueryStringDecoder createDecoder(URI uri) {
++        Charset cs = getCharacterEncoding();
++        boolean semicolonIsNormalChar = isSemicolonIsNormalChar();
++        int maxParams = getMaxParams();
++        return cs != null ?
++            new QueryStringDecoder(uri, cs, maxParams, semicolonIsNormalChar) :
++            new QueryStringDecoder(uri, HttpConstants.DEFAULT_CHARSET, maxParams, semicolonIsNormalChar);
++    }
++
++    private NettyHttpParameters decodeParameters() {
++        QueryStringDecoder queryStringDecoder = createDecoder(getUri());
++        return new NettyHttpParameters(queryStringDecoder.parameters(), conversionService, null);
++    }
++
++    @Override
++    public String getMethodName() {
++        return httpMethodName;
++    }
++
++    private static URI createURI(String url) {
++        URI fullUri = URI.create(url);
++        if (fullUri.getAuthority() != null || fullUri.getScheme() != null) {
++            // https://example.com/foo -> /foo
++            try {
++                fullUri = new URI(
++                    null, // scheme
++                    null, // authority
++                    fullUri.getPath(),
++                    fullUri.getQuery(),
++                    fullUri.getFragment()
++                );
++            } catch (URISyntaxException e) {
++                throw new IllegalArgumentException(e);
++            }
++        }
++        return fullUri;
++    }
++
++    /**
++     * Extract the path out of the uri.
++     * https://github.com/eclipse-vertx/vert.x/blob/master/src/main/java/io/vertx/core/http/impl/HttpUtils.java
++     */
++    private static String parsePath(String uri) {
++        if (uri.isEmpty()) {
++            return "";
++        }
++        int i;
++        if (uri.charAt(0) == '/') {
++            i = 0;
++        } else {
++            i = uri.indexOf("://");
++            if (i == -1) {
++                i = 0;
++            } else {
++                i = uri.indexOf('/', i + 3);
++                if (i == -1) {
++                    // contains no /
++                    return "/";
++                }
++            }
++        }
++        int queryStart = uri.indexOf('?', i);
++        if (queryStart == -1) {
++            queryStart = uri.length();
++            if (i == 0) {
++                return uri;
++            }
++        }
++        return uri.substring(i, queryStart);
++    }
++}
+diff --git a/http-server-netty/src/main/java/io/micronaut/http/server/netty/NettyHttpRequest.java b/http-server-netty/src/main/java/io/micronaut/http/server/netty/NettyHttpRequest.java
+index 70ddd10e41..97e9c2b6f0 100644
+--- a/http-server-netty/src/main/java/io/micronaut/http/server/netty/NettyHttpRequest.java
++++ b/http-server-netty/src/main/java/io/micronaut/http/server/netty/NettyHttpRequest.java
+@@ -47,7 +47,6 @@ import io.micronaut.http.body.CloseableByteBody;
+ import io.micronaut.http.body.InternalByteBody;
+ import io.micronaut.http.cookie.Cookie;
+ import io.micronaut.http.cookie.Cookies;
+-import io.micronaut.http.netty.AbstractNettyHttpRequest;
+ import io.micronaut.http.netty.NettyHttpHeaders;
+ import io.micronaut.http.netty.NettyHttpParameters;
+ import io.micronaut.http.netty.NettyHttpRequestBuilder;
+@@ -197,7 +196,7 @@ public final class NettyHttpRequest<T> extends AbstractNettyHttpRequest<T> imple
+                             ChannelHandlerContext ctx,
+                             ConversionService environment,
+                             HttpServerConfiguration serverConfiguration) throws IllegalArgumentException {
+-        super(nettyRequest, environment);
++        super(nettyRequest, environment, serverConfiguration.isEscapeHtmlUrl());
+         Objects.requireNonNull(nettyRequest, "Netty request cannot be null");
+         Objects.requireNonNull(ctx, "ChannelHandlerContext cannot be null");
+         Objects.requireNonNull(environment, "Environment cannot be null");
+diff --git a/http-server-netty/src/main/java/io/micronaut/http/server/netty/RoutingInBoundHandler.java b/http-server-netty/src/main/java/io/micronaut/http/server/netty/RoutingInBoundHandler.java
+index acf6175b7d..01657a96b4 100644
+--- a/http-server-netty/src/main/java/io/micronaut/http/server/netty/RoutingInBoundHandler.java
++++ b/http-server-netty/src/main/java/io/micronaut/http/server/netty/RoutingInBoundHandler.java
+@@ -29,6 +29,7 @@ import io.micronaut.http.body.CloseableByteBody;
+ import io.micronaut.http.body.MessageBodyHandlerRegistry;
+ import io.micronaut.http.context.ServerHttpRequestContext;
+ import io.micronaut.http.context.event.HttpRequestReceivedEvent;
++import io.micronaut.http.context.event.HttpRequestReceivedEvent;
+ import io.micronaut.http.context.event.HttpRequestTerminatedEvent;
+ import io.micronaut.http.netty.NettyMutableHttpResponse;
+ import io.micronaut.http.netty.body.AvailableNettyByteBody;
+@@ -168,30 +169,31 @@ public final class RoutingInBoundHandler implements RequestHandler {
+ 
+     @Override
+     public void accept(ChannelHandlerContext ctx, io.netty.handler.codec.http.HttpRequest request, CloseableByteBody body, OutboundAccess outboundAccess) {
+-        NettyHttpRequest<Object> mnRequest = new NettyHttpRequest<>(request, body, ctx, conversionService, serverConfiguration);
+-        if (receivedPublisher != ApplicationEventPublisher.NO_OP) {
+-            receivedPublisher.publishEvent(new HttpRequestReceivedEvent(mnRequest));
+-        }
+-        if (serverConfiguration.isValidateUrl()) {
+-            try {
+-                mnRequest.getUri();
+-            } catch (IllegalArgumentException e) {
+-                body.close();
++        NettyHttpRequest<Object> mnRequest;
++        try {
++            mnRequest = new NettyHttpRequest<>(request, body, ctx, conversionService, serverConfiguration);
++        } catch (IllegalArgumentException e) {
++            body.close();
+ 
+-                // invalid URI
+-                NettyHttpRequest<Object> errorRequest = new NettyHttpRequest<>(
+-                    new DefaultHttpRequest(request.protocolVersion(), request.method(), "/"),
+-                    AvailableNettyByteBody.empty(),
+-                    ctx,
+-                    conversionService,
+-                    serverConfiguration
+-                );
+-                outboundAccess.attachment(errorRequest);
+-                try (PropagatedContext.Scope ignore = PropagatedContext.getOrEmpty().plus(new ServerHttpRequestContext(errorRequest)).propagate()) {
+-                    new NettyRequestLifecycle(this, outboundAccess).handleException(errorRequest, e.getCause() == null ? e : e.getCause());
+-                }
+-                return;
++            // invalid URI
++            NettyHttpRequest<Object> errorRequest = new NettyHttpRequest<>(
++                new DefaultHttpRequest(request.protocolVersion(), request.method(), "/"),
++                AvailableNettyByteBody.empty(),
++                ctx,
++                conversionService,
++                serverConfiguration
++            );
++            outboundAccess.attachment(errorRequest);
++            if (receivedPublisher != ApplicationEventPublisher.NO_OP) {
++                receivedPublisher.publishEvent(new HttpRequestReceivedEvent(errorRequest));
+             }
++            try (PropagatedContext.Scope ignore = PropagatedContext.getOrEmpty().plus(new ServerHttpRequestContext(errorRequest)).propagate()) {
++                new NettyRequestLifecycle(this, outboundAccess).handleException(errorRequest, e.getCause() == null ? e : e.getCause());
++            }
++            return;
++        }
++        if (receivedPublisher != ApplicationEventPublisher.NO_OP) {
++            receivedPublisher.publishEvent(new HttpRequestReceivedEvent(mnRequest));
+         }
+         if (supportLoggingHandler && ctx.pipeline().get(ChannelPipelineCustomizer.HANDLER_ACCESS_LOGGER) != null) {
+             // Micronaut Session needs this to extract values from the Micronaut Http Request for logging
+diff --git a/http-server/src/main/java/io/micronaut/http/server/HttpServerConfiguration.java b/http-server/src/main/java/io/micronaut/http/server/HttpServerConfiguration.java
+index eeb3b15ac9..e451331b1b 100644
+--- a/http-server/src/main/java/io/micronaut/http/server/HttpServerConfiguration.java
++++ b/http-server/src/main/java/io/micronaut/http/server/HttpServerConfiguration.java
+@@ -166,6 +166,7 @@ public class HttpServerConfiguration implements ServerContextPathProvider {
+     private Charset defaultCharset;
+     private ThreadSelection threadSelection = ThreadSelection.MANUAL;
+     private boolean validateUrl = true;
++    private boolean escapeHtmlUrl = false;
+     private boolean notFoundOnMissingBody = true;
+     private boolean semicolonIsNormalChar = DEFAULT_SEMICOLON_IS_NORMAL_CHAR;
+     private int maxParams = DEFAULT_MAX_PARAMS;
+@@ -583,7 +584,9 @@ public class HttpServerConfiguration implements ServerContextPathProvider {
+      *
+      * @param validateUrl The validate URL value
+      * @since 4.3.0
++     * @deprecated URLs are always validated again as of 4.9. This setting does nothing
+      */
++    @Deprecated(forRemoval = true, since = "4.9.0")
+     public void setValidateUrl(boolean validateUrl) {
+         this.validateUrl = validateUrl;
+     }
+@@ -591,11 +594,39 @@ public class HttpServerConfiguration implements ServerContextPathProvider {
+     /**
+      * @return True if the url should be validated
+      * @since 4.3.0
++     * @deprecated URLs are always validated again as of 4.9. This setting does nothing
+      */
++    @Deprecated(forRemoval = true, since = "4.9.0")
+     public boolean isValidateUrl() {
+         return validateUrl;
+     }
+ 
++    /**
++     * Browsers can send characters (such as {@code |}) which are not permitted under RFC 3986 as
++     * part of the request path. These characters are normally rejected by the server. If this
++     * setting is enabled, the server will escape these characters before parsing them using
++     * {@link java.net.URI} so that they are not rejected. Default off.
++     *
++     * @return Whether to escape forbidden URL characters prior to parsing
++     * @since 4.9.0
++     */
++    public boolean isEscapeHtmlUrl() {
++        return escapeHtmlUrl;
++    }
++
++    /**
++     * Browsers can send characters (such as {@code |}) which are not permitted under RFC 3986 as
++     * part of the request path. These characters are normally rejected by the server. If this
++     * setting is enabled, the server will escape these characters before parsing them using
++     * {@link java.net.URI} so that they are not rejected. Default off.
++     *
++     * @param escapeHtmlUrl Whether to escape forbidden URL characters prior to parsing
++     * @since 4.9.0
++     */
++    public void setEscapeHtmlUrl(boolean escapeHtmlUrl) {
++        this.escapeHtmlUrl = escapeHtmlUrl;
++    }
++
+     /**
+      * @return True if not-found should be returned on missing body. False to return an empty body.
+      * @since 4.6
+diff --git a/router/build.gradle.kts b/router/build.gradle.kts
+index bae112833a..0417535767 100644
+--- a/router/build.gradle.kts
++++ b/router/build.gradle.kts
+@@ -14,6 +14,9 @@ dependencies {
+     testImplementation(projects.micronautInjectJava)
+     testAnnotationProcessor(projects.micronautInjectJava)
+     testImplementation(projects.micronautInjectGroovyTest)
++    testImplementation(libs.jazzer.junit)
++    testImplementation(libs.jazzer.api)
++    testImplementation(libs.icu4j)
+ }
+ 
+ 
+diff --git a/router/src/main/java/io/micronaut/web/router/uri/PercentEncoder.java b/router/src/main/java/io/micronaut/web/router/uri/PercentEncoder.java
+new file mode 100644
+index 0000000000..f770ce3466
+--- /dev/null
++++ b/router/src/main/java/io/micronaut/web/router/uri/PercentEncoder.java
+@@ -0,0 +1,143 @@
++/*
++ * Copyright 2017-2025 original authors
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * https://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package io.micronaut.web.router.uri;
++
++import io.micronaut.core.annotation.Internal;
++
++import java.util.BitSet;
++import java.util.Locale;
++
++/**
++ * Utility class for different URL percent encoding sets.
++ *
++ * @since 4.9.0
++ * @author Jonas Konrad
++ */
++@Internal
++final class PercentEncoder {
++    static final PercentEncoder C0 = new PercentEncoder(new BitSet());
++
++    static {
++        for (char c = 0x20; c <= 0x7e; c++) {
++            C0.keepSet.set(c);
++        }
++    }
++
++    // whatwg sets
++    static final PercentEncoder FRAGMENT = C0.addEncode(' ', '"', '<', '>', '`');
++    static final PercentEncoder QUERY = C0.addEncode(' ', '"', '<', '>', '#');
++    static final PercentEncoder SPECIAL_QUERY = QUERY.addEncode('\'');
++    static final PercentEncoder PATH = QUERY.addEncode('?', '`', '{', '}');
++    static final PercentEncoder USERINFO = PATH.addEncode('/', ':', ';', '=', '@', '|').addEncodeRange('[', '^');
++    static final PercentEncoder COMPONENT = USERINFO.addEncode('+', ',').addEncodeRange('$', '&');
++    static final PercentEncoder FORM = COMPONENT.addEncode('!', '~').addEncodeRange('\'', ')');
++
++    // RFC 3986 (URI) sets
++    static final PercentEncoder RFC3986_UNRESERVED = new PercentEncoder(new BitSet())
++        .removeEncodeRange('a', 'z')
++        .removeEncodeRange('A', 'Z')
++        .removeEncodeRange('0', '9')
++        .removeEncode('-', '.', '_', '~');
++    static final PercentEncoder RFC3986_PCHAR = RFC3986_UNRESERVED.removeEncode('%', '!', '$', '&', '\'', '(', ')', '*', '+', ',', ';', '=', '@'); // ':' is allowed but makes java.net.URI hiccup
++    static final PercentEncoder RFC3986_QUERY_CHAR = RFC3986_PCHAR.removeEncode('/', '?');
++
++    private final BitSet keepSet;
++
++    private PercentEncoder(BitSet keepSet) {
++        this.keepSet = keepSet;
++    }
++
++    public void encodeByte(StringBuilder target, byte b) {
++        if (keep(b)) {
++            target.append((char) (b & 0xff));
++        } else {
++            target.ensureCapacity(target.length() + 3);
++            appendEncodedByte(target, b);
++        }
++    }
++
++    public boolean keep(byte b) {
++        return keepSet.get(b & 0xff);
++    }
++
++    public void encodeUtf8(StringBuilder target, int codePoint) {
++        if (codePoint < 0x80) {
++            if (keepSet.get(codePoint)) {
++                target.append((char) codePoint);
++            } else {
++                target.ensureCapacity(target.length() + 3);
++                appendEncodedByte(target, (byte) codePoint);
++            }
++        } else if (codePoint < 0x800) {
++            target.ensureCapacity(target.length() + 6);
++            appendEncodedByte(target, (byte) (0b11000000 | (codePoint >> 6)));
++            appendEncodedByte(target, (byte) (0b10000000 | (codePoint & 0b111111)));
++        } else if (codePoint < 0x10000) {
++            target.ensureCapacity(target.length() + 9);
++            appendEncodedByte(target, (byte) (0b11100000 | (codePoint >> 12)));
++            appendEncodedByte(target, (byte) (0b10000000 | ((codePoint >> 6) & 0b111111)));
++            appendEncodedByte(target, (byte) (0b10000000 | (codePoint & 0b111111)));
++        } else if (codePoint < 0x110000) {
++            target.ensureCapacity(target.length() + 12);
++            appendEncodedByte(target, (byte) (0b11110000 | (codePoint >> 18)));
++            appendEncodedByte(target, (byte) (0b10000000 | ((codePoint >> 12) & 0b111111)));
++            appendEncodedByte(target, (byte) (0b10000000 | ((codePoint >> 6) & 0b111111)));
++            appendEncodedByte(target, (byte) (0b10000000 | (codePoint & 0b111111)));
++        } else {
++            throw new IllegalArgumentException("Code point out of range: " + codePoint);
++        }
++    }
++
++    static void appendEncodedByte(StringBuilder target, byte b) {
++        target.append('%');
++        if ((b & 0xff) < 0x10) {
++            target.append('0');
++        }
++        target.append(Integer.toHexString(b & 0xFF).toUpperCase(Locale.ROOT));
++    }
++
++    private PercentEncoder addEncode(char... removed) {
++        BitSet result = (BitSet) keepSet.clone();
++        for (char c : removed) {
++            result.clear(c);
++        }
++        return new PercentEncoder(result);
++    }
++
++    private PercentEncoder addEncodeRange(char fromInclusive, char toExclusive) {
++        BitSet result = (BitSet) keepSet.clone();
++        for (char c = fromInclusive; c <= toExclusive; c++) {
++            result.clear(c);
++        }
++        return new PercentEncoder(result);
++    }
++
++    private PercentEncoder removeEncode(char... removed) {
++        BitSet result = (BitSet) keepSet.clone();
++        for (char c : removed) {
++            result.set(c);
++        }
++        return new PercentEncoder(result);
++    }
++
++    private PercentEncoder removeEncodeRange(char fromInclusive, char toExclusive) {
++        BitSet result = (BitSet) keepSet.clone();
++        for (char c = fromInclusive; c <= toExclusive; c++) {
++            result.set(c);
++        }
++        return new PercentEncoder(result);
++    }
++}
+diff --git a/router/src/main/java/io/micronaut/web/router/uri/UriUtil.java b/router/src/main/java/io/micronaut/web/router/uri/UriUtil.java
+new file mode 100644
+index 0000000000..60818f9d51
+--- /dev/null
++++ b/router/src/main/java/io/micronaut/web/router/uri/UriUtil.java
+@@ -0,0 +1,190 @@
++/*
++ * Copyright 2017-2025 original authors
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * https://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package io.micronaut.web.router.uri;
++
++import io.micronaut.core.annotation.NonNull;
++
++import java.net.URI;
++
++/**
++ * Utilities for converting URI formats.
++ *
++ * @author Jonas Konrad
++ * @since 4.9.0
++ */
++public final class UriUtil {
++    private UriUtil() {
++    }
++
++    /**
++     * Transform a path+query as specified by the whatwg url spec into a path+query that is allowed
++     * by RFC 3986. Whatwg permits certain characters (e.g. '|') and invalid percent escape
++     * sequences that RFC 3986 (or {@link URI}) does not allow. This method will percent-encode
++     * those cases, so that any URI sent by a browser can be transformed to {@link URI}.
++     *
++     * @param path The whatwg path+query
++     * @return A valid RFC 3986 {@code relative-ref}
++     */
++    public static String toValidPath(String path) {
++        StringBuilder sb = new StringBuilder();
++        for (int i = 0; i < path.length();) {
++            int cp = path.codePointAt(i);
++            if (cp == '%') {
++                boolean validEscape;
++                if (i + 2 >= path.length()) {
++                    validEscape = false;
++                } else {
++                    char c1 = path.charAt(i + 1);
++                    char c2 = path.charAt(i + 2);
++                    validEscape = isAsciiHexDigit(c1) && isAsciiHexDigit(c2);
++                }
++                if (validEscape) {
++                    sb.appendCodePoint(cp);
++                } else {
++                    PercentEncoder.appendEncodedByte(sb, (byte) '%');
++                }
++            } else {
++                if (cp == '/' && sb.length() == 1 && sb.charAt(0) == '/') {
++                    // prevent '//' at start of url
++                } else {
++                    PercentEncoder.RFC3986_QUERY_CHAR.encodeUtf8(sb, cp);
++                }
++            }
++            i += Character.charCount(cp);
++        }
++        return sb.toString();
++    }
++
++    /**
++     * Check whether the given HTTP request target is a valid RFC 3986 relative URI (path + query)
++     * that will be parsed without complaint by {@link URI}. If this is true, we can skip the
++     * expensive parsing until necessary.
++     *
++     * @param requestTarget The HTTP request line
++     * @return {@code true} iff this is a valid relative URI
++     */
++    public static boolean isValidPath(@NonNull String requestTarget) {
++        if (requestTarget.isEmpty() || requestTarget.charAt(0) != '/') {
++            return false;
++        }
++        for (int i = 0; i < requestTarget.length(); i++) {
++            char c = requestTarget.charAt(i);
++            if (c == '%' || c > 0x7f || !PercentEncoder.RFC3986_QUERY_CHAR.keep((byte) c)) {
++                return false;
++            }
++            if (c == '/' && i < requestTarget.length() - 1) {
++                char next = requestTarget.charAt(i + 1);
++                if (next == '/') {
++                    return false;
++                }
++                if (next == '.') {
++                    if (i >= requestTarget.length() - 2) {
++                        return false;
++                    }
++                    char nextNext = requestTarget.charAt(i + 2);
++                    if (nextNext == '.' || nextNext == '/' || nextNext == '?' || nextNext == '#') {
++                        return false;
++                    }
++                }
++            }
++        }
++        return true;
++    }
++
++    /**
++     * Determine whether the given HTTP request target is a relative URI (path+query) appropriate
++     * for {@link #toValidPath(String)}. The invariants are:
++     *
++     * <ul>
++     *     <li>This method returns {@code true} exactly when, according to the whatwg URL spec, this
++     *     URL has no scheme</li>
++     *     <li>If the input is a valid URI, this method is equal to the inverse of
++     *     {@link URI#isAbsolute()}</li>
++     *     <li>If this method returns {@code true}, and the input is a valid URI after going
++     *     through {@link #toValidPath(String)}, {@link URI#isAbsolute()} is {@code false}</li>
++     * </ul>
++     *
++     * @param requestTarget The HTTP request target
++     * @return {@code true} if this URL is relative
++     */
++    public static boolean isRelative(@NonNull String requestTarget) {
++        // yes this code is weird. There's a fuzz test that checks it against the whatwg spec
++        boolean start = true;
++        for (int i = 0; i < requestTarget.length(); i++) {
++            char c = requestTarget.charAt(i);
++            if (c == '\t' || c == '\n' || c == '\r') {
++                // newline and tab is ignored anywhere.
++                continue;
++            }
++            if (isAsciiLowerAlpha(c) || isAsciiUpperAlpha(c)) {
++                start = false;
++                continue;
++            }
++            if (!start) {
++                if (c == ':') {
++                    return false;
++                }
++                if (isAsciiDigit(c) || c == '+' || c == '-' || c == '.') {
++                    continue;
++                }
++                if (isC0OrSpace(c)) {
++                    // c0 and space are trimmed at start and end, so we are either invalid or at
++                    // the end
++                    break;
++                }
++            } else {
++                if (isC0OrSpace(c)) {
++                    // c0 and space are trimmed at start and end.
++                    continue;
++                }
++            }
++            break;
++        }
++        return true;
++    }
++
++    private static boolean isC0(int c) {
++        return c <= 0x1f;
++    }
++
++    private static boolean isC0OrSpace(char c) {
++        return isC0(c) || c == ' ';
++    }
++
++    private static boolean isAsciiDigit(int c) {
++        return c >= '0' && c <= '9';
++    }
++
++    private static boolean isAsciiUpperHexDigit(int c) {
++        return isAsciiDigit(c) || (c >= 'A' && c <= 'F');
++    }
++
++    private static boolean isAsciiLowerHexDigit(int c) {
++        return isAsciiDigit(c) || (c >= 'a' && c <= 'f');
++    }
++
++    private static boolean isAsciiHexDigit(int c) {
++        return isAsciiLowerHexDigit(c) || isAsciiUpperHexDigit(c);
++    }
++
++    private static boolean isAsciiUpperAlpha(int c) {
++        return c >= 'A' && c <= 'Z';
++    }
++
++    private static boolean isAsciiLowerAlpha(int c) {
++        return c >= 'a' && c <= 'z';
++    }
++}

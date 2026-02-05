@@ -1,0 +1,275 @@
+diff --git a/src/main/java/org/mockito/internal/creation/bytebuddy/MockMethodInterceptor.java b/src/main/java/org/mockito/internal/creation/bytebuddy/MockMethodInterceptor.java
+index 7c2dec875..906692768 100644
+--- a/src/main/java/org/mockito/internal/creation/bytebuddy/MockMethodInterceptor.java
++++ b/src/main/java/org/mockito/internal/creation/bytebuddy/MockMethodInterceptor.java
+@@ -13,12 +13,8 @@ import net.bytebuddy.implementation.bind.annotation.RuntimeType;
+ import net.bytebuddy.implementation.bind.annotation.StubValue;
+ import net.bytebuddy.implementation.bind.annotation.SuperCall;
+ import net.bytebuddy.implementation.bind.annotation.This;
+-import org.mockito.internal.creation.DelegatingMethod;
+ import org.mockito.internal.debugging.LocationImpl;
+-import org.mockito.internal.invocation.MockitoMethod;
+ import org.mockito.internal.invocation.RealMethod;
+-import org.mockito.internal.invocation.SerializableMethod;
+-import org.mockito.internal.progress.SequenceNumber;
+ import org.mockito.invocation.Location;
+ import org.mockito.invocation.MockHandler;
+ import org.mockito.mock.MockCreationSettings;
+@@ -28,6 +24,8 @@ import java.io.Serializable;
+ import java.lang.reflect.Method;
+ import java.util.concurrent.Callable;
+ 
++import static org.mockito.internal.invocation.DefaultInvocationFactory.createInvocation;
++
+ public class MockMethodInterceptor implements Serializable {
+ 
+     private static final long serialVersionUID = 7152947254057253027L;
+@@ -65,29 +63,6 @@ public class MockMethodInterceptor implements Serializable {
+         return handler.handle(createInvocation(mock, invokedMethod, arguments, realMethod, mockCreationSettings, location));
+     }
+ 
+-    public static InterceptedInvocation createInvocation(Object mock, Method invokedMethod, Object[] arguments, RealMethod realMethod, MockCreationSettings settings, Location location) {
+-        return new InterceptedInvocation(
+-            mock,
+-            createMockitoMethod(invokedMethod, settings),
+-            arguments,
+-            realMethod,
+-            location,
+-            SequenceNumber.next()
+-        );
+-    }
+-
+-    public static InterceptedInvocation createInvocation(Object mock, Method invokedMethod, Object[] arguments, RealMethod realMethod, MockCreationSettings settings) {
+-        return createInvocation(mock, invokedMethod, arguments, realMethod, settings, new LocationImpl());
+-    }
+-
+-    private static MockitoMethod createMockitoMethod(Method method, MockCreationSettings settings) {
+-        if (settings.isSerializable()) {
+-            return new SerializableMethod(method);
+-        } else {
+-            return new DelegatingMethod(method);
+-        }
+-    }
+-
+     public MockHandler getMockHandler() {
+         return handler;
+     }
+diff --git a/src/main/java/org/mockito/internal/invocation/DefaultInvocationFactory.java b/src/main/java/org/mockito/internal/invocation/DefaultInvocationFactory.java
+index 03ee54bea..875a903ec 100644
+--- a/src/main/java/org/mockito/internal/invocation/DefaultInvocationFactory.java
++++ b/src/main/java/org/mockito/internal/invocation/DefaultInvocationFactory.java
+@@ -4,9 +4,12 @@
+  */
+ package org.mockito.internal.invocation;
+ 
+-import org.mockito.internal.creation.bytebuddy.MockMethodInterceptor;
++import org.mockito.internal.creation.DelegatingMethod;
++import org.mockito.internal.debugging.LocationImpl;
++import org.mockito.internal.progress.SequenceNumber;
+ import org.mockito.invocation.Invocation;
+ import org.mockito.invocation.InvocationFactory;
++import org.mockito.invocation.Location;
+ import org.mockito.mock.MockCreationSettings;
+ 
+ import java.lang.reflect.Method;
+@@ -25,6 +28,30 @@ public class DefaultInvocationFactory implements InvocationFactory {
+     }
+ 
+     private Invocation createInvocation(Object target, MockCreationSettings settings, Method method, RealMethod superMethod, Object[] args) {
+-        return MockMethodInterceptor.createInvocation(target, method, args, superMethod, settings);
++        return createInvocation(target, method, args, superMethod, settings);
++    }
++
++    public static InterceptedInvocation createInvocation(Object mock, Method invokedMethod, Object[] arguments, RealMethod realMethod, MockCreationSettings settings, Location location) {
++        return new InterceptedInvocation(
++            mock,
++            createMockitoMethod(invokedMethod, settings),
++            arguments,
++            realMethod,
++            location,
++            SequenceNumber.next()
++        );
++    }
++
++    private static InterceptedInvocation createInvocation(Object mock, Method invokedMethod, Object[]
++        arguments, RealMethod realMethod, MockCreationSettings settings) {
++        return createInvocation(mock, invokedMethod, arguments, realMethod, settings, new LocationImpl());
++    }
++
++    private static MockitoMethod createMockitoMethod(Method method, MockCreationSettings settings) {
++        if (settings.isSerializable()) {
++            return new SerializableMethod(method);
++        } else {
++            return new DelegatingMethod(method);
++        }
+     }
+ }
+diff --git a/src/main/java/org/mockito/internal/invocation/InterceptedInvocation.java b/src/main/java/org/mockito/internal/invocation/InterceptedInvocation.java
+new file mode 100644
+index 000000000..d3a9b976c
+--- /dev/null
++++ b/src/main/java/org/mockito/internal/invocation/InterceptedInvocation.java
+@@ -0,0 +1,163 @@
++/*
++ * Copyright (c) 2016 Mockito contributors
++ * This program is made available under the terms of the MIT License.
++ */
++package org.mockito.internal.invocation;
++
++import org.mockito.internal.exceptions.VerificationAwareInvocation;
++import org.mockito.internal.reporting.PrintSettings;
++import org.mockito.invocation.Invocation;
++import org.mockito.invocation.Location;
++import org.mockito.invocation.StubInfo;
++
++import java.lang.reflect.Method;
++import java.util.Arrays;
++
++import static org.mockito.internal.exceptions.Reporter.cannotCallAbstractRealMethod;
++
++public class InterceptedInvocation implements Invocation, VerificationAwareInvocation {
++
++    private static final long serialVersionUID = 475027563923510472L;
++
++    private final Object mock;
++    private final MockitoMethod mockitoMethod;
++    private final Object[] arguments, rawArguments;
++    private final RealMethod realMethod;
++
++    private final int sequenceNumber;
++
++    private final Location location;
++
++    private boolean verified;
++    private boolean isIgnoredForVerification;
++    private StubInfo stubInfo;
++
++    public InterceptedInvocation(Object mock,
++                                 MockitoMethod mockitoMethod,
++                                 Object[] arguments,
++                                 RealMethod realMethod,
++                                 Location location,
++                                 int sequenceNumber) {
++        this.mock = mock;
++        this.mockitoMethod = mockitoMethod;
++        this.arguments = ArgumentsProcessor.expandArgs(mockitoMethod, arguments);
++        this.rawArguments = arguments;
++        this.realMethod = realMethod;
++        this.location = location;
++        this.sequenceNumber = sequenceNumber;
++    }
++
++    @Override
++    public boolean isVerified() {
++        return verified || isIgnoredForVerification;
++    }
++
++    @Override
++    public int getSequenceNumber() {
++        return sequenceNumber;
++    }
++
++    @Override
++    public Location getLocation() {
++        return location;
++    }
++
++    @Override
++    public Object[] getRawArguments() {
++        return rawArguments;
++    }
++
++    @Override
++    public Class<?> getRawReturnType() {
++        return mockitoMethod.getReturnType();
++    }
++
++    @Override
++    public void markVerified() {
++        verified = true;
++    }
++
++    @Override
++    public StubInfo stubInfo() {
++        return stubInfo;
++    }
++
++    @Override
++    public void markStubbed(StubInfo stubInfo) {
++        this.stubInfo = stubInfo;
++    }
++
++    @Override
++    public boolean isIgnoredForVerification() {
++        return isIgnoredForVerification;
++    }
++
++    @Override
++    public void ignoreForVerification() {
++        isIgnoredForVerification = true;
++    }
++
++    @Override
++    public Object getMock() {
++        return mock;
++    }
++
++    @Override
++    public Method getMethod() {
++        return mockitoMethod.getJavaMethod();
++    }
++
++    @Override
++    public Object[] getArguments() {
++        return arguments;
++    }
++
++    @Override
++    @SuppressWarnings("unchecked")
++    public <T> T getArgument(int index) {
++        return (T) arguments[index];
++    }
++
++    @Override
++    public Object callRealMethod() throws Throwable {
++        if (!realMethod.isInvokable()) {
++            throw cannotCallAbstractRealMethod();
++        }
++        return realMethod.invoke();
++    }
++
++    @Override
++    public int hashCode() {
++        //TODO SF we need to provide hash code implementation so that there are no unexpected, slight perf issues
++        return 1;
++    }
++
++    @Override
++    public boolean equals(Object o) {
++        if (o == null || !o.getClass().equals(this.getClass())) {
++            return false;
++        }
++        InterceptedInvocation other = (InterceptedInvocation) o;
++        return this.mock.equals(other.mock)
++                && this.mockitoMethod.equals(other.mockitoMethod)
++                && this.equalArguments(other.arguments);
++    }
++
++    private boolean equalArguments(Object[] arguments) {
++        return Arrays.equals(arguments, this.arguments);
++    }
++
++    public String toString() {
++        return new PrintSettings().print(ArgumentsProcessor.argumentsToMatchers(getArguments()), this);
++    }
++
++    public final static RealMethod NO_OP = new RealMethod() {
++        public boolean isInvokable() {
++            return false;
++        }
++        public Object invoke() throws Throwable {
++            return null;
++        }
++    };
++
++}

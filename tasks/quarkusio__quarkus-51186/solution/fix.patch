@@ -1,0 +1,338 @@
+diff --git a/docs/src/main/asciidoc/http-reference.adoc b/docs/src/main/asciidoc/http-reference.adoc
+index 50d694c3754..1ef694dd5a2 100644
+--- a/docs/src/main/asciidoc/http-reference.adoc
++++ b/docs/src/main/asciidoc/http-reference.adoc
+@@ -62,6 +62,44 @@ public class StaticResources {
+ }
+ ----
+ 
++=== Local filesystem static resources
++
++NOTE: Serving static resources from a local filesystem directory is enabled
++when `quarkus.http.static-dir.path` is set.
++The `quarkus.http.static-dir.enabled` property can be used to explicitly
++disable this feature.
++
++Quarkus can serve static files from a local filesystem directory, outside of the application JAR and Java resources.
++This is configured via the `quarkus.http.static-dir.*` properties.
++
++To expose the contents of a `static/` directory:
++
++[source,properties]
++----
++quarkus.http.static-dir.path=static
++----
++
++By default, static files are exposed under the `/static` endpoint.
++
++With this configuration, a file located at `static/picture.jpg` will be available at:
++`http://localhost:8080/static/picture.jpg`.
++
++To change the default endpoint:
++[source,properties]
++----
++quarkus.http.static-dir.endpoint=/
++----
++
++With this configuration, a file located at `static/picture.jpg` will be available at:
++`http://localhost:8080/picture.jpg`.
++
++The `quarkus.http.static-dir.endpoint` value must not contain `*` or `..`, and it will be normalized
++to avoid trailing slashes.
++Similarly, `quarkus.http.static-dir.path` must be a relative path without `..`.
++Quarkus validates these values at build time.
++
++This feature can be used in both development and production environments.
++
+ === HTTP Compression
+ 
+ The response body of a static resource is not compressed by default.
+diff --git a/extensions/vertx-http/deployment-spi/src/main/java/io/quarkus/vertx/http/deployment/spi/GeneratedStaticResourceBuildItem.java b/extensions/vertx-http/deployment-spi/src/main/java/io/quarkus/vertx/http/deployment/spi/GeneratedStaticResourceBuildItem.java
+index da220066d81..b18caa71c07 100644
+--- a/extensions/vertx-http/deployment-spi/src/main/java/io/quarkus/vertx/http/deployment/spi/GeneratedStaticResourceBuildItem.java
++++ b/extensions/vertx-http/deployment-spi/src/main/java/io/quarkus/vertx/http/deployment/spi/GeneratedStaticResourceBuildItem.java
+@@ -70,7 +70,7 @@ public String getEndpoint() {
+ 
+     public boolean isFile() {
+         return file != null;
+-    };
++    }
+ 
+     public byte[] getContent() {
+         return this.content;
+diff --git a/extensions/vertx-http/deployment/src/main/java/io/quarkus/vertx/http/deployment/VertxHttpProcessor.java b/extensions/vertx-http/deployment/src/main/java/io/quarkus/vertx/http/deployment/VertxHttpProcessor.java
+index a18c7e48697..11259b20996 100644
+--- a/extensions/vertx-http/deployment/src/main/java/io/quarkus/vertx/http/deployment/VertxHttpProcessor.java
++++ b/extensions/vertx-http/deployment/src/main/java/io/quarkus/vertx/http/deployment/VertxHttpProcessor.java
+@@ -5,6 +5,8 @@
+ 
+ import java.io.IOException;
+ import java.io.UncheckedIOException;
++import java.nio.file.Files;
++import java.nio.file.Path;
+ import java.util.ArrayList;
+ import java.util.Collections;
+ import java.util.HashSet;
+@@ -14,6 +16,7 @@
+ import java.util.concurrent.SubmissionPublisher;
+ import java.util.logging.Level;
+ import java.util.stream.Collectors;
++import java.util.stream.Stream;
+ 
+ import org.eclipse.microprofile.config.Config;
+ import org.eclipse.microprofile.config.ConfigProvider;
+@@ -37,6 +40,7 @@
+ import io.quarkus.deployment.annotations.Record;
+ import io.quarkus.deployment.builditem.ApplicationStartBuildItem;
+ import io.quarkus.deployment.builditem.ExecutorBuildItem;
++import io.quarkus.deployment.builditem.HotDeploymentWatchedFileBuildItem;
+ import io.quarkus.deployment.builditem.LaunchModeBuildItem;
+ import io.quarkus.deployment.builditem.LogCategoryBuildItem;
+ import io.quarkus.deployment.builditem.NativeImageFeatureBuildItem;
+@@ -64,10 +68,12 @@
+ import io.quarkus.vertx.http.deployment.HttpSecurityProcessor.HttpSecurityConfigSetupCompleteBuildItem;
+ import io.quarkus.vertx.http.deployment.devmode.NotFoundPageDisplayableEndpointBuildItem;
+ import io.quarkus.vertx.http.deployment.spi.FrameworkEndpointsBuildItem;
++import io.quarkus.vertx.http.deployment.spi.GeneratedStaticResourceBuildItem;
+ import io.quarkus.vertx.http.deployment.spi.UseManagementInterfaceBuildItem;
+ import io.quarkus.vertx.http.runtime.CurrentRequestProducer;
+ import io.quarkus.vertx.http.runtime.CurrentVertxRequest;
+ import io.quarkus.vertx.http.runtime.HttpCertificateUpdateEventListener;
++import io.quarkus.vertx.http.runtime.HttpStaticDirConfig;
+ import io.quarkus.vertx.http.runtime.VertxConfigBuilder;
+ import io.quarkus.vertx.http.runtime.VertxHttpBuildTimeConfig;
+ import io.quarkus.vertx.http.runtime.VertxHttpConfig.InsecureRequests;
+@@ -208,6 +214,88 @@ public KubernetesPortBuildItem kubernetesForManagement(
+                 managementBuildTimeConfig.enabled());
+     }
+ 
++    @BuildStep
++    void registerHttpStaticDir(VertxHttpBuildTimeConfig httpBuildTimeConfig,
++            BuildProducer<GeneratedStaticResourceBuildItem> generatedStaticResources) {
++
++        Optional<HttpStaticDirConfig> httpStaticDirConfig = httpBuildTimeConfig.httpStaticDirConfig();
++
++        if (httpStaticDirConfig.isEmpty()) {
++            return;
++        }
++
++        HttpStaticDirConfig localStatic = httpStaticDirConfig.get();
++
++        if (!localStatic.enabled()) {
++            return;
++        }
++
++        final String basePath = localStatic.normalizedEndpoint();
++        String dir = localStatic.normalizedPath();
++
++        if (dir == null) {
++            return;
++        }
++
++        Path root = Path.of(dir).normalize().toAbsolutePath();
++        if (!Files.isDirectory(root)) {
++            throw new IllegalStateException(
++                    "Invalid configuration: quarkus.http.static-dir.path must point to an existing directory, but was: "
++                            + root);
++        }
++
++        try (Stream<Path> paths = Files.walk(root)) {
++
++            paths.filter(Files::isRegularFile).forEach(file -> {
++
++                Path relative = root.relativize(file).normalize();
++                String relativeUnix = relative.toString().replace('\\', '/');
++                if (relativeUnix.contains("..")) {
++                    throw new IllegalStateException("Invalid static resource path '" + relativeUnix
++                            + "'. Paths must not contain '..' when registering static resources.");
++                }
++                String endpoint = basePath + "/" + relativeUnix;
++                generatedStaticResources.produce(
++                        new GeneratedStaticResourceBuildItem(endpoint, file));
++
++            });
++        } catch (IOException e) {
++            throw new UncheckedIOException(
++                    "Failed to register local static resources from directory " + root, e);
++        }
++    }
++
++    @BuildStep(onlyIf = IsDevelopment.class)
++    void watchHttpStaticDirForDev(VertxHttpBuildTimeConfig httpBuildTimeConfig,
++            BuildProducer<HotDeploymentWatchedFileBuildItem> watchedFiles) {
++
++        Optional<HttpStaticDirConfig> httpStaticDirConfig = httpBuildTimeConfig.httpStaticDirConfig();
++
++        if (httpStaticDirConfig.isEmpty()) {
++            return;
++        }
++
++        var localStatic = httpStaticDirConfig.get();
++
++        if (!localStatic.enabled()) {
++            return;
++        }
++
++        String dir = localStatic.normalizedPath();
++
++        if (dir == null) {
++            return;
++        }
++
++        String normalizedDir = Path.of(dir).normalize().toAbsolutePath().toString();
++
++        watchedFiles.produce(
++                HotDeploymentWatchedFileBuildItem.builder()
++                        .setLocationPredicate(path -> path.startsWith(normalizedDir))
++                        .setRestartNeeded(false)
++                        .build());
++    }
++
+     @BuildStep
+     void notFoundRoutes(
+             List<RouteBuildItem> routes,
+diff --git a/extensions/vertx-http/runtime/src/main/java/io/quarkus/vertx/http/runtime/HttpStaticDirConfig.java b/extensions/vertx-http/runtime/src/main/java/io/quarkus/vertx/http/runtime/HttpStaticDirConfig.java
+new file mode 100644
+index 00000000000..c98516060b3
+--- /dev/null
++++ b/extensions/vertx-http/runtime/src/main/java/io/quarkus/vertx/http/runtime/HttpStaticDirConfig.java
+@@ -0,0 +1,123 @@
++package io.quarkus.vertx.http.runtime;
++
++import java.nio.file.Path;
++import java.util.Optional;
++
++import io.quarkus.runtime.annotations.ConfigGroup;
++import io.smallrye.config.WithDefault;
++
++@ConfigGroup
++public interface HttpStaticDirConfig {
++
++    /**
++     * Allows explicitly disabling static directory serving (e.g. for CI or DevOps use cases).
++     * <p>
++     * Defaults to {@code true}. Note that this property does not enable static directory serving
++     * by itself. The feature is enabled only when {@code quarkus.http.static-dir.path} is set.
++     */
++    @WithDefault("true")
++    boolean enabled();
++
++    /**
++     * The base endpoint under which the local directory is exposed.
++     * <p>
++     * e.g. {@code /static} with hello.txt will be served at <code>/static/hello.txt</code>.
++     */
++    @WithDefault("static")
++    String endpoint();
++
++    /**
++     * The local directory from which static files will be served,
++     * relative to the application's working directory.
++     * <p>
++     * For example, if set to {@code static} and the directory contains
++     * {@code picture.jpg}, it will be available at the configured
++     * {@code quarkus.http.static-dir.endpoint}/picture.jpg.
++     */
++    Optional<String> path();
++
++    /**
++     * Normalizes and validates the local path from which files are served.
++     *
++     * @return a normalized directory string
++     * @throws IllegalArgumentException if the directory contains {@code ..}
++     */
++    default String normalizedPath() {
++
++        Optional<String> path = path();
++        if (path.isEmpty()) {
++            return null;
++        }
++
++        String d = path.get().trim();
++
++        if (d.isEmpty()) {
++            throw new IllegalArgumentException(
++                    "quarkus.http.static-dir.path must not be empty or blank");
++        }
++
++        if (d.contains("..")) {
++            throw new IllegalArgumentException(
++                    "quarkus.http.static-dir.path must not contain '..': " + d);
++        }
++
++        Path p = Path.of(d);
++
++        if (p.getNameCount() == 0 || ".".equals(d)) {
++            throw new IllegalArgumentException(
++                    "quarkus.http.static-dir.path must not resolve to the project root directory (e.g. '.', './'): " + d);
++        }
++
++        if (p.isAbsolute()) {
++            throw new IllegalArgumentException(
++                    "quarkus.http.static-dir.path must be relative, but was: " + d);
++        }
++
++        return d;
++    }
++
++    /**
++     * Normalizes the configured path for serving endpoint.
++     *
++     * @return a normalized, safe base path for static resources
++     * @throws IllegalArgumentException if the path contains {@code *} or {@code ..}
++     */
++    default String normalizedEndpoint() {
++        String p = endpoint().trim();
++
++        if (p.contains("*")) {
++            throw new IllegalArgumentException(
++                    "quarkus.http.static-dir.endpoint must not contain '*': " + p);
++        }
++
++        if (p.contains("..")) {
++            throw new IllegalArgumentException(
++                    "quarkus.http.static-dir.endpoint must not contain '..': " + p);
++        }
++
++        if (p.indexOf(' ') >= 0) {
++            throw new IllegalArgumentException(
++                    "quarkus.http.static-dir.endpoint must not contain spaces: " + p);
++        }
++
++        if (p.contains("\\")) {
++            throw new IllegalArgumentException(
++                    "quarkus.http.static-dir.endpoint must use '/' as separator: " + p);
++        }
++
++        if (p.isEmpty()) {
++            return "/";
++        }
++
++        if (!p.startsWith("/")) {
++            p = "/" + p;
++        }
++
++        while (p.endsWith("/") && p.length() > 1) {
++            p = p.substring(0, p.length() - 1);
++        }
++
++        return p;
++    }
++
++}
+diff --git a/extensions/vertx-http/runtime/src/main/java/io/quarkus/vertx/http/runtime/VertxHttpBuildTimeConfig.java b/extensions/vertx-http/runtime/src/main/java/io/quarkus/vertx/http/runtime/VertxHttpBuildTimeConfig.java
+index 9527b18f41e..9b0c36f71e5 100644
+--- a/extensions/vertx-http/runtime/src/main/java/io/quarkus/vertx/http/runtime/VertxHttpBuildTimeConfig.java
++++ b/extensions/vertx-http/runtime/src/main/java/io/quarkus/vertx/http/runtime/VertxHttpBuildTimeConfig.java
+@@ -115,4 +115,11 @@ public interface VertxHttpBuildTimeConfig {
+      * The compression level used when compression support is enabled.
+      */
+     OptionalInt compressionLevel();
++
++    /**
++     * Configure Quarkus to serve static files from a local filesystem directory (outside of Java resources)
++     *
++     */
++    @WithName("static-dir")
++    Optional<HttpStaticDirConfig> httpStaticDirConfig();
+ }

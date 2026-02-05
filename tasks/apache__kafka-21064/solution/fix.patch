@@ -1,0 +1,89 @@
+diff --git a/core/src/main/java/kafka/server/share/ShareFetchUtils.java b/core/src/main/java/kafka/server/share/ShareFetchUtils.java
+index ab7bee1d99..88f369b761 100644
+--- a/core/src/main/java/kafka/server/share/ShareFetchUtils.java
++++ b/core/src/main/java/kafka/server/share/ShareFetchUtils.java
+@@ -274,4 +274,47 @@ public class ShareFetchUtils {
+         }
+         return defaultValue;
+     }
++
++    /**
++     * Merges contiguous AcquiredRecords with the same delivery count into single records.
++     * <p>
++     * This method takes a list of AcquiredRecords where firstOffset and lastOffset typically are the
++     * same (representing single offsets), but not necessarily required, and merges contiguous offsets
++     * that have the same delivery count into ranges.
++     *
++     * @param result the list to accumulate merged AcquiredRecords into
++     * @param acquiredRecords the sorted list of AcquiredRecords to merge
++     */
++    static void accumulateAcquiredRecords(List<AcquiredRecords> result, List<AcquiredRecords> acquiredRecords) {
++        if (acquiredRecords.isEmpty()) {
++            return;
++        }
++
++        long firstOffset = acquiredRecords.get(0).firstOffset();
++        long lastOffset = acquiredRecords.get(0).lastOffset();
++        short deliveryCount = acquiredRecords.get(0).deliveryCount();
++
++        for (int i = 1; i < acquiredRecords.size(); i++) {
++            AcquiredRecords current = acquiredRecords.get(i);
++            if (current.firstOffset() == lastOffset + 1 && deliveryCount == current.deliveryCount()) {
++                // Extend the last offset.
++                lastOffset = current.lastOffset();
++            } else {
++                // Append the current accumulated batch and start a new batch.
++                result.add(new AcquiredRecords()
++                    .setFirstOffset(firstOffset)
++                    .setLastOffset(lastOffset)
++                    .setDeliveryCount(deliveryCount));
++                // Reset the accumulation variables to the current acquired records.
++                firstOffset = current.firstOffset();
++                lastOffset = current.lastOffset();
++                deliveryCount = current.deliveryCount();
++            }
++        }
++        // Add the last accumulated batch.
++        result.add(new AcquiredRecords()
++            .setFirstOffset(firstOffset)
++            .setLastOffset(lastOffset)
++            .setDeliveryCount(deliveryCount));
++    }
+ }
+diff --git a/core/src/main/java/kafka/server/share/SharePartition.java b/core/src/main/java/kafka/server/share/SharePartition.java
+index c6eb76129a..f70806468e 100644
+--- a/core/src/main/java/kafka/server/share/SharePartition.java
++++ b/core/src/main/java/kafka/server/share/SharePartition.java
+@@ -1921,10 +1921,11 @@ public class SharePartition {
+         InFlightBatch inFlightBatch,
+         List<AcquiredRecords> result
+     ) {
+-        lock.writeLock().lock();
+         int acquiredCount = 0;
+         long maxFetchRecordsWhileThrottledRecords = -1;
+         boolean hasThrottledRecord = false;
++        List<AcquiredRecords> offsetAcquiredRecords = new ArrayList<>();
++        lock.writeLock().lock();
+         try {
+             for (Map.Entry<Long, InFlightState> offsetState : inFlightBatch.offsetState().entrySet()) {
+                 // For the first batch which might have offsets prior to the request base
+@@ -1986,8 +1987,7 @@ public class SharePartition {
+                 // Update acquisition lock timeout task for the offset.
+                 offsetState.getValue().updateAcquisitionLockTimeoutTask(acquisitionLockTimeoutTask);
+ 
+-                // TODO: Maybe we can club the continuous offsets here.
+-                result.add(new AcquiredRecords()
++                offsetAcquiredRecords.add(new AcquiredRecords()
+                     .setFirstOffset(offsetState.getKey())
+                     .setLastOffset(offsetState.getKey())
+                     .setDeliveryCount((short) offsetState.getValue().deliveryCount()));
+@@ -2008,6 +2008,9 @@ public class SharePartition {
+         } finally {
+             lock.writeLock().unlock();
+         }
++
++        // Accumulate the acquired records for the offset acquired records in the result.
++        ShareFetchUtils.accumulateAcquiredRecords(result, offsetAcquiredRecords);
+         return acquiredCount;
+     }
+ 

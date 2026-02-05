@@ -1,0 +1,194 @@
+diff --git a/mockwebserver/api/mockwebserver3.api b/mockwebserver/api/mockwebserver3.api
+index 7a9a4b75c..3de174029 100644
+--- a/mockwebserver/api/mockwebserver3.api
++++ b/mockwebserver/api/mockwebserver3.api
+@@ -28,7 +28,6 @@ public final class mockwebserver3/MockResponse : java/lang/Cloneable {
+ 	public final fun getHeaders ()Lokhttp3/Headers;
+ 	public final fun getHeadersDelay (Ljava/util/concurrent/TimeUnit;)J
+ 	public final fun getHttp2ErrorCode ()I
+-	public final fun getInTunnel ()Z
+ 	public final fun getInformationalResponses ()Ljava/util/List;
+ 	public final fun getMessage ()Ljava/lang/String;
+ 	public final fun getPushPromises ()Ljava/util/List;
+@@ -41,7 +40,6 @@ public final class mockwebserver3/MockResponse : java/lang/Cloneable {
+ 	public final fun getWebSocketListener ()Lokhttp3/WebSocketListener;
+ 	public final fun headers (Lokhttp3/Headers;)V
+ 	public final fun http2ErrorCode (I)V
+-	public final fun inTunnel ()Lmockwebserver3/MockResponse;
+ 	public final fun isDuplex ()Z
+ 	public final fun removeHeader (Ljava/lang/String;)Lmockwebserver3/MockResponse;
+ 	public final fun setBody (Ljava/lang/String;)Lmockwebserver3/MockResponse;
+@@ -183,6 +181,7 @@ public final class mockwebserver3/SocketPolicy : java/lang/Enum {
+ 	public static final field SHUTDOWN_OUTPUT_AT_END Lmockwebserver3/SocketPolicy;
+ 	public static final field SHUTDOWN_SERVER_AFTER_RESPONSE Lmockwebserver3/SocketPolicy;
+ 	public static final field STALL_SOCKET_AT_START Lmockwebserver3/SocketPolicy;
++	public static final field UPGRADE_TO_SSL_AT_END Lmockwebserver3/SocketPolicy;
+ 	public static fun valueOf (Ljava/lang/String;)Lmockwebserver3/SocketPolicy;
+ 	public static fun values ()[Lmockwebserver3/SocketPolicy;
+ }
+diff --git a/okhttp/src/jvmMain/kotlin/okhttp3/Route.kt b/okhttp/src/jvmMain/kotlin/okhttp3/Route.kt
+index bfd9093dd..78d33cfe0 100644
+--- a/okhttp/src/jvmMain/kotlin/okhttp3/Route.kt
++++ b/okhttp/src/jvmMain/kotlin/okhttp3/Route.kt
+@@ -64,16 +64,12 @@ class Route(
+   fun socketAddress(): InetSocketAddress = socketAddress
+ 
+   /**
+-   * Returns true if this route tunnels HTTPS or HTTP/2 through an HTTP proxy.
++   * Returns true if this route tunnels HTTPS through an HTTP proxy.
+    * See [RFC 2817, Section 5.2][rfc_2817].
+    *
+    * [rfc_2817]: http://www.ietf.org/rfc/rfc2817.txt
+    */
+-  fun requiresTunnel(): Boolean {
+-    if (proxy.type() != Proxy.Type.HTTP) return false
+-    return (address.sslSocketFactory != null) ||
+-      (Protocol.H2_PRIOR_KNOWLEDGE in address.protocols)
+-  }
++  fun requiresTunnel(): Boolean = address.sslSocketFactory != null && proxy.type() == Proxy.Type.HTTP
+ 
+   override fun equals(other: Any?): Boolean {
+     return other is Route &&
+diff --git a/okhttp/src/jvmMain/kotlin/okhttp3/internal/connection/ConnectPlan.kt b/okhttp/src/jvmMain/kotlin/okhttp3/internal/connection/ConnectPlan.kt
+index d39401524..e874ab95e 100644
+--- a/okhttp/src/jvmMain/kotlin/okhttp3/internal/connection/ConnectPlan.kt
++++ b/okhttp/src/jvmMain/kotlin/okhttp3/internal/connection/ConnectPlan.kt
+@@ -160,14 +160,6 @@ class ConnectPlan(
+       }
+ 
+       if (route.address.sslSocketFactory != null) {
+-        // Assume the server won't send a TLS ServerHello until we send a TLS ClientHello. If
+-        // that happens, then we will have buffered bytes that are needed by the SSLSocket!
+-        // This check is imperfect: it doesn't tell us whether a handshake will succeed, just
+-        // that it will almost certainly fail because the proxy has sent unexpected data.
+-        if (source?.buffer?.exhausted() == false || sink?.buffer?.exhausted() == false) {
+-          throw IOException("TLS tunnel buffered too many bytes!")
+-        }
+-
+         eventListener.secureConnectStart(call)
+ 
+         // Create the wrapper over the connected socket.
+@@ -412,7 +404,16 @@ class ConnectPlan(
+       tunnelCodec.skipConnectBody(response)
+ 
+       when (response.code) {
+-        HttpURLConnection.HTTP_OK -> return null
++        HttpURLConnection.HTTP_OK -> {
++          // Assume the server won't send a TLS ServerHello until we send a TLS ClientHello. If
++          // that happens, then we will have buffered bytes that are needed by the SSLSocket!
++          // This check is imperfect: it doesn't tell us whether a handshake will succeed, just
++          // that it will almost certainly fail because the proxy has sent unexpected data.
++          if (!source.buffer.exhausted() || !sink.buffer.exhausted()) {
++            throw IOException("TLS tunnel buffered too many bytes!")
++          }
++          return null
++        }
+ 
+         HttpURLConnection.HTTP_PROXY_AUTH -> {
+           nextRequest = route.address.proxyAuthenticator.authenticate(route, response)
+diff --git a/okhttp/src/jvmTest/java/okhttp3/internal/http2/HttpOverHttp2Test.kt b/okhttp/src/jvmTest/java/okhttp3/internal/http2/HttpOverHttp2Test.kt
+index 772387dbf..faa0c08e2 100644
+--- a/okhttp/src/jvmTest/java/okhttp3/internal/http2/HttpOverHttp2Test.kt
++++ b/okhttp/src/jvmTest/java/okhttp3/internal/http2/HttpOverHttp2Test.kt
+@@ -76,6 +76,7 @@ import okio.BufferedSink
+ import okio.GzipSink
+ import okio.buffer
+ import org.assertj.core.api.Assertions.assertThat
++import org.assertj.core.api.Assumptions.assumeThat
+ import org.assertj.core.data.Offset
+ import org.junit.jupiter.api.AfterEach
+ import org.junit.jupiter.api.Assertions.fail
+@@ -2027,6 +2028,9 @@ class HttpOverHttp2Test {
+   @ParameterizedTest
+   @ArgumentsSource(ProtocolParamProvider::class)
+   fun http2WithProxy(protocol: Protocol, mockWebServer: MockWebServer) {
++    // TODO(jwilson): fix H2_PRIOR_KNOWLEDGE
++    assumeThat(protocol).isEqualTo(Protocol.HTTP_2)
++
+     setUp(protocol, mockWebServer)
+     server.enqueue(
+       MockResponse()
+@@ -2041,14 +2045,12 @@ class HttpOverHttp2Test {
+       .proxy(server.toProxyAddress())
+       .build()
+ 
+-    val url = server.url("/").resolve("//android.com/foo")!!
+-    val port = when (url.scheme) {
+-      "https" -> 443
+-      "http" -> 80
+-      else -> error("unexpected scheme")
+-    }
++    val call = client.newCall(
++      Request(
++        server.url("/").resolve("//android.com/foo")!!
++      )
++    )
+ 
+-    val call = client.newCall(Request(url))
+     val response = call.execute()
+     assertThat(response.body.string()).isEqualTo("ABCDE")
+     assertThat(response.code).isEqualTo(200)
+@@ -2056,7 +2058,7 @@ class HttpOverHttp2Test {
+     assertThat(response.protocol).isEqualTo(protocol)
+ 
+     val tunnelRequest = server.takeRequest()
+-    assertThat(tunnelRequest.requestLine).isEqualTo("CONNECT android.com:$port HTTP/1.1")
++    assertThat(tunnelRequest.requestLine).isEqualTo("CONNECT android.com:443 HTTP/1.1")
+ 
+     val request = server.takeRequest()
+     assertThat(request.requestLine).isEqualTo("GET /foo HTTP/1.1")
+@@ -2064,54 +2066,6 @@ class HttpOverHttp2Test {
+     assertThat(request.getHeader(":authority")).isEqualTo("android.com")
+   }
+ 
+-  /** Respond to a proxy authorization challenge.  */
+-  @ParameterizedTest
+-  @ArgumentsSource(ProtocolParamProvider::class)
+-  fun proxyAuthenticateOnConnect(protocol: Protocol, mockWebServer: MockWebServer) {
+-    setUp(protocol, mockWebServer)
+-    server.enqueue(
+-      MockResponse()
+-        .inTunnel()
+-        .setResponseCode(407)
+-        .addHeader("Proxy-Authenticate: Basic realm=\"localhost\"")
+-    )
+-    server.enqueue(
+-      MockResponse()
+-        .inTunnel()
+-    )
+-    server.enqueue(
+-      MockResponse()
+-        .setBody("response body")
+-    )
+-    val client = client.newBuilder()
+-      .proxy(server.toProxyAddress())
+-      .proxyAuthenticator(RecordingOkAuthenticator("password", "Basic"))
+-      .build()
+-
+-    val url = server.url("/").resolve("//android.com/foo")!!
+-    val port = when (url.scheme) {
+-      "https" -> 443
+-      "http" -> 80
+-      else -> error("unexpected scheme")
+-    }
+-
+-    val request = Request(url)
+-    val response = client.newCall(request).execute()
+-    assertThat(response.body.string()).isEqualTo("response body")
+-
+-    val connect1 = server.takeRequest()
+-    assertThat(connect1.requestLine).isEqualTo("CONNECT android.com:$port HTTP/1.1")
+-    assertThat(connect1.getHeader("Proxy-Authorization")).isNull()
+-
+-    val connect2 = server.takeRequest()
+-    assertThat(connect2.requestLine).isEqualTo("CONNECT android.com:$port HTTP/1.1")
+-    assertThat(connect2.getHeader("Proxy-Authorization")).isEqualTo("password")
+-
+-    val get = server.takeRequest()
+-    assertThat(get.requestLine).isEqualTo("GET /foo HTTP/1.1")
+-    assertThat(get.getHeader("Proxy-Authorization")).isNull()
+-  }
+-
+   companion object {
+     // Flaky https://github.com/square/okhttp/issues/4632
+     // Flaky https://github.com/square/okhttp/issues/4633

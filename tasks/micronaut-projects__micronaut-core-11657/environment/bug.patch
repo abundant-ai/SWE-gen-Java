@@ -1,0 +1,864 @@
+diff --git a/core-processor/src/main/java/io/micronaut/aop/writer/AopProxyWriter.java b/core-processor/src/main/java/io/micronaut/aop/writer/AopProxyWriter.java
+index e956b72823..809a82d4d7 100644
+--- a/core-processor/src/main/java/io/micronaut/aop/writer/AopProxyWriter.java
++++ b/core-processor/src/main/java/io/micronaut/aop/writer/AopProxyWriter.java
+@@ -668,26 +668,24 @@ public class AopProxyWriter implements ProxyingBeanDefinitionVisitor, ClassOutpu
+ 
+         if (!proxiedMethodsRefSet.contains(methodKey)) {
+ 
+-            ClassTypeDef interceptedProxyDef = null;
+-            MethodDef interceptedProxyBridgeMethod = null;
++            String interceptedProxyClassName = null;
++            String interceptedProxyBridgeMethodName = null;
+ 
+             if (!isProxyTarget) {
+                 // if the target is not being proxied then we need to generate a bridge method and executable method that knows about it
+ 
+                 if (!methodElement.isAbstract() || methodElement.isDefault()) {
+-                    interceptedProxyDef = ClassTypeDef.of(proxyFullName);
+-                    interceptedProxyBridgeMethod = MethodDef.builder("$$access$$" + methodName)
+-                        .addModifiers(Modifier.PUBLIC)
+-                        .addParameters(argumentTypeList.stream().map(p -> ParameterDef.of(p.getName(), TypeDef.erasure(p.getType()))).toList())
+-                        .returns(TypeDef.erasure(returnType))
+-                        .build((aThis, methodParameters) -> aThis.superRef((ClassTypeDef) TypeDef.erasure(methodElement.getOwningType()))
+-                            .invoke(methodElement, methodParameters)
+-                            .returning()
+-                        );
++                    interceptedProxyClassName = proxyFullName;
++                    interceptedProxyBridgeMethodName = "$$access$$" + methodName;
+ 
+                     // now build a bridge to invoke the original method
+                     proxyBuilder.addMethod(
+-                        interceptedProxyBridgeMethod
++                        MethodDef.builder(interceptedProxyBridgeMethodName)
++                            .addModifiers(Modifier.PUBLIC)
++                            .addParameters(argumentTypeList.stream().map(p -> ParameterDef.of(p.getName(), TypeDef.erasure(p.getType()))).toList())
++                            .returns(TypeDef.erasure(returnType))
++                            .build((aThis, methodParameters) -> aThis.superRef((ClassTypeDef) TypeDef.erasure(methodElement.getOwningType()))
++                                .invoke(methodElement, methodParameters).returning())
+                     );
+                 }
+             }
+@@ -696,8 +694,8 @@ public class AopProxyWriter implements ProxyingBeanDefinitionVisitor, ClassOutpu
+             int methodIndex = beanDefinitionWriter.visitExecutableMethod(
+                 beanType,
+                 methodElement,
+-                interceptedProxyDef,
+-                interceptedProxyBridgeMethod
++                interceptedProxyClassName,
++                interceptedProxyBridgeMethodName
+             );
+             int index = proxyMethodCount++;
+ 
+diff --git a/core-processor/src/main/java/io/micronaut/context/visitor/InternalApiTypeElementVisitor.java b/core-processor/src/main/java/io/micronaut/context/visitor/InternalApiTypeElementVisitor.java
+index 29f6a2c324..5414d28204 100644
+--- a/core-processor/src/main/java/io/micronaut/context/visitor/InternalApiTypeElementVisitor.java
++++ b/core-processor/src/main/java/io/micronaut/context/visitor/InternalApiTypeElementVisitor.java
+@@ -55,6 +55,11 @@ public class InternalApiTypeElementVisitor implements TypeElementVisitor<Object,
+         );
+     }
+ 
++    @Override
++    public Set<String> getSupportedOptions() {
++        return Set.of(MICRONAUT_PROCESSING_INTERNAL_WARNINGS);
++    }
++
+     @NonNull
+     @Override
+     public VisitorKind getVisitorKind() {
+diff --git a/core-processor/src/main/java/io/micronaut/inject/beans/visitor/BeanIntrospectionWriter.java b/core-processor/src/main/java/io/micronaut/inject/beans/visitor/BeanIntrospectionWriter.java
+index 4e46062fb0..c0e8d139e8 100644
+--- a/core-processor/src/main/java/io/micronaut/inject/beans/visitor/BeanIntrospectionWriter.java
++++ b/core-processor/src/main/java/io/micronaut/inject/beans/visitor/BeanIntrospectionWriter.java
+@@ -419,7 +419,7 @@ final class BeanIntrospectionWriter implements OriginatingElements, ClassOutputW
+     }
+ 
+     private ExpressionDef pushBeanPropertyReference(BeanPropertyData beanPropertyData,
+-                                                    List<StatementDef> staticStatements,
++                                                    List<StatementDef> statements,
+                                                     Function<String, ExpressionDef> loadClassValueExpressionFn) {
+         ClassTypeDef beanPropertyRefDef = ClassTypeDef.of(AbstractInitializableBeanIntrospection.BeanPropertyRef.class);
+ 
+@@ -434,7 +434,7 @@ final class BeanIntrospectionWriter implements OriginatingElements, ClassOutputW
+             loadClassValueExpressionFn
+         ).newLocal(beanPropertyData.name + "Arg");
+ 
+-        staticStatements.add(defineAndAssign);
++        statements.add(defineAndAssign);
+ 
+         VariableDef mainArgument = defineAndAssign.variable();
+         ExpressionDef readArgument = null;
+@@ -603,13 +603,32 @@ final class BeanIntrospectionWriter implements OriginatingElements, ClassOutputW
+                 .addModifiers(Modifier.PRIVATE, Modifier.FINAL, Modifier.STATIC)
+                 .build();
+             classDefBuilder.addField(beanPropertiesField);
++            ClassTypeDef beanPropertyRefType = ClassTypeDef.of(AbstractInitializableBeanIntrospection.BeanPropertyRef.class);
++            List<ExpressionDef> propsExpressions = new ArrayList<>();
++            for (BeanPropertyData beanProperty : beanProperties) {
++                MethodDef metadataMethod = MethodDef.builder("$property$" + beanProperty.name + "$metadata")
++                    .addModifiers(Modifier.PRIVATE, Modifier.STATIC)
++                    .returns(beanPropertyRefType)
++                    .build((aThis, methodParameters) -> {
++                        List<StatementDef> statements = new ArrayList<>();
++                        statements.add(
++                            pushBeanPropertyReference(beanProperty, statements, loadClassValueExpressionFn).returning()
++                        );
++                        return StatementDef.multi(statements);
++                    });
++                classDefBuilder.addMethod(
++                    metadataMethod
++                );
++                propsExpressions.add(
++                    thisType.invokeStatic(metadataMethod)
++                );
++            }
++
+             staticStatements.add(
+                 thisType.getStaticField(beanPropertiesField).put(
+-                    ClassTypeDef.of(AbstractInitializableBeanIntrospection.BeanPropertyRef.class).array()
++                    beanPropertyRefType.array()
+                         .instantiate(
+-                            beanProperties.stream()
+-                                .map(e -> pushBeanPropertyReference(e, staticStatements, loadClassValueExpressionFn))
+-                                .toList()
++                            propsExpressions
+                         )
+                 )
+             );
+@@ -617,14 +636,33 @@ final class BeanIntrospectionWriter implements OriginatingElements, ClassOutputW
+             beanPropertiesField = null;
+         }
+         if (!beanMethods.isEmpty()) {
++            ClassTypeDef beanMethodRefType = ClassTypeDef.of(AbstractInitializableBeanIntrospection.BeanMethodRef.class);
++            Set<String> usedNames = new HashSet<>();
++            List<ExpressionDef> methodsExpressions = new ArrayList<>();
++            for (BeanMethodData beanMethod : beanMethods) {
++                String methodName = beanMethod.methodElement().getName();
++                int index = 2;
++                while (!usedNames.add(methodName)) {
++                    methodName += index++;
++                }
++                MethodDef metadataMethod = MethodDef.builder("$method$" + methodName + "$metadata")
++                    .addModifiers(Modifier.PRIVATE, Modifier.STATIC)
++                    .returns(beanMethodRefType)
++                    .build((aThis, methodParameters) -> newBeanMethodRef(beanMethod, loadClassValueExpressionFn).returning());
++                classDefBuilder.addMethod(
++                    metadataMethod
++                );
++                methodsExpressions.add(
++                    thisType.invokeStatic(metadataMethod)
++                );
++            }
++
+             beanMethodsField = FieldDef.builder(FIELD_BEAN_METHODS_REFERENCES, AbstractInitializableBeanIntrospection.BeanMethodRef[].class)
+                 .addModifiers(Modifier.PRIVATE, Modifier.FINAL, Modifier.STATIC)
+                 .initializer(
+-                    ClassTypeDef.of(AbstractInitializableBeanIntrospection.BeanMethodRef.class).array()
++                    beanMethodRefType.array()
+                         .instantiate(
+-                            beanMethods.stream()
+-                                .map(e -> newBeanMethodRef(e, loadClassValueExpressionFn))
+-                                .toList()
++                            methodsExpressions
+                         )
+                 )
+                 .build();
+@@ -821,28 +859,29 @@ final class BeanIntrospectionWriter implements OriginatingElements, ClassOutputW
+                     .asStatementSwitch(returnType, keys.stream()
+                         .collect(Collectors.toMap(
+                             ExpressionDef::constant,
+-                            annotationName -> onMatch(aThis, methodParameters, annotationName, returnType)
++                            annotationName -> onAnnotationNameMatch(aThis, methodParameters, annotationName, returnType)
+                         )), ExpressionDef.nullValue().returning()));
+     }
+ 
+-    private StatementDef onMatch(VariableDef.This aThis, List<VariableDef.MethodParameter> parameters, String annotationName, TypeDef returnType) {
++    private StatementDef onAnnotationNameMatch(VariableDef.This aThis,
++                                               List<VariableDef.MethodParameter> parameters,
++                                               String annotationName,
++                                               TypeDef returnType) {
+         List<StatementDef> statements = new ArrayList<>();
+         VariableDef.MethodParameter annotationValueParameter = parameters.get(1);
++        ExpressionDef nullValue;
+         if (indexByAnnotationAndValue.keySet().stream().anyMatch(s -> s.annotationName.equals(annotationName) && s.value == null)) {
+             String propertyName = indexByAnnotationAndValue.get(new AnnotationWithValue(annotationName, null));
+             int propertyIndex = getPropertyIndex(propertyName);
+-            statements.add(
+-                annotationValueParameter.ifNonNull(
+-                    aThis.invoke(FIND_PROPERTY_BY_INDEX_METHOD, ExpressionDef.constant(propertyIndex)).returning()
+-                )
+-            );
++            nullValue = aThis.invoke(FIND_PROPERTY_BY_INDEX_METHOD, ExpressionDef.constant(propertyIndex));
+         } else {
+-            statements.add(
+-                annotationValueParameter.ifNull(
+-                    ExpressionDef.nullValue().returning()
+-                )
+-            );
++            nullValue = ExpressionDef.nullValue();
+         }
++        statements.add(
++            annotationValueParameter.ifNull(
++                nullValue.returning()
++            )
++        );
+         Set<String> valueMatches = indexByAnnotationAndValue.keySet()
+             .stream()
+             .filter(s -> s.annotationName.equals(annotationName) && s.value != null)
+diff --git a/core-processor/src/main/java/io/micronaut/inject/writer/BeanDefinitionWriter.java b/core-processor/src/main/java/io/micronaut/inject/writer/BeanDefinitionWriter.java
+index 06731e1be8..db90b4d036 100644
+--- a/core-processor/src/main/java/io/micronaut/inject/writer/BeanDefinitionWriter.java
++++ b/core-processor/src/main/java/io/micronaut/inject/writer/BeanDefinitionWriter.java
+@@ -2620,14 +2620,14 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
+      * @param declaringType                    The declaring type of the method. Either a Class or a string representing the
+      *                                         name of the type
+      * @param methodElement                    The method element
+-     * @param interceptedProxyType             The intercepted proxy type
+-     * @param interceptedProxyBridgeMethod     The intercepted proxy bridge method name
++     * @param interceptedProxyClassName        The intercepted proxy class name
++     * @param interceptedProxyBridgeMethodName The intercepted proxy bridge method name
+      * @return The index of a new method.
+      */
+     public int visitExecutableMethod(TypedElement declaringType,
+                                      MethodElement methodElement,
+-                                     ClassTypeDef interceptedProxyType,
+-                                     MethodDef interceptedProxyBridgeMethod) {
++                                     String interceptedProxyClassName,
++                                     String interceptedProxyBridgeMethodName) {
+ 
+         if (executableMethodsDefinitionWriter == null) {
+             executableMethodsDefinitionWriter = new ExecutableMethodsDefinitionWriter(
+@@ -2639,7 +2639,7 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
+                 visitorContext
+             );
+         }
+-        return executableMethodsDefinitionWriter.visitExecutableMethod(declaringType, methodElement, interceptedProxyType, interceptedProxyBridgeMethod);
++        return executableMethodsDefinitionWriter.visitExecutableMethod(declaringType, methodElement, interceptedProxyClassName, interceptedProxyBridgeMethodName);
+     }
+ 
+     @Override
+diff --git a/core-processor/src/main/java/io/micronaut/inject/writer/DispatchWriter.java b/core-processor/src/main/java/io/micronaut/inject/writer/DispatchWriter.java
+index 0a8ddbb47d..be230639f0 100644
+--- a/core-processor/src/main/java/io/micronaut/inject/writer/DispatchWriter.java
++++ b/core-processor/src/main/java/io/micronaut/inject/writer/DispatchWriter.java
+@@ -160,21 +160,21 @@ public final class DispatchWriter implements ClassOutputWriter {
+      *
+      * @param declaringType                    The declaring type
+      * @param methodElement                    The method element
+-     * @param interceptedProxyType             The interceptedProxyType
+-     * @param interceptedProxyBridgeMethod     The interceptedProxyBridgeMethod
++     * @param interceptedProxyClassName        The interceptedProxyClassName
++     * @param interceptedProxyBridgeMethodName The interceptedProxyBridgeMethodName
+      * @return the target index
+      */
+     public int addInterceptedMethod(TypedElement declaringType,
+                                     MethodElement methodElement,
+-                                    ClassTypeDef interceptedProxyType,
+-                                    MethodDef interceptedProxyBridgeMethod) {
++                                    String interceptedProxyClassName,
++                                    String interceptedProxyBridgeMethodName) {
+         hasInterceptedMethod = true;
+         return addDispatchTarget(new InterceptableMethodDispatchTarget(
+             findDispatchTarget(declaringType, methodElement, false),
+             declaringType,
+             methodElement,
+-            interceptedProxyType,
+-            interceptedProxyBridgeMethod)
++            interceptedProxyClassName,
++            interceptedProxyBridgeMethodName)
+         );
+     }
+ 
+@@ -770,20 +770,20 @@ public final class DispatchWriter implements ClassOutputWriter {
+     public static final class InterceptableMethodDispatchTarget extends AbstractDispatchTarget {
+         private final TypedElement declaringType;
+         private final DispatchTarget dispatchTarget;
+-        private final ClassTypeDef interceptedProxyType;
+-        private final MethodDef interceptedProxyBridgeMethod;
++        private final String interceptedProxyClassName;
++        private final String interceptedProxyBridgeMethodName;
+         private final MethodElement methodElement;
+ 
+         private InterceptableMethodDispatchTarget(DispatchTarget dispatchTarget,
+                                                   TypedElement declaringType,
+                                                   MethodElement methodElement,
+-                                                  ClassTypeDef interceptedProxyType,
+-                                                  MethodDef interceptedProxyBridgeMethod) {
++                                                  String interceptedProxyClassName,
++                                                  String interceptedProxyBridgeMethodName) {
+             this.declaringType = declaringType;
+             this.methodElement = methodElement;
+             this.dispatchTarget = dispatchTarget;
+-            this.interceptedProxyType = interceptedProxyType;
+-            this.interceptedProxyBridgeMethod = interceptedProxyBridgeMethod;
++            this.interceptedProxyClassName = interceptedProxyClassName;
++            this.interceptedProxyBridgeMethodName = interceptedProxyBridgeMethodName;
+         }
+ 
+         @Override
+@@ -811,21 +811,23 @@ public final class DispatchWriter implements ClassOutputWriter {
+             VariableDef.Field interceptableField = new VariableDef.This()
+                 .field(FIELD_INTERCEPTABLE, TypeDef.of(boolean.class));
+ 
++            ClassTypeDef proxyType = ClassTypeDef.of(interceptedProxyClassName);
+ 
+-            return interceptableField.isTrue().and(target.instanceOf(interceptedProxyType))
++            return interceptableField.isTrue().and(target.instanceOf(proxyType))
+                 .doIfElse(
+-                    invokeProxyBridge(interceptedProxyType, target, valuesArray),
++                    invokeProxyBridge(proxyType, target, valuesArray),
+                     dispatchTarget.dispatch(target, valuesArray)
+                 );
+         }
+ 
+         private StatementDef invokeProxyBridge(ClassTypeDef proxyType, ExpressionDef target, ExpressionDef valuesArray) {
+             boolean suspend = methodElement.isSuspend();
+-            ExpressionDef.InvokeInstanceMethod invoke = target.cast(proxyType)
+-                .invoke(
+-                    interceptedProxyBridgeMethod,
+-                    IntStream.range(0, methodElement.getSuspendParameters().length).mapToObj(valuesArray::arrayElement).toList()
+-                );
++            ExpressionDef.InvokeInstanceMethod invoke = target.cast(proxyType).invoke(
++                interceptedProxyBridgeMethodName,
++                Arrays.stream(methodElement.getSuspendParameters()).map(p -> TypeDef.of(p.getType())).toList(),
++                suspend ? TypeDef.OBJECT : TypeDef.of(methodElement.getReturnType()),
++                IntStream.range(0, methodElement.getSuspendParameters().length).mapToObj(valuesArray::arrayElement).toList()
++            );
+             if (dispatchTarget.getMethodElement().getReturnType().isVoid() && !suspend) {
+                 return StatementDef.multi(
+                     invoke,
+diff --git a/core-processor/src/main/java/io/micronaut/inject/writer/ExecutableMethodsDefinitionWriter.java b/core-processor/src/main/java/io/micronaut/inject/writer/ExecutableMethodsDefinitionWriter.java
+index 35493b9cec..df6f42f2df 100644
+--- a/core-processor/src/main/java/io/micronaut/inject/writer/ExecutableMethodsDefinitionWriter.java
++++ b/core-processor/src/main/java/io/micronaut/inject/writer/ExecutableMethodsDefinitionWriter.java
+@@ -197,14 +197,14 @@ public class ExecutableMethodsDefinitionWriter implements ClassOutputWriter {
+      * @param declaringType                    The declaring type of the method. Either a Class or a string representing the
+      *                                         name of the type
+      * @param methodElement                    The method element
+-     * @param interceptedProxyType             The intercepted proxy type
+-     * @param interceptedProxyBridgeMethod     The intercepted proxy bridge method
++     * @param interceptedProxyClassName        The intercepted proxy class name
++     * @param interceptedProxyBridgeMethodName The intercepted proxy bridge method name
+      * @return The method index
+      */
+     public int visitExecutableMethod(TypedElement declaringType,
+                                      MethodElement methodElement,
+-                                     ClassTypeDef interceptedProxyType,
+-                                     MethodDef interceptedProxyBridgeMethod) {
++                                     String interceptedProxyClassName,
++                                     String interceptedProxyBridgeMethodName) {
+         evaluatedExpressionProcessor.processEvaluatedExpressions(methodElement);
+ 
+         String methodKey = methodElement.getName() +
+@@ -219,10 +219,10 @@ public class ExecutableMethodsDefinitionWriter implements ClassOutputWriter {
+             return index;
+         }
+         addedMethods.add(methodKey);
+-        if (interceptedProxyType == null) {
++        if (interceptedProxyClassName == null) {
+             return methodDispatchWriter.addMethod(declaringType, methodElement);
+         } else {
+-            return methodDispatchWriter.addInterceptedMethod(declaringType, methodElement, interceptedProxyType, interceptedProxyBridgeMethod);
++            return methodDispatchWriter.addInterceptedMethod(declaringType, methodElement, interceptedProxyClassName, interceptedProxyBridgeMethodName);
+         }
+     }
+ 
+diff --git a/core-processor/src/main/java/io/micronaut/inject/writer/MethodGenUtils.java b/core-processor/src/main/java/io/micronaut/inject/writer/MethodGenUtils.java
+index 7ffae0c1e4..9e89964d8a 100644
+--- a/core-processor/src/main/java/io/micronaut/inject/writer/MethodGenUtils.java
++++ b/core-processor/src/main/java/io/micronaut/inject/writer/MethodGenUtils.java
+@@ -166,7 +166,7 @@ public final class MethodGenUtils {
+         newValues.addAll(List.of(masks)); // Bit mask of defaults
+         newValues.add(ExpressionDef.nullValue()); // Last parameter is just a marker and is always null
+ 
+-        MethodDef defaultKotlinMethod = MethodGenUtils.asDefaultKotlinMethod(TypeDef.erasure(declaringType), methodElement, numberOfMasks);
++        MethodDef defaultKotlinMethod = MethodGenUtils.asDefaultKotlinMethod(TypeDef.of(declaringType), methodElement, numberOfMasks);
+ 
+         return ClassTypeDef.of(declaringType).invokeStatic(defaultKotlinMethod, newValues);
+     }
+diff --git a/gradle.properties b/gradle.properties
+index c614472512..5386be74ea 100644
+--- a/gradle.properties
++++ b/gradle.properties
+@@ -1,4 +1,4 @@
+-projectVersion=4.8.7-SNAPSHOT
++projectVersion=4.8.8-SNAPSHOT
+ projectGroupId=io.micronaut
+ projectDesc=Core components supporting the Micronaut Framework
+ title=Micronaut Core
+diff --git a/inject-java-test/src/test/groovy/io/micronaut/inject/visitor/beans/BeanIntrospectionSpec.groovy b/inject-java-test/src/test/groovy/io/micronaut/inject/visitor/beans/BeanIntrospectionSpec.groovy
+index a07f8606ed..5041ac0717 100644
+--- a/inject-java-test/src/test/groovy/io/micronaut/inject/visitor/beans/BeanIntrospectionSpec.groovy
++++ b/inject-java-test/src/test/groovy/io/micronaut/inject/visitor/beans/BeanIntrospectionSpec.groovy
+@@ -46,6 +46,7 @@ import javax.persistence.Column
+ import javax.persistence.Entity
+ import javax.persistence.Id
+ import javax.persistence.Version
++import java.lang.annotation.Annotation
+ import java.lang.reflect.Field
+ import java.util.stream.Collectors
+ import java.util.stream.IntStream
+@@ -3229,6 +3230,8 @@ class Test {
+         bi.getIndexedProperties(Id).size() == 1
+         bi.getIndexedProperty(Id).isPresent()
+         !bi.getIndexedProperty(Column, null).isPresent()
++        bi.getIndexedProperty(Column, "unknown").isEmpty()
++        bi.getIndexedProperty(Column, null).isEmpty()
+         bi.getIndexedProperty(Column, "test_name").isPresent()
+         bi.getIndexedProperty(Column, "test_name").get().name == 'name'
+         bi.getProperty("version").get().hasAnnotation(Version)
+@@ -3329,6 +3332,125 @@ class Test {
+         context?.close()
+     }
+ 
++    void "test write bean introspection indexes"() {
++        given:
++        ApplicationContext context = buildContext('test.Test', '''
++package test;
++
++import jakarta.validation.constraints.*;
++import javax.persistence.*;
++
++
++import java.lang.annotation.*;
++import io.micronaut.core.annotation.Introspected;
++
++@Retention(RetentionPolicy.RUNTIME)
++@Target({ElementType.ANNOTATION_TYPE, ElementType.FIELD, ElementType.METHOD})
++@Documented
++@interface MappedProperty1 {
++
++    /**
++     * The destination the property is persisted to. This could be the column name etc. or some external form.
++     *
++     * @return The destination
++     */
++    String value() default "";
++}
++
++@Retention(RetentionPolicy.RUNTIME)
++@Target({ElementType.ANNOTATION_TYPE, ElementType.FIELD, ElementType.METHOD})
++@Documented
++@interface MappedProperty2 {
++
++    /**
++     * The destination the property is persisted to. This could be the column name etc. or some external form.
++     *
++     * @return The destination
++     */
++    String value() default "";
++}
++
++@Introspected(indexed = {
++        @Introspected.IndexedAnnotation(annotation = MappedProperty1.class, member = "value"),
++        @Introspected.IndexedAnnotation(annotation = MappedProperty2.class, member = "value")
++})
++@Entity
++class Test {
++    @Id
++    @GeneratedValue
++    private Long id;
++    @Version
++    @MappedProperty1("test_version")
++    private Long version;
++    @MappedProperty1
++    @MappedProperty2("xyz")
++    private String ln;
++    @MappedProperty1("test_name")
++    private String name;
++    @Size(max=100)
++    private int age;
++
++    public String getLn() {
++        return ln;
++    }
++
++    public void setLn(String ln) {
++        this.ln = ln;
++    }
++
++    public String getName() {
++        return this.name;
++    }
++    public void setName(String n) {
++        this.name = n;
++    }
++    public int getAge() {
++        return age;
++    }
++    public void setAge(int age) {
++        this.age = age;
++    }
++
++    public void setId(Long id) {
++        this.id = id;
++    }
++
++    public Long getId() {
++        return this.id;
++    }
++
++    public void setVersion(Long version) {
++        this.version = version;
++    }
++
++    public Long getVersion() {
++        return this.version;
++    }
++}
++''')
++
++        when:"The introspection is loaded"
++        def clazz = context.classLoader.loadClass('test.$Test$Introspection')
++        Class<Annotation> mappedProperty1Class = context.classLoader.loadClass("test.MappedProperty1")
++        Class<Annotation> mappedProperty2Class = context.classLoader.loadClass("test.MappedProperty2")
++        BeanIntrospectionReference reference = clazz.newInstance()
++
++        BeanIntrospection bi = reference.load()
++
++        then:"it is correct"
++        bi.instantiate()
++        bi.getIndexedProperties(mappedProperty1Class).size() == 3
++        bi.getIndexedProperty(mappedProperty1Class, "test_version").get().name == "version"
++        bi.getIndexedProperty(mappedProperty1Class, "test_name").get().name == "name"
++        bi.getIndexedProperty(mappedProperty1Class, null).get().name == "ln"
++        bi.getIndexedProperty(mappedProperty1Class, "unknown").isEmpty()
++        bi.getIndexedProperty(mappedProperty2Class, "xyz").get().name == "ln"
++        bi.getIndexedProperty(mappedProperty2Class, null).isEmpty()
++
++        cleanup:
++        context?.close()
++    }
++
+     void "test write bean introspection data for class in another package"() {
+         given:
+         ApplicationContext context = buildContext('test.Test', '''
+@@ -5489,6 +5611,57 @@ class Massive {
+         introspection.getBeanProperties().size() == count
+     }
+ 
++    void "test massive dispatch with annotations"() {
++        given:
++        int count = 120
++        List<String> fieldNames = IntStream.range(0, count).mapToObj(i -> "f$i").toList()
++        BeanIntrospection introspection = buildBeanIntrospection('test.Massive', """
++package test;
++import io.micronaut.core.annotation.Introspected;
++
++@Introspected
++class Massive {
++    ${fieldNames.stream().map(f -> "@io.micronaut.core.annotation.NextMajorVersion(\"$f\") private final String $f;").collect(Collectors.joining("\n"))}
++
++    Massive(${fieldNames.stream().map(f -> "String $f").collect(Collectors.joining(", "))}) {
++        ${fieldNames.stream().map(f -> "this.$f = $f;").collect(Collectors.joining("\n"))}
++    }
++
++    ${fieldNames.stream().map(f -> "public String get${f.capitalize()}() { return $f; }").collect(Collectors.joining("\n"))}
++}""")
++
++        expect:
++        introspection.getBeanProperties().size() == count
++    }
++
++    void "test massive dispatch and executable methods with annotations"() {
++        given:
++        int propsCount = 100
++        int methodsCount = 1000
++        List<String> methods = IntStream.range(0, methodsCount).mapToObj(i -> "f$i").toList()
++        List<String> fieldNames = IntStream.range(0, propsCount).mapToObj(i -> "f$i").toList()
++        BeanIntrospection introspection = buildBeanIntrospection('test.Massive', """
++package test;
++import io.micronaut.core.annotation.Introspected;
++
++@Introspected
++class Massive {
++    ${fieldNames.stream().map(f -> "@io.micronaut.core.annotation.NextMajorVersion(\"$f\") private final String $f;").collect(Collectors.joining("\n"))}
++
++    Massive(${fieldNames.stream().map(f -> "String $f").collect(Collectors.joining(", "))}) {
++        ${fieldNames.stream().map(f -> "this.$f = $f;").collect(Collectors.joining("\n"))}
++    }
++
++    ${fieldNames.stream().map(f -> "public String get${f.capitalize()}() { return $f; }").collect(Collectors.joining("\n"))}
++
++    ${methods.stream().map(m -> "@io.micronaut.core.annotation.NextMajorVersion(\"$m\") @io.micronaut.context.annotation.Executable public void ${m}() {}").collect(Collectors.joining("\n"))}
++}""")
++
++        expect:
++        introspection.getBeanProperties().size() == propsCount
++        introspection.getBeanMethods().size() == methodsCount
++    }
++
+     @Issue("https://github.com/micronaut-projects/micronaut-core/issues/10647")
+     void 'handles generic definitions as generated by protobuf'() {
+         when:
+diff --git a/inject-java/src/test/groovy/io/micronaut/aop/compile/AroundCompileSpec.groovy b/inject-java/src/test/groovy/io/micronaut/aop/compile/AroundCompileSpec.groovy
+index a7d4340b8c..303cd4bf67 100644
+--- a/inject-java/src/test/groovy/io/micronaut/aop/compile/AroundCompileSpec.groovy
++++ b/inject-java/src/test/groovy/io/micronaut/aop/compile/AroundCompileSpec.groovy
+@@ -142,114 +142,6 @@ class TestInterceptor implements Interceptor {
+             interceptor.invoked
+     }
+ 
+-    void 'test apply interceptor using interface return ENUM'() {
+-        given:
+-            ApplicationContext context = buildContext('''
+-package test;
+-
+-import java.lang.annotation.*;
+-import io.micronaut.aop.*;
+-import jakarta.inject.*;
+-import static java.lang.annotation.RetentionPolicy.RUNTIME;
+-
+-interface IMyBean {
+-    @TestAnn
+-    <E extends Enum<E>> E test();
+-}
+-
+-@Singleton
+-class MyBean implements IMyBean {
+-
+-    @Override
+-    public <E extends Enum<E>> E test() {
+-        return null;
+-    }
+-
+-}
+-
+-@Inherited
+-@Retention(RUNTIME)
+-@Target({ElementType.METHOD, ElementType.TYPE})
+-@InterceptorBinding
+-@interface TestAnn {
+-}
+-
+-@InterceptorBean(TestAnn.class)
+-class TestInterceptor implements Interceptor {
+-    boolean invoked = false;
+-    @Override
+-    public Object intercept(InvocationContext context) {
+-        invoked = true;
+-        return context.proceed();
+-    }
+-}
+-
+-''')
+-            def instance = getBean(context, 'test.MyBean')
+-            def interceptor = getBean(context, 'test.TestInterceptor')
+-
+-        when:
+-            instance.test() == null
+-
+-        then:"the interceptor was invoked"
+-            instance instanceof Intercepted
+-            interceptor.invoked
+-    }
+-
+-    void 'test apply interceptor using interface parameter ENUM'() {
+-        given:
+-            ApplicationContext context = buildContext('''
+-package test;
+-
+-import java.lang.annotation.*;
+-import io.micronaut.aop.*;
+-import jakarta.inject.*;
+-import static java.lang.annotation.RetentionPolicy.RUNTIME;
+-
+-interface IMyBean {
+-    @TestAnn
+-    <E extends Enum<E>> String test(E param);
+-}
+-
+-@Singleton
+-class MyBean implements IMyBean {
+-
+-    @Override
+-    public <E extends Enum<E>> String test(E param) {
+-        return "sss";
+-    }
+-
+-}
+-
+-@Inherited
+-@Retention(RUNTIME)
+-@Target({ElementType.METHOD, ElementType.TYPE})
+-@InterceptorBinding
+-@interface TestAnn {
+-}
+-
+-@InterceptorBean(TestAnn.class)
+-class TestInterceptor implements Interceptor {
+-    boolean invoked = false;
+-    @Override
+-    public Object intercept(InvocationContext context) {
+-        invoked = true;
+-        return context.proceed();
+-    }
+-}
+-
+-''')
+-            def instance = getBean(context, 'test.MyBean')
+-            def interceptor = getBean(context, 'test.TestInterceptor')
+-
+-        when:
+-            instance.test(null) == "sss"
+-
+-        then:"the interceptor was invoked"
+-            instance instanceof Intercepted
+-            interceptor.invoked
+-    }
+-
+     void 'test stereotype method level interceptor matching'() {
+         given:
+         ApplicationContext context = buildContext('''
+diff --git a/inject-java/src/test/groovy/io/micronaut/visitors/IntroductionTest.java b/inject-java/src/test/groovy/io/micronaut/visitors/IntroductionTest.java
+new file mode 100644
+index 0000000000..798fc61d7e
+--- /dev/null
++++ b/inject-java/src/test/groovy/io/micronaut/visitors/IntroductionTest.java
+@@ -0,0 +1,11 @@
++package io.micronaut.visitors;
++
++import io.micronaut.aop.Introduction;
++
++import java.lang.annotation.Retention;
++import java.lang.annotation.RetentionPolicy;
++
++@Introduction
++@Retention(RetentionPolicy.RUNTIME)
++public @interface IntroductionTest {
++}
+diff --git a/inject-java/src/test/groovy/io/micronaut/visitors/IntroductionTestGen.java b/inject-java/src/test/groovy/io/micronaut/visitors/IntroductionTestGen.java
+new file mode 100644
+index 0000000000..767a759c4d
+--- /dev/null
++++ b/inject-java/src/test/groovy/io/micronaut/visitors/IntroductionTestGen.java
+@@ -0,0 +1,10 @@
++package io.micronaut.visitors;
++
++import io.micronaut.aop.Introduction;
++
++import java.lang.annotation.Retention;
++import java.lang.annotation.RetentionPolicy;
++
++@Retention(RetentionPolicy.RUNTIME)
++public @interface IntroductionTestGen {
++}
+diff --git a/inject-java/src/test/groovy/io/micronaut/visitors/IntroductionTestVisitor.java b/inject-java/src/test/groovy/io/micronaut/visitors/IntroductionTestVisitor.java
+new file mode 100644
+index 0000000000..1049ac7cfc
+--- /dev/null
++++ b/inject-java/src/test/groovy/io/micronaut/visitors/IntroductionTestVisitor.java
+@@ -0,0 +1,31 @@
++package io.micronaut.visitors;
++
++import io.micronaut.inject.ast.ClassElement;
++import io.micronaut.inject.processing.ProcessingException;
++import io.micronaut.inject.visitor.TypeElementVisitor;
++import io.micronaut.inject.visitor.VisitorContext;
++
++public class IntroductionTestVisitor implements TypeElementVisitor<IntroductionTestGen, Object> {
++
++    @Override
++    public void visitClass(ClassElement element, VisitorContext context) {
++            context.visitGeneratedSourceFile(
++                "test",
++                "IntroductionTestParent",
++                element
++            ).ifPresent(sourceFile -> {
++                try {
++                    sourceFile.write(writer -> writer.write("""
++                        package test;
++
++                        public interface IntroductionTestParent {
++                            String getParentMethod();
++                        }
++                        """));
++                } catch (Exception e) {
++                    throw new ProcessingException(element, "Failed to generate a Parent introduction: " + e.getMessage(), e);
++                }
++            });
++    }
++
++}
+diff --git a/inject-java/src/test/groovy/io/micronaut/visitors/PostponedVisitorsSpec.groovy b/inject-java/src/test/groovy/io/micronaut/visitors/PostponedVisitorsSpec.groovy
+index e2a6d86f44..be80694b22 100644
+--- a/inject-java/src/test/groovy/io/micronaut/visitors/PostponedVisitorsSpec.groovy
++++ b/inject-java/src/test/groovy/io/micronaut/visitors/PostponedVisitorsSpec.groovy
+@@ -2,10 +2,12 @@ package io.micronaut.visitors
+ 
+ 
+ import io.micronaut.annotation.processing.test.AbstractTypeElementSpec
++import io.micronaut.inject.writer.BeanDefinitionVisitor
++import spock.lang.PendingFeature
+ 
+ class PostponedVisitorsSpec extends AbstractTypeElementSpec {
+ 
+-    void 'test'() {
++    void 'test postpone introspection generation implementing generated interface'() {
+         when:
+             def definition = buildBeanIntrospection('test.Walrus', '''
+ package test;
+@@ -28,4 +30,42 @@ public record Walrus (
+         then:
+             definition
+     }
++
++    @PendingFeature(reason = "It is currently not possible to implement a generated interface")
++    void 'test postpone introduction generation implementing generated interface'() {
++        when:
++        def context = buildContext('test.MyIntroduction' + BeanDefinitionVisitor.PROXY_SUFFIX, '''
++package test;
++
++import io.micronaut.core.annotation.Introspected;
++import io.micronaut.core.annotation.NonNull;
++import io.micronaut.visitors.IntroductionTest;
++import io.micronaut.visitors.IntroductionTestGen;
++import io.micronaut.aop.InterceptorBean;
++import io.micronaut.aop.MethodInterceptor;
++import io.micronaut.aop.MethodInvocationContext;
++
++
++@IntroductionTestGen
++class Foo {}
++
++@IntroductionTest
++interface MyIntroduction extends IntroductionTestParent  {
++}
++
++
++@InterceptorBean(IntroductionTest.class)
++class IntroductionTestInterceptor
++    implements MethodInterceptor<Object, Object> {
++    @Override
++    public Object intercept(MethodInvocationContext<Object, Object> context) {
++        return "good";
++    }
++}
++''')
++        def introduction = getBean(context, 'test.MyIntroduction')
++
++        then:
++        introduction.getParentMethod() == 'good'
++    }
+ }
+diff --git a/inject-java/src/test/resources/META-INF/services/io.micronaut.inject.visitor.TypeElementVisitor b/inject-java/src/test/resources/META-INF/services/io.micronaut.inject.visitor.TypeElementVisitor
+index e8e846e183..2b6bc21382 100644
+--- a/inject-java/src/test/resources/META-INF/services/io.micronaut.inject.visitor.TypeElementVisitor
++++ b/inject-java/src/test/resources/META-INF/services/io.micronaut.inject.visitor.TypeElementVisitor
+@@ -20,3 +20,4 @@ io.micronaut.annotation.AnnotateClassSpec$AnnotateClassVisitor
+ io.micronaut.annotation.AnnotateTypeArgSpec$AnnotateTypeArgVisitor
+ io.micronaut.aop.introduction.beans.MyRepoVisitor2
+ io.micronaut.visitors.WitherVisitor
++io.micronaut.visitors.IntroductionTestVisitor
+diff --git a/src/main/docs/guide/httpServer/statusAnnotation.adoc b/src/main/docs/guide/httpServer/statusAnnotation.adoc
+index cd439c6221..a6d6ce2006 100644
+--- a/src/main/docs/guide/httpServer/statusAnnotation.adoc
++++ b/src/main/docs/guide/httpServer/statusAnnotation.adoc
+@@ -11,3 +11,7 @@ snippet::io.micronaut.docs.server.response.StatusController[tags="atstatus", ind
+ or even respond with an `HttpStatus`
+ 
+ snippet::io.micronaut.docs.server.response.StatusController[tags="httpstatus", indent=0]
++
++=== Custom HTTP Status Codes
++Micronaut supports arbitrary HTTP status codes not part of the predefined `HttpStatus` enum.
++You can use the API method https://docs.micronaut.io/latest/api/io/micronaut/http/HttpResponse.html#status(int,java.lang.String)[`HttpResponse#status(int,java.lang.String)`]

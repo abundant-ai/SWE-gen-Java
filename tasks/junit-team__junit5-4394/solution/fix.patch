@@ -1,0 +1,134 @@
+diff --git a/documentation/src/docs/asciidoc/release-notes/release-notes-5.13.0-M1.adoc b/documentation/src/docs/asciidoc/release-notes/release-notes-5.13.0-M1.adoc
+index ffda3c1d5..5f5e5199e 100644
+--- a/documentation/src/docs/asciidoc/release-notes/release-notes-5.13.0-M1.adoc
++++ b/documentation/src/docs/asciidoc/release-notes/release-notes-5.13.0-M1.adoc
+@@ -29,6 +29,8 @@ repository on GitHub.
+ 
+ * New `ConsoleLauncher` options `--redirect-stdout` and `--redirect-stderr` for
+   redirecting `stdout` and `stderr` output streams to files.
++* Add `TestDescriptor.Visitor.composite(List)` factory method for creating a composite
++  visitor that delegates to the given visitors in order.
+ 
+ 
+ [[release-notes-5.13.0-M1-junit-jupiter]]
+diff --git a/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/discovery/DiscoverySelectorResolver.java b/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/discovery/DiscoverySelectorResolver.java
+index 97f4e8da2..89a79c679 100644
+--- a/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/discovery/DiscoverySelectorResolver.java
++++ b/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/discovery/DiscoverySelectorResolver.java
+@@ -40,13 +40,15 @@ public class DiscoverySelectorResolver {
+ 			.addClassContainerSelectorResolver(new IsTestClassWithTests()) //
+ 			.addSelectorResolver(ctx -> new ClassSelectorResolver(ctx.getClassNameFilter(), getConfiguration(ctx))) //
+ 			.addSelectorResolver(ctx -> new MethodSelectorResolver(getConfiguration(ctx))) //
+-			.addTestDescriptorVisitor(ctx -> new ClassOrderingVisitor(getConfiguration(ctx))) //
+-			.addTestDescriptorVisitor(ctx -> new MethodOrderingVisitor(getConfiguration(ctx))) //
+-			.addTestDescriptorVisitor(ctx -> descriptor -> {
+-				if (descriptor instanceof JupiterTestDescriptor) {
+-					((JupiterTestDescriptor) descriptor).prunePriorToFiltering();
+-				}
+-			}) //
++			.addTestDescriptorVisitor(ctx -> TestDescriptor.Visitor.composite( //
++				new ClassOrderingVisitor(getConfiguration(ctx)), //
++				new MethodOrderingVisitor(getConfiguration(ctx)), //
++				descriptor -> {
++					if (descriptor instanceof JupiterTestDescriptor) {
++						((JupiterTestDescriptor) descriptor).prunePriorToFiltering();
++					}
++				} //
++			)) //
+ 			.build();
+ 
+ 	private static JupiterConfiguration getConfiguration(InitializationContext<JupiterEngineDescriptor> context) {
+diff --git a/junit-platform-engine/src/main/java/org/junit/platform/engine/CompositeTestDescriptorVisitor.java b/junit-platform-engine/src/main/java/org/junit/platform/engine/CompositeTestDescriptorVisitor.java
+new file mode 100644
+index 000000000..28de4e46b
+--- /dev/null
++++ b/junit-platform-engine/src/main/java/org/junit/platform/engine/CompositeTestDescriptorVisitor.java
+@@ -0,0 +1,41 @@
++/*
++ * Copyright 2015-2025 the original author or authors.
++ *
++ * All rights reserved. This program and the accompanying materials are
++ * made available under the terms of the Eclipse Public License v2.0 which
++ * accompanies this distribution and is available at
++ *
++ * https://www.eclipse.org/legal/epl-v20.html
++ */
++
++package org.junit.platform.engine;
++
++import java.util.Arrays;
++
++import org.junit.platform.commons.util.Preconditions;
++
++/**
++ * @since 1.13
++ */
++final class CompositeTestDescriptorVisitor implements TestDescriptor.Visitor {
++
++	private final TestDescriptor.Visitor[] visitors;
++
++	static TestDescriptor.Visitor from(TestDescriptor.Visitor... visitors) {
++		Preconditions.notNull(visitors, "visitors must not be null");
++		Preconditions.notEmpty(visitors, "visitors must not be empty");
++		Preconditions.containsNoNullElements(visitors, "visitors must not contain any null elements");
++		return visitors.length == 1 ? visitors[0] : new CompositeTestDescriptorVisitor(visitors);
++	}
++
++	private CompositeTestDescriptorVisitor(TestDescriptor.Visitor[] visitors) {
++		this.visitors = Arrays.copyOf(visitors, visitors.length);
++	}
++
++	@Override
++	public void visit(TestDescriptor descriptor) {
++		for (TestDescriptor.Visitor visitor : visitors) {
++			visitor.visit(descriptor);
++		}
++	}
++}
+diff --git a/junit-platform-engine/src/main/java/org/junit/platform/engine/TestDescriptor.java b/junit-platform-engine/src/main/java/org/junit/platform/engine/TestDescriptor.java
+index c0d0a737a..b23d2d79e 100644
+--- a/junit-platform-engine/src/main/java/org/junit/platform/engine/TestDescriptor.java
++++ b/junit-platform-engine/src/main/java/org/junit/platform/engine/TestDescriptor.java
+@@ -319,6 +319,25 @@ public interface TestDescriptor {
+ 	@FunctionalInterface
+ 	interface Visitor {
+ 
++		/**
++		 * Combine the supplied {@code visitors} into a single {@code Visitor}.
++		 *
++		 * <p>If the supplied array contains only a single {@code Visitor}, that
++		 * {@code Visitor} is returned as is.
++		 *
++		 * @param visitors the {@code Visitor}s to combine; never {@code null}
++		 * or empty
++		 * @return the combined {@code Visitor}
++		 * @throws org.junit.platform.commons.PreconditionViolationException if
++		 * {@code visitors} is {@code null}, contains {@code null} elements, or
++		 * is empty
++		 * @since 1.13
++		 */
++		@API(status = EXPERIMENTAL, since = "1.13")
++		static Visitor composite(Visitor... visitors) {
++			return CompositeTestDescriptorVisitor.from(visitors);
++		}
++
+ 		/**
+ 		 * Visit a {@link TestDescriptor}.
+ 		 *
+diff --git a/junit-platform-engine/src/main/java/org/junit/platform/engine/support/discovery/EngineDiscoveryRequestResolver.java b/junit-platform-engine/src/main/java/org/junit/platform/engine/support/discovery/EngineDiscoveryRequestResolver.java
+index cf0ddf0c7..431975615 100644
+--- a/junit-platform-engine/src/main/java/org/junit/platform/engine/support/discovery/EngineDiscoveryRequestResolver.java
++++ b/junit-platform-engine/src/main/java/org/junit/platform/engine/support/discovery/EngineDiscoveryRequestResolver.java
+@@ -213,6 +213,12 @@ public class EngineDiscoveryRequestResolver<T extends TestDescriptor> {
+ 		 * Add a context sensitive {@link TestDescriptor.Visitor} to this
+ 		 * builder.
+ 		 *
++		 * <p>If multiple {@linkplain TestDescriptor.Visitor visitors} are registered,
++		 * they will iterate over the test tree separately. To avoid the overhead of
++		 * multiple iterations, consider combining multiple visitors into a single
++		 * visitor using
++		 * {@link TestDescriptor.Visitor#composite(TestDescriptor.Visitor...)}.
++		 *
+ 		 * @param visitorCreator the function that will be called to create the
+ 		 * {@link TestDescriptor.Visitor} to be added.
+ 		 * @return this builder for method chaining

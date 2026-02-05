@@ -1,0 +1,1128 @@
+diff --git a/bom/application/pom.xml b/bom/application/pom.xml
+index 627d70af014..32b4c628100 100644
+--- a/bom/application/pom.xml
++++ b/bom/application/pom.xml
+@@ -50,14 +50,14 @@
+         <smallrye-config.version>3.14.1</smallrye-config.version>
+         <smallrye-health.version>4.2.0</smallrye-health.version>
+         <smallrye-metrics.version>4.0.0</smallrye-metrics.version>
+-        <smallrye-open-api.version>4.2.1</smallrye-open-api.version>
++        <smallrye-open-api.version>4.2.0</smallrye-open-api.version>
+         <smallrye-graphql.version>2.16.0</smallrye-graphql.version>
+         <smallrye-fault-tolerance.version>6.9.3</smallrye-fault-tolerance.version>
+         <smallrye-jwt.version>4.6.2</smallrye-jwt.version>
+         <smallrye-context-propagation.version>2.2.1</smallrye-context-propagation.version>
+         <smallrye-reactive-streams-operators.version>1.0.13</smallrye-reactive-streams-operators.version>
+         <smallrye-reactive-types-converter.version>3.0.3</smallrye-reactive-types-converter.version>
+-        <smallrye-mutiny-vertx-binding.version>3.20.2</smallrye-mutiny-vertx-binding.version>
++        <smallrye-mutiny-vertx-binding.version>3.20.1</smallrye-mutiny-vertx-binding.version>
+         <smallrye-reactive-messaging.version>4.30.0</smallrye-reactive-messaging.version>
+         <smallrye-stork.version>2.7.3</smallrye-stork.version>
+         <jakarta.activation.version>2.1.4</jakarta.activation.version>
+diff --git a/docs/src/main/asciidoc/redis-reference.adoc b/docs/src/main/asciidoc/redis-reference.adoc
+index 04b84641894..4c7bfa21c95 100644
+--- a/docs/src/main/asciidoc/redis-reference.adoc
++++ b/docs/src/main/asciidoc/redis-reference.adoc
+@@ -138,6 +138,70 @@ public class RedisExample {
+ 
+ TIP: You can omit the `@Inject` annotation when using `@RedisClientName`.
+ 
++=== Activate or deactivate Redis Clients
++
++When a Redis Clients is configured at build time, and its URL is set at runtime, it is active by default. Quarkus
++starts the corresponding Redis Client when the application starts.
++
++To deactivate a Redis Client at runtime, either:
++
++* Do not set `quarkus.redis[.optional name].hosts` or `quarkus.redis[.optional name].hosts-provider-name`.
++* Set `quarkus.redis[.optional name].active` to `false`.
++
++If a Redis Client is not active:
++
++* The Redis Client does not attempt to connect to Redis during application startup.
++* The Redis Client does not contribute a <<redis-health-check,health check>>.
++* Static CDI injection points involving the Redis Client, such as `@Inject ReactiveRedisDataSource redis` or `@Inject RedisDataSource redis`, cause application startup to fail.
++* Dynamic retrieval of the Redis Client, such as through `CDI.getBeanContainer()`, `Arc.instance()`, or an injected `Instance<ReactiveRedisDataSource>`, causes an exception to be thrown.
++* Other Quarkus extensions that consume the Redis Client may cause application startup to fail.
++
++This feature is especially useful when the application must dynamically select a Redis Client from a predefined set at
++runtime.
++
++.An example of configuring multiple Redis Clients for runtime selection:
++
++[source,properties]
++----
++quarkus.redis.one.active=false
++quarkus.redis.one.hosts=redis://localhost:64251
++
++quarkus.redis.two.active=false
++quarkus.redis.two.hosts=redis://localhost:64251
++----
++
++[source,java]
++----
++import io.quarkus.arc.InjectableInstance;
++
++@ApplicationScoped
++public class MyConsumer {
++    @Inject
++    @RedisClientName("one")
++    InjectableInstance<ReactiveRedisDataSource> one;
++    @Inject
++    @RedisClientName("two")
++    InjectableInstance<ReactiveRedisDataSource> two;
++
++    public void doSomething() {
++        ReactiveRedisDataSource redis = one.getActive();
++        // ...
++    }
++}
++----
++
++Setting `quarkus.redis.one.active=true` xref:config-reference.adoc#configuration-sources[at runtime] makes only the
++Redis Client `one` available.
++Setting `quarkus.redis.two.active=true` at runtime makes only the Redis Client `two` available.
++
++[IMPORTANT]
++====
++A Redis Client (either default or named) must always be discoverable at build-time to be considered for runtime
++injection. This can be done by injecting the Redis Client name with `@RedisClientName`. If the Redis Client name may be
++active or inactive, it needs to use the wrapper `InjectableInstance<>`, or else Quarkus will throw an exception at
++startup time if the Redis Client is inactive. Alternatively, Redis Clients may also be discovered via configuration.
++====
++
+ == Connect to the Redis server
+ 
+ The Redis extension can operate in 4 distinct modes:
+@@ -1014,6 +1078,7 @@ See xref:redis-dev-services.adoc[Redis Dev Service].
+ 
+ == Configure Redis observability
+ 
++[[redis-health-check]]
+ === Enable the health checks
+ 
+ If you are using the `quarkus-smallrye-health` extension, `quarkus-redis` will automatically add a readiness health check to validate the connection to the Redis server.
+diff --git a/extensions/redis-client/deployment/src/main/java/io/quarkus/redis/deployment/client/DevServicesRedisProcessor.java b/extensions/redis-client/deployment/src/main/java/io/quarkus/redis/deployment/client/DevServicesRedisProcessor.java
+index 0a4fd899be2..dd12904190a 100644
+--- a/extensions/redis-client/deployment/src/main/java/io/quarkus/redis/deployment/client/DevServicesRedisProcessor.java
++++ b/extensions/redis-client/deployment/src/main/java/io/quarkus/redis/deployment/client/DevServicesRedisProcessor.java
+@@ -2,12 +2,14 @@
+ 
+ import static io.quarkus.devservices.common.ConfigureUtil.configureSharedServiceLabel;
+ import static io.quarkus.devservices.common.ContainerLocator.locateContainerWithLabels;
++import static io.quarkus.redis.runtime.client.config.RedisConfig.HOSTS;
++import static io.quarkus.redis.runtime.client.config.RedisConfig.getPropertyName;
+ 
+-import java.util.HashMap;
++import java.util.HashSet;
+ import java.util.List;
+ import java.util.Map;
+-import java.util.Map.Entry;
+ import java.util.OptionalInt;
++import java.util.Set;
+ 
+ import org.jboss.logging.Logger;
+ import org.testcontainers.containers.GenericContainer;
+@@ -28,7 +30,6 @@
+ import io.quarkus.devservices.common.ComposeLocator;
+ import io.quarkus.devservices.common.ConfigureUtil;
+ import io.quarkus.devservices.common.ContainerLocator;
+-import io.quarkus.redis.deployment.client.RedisBuildTimeConfig.DevServiceConfiguration;
+ import io.quarkus.redis.runtime.client.config.RedisConfig;
+ import io.quarkus.runtime.LaunchMode;
+ import io.quarkus.runtime.configuration.ConfigUtils;
+@@ -50,9 +51,6 @@ public class DevServicesRedisProcessor {
+     private static final ContainerLocator redisContainerLocator = locateContainerWithLabels(REDIS_EXPOSED_PORT,
+             DEV_SERVICE_LABEL);
+ 
+-    private static final String QUARKUS = "quarkus.";
+-    private static final String DOT = ".";
+-
+     @BuildStep
+     public void startRedisContainers(LaunchModeBuildItem launchMode,
+             DockerStatusBuildItem dockerStatusBuildItem,
+@@ -62,23 +60,21 @@ public void startRedisContainers(LaunchModeBuildItem launchMode,
+             BuildProducer<DevServicesResultBuildItem> devServicesResult,
+             DevServicesConfig devServicesConfig) {
+ 
+-        Map<String, DevServiceConfiguration> currentDevServicesConfiguration = new HashMap<>(config.additionalDevServices());
+-        currentDevServicesConfiguration.put(RedisConfig.DEFAULT_CLIENT_NAME, config.defaultDevService());
++        Set<String> names = new HashSet<>(config.clients().keySet());
++        names.add(RedisConfig.DEFAULT_CLIENT_NAME);
+ 
+         try {
+-            for (Entry<String, DevServiceConfiguration> entry : currentDevServicesConfiguration.entrySet()) {
+-                String name = entry.getKey();
++            for (String name : names) {
+                 boolean useSharedNetwork = DevServicesSharedNetworkBuildItem.isSharedNetworkRequired(devServicesConfig,
+                         devServicesSharedNetworkBuildItem);
+ 
+-                String configPrefix = getConfigPrefix(name);
+-                io.quarkus.redis.deployment.client.DevServicesConfig redisConfig = entry.getValue().devservices();
+-                if (redisDevServicesEnabled(dockerStatusBuildItem, name, redisConfig, configPrefix)) {
++                io.quarkus.redis.deployment.client.DevServicesConfig redisConfig = config.clients().get(name).devservices();
++                if (redisDevServicesEnabled(dockerStatusBuildItem, name, redisConfig)) {
+                     // If the dev services are disabled, we don't need to do anything
+                     continue;
+                 }
+ 
+-                DevServicesResultBuildItem discovered = discoverRunningService(composeProjectBuildItem, configPrefix,
++                DevServicesResultBuildItem discovered = discoverRunningService(composeProjectBuildItem, name,
+                         redisConfig, launchMode.getLaunchMode(), useSharedNetwork);
+                 if (discovered != null) {
+                     devServicesResult.produce(discovered);
+@@ -97,15 +93,14 @@ public void startRedisContainers(LaunchModeBuildItem launchMode,
+                                             // Dev Service discovery works using a global dev service label applied in DevServicesCustomizerBuildItem
+                                             // for backwards compatibility we still add the custom label
+                                             .withSharedServiceLabel(launchMode.getLaunchMode(), redisConfig.serviceName()))
+-                                    .configProvider(Map.of(configPrefix + RedisConfig.HOSTS_CONFIG_NAME,
+-                                            s -> REDIS_SCHEME + s.getConnectionInfo()))
++                                    .configProvider(
++                                            Map.of(getPropertyName(name, HOSTS), s -> REDIS_SCHEME + s.getConnectionInfo()))
+                                     .build());
+                 }
+             }
+         } catch (Throwable t) {
+             throw new RuntimeException(t);
+         }
+-
+     }
+ 
+     /**
+@@ -127,7 +122,7 @@ public void startRedisContainers(LaunchModeBuildItem launchMode,
+      * extra sure we'd put on a special 'not external' label and filter for that, too
+      */
+     private DevServicesResultBuildItem discoverRunningService(DevServicesComposeProjectBuildItem composeProjectBuildItem,
+-            String configPrefix,
++            String name,
+             io.quarkus.redis.deployment.client.DevServicesConfig devServicesConfig,
+             LaunchMode launchMode,
+             boolean useSharedNetwork) {
+@@ -140,14 +135,13 @@ private DevServicesResultBuildItem discoverRunningService(DevServicesComposeProj
+                     return DevServicesResultBuildItem.discovered()
+                             .feature(Feature.REDIS_CLIENT)
+                             .containerId(containerAddress.getId())
+-                            .config(Map.of(configPrefix + RedisConfig.HOSTS_CONFIG_NAME, redisUrl))
++                            .config(Map.of(RedisConfig.getPropertyName(name, HOSTS), redisUrl))
+                             .build();
+                 }).orElse(null);
+     }
+ 
+     private static boolean redisDevServicesEnabled(DockerStatusBuildItem dockerStatusBuildItem, String name,
+-            io.quarkus.redis.deployment.client.DevServicesConfig devServicesConfig,
+-            String configPrefix) {
++            io.quarkus.redis.deployment.client.DevServicesConfig devServicesConfig) {
+         if (!devServicesConfig.enabled()) {
+             // explicitly disabled
+             log.debug("Not starting devservices for " + (RedisConfig.isDefaultClient(name) ? "default redis client" : name)
+@@ -155,7 +149,8 @@ private static boolean redisDevServicesEnabled(DockerStatusBuildItem dockerStatu
+             return true;
+         }
+ 
+-        boolean needToStart = !ConfigUtils.isPropertyNonEmpty(configPrefix + RedisConfig.HOSTS_CONFIG_NAME);
++        // TODO - We shouldn't query runtime config during deployment
++        boolean needToStart = !ConfigUtils.isPropertyNonEmpty(RedisConfig.getPropertyName(name, HOSTS));
+         if (!needToStart) {
+             log.debug("Not starting dev services for " + (RedisConfig.isDefaultClient(name) ? "default redis client" : name)
+                     + " as hosts have been provided");
+@@ -171,14 +166,6 @@ private static boolean redisDevServicesEnabled(DockerStatusBuildItem dockerStatu
+         return false;
+     }
+ 
+-    private String getConfigPrefix(String name) {
+-        String configPrefix = QUARKUS + RedisConfig.REDIS_CONFIG_ROOT_NAME + DOT;
+-        if (!RedisConfig.isDefaultClient(name)) {
+-            configPrefix = configPrefix + name + DOT;
+-        }
+-        return configPrefix;
+-    }
+-
+     private static class QuarkusPortRedisContainer extends GenericContainer<QuarkusPortRedisContainer> implements Startable {
+         private final OptionalInt fixedExposedPort;
+         private final boolean useSharedNetwork;
+diff --git a/extensions/redis-client/deployment/src/main/java/io/quarkus/redis/deployment/client/RedisBuildTimeConfig.java b/extensions/redis-client/deployment/src/main/java/io/quarkus/redis/deployment/client/RedisBuildTimeConfig.java
+index 82aba9963d4..145401f3348 100644
+--- a/extensions/redis-client/deployment/src/main/java/io/quarkus/redis/deployment/client/RedisBuildTimeConfig.java
++++ b/extensions/redis-client/deployment/src/main/java/io/quarkus/redis/deployment/client/RedisBuildTimeConfig.java
+@@ -1,57 +1,90 @@
+ package io.quarkus.redis.deployment.client;
+ 
++import static io.quarkus.redis.runtime.client.config.RedisConfig.DEFAULT_CLIENT_NAME;
++
++import java.util.ArrayList;
++import java.util.List;
+ import java.util.Map;
+ 
+ import io.quarkus.runtime.annotations.ConfigDocMapKey;
+-import io.quarkus.runtime.annotations.ConfigDocSection;
+-import io.quarkus.runtime.annotations.ConfigGroup;
+ import io.quarkus.runtime.annotations.ConfigPhase;
+ import io.quarkus.runtime.annotations.ConfigRoot;
+ import io.smallrye.config.ConfigMapping;
+ import io.smallrye.config.WithDefault;
++import io.smallrye.config.WithDefaults;
+ import io.smallrye.config.WithName;
+ import io.smallrye.config.WithParentName;
++import io.smallrye.config.WithUnnamedKey;
+ 
+ @ConfigMapping(prefix = "quarkus.redis")
+ @ConfigRoot(phase = ConfigPhase.BUILD_TIME)
+ public interface RedisBuildTimeConfig {
+-
+-    /**
+-     * The default redis client
+-     */
+-    @WithParentName
+-    RedisClientBuildTimeConfig defaultRedisClient();
+-
+     /**
+-     * Configures additional (named) Redis clients.
++     * Configures the Redis clients.
+      * <p>
+-     * Each client has a unique name which must be identified to select the right client.
+-     * For example:
++     * The default client does not have a name, and it is configured as:
++     *
++     * <pre>
++     * quarkus.redis.hosts = redis://localhost:6379
++     * </pre>
++     *
++     * And then use {@link jakarta.inject.Inject} to inject the client:
++     *
++     * <pre>
++     * &#64;Inject
++     * RedisAPI redis;
++     * </pre>
++     *
+      * <p>
++     * Named clients must be identified to select the right client:
+      *
+      * <pre>
+      * quarkus.redis.client1.hosts = redis://localhost:6379
+      * quarkus.redis.client2.hosts = redis://localhost:6380
+      * </pre>
+-     * <p>
+-     * And then use the {@link io.quarkus.redis.client.RedisClientName} annotation to select the
+-     * {@link io.vertx.mutiny.redis.client.Redis},
+-     * {@link io.vertx.redis.client.Redis}, {@link io.vertx.mutiny.redis.client.RedisAPI} and
+-     * {@link io.vertx.redis.client.RedisAPI} beans.
+-     * <p>
++     *
++     * And then use the {@link io.quarkus.redis.client.RedisClientName} annotation to select any of the beans:
++     * <ul>
++     * <li>{@link io.vertx.mutiny.redis.client.Redis}</li>
++     * <li>{@link io.vertx.redis.client.Redis}</li>
++     * <li>{@link io.vertx.mutiny.redis.client.RedisAPI}</li>
++     * <li>{@link io.vertx.redis.client.RedisAPI}</li>
++     * <li>{@link io.quarkus.redis.datasource.RedisDataSource}</li>
++     * <li>{@link io.quarkus.redis.datasource.ReactiveRedisDataSource}</li>
++     * </ul>
++     * And inject the client:
+      *
+      * <pre>
+-     * {
+-     *     &#64;code
+-     *     &#64;RedisClientName("client1")
+-     *     &#64;Inject
+-     *     RedisAPI redis;
+-     * }
++     * &#64;RedisClientName("client1")
++     * &#64;Inject
++     * RedisAPI redis;
+      * </pre>
+      */
+     @WithParentName
++    @WithDefaults
++    @WithUnnamedKey(DEFAULT_CLIENT_NAME)
+     @ConfigDocMapKey("redis-client-name")
+-    Map<String, RedisClientBuildTimeConfig> namedRedisClients();
++    Map<String, RedisClientBuildTimeConfig> clients();
++
++    /**
++     * Returns a {@code List} of Redis Client names. The first element of the list is the default Redis Client if
++     * available. The remaining order is unspecified.
++     *
++     * @return a {@code List} of Redis Client names
++     */
++    default List<String> clientsNames() {
++        List<String> names = new ArrayList<>();
++        if (clients().containsKey(DEFAULT_CLIENT_NAME)) {
++            names.add(DEFAULT_CLIENT_NAME);
++        }
++        for (String name : clients().keySet()) {
++            if (name.equals(DEFAULT_CLIENT_NAME)) {
++                continue;
++            }
++            names.add(name);
++        }
++        return names;
++    }
+ 
+     /**
+      * Whether a health check is published in case the smallrye-health extension is present.
+@@ -59,28 +92,4 @@ public interface RedisBuildTimeConfig {
+     @WithName("health.enabled")
+     @WithDefault("true")
+     boolean healthEnabled();
+-
+-    /**
+-     * Default Dev services configuration.
+-     */
+-    @WithParentName
+-    DevServiceConfiguration defaultDevService();
+-
+-    /**
+-     * Additional dev services configurations
+-     */
+-    @WithParentName
+-    @ConfigDocMapKey("additional-redis-clients")
+-    Map<String, DevServiceConfiguration> additionalDevServices();
+-
+-    @ConfigGroup
+-    public interface DevServiceConfiguration {
+-        /**
+-         * Dev Services
+-         * <p>
+-         * Dev Services allows Quarkus to automatically start Redis in dev and test mode.
+-         */
+-        @ConfigDocSection(generated = true)
+-        DevServicesConfig devservices();
+-    }
+ }
+diff --git a/extensions/redis-client/deployment/src/main/java/io/quarkus/redis/deployment/client/RedisClientBuildTimeConfig.java b/extensions/redis-client/deployment/src/main/java/io/quarkus/redis/deployment/client/RedisClientBuildTimeConfig.java
+index 11cdb13b136..1b338eea34c 100644
+--- a/extensions/redis-client/deployment/src/main/java/io/quarkus/redis/deployment/client/RedisClientBuildTimeConfig.java
++++ b/extensions/redis-client/deployment/src/main/java/io/quarkus/redis/deployment/client/RedisClientBuildTimeConfig.java
+@@ -4,6 +4,7 @@
+ import java.util.Optional;
+ 
+ import io.quarkus.runtime.annotations.ConfigDocDefault;
++import io.quarkus.runtime.annotations.ConfigDocSection;
+ import io.quarkus.runtime.annotations.ConfigGroup;
+ import io.quarkus.runtime.configuration.TrimmedStringConverter;
+ import io.smallrye.config.WithConverter;
+@@ -11,7 +12,6 @@
+ 
+ @ConfigGroup
+ public interface RedisClientBuildTimeConfig {
+-
+     /**
+      * A list of files allowing to pre-load data into the Redis server.
+      * The file is formatted as follows:
+@@ -38,4 +38,9 @@ public interface RedisClientBuildTimeConfig {
+     @WithDefault("true")
+     boolean loadOnlyIfEmpty();
+ 
++    /**
++     * Dev Services allows Quarkus to automatically start Redis in dev and test mode.
++     */
++    @ConfigDocSection(generated = true)
++    DevServicesConfig devservices();
+ }
+diff --git a/extensions/redis-client/deployment/src/main/java/io/quarkus/redis/deployment/client/RedisClientProcessor.java b/extensions/redis-client/deployment/src/main/java/io/quarkus/redis/deployment/client/RedisClientProcessor.java
+index c7125e56cb1..23be3f43526 100644
+--- a/extensions/redis-client/deployment/src/main/java/io/quarkus/redis/deployment/client/RedisClientProcessor.java
++++ b/extensions/redis-client/deployment/src/main/java/io/quarkus/redis/deployment/client/RedisClientProcessor.java
+@@ -1,6 +1,8 @@
+ package io.quarkus.redis.deployment.client;
+ 
+ import static io.quarkus.redis.runtime.client.config.RedisConfig.DEFAULT_CLIENT_NAME;
++import static io.quarkus.redis.runtime.client.config.RedisConfig.HOSTS;
++import static io.quarkus.redis.runtime.client.config.RedisConfig.HOSTS_PROVIDER_NAME;
+ 
+ import java.nio.file.Files;
+ import java.nio.file.Path;
+@@ -10,10 +12,9 @@
+ import java.util.HashSet;
+ import java.util.List;
+ import java.util.Map;
++import java.util.Map.Entry;
+ import java.util.Set;
+ import java.util.function.Supplier;
+-import java.util.regex.Matcher;
+-import java.util.regex.Pattern;
+ import java.util.stream.Collectors;
+ 
+ import jakarta.enterprise.context.ApplicationScoped;
+@@ -25,6 +26,7 @@
+ import org.jboss.jandex.DotName;
+ import org.jboss.jandex.IndexView;
+ 
++import io.quarkus.arc.ActiveResult;
+ import io.quarkus.arc.deployment.AdditionalBeanBuildItem;
+ import io.quarkus.arc.deployment.BeanArchiveIndexBuildItem;
+ import io.quarkus.arc.deployment.BeanDiscoveryFinishedBuildItem;
+@@ -53,9 +55,11 @@
+ import io.quarkus.redis.runtime.client.config.RedisConfig;
+ import io.quarkus.runtime.LaunchMode;
+ import io.quarkus.runtime.configuration.ConfigurationException;
++import io.quarkus.runtime.configuration.NameIterator;
+ import io.quarkus.smallrye.health.deployment.spi.HealthBuildItem;
+ import io.quarkus.tls.deployment.spi.TlsRegistryBuildItem;
+ import io.quarkus.vertx.deployment.VertxBuildItem;
++import io.smallrye.config.SmallRyeConfig;
+ import io.vertx.redis.client.impl.types.BulkType;
+ 
+ public class RedisClientProcessor {
+@@ -64,9 +68,6 @@ public class RedisClientProcessor {
+ 
+     private static final String FEATURE = "redis-client";
+ 
+-    private static final Pattern NAMED_CLIENT_PROPERTY_NAME_PATTERN = Pattern
+-            .compile("^quarkus\\.redis\\.(.+)\\.hosts(-provider-name)?$");
+-
+     private static final List<DotName> SUPPORTED_INJECTION_TYPE = List.of(
+             // Legacy types
+             DotName.createSimple(RedisClient.class.getName()),
+@@ -164,70 +165,80 @@ public void init(
+ 
+         // Create the supplier and define the beans.
+         for (String name : names) {
++            Supplier<ActiveResult> checkActive = recorder.checkActive(name);
++
+             // Redis objects
+             syntheticBeans.produce(configureAndCreateSyntheticBean(name, io.vertx.mutiny.redis.client.Redis.class,
+-                    recorder.getRedisClient(name)));
++                    checkActive, recorder.getRedisClient(name)));
+             syntheticBeans.produce(configureAndCreateSyntheticBean(name, io.vertx.redis.client.Redis.class,
+-                    recorder.getBareRedisClient(name)));
++                    checkActive, recorder.getBareRedisClient(name)));
+ 
+             // Redis API objects
+             syntheticBeans.produce(configureAndCreateSyntheticBean(name, io.vertx.mutiny.redis.client.RedisAPI.class,
+-                    recorder.getRedisAPI(name)));
++                    checkActive, recorder.getRedisAPI(name)));
+             syntheticBeans.produce(configureAndCreateSyntheticBean(name, io.vertx.redis.client.RedisAPI.class,
+-                    recorder.getBareRedisAPI(name)));
++                    checkActive, recorder.getBareRedisAPI(name)));
+ 
+             // Legacy clients
+-            syntheticBeans
+-                    .produce(configureAndCreateSyntheticBean(name, RedisClient.class, recorder.getLegacyRedisClient(name)));
++            syntheticBeans.produce(configureAndCreateSyntheticBean(name, RedisClient.class,
++                    checkActive, recorder.getLegacyRedisClient(name)));
+             syntheticBeans.produce(configureAndCreateSyntheticBean(name, ReactiveRedisClient.class,
+-                    recorder.getLegacyReactiveRedisClient(name)));
++                    checkActive, recorder.getLegacyReactiveRedisClient(name)));
+         }
+ 
+         recorder.cleanup(shutdown);
+ 
+         // Handle data import
+-        preloadRedisData(DEFAULT_CLIENT_NAME, buildTimeConfig.defaultRedisClient(), applicationArchivesBuildItem,
+-                launchMode.getLaunchMode(),
+-                nativeImageResources, hotDeploymentWatchedFiles, recorder);
+-
+-        if (buildTimeConfig.namedRedisClients() != null) {
+-            for (Map.Entry<String, RedisClientBuildTimeConfig> entry : buildTimeConfig.namedRedisClients().entrySet()) {
+-                preloadRedisData(entry.getKey(), entry.getValue(), applicationArchivesBuildItem, launchMode.getLaunchMode(),
+-                        nativeImageResources, hotDeploymentWatchedFiles, recorder);
+-            }
++        for (String name : buildTimeConfig.clientsNames()) {
++            preloadRedisData(name, buildTimeConfig.clients().get(name), applicationArchivesBuildItem,
++                    launchMode.getLaunchMode(),
++                    nativeImageResources, hotDeploymentWatchedFiles, recorder);
+         }
+     }
+ 
+     static Set<String> configuredClientNames(RedisBuildTimeConfig buildTimeConfig, Config config) {
+         Set<String> names = new HashSet<>();
+         // redis client names from dev services
+-        if (buildTimeConfig.defaultDevService().devservices().enabled()) {
+-            names.add(DEFAULT_CLIENT_NAME);
++        for (Entry<String, RedisClientBuildTimeConfig> client : buildTimeConfig.clients().entrySet()) {
++            if (client.getValue().devservices().enabled()) {
++                names.add(client.getKey());
++            }
+         }
+-        names.addAll(buildTimeConfig.additionalDevServices().keySet());
+-        // redis client names declared in config
+-        for (String propertyName : config.getPropertyNames()) {
+-            if (propertyName.equals("quarkus.redis.hosts")) {
++
++        // TODO - We shouldn't query runtime config during deployment
++        Map<String, String> map = config.unwrap(SmallRyeConfig.class).getMapKeys("quarkus.redis");
++        for (Entry<String, String> entry : map.entrySet()) {
++            NameIterator nameIterator = new NameIterator(entry.getKey());
++
++            if (nameIterator.nextSegmentEquals(HOSTS) || nameIterator.nextSegmentEquals(HOSTS_PROVIDER_NAME)) {
+                 names.add(DEFAULT_CLIENT_NAME);
+                 continue;
+             }
+-            Matcher matcher = NAMED_CLIENT_PROPERTY_NAME_PATTERN.matcher(propertyName);
+-            if (matcher.matches()) {
+-                names.add(matcher.group(1));
++
++            if (nameIterator.hasNext()) {
++                String candidateName = nameIterator.getNextSegment();
++                nameIterator.next();
++                if (nameIterator.hasNext()
++                        && (nameIterator.nextSegmentEquals(HOSTS) || nameIterator.nextSegmentEquals(HOSTS_PROVIDER_NAME))) {
++                    names.add(candidateName);
++                }
+             }
+         }
++
+         return names;
+     }
+ 
+-    static <T> SyntheticBeanBuildItem configureAndCreateSyntheticBean(String name,
+-            Class<T> type,
+-            Supplier<T> supplier) {
++    static <T> SyntheticBeanBuildItem configureAndCreateSyntheticBean(String name, Class<T> type,
++            Supplier<ActiveResult> checkActive, Supplier<T> supplier) {
++
+         SyntheticBeanBuildItem.ExtendedBeanConfigurator configurator = SyntheticBeanBuildItem
+                 .configure(type)
+-                .supplier(supplier)
+-                .scope(ApplicationScoped.class)
++                .checkActive(checkActive)
++                .startup()
++                .setRuntimeInit()
+                 .unremovable()
+-                .setRuntimeInit();
++                .supplier(supplier)
++                .scope(ApplicationScoped.class);
+ 
+         if (DEFAULT_CLIENT_NAME.equalsIgnoreCase(name)) {
+             configurator.addQualifier(Default.class);
+@@ -251,7 +262,7 @@ private void preloadRedisData(String name, RedisClientBuildTimeConfig clientConf
+             } catch (RuntimeException e) {
+                 throw new ConfigurationException(
+                         "Unable to interpret path referenced in '"
+-                                + RedisConfig.propertyKey(name, "redis-load-script") + "="
++                                + RedisConfig.getPropertyName(name, "redis-load-script") + "="
+                                 + String.join(",", importFiles)
+                                 + "': " + e.getMessage());
+             }
+@@ -263,7 +274,7 @@ private void preloadRedisData(String name, RedisClientBuildTimeConfig clientConf
+                 //raise exception if explicit file is not present (i.e. not the default)
+                 throw new ConfigurationException(
+                         "Unable to find file referenced in '"
+-                                + RedisConfig.propertyKey(name, "redis-load-script") + "="
++                                + RedisConfig.getPropertyName(name, "redis-load-script") + "="
+                                 + String.join(", ", clientConfig.loadScript().get())
+                                 + "'. Remove property or add file to your path.");
+             }
+diff --git a/extensions/redis-client/deployment/src/main/java/io/quarkus/redis/deployment/client/RedisDatasourceProcessor.java b/extensions/redis-client/deployment/src/main/java/io/quarkus/redis/deployment/client/RedisDatasourceProcessor.java
+index 884eee37b90..b455f002537 100644
+--- a/extensions/redis-client/deployment/src/main/java/io/quarkus/redis/deployment/client/RedisDatasourceProcessor.java
++++ b/extensions/redis-client/deployment/src/main/java/io/quarkus/redis/deployment/client/RedisDatasourceProcessor.java
+@@ -9,6 +9,7 @@
+ import java.util.HashSet;
+ import java.util.List;
+ import java.util.Set;
++import java.util.function.Supplier;
+ 
+ import org.eclipse.microprofile.config.ConfigProvider;
+ import org.jboss.jandex.AnnotationInstance;
+@@ -16,6 +17,7 @@
+ import org.jboss.jandex.DotName;
+ import org.jboss.jandex.IndexView;
+ 
++import io.quarkus.arc.ActiveResult;
+ import io.quarkus.arc.deployment.AdditionalBeanBuildItem;
+ import io.quarkus.arc.deployment.BeanArchiveIndexBuildItem;
+ import io.quarkus.arc.deployment.BeanDiscoveryFinishedBuildItem;
+@@ -103,11 +105,12 @@ public void init(RedisClientRecorder recorder,
+ 
+         // Create the supplier and define the beans.
+         for (String name : names) {
++            Supplier<ActiveResult> checkActive = recorder.checkActive(name);
+             // Data sources
+             syntheticBeans.produce(configureAndCreateSyntheticBean(name, RedisDataSource.class,
+-                    recorder.getBlockingDataSource(name)));
++                    checkActive, recorder.getBlockingDataSource(name)));
+             syntheticBeans.produce(configureAndCreateSyntheticBean(name, ReactiveRedisDataSource.class,
+-                    recorder.getReactiveDataSource(name)));
++                    checkActive, recorder.getReactiveDataSource(name)));
+         }
+ 
+         recorder.cleanup(shutdown);
+diff --git a/extensions/redis-client/runtime/src/main/java/io/quarkus/redis/runtime/client/RedisClientRecorder.java b/extensions/redis-client/runtime/src/main/java/io/quarkus/redis/runtime/client/RedisClientRecorder.java
+index 831a3cd9890..2b9447cce1f 100644
+--- a/extensions/redis-client/runtime/src/main/java/io/quarkus/redis/runtime/client/RedisClientRecorder.java
++++ b/extensions/redis-client/runtime/src/main/java/io/quarkus/redis/runtime/client/RedisClientRecorder.java
+@@ -1,18 +1,20 @@
+ package io.quarkus.redis.runtime.client;
+ 
+-import static io.quarkus.redis.runtime.client.config.RedisConfig.DEFAULT_CLIENT_NAME;
++import static io.quarkus.redis.runtime.client.config.RedisConfig.HOSTS;
++import static io.quarkus.redis.runtime.client.config.RedisConfig.HOSTS_PROVIDER_NAME;
++import static io.quarkus.redis.runtime.client.config.RedisConfig.getPropertyName;
+ 
+ import java.time.Duration;
+ import java.util.HashMap;
+ import java.util.List;
+ import java.util.Map;
+-import java.util.Optional;
+ import java.util.Set;
+ import java.util.function.Supplier;
+ 
+ import jakarta.enterprise.inject.Instance;
+ import jakarta.enterprise.inject.spi.CDI;
+ 
++import io.quarkus.arc.ActiveResult;
+ import io.quarkus.proxy.ProxyConfigurationRegistry;
+ import io.quarkus.redis.client.RedisClient;
+ import io.quarkus.redis.client.reactive.ReactiveRedisClient;
+@@ -27,7 +29,6 @@
+ import io.quarkus.runtime.RuntimeValue;
+ import io.quarkus.runtime.ShutdownContext;
+ import io.quarkus.runtime.annotations.Recorder;
+-import io.quarkus.runtime.configuration.ConfigurationException;
+ import io.quarkus.tls.TlsConfigurationRegistry;
+ import io.vertx.mutiny.core.Vertx;
+ import io.vertx.mutiny.redis.client.Command;
+@@ -37,16 +38,15 @@
+ 
+ @Recorder
+ public class RedisClientRecorder {
+-
+     // Split client and DS recorders
+-    private final RuntimeValue<RedisConfig> config;
++    private final RuntimeValue<RedisConfig> runtimeConfig;
+     private static final Map<String, RedisClientAndApi> clients = new HashMap<>();
+     private static final Map<String, ReactiveRedisDataSourceImpl> dataSources = new HashMap<>();
+     private Vertx vertx;
+     private ObservableRedisMetrics metrics;
+ 
+-    public RedisClientRecorder(RuntimeValue<RedisConfig> rc) {
+-        this.config = rc;
++    public RedisClientRecorder(RuntimeValue<RedisConfig> runtimeConfig) {
++        this.runtimeConfig = runtimeConfig;
+     }
+ 
+     public void initialize(RuntimeValue<io.vertx.core.Vertx> vertx, Set<String> names,
+@@ -78,47 +78,12 @@ private static void _registerCodecs() {
+     public void _initialize(io.vertx.core.Vertx vertx, Set<String> names, TlsConfigurationRegistry tlsRegistry,
+             ProxyConfigurationRegistry proxyRegistry) {
+         for (String name : names) {
+-            // Search if we have an associated config:
+-            // - if default -> Default
+-            // - if named -> Look for that config
+-            // - if not found -> ConfigurationException
+-            Optional<RedisClientConfig> maybe = getConfigForName(config.getValue(), name);
+-            if (!RedisConfig.isDefaultClient(name)) {
+-                RedisClientConfig actualConfig = maybe
+-                        .orElseThrow(new Supplier<ConfigurationException>() {
+-                            @Override
+-                            public ConfigurationException get() {
+-                                return new ConfigurationException("The application contains a " +
+-                                        "@RedisClientName(\"" + name
+-                                        + "\"), but the application configuration does not configure this " +
+-                                        "redis client configuration with that name. " +
+-                                        "You must at least configure `quarkus.redis." + name + ".hosts`.");
+-                            }
+-                        });
+-                clients.computeIfAbsent(name, x -> new RedisClientAndApi(name,
+-                        VertxRedisClientFactory.create(name, vertx, actualConfig, tlsRegistry, proxyRegistry),
+-                        metrics));
+-            } else if (DEFAULT_CLIENT_NAME.equalsIgnoreCase(name) && maybe.isPresent()) {
+-                clients.computeIfAbsent(name, x -> new RedisClientAndApi(name,
+-                        VertxRedisClientFactory.create(DEFAULT_CLIENT_NAME, vertx, maybe.get(), tlsRegistry, proxyRegistry),
+-                        metrics));
+-            }
+-            // Do not throw an error. We would need to check if the default redis client is used.
+-        }
+-
+-    }
+-
+-    static Optional<RedisClientConfig> getConfigForName(RedisConfig cfg, String name) {
+-        if (RedisConfig.isDefaultClient(name)) {
+-            return Optional.ofNullable(cfg.defaultRedisClient());
+-        }
+-
+-        for (Map.Entry<String, RedisClientConfig> entry : cfg.namedRedisClients().entrySet()) {
+-            if (entry.getKey().equalsIgnoreCase(name)) {
+-                return Optional.of(entry.getValue());
++            if (checkActive(name).get().value()) {
++                RedisClientConfig redisClientConfig = runtimeConfig.getValue().clients().get(name);
++                clients.putIfAbsent(name, new RedisClientAndApi(name,
++                        VertxRedisClientFactory.create(name, vertx, redisClientConfig, tlsRegistry, proxyRegistry), metrics));
+             }
+         }
+-        return Optional.empty();
+     }
+ 
+     public Supplier<Redis> getRedisClient(String name) {
+@@ -175,7 +140,7 @@ public Supplier<RedisDataSource> getBlockingDataSource(String name) {
+         return new Supplier<RedisDataSource>() {
+             @Override
+             public RedisDataSource get() {
+-                Duration timeout = RedisClientRecorder.this.getTimeoutForClient(name);
++                Duration timeout = runtimeConfig.getValue().clients().get(name).timeout();
+                 return new BlockingRedisDataSourceImpl(
+                         (ReactiveRedisDataSourceImpl) RedisClientRecorder.this.getReactiveDataSource(name).get(), timeout);
+             }
+@@ -187,7 +152,7 @@ public Supplier<RedisClient> getLegacyRedisClient(String name) {
+         return new Supplier<RedisClient>() {
+             @Override
+             public RedisClient get() {
+-                Duration timeout = getTimeoutForClient(name);
++                Duration timeout = runtimeConfig.getValue().clients().get(name).timeout();
+                 return new RedisClientImpl(
+                         RedisClientRecorder.this.getRedisClient(name).get(),
+                         RedisClientRecorder.this.getRedisAPI(name).get(),
+@@ -196,16 +161,6 @@ public RedisClient get() {
+         };
+     }
+ 
+-    private Duration getTimeoutForClient(String name) {
+-        Duration timeout;
+-        if (RedisConfig.isDefaultClient(name)) {
+-            timeout = config.getValue().defaultRedisClient().timeout();
+-        } else {
+-            timeout = config.getValue().namedRedisClients().get(name).timeout();
+-        }
+-        return timeout;
+-    }
+-
+     public Supplier<ReactiveRedisClient> getLegacyReactiveRedisClient(String name) {
+         return new Supplier<ReactiveRedisClient>() {
+             @Override
+@@ -216,6 +171,34 @@ public ReactiveRedisClient get() {
+         };
+     }
+ 
++    public Supplier<ActiveResult> checkActive(final String name) {
++        return new Supplier<>() {
++            @Override
++            public ActiveResult get() {
++                RedisClientConfig redisClientConfig = runtimeConfig.getValue().clients().get(name);
++                if (!redisClientConfig.active()) {
++                    return ActiveResult.inactive(String.format(
++                            """
++                                    Redis Client '%s' was deactivated through configuration properties. \
++                                    To activate the Redis Client, set configuration property '%s' to 'true' and configure the Redis Client '%s'. \
++                                    Refer to https://quarkus.io/guides/redis-reference for guidance.
++                                    """,
++                            name, getPropertyName(name, "active"), name));
++                }
++                if (redisClientConfig.hosts().isEmpty() && redisClientConfig.hostsProviderName().isEmpty()) {
++                    return ActiveResult.inactive(String.format(
++                            """
++                                    Redis Client '%s' was deactivated automatically because neither the hosts nor the hostsProviderName is set. \
++                                    To activate the Redis Client, set the configuration property '%s' or '%s'. \
++                                    Refer to https://quarkus.io/guides/redis-reference for guidance.
++                                    """,
++                            name, getPropertyName(name, HOSTS), getPropertyName(name, HOSTS_PROVIDER_NAME)));
++                }
++                return ActiveResult.active();
++            }
++        };
++    }
++
+     public void cleanup(ShutdownContext context) {
+         context.addShutdownTask(new Runnable() {
+             @Override
+@@ -263,5 +246,4 @@ private RedisClientAndApi(String name, io.vertx.redis.client.Redis redis, Observ
+             this.api = RedisAPI.api(this.redis);
+         }
+     }
+-
+ }
+diff --git a/extensions/redis-client/runtime/src/main/java/io/quarkus/redis/runtime/client/config/RedisClientConfig.java b/extensions/redis-client/runtime/src/main/java/io/quarkus/redis/runtime/client/config/RedisClientConfig.java
+index 79888ec740a..24ae2ce6258 100644
+--- a/extensions/redis-client/runtime/src/main/java/io/quarkus/redis/runtime/client/config/RedisClientConfig.java
++++ b/extensions/redis-client/runtime/src/main/java/io/quarkus/redis/runtime/client/config/RedisClientConfig.java
+@@ -19,6 +19,11 @@
+ 
+ @ConfigGroup
+ public interface RedisClientConfig {
++    /**
++     * Whether this Redis Client should be active at runtime.
++     */
++    @WithDefault("true")
++    boolean active();
+ 
+     /**
+      * The Redis hosts to use while connecting to the Redis server. Only the cluster and sentinel modes will consider more than
+@@ -287,5 +292,4 @@ default String toDebugString() {
+                 ", configureClientName=" + configureClientName() +
+                 '}';
+     }
+-
+ }
+diff --git a/extensions/redis-client/runtime/src/main/java/io/quarkus/redis/runtime/client/config/RedisConfig.java b/extensions/redis-client/runtime/src/main/java/io/quarkus/redis/runtime/client/config/RedisConfig.java
+index 9feca011000..dc4e714993d 100644
+--- a/extensions/redis-client/runtime/src/main/java/io/quarkus/redis/runtime/client/config/RedisConfig.java
++++ b/extensions/redis-client/runtime/src/main/java/io/quarkus/redis/runtime/client/config/RedisConfig.java
+@@ -6,60 +6,72 @@
+ import io.quarkus.runtime.annotations.ConfigPhase;
+ import io.quarkus.runtime.annotations.ConfigRoot;
+ import io.smallrye.config.ConfigMapping;
++import io.smallrye.config.WithDefaults;
+ import io.smallrye.config.WithParentName;
++import io.smallrye.config.WithUnnamedKey;
+ 
+ @ConfigMapping(prefix = "quarkus.redis")
+ @ConfigRoot(phase = ConfigPhase.RUN_TIME)
+ public interface RedisConfig {
+-    String REDIS_CONFIG_ROOT_NAME = "redis";
+-    String HOSTS_CONFIG_NAME = "hosts";
+     String DEFAULT_CLIENT_NAME = "<default>";
++    String HOSTS = "hosts";
++    String HOSTS_PROVIDER_NAME = "hosts-provider-name";
+ 
+     /**
+-     * The default redis client
+-     */
+-    @WithParentName
+-    RedisClientConfig defaultRedisClient();
+-
+-    /**
+-     * Configures additional (named) Redis clients.
++     * Configures the Redis clients.
+      * <p>
+-     * Each client has a unique name which must be identified to select the right client.
+-     * For example:
++     * The default client does not have a name, and it is configured as:
++     *
++     * <pre>
++     * quarkus.redis.hosts = redis://localhost:6379
++     * </pre>
++     *
++     * And then use {@link jakarta.inject.Inject} to inject the client:
++     *
++     * <pre>
++     * &#64;Inject
++     * RedisAPI redis;
++     * </pre>
++     *
+      * <p>
++     * Named clients must be identified to select the right client:
+      *
+      * <pre>
+      * quarkus.redis.client1.hosts = redis://localhost:6379
+      * quarkus.redis.client2.hosts = redis://localhost:6380
+      * </pre>
+-     * <p>
+-     * And then use the {@link io.quarkus.redis.client.RedisClientName} annotation to select the
+-     * {@link io.vertx.mutiny.redis.client.Redis},
+-     * {@link io.vertx.redis.client.Redis}, {@link io.vertx.mutiny.redis.client.RedisAPI} and
+-     * {@link io.vertx.redis.client.RedisAPI} beans.
+-     * <p>
++     *
++     * And then use the {@link io.quarkus.redis.client.RedisClientName} annotation to select any of the beans:
++     * <ul>
++     * <li>{@link io.vertx.mutiny.redis.client.Redis}</li>
++     * <li>{@link io.vertx.redis.client.Redis}</li>
++     * <li>{@link io.vertx.mutiny.redis.client.RedisAPI}</li>
++     * <li>{@link io.vertx.redis.client.RedisAPI}</li>
++     * <li>{@link io.quarkus.redis.datasource.RedisDataSource}</li>
++     * <li>{@link io.quarkus.redis.datasource.ReactiveRedisDataSource}</li>
++     * </ul>
++     * And inject the client:
+      *
+      * <pre>
+-     * {
+-     *     &#64;code
+-     *     &#64;RedisClientName("client1")
+-     *     &#64;Inject
+-     *     RedisAPI redis;
+-     * }
++     * &#64;RedisClientName("client1")
++     * &#64;Inject
++     * RedisAPI redis;
+      * </pre>
+      */
+     @WithParentName
++    @WithDefaults
++    @WithUnnamedKey(DEFAULT_CLIENT_NAME)
+     @ConfigDocMapKey("redis-client-name")
+-    Map<String, RedisClientConfig> namedRedisClients();
++    Map<String, RedisClientConfig> clients();
+ 
+-    static boolean isDefaultClient(String name) {
++    static boolean isDefaultClient(final String name) {
+         return DEFAULT_CLIENT_NAME.equalsIgnoreCase(name);
+     }
+ 
+-    static String propertyKey(String name, String radical) {
++    static String getPropertyName(final String name, final String attribute) {
+         String prefix = DEFAULT_CLIENT_NAME.equals(name)
+                 ? "quarkus.redis."
+-                : "quarkus.redis.\"" + name + "\".";
+-        return prefix + radical;
++                : "quarkus.redis." + (name.contains(".") ? "\"" + name + "\"" : name) + ".";
++        return prefix + attribute;
+     }
+ }
+diff --git a/extensions/redis-client/runtime/src/main/java/io/quarkus/redis/runtime/client/health/RedisHealthCheck.java b/extensions/redis-client/runtime/src/main/java/io/quarkus/redis/runtime/client/health/RedisHealthCheck.java
+index d30c2068ef7..3bc652836fa 100644
+--- a/extensions/redis-client/runtime/src/main/java/io/quarkus/redis/runtime/client/health/RedisHealthCheck.java
++++ b/extensions/redis-client/runtime/src/main/java/io/quarkus/redis/runtime/client/health/RedisHealthCheck.java
+@@ -1,6 +1,6 @@
+ package io.quarkus.redis.runtime.client.health;
+ 
+-import static io.quarkus.redis.runtime.client.VertxRedisClientFactory.DEFAULT_CLIENT;
++import static io.quarkus.redis.runtime.client.config.RedisConfig.DEFAULT_CLIENT_NAME;
+ 
+ import java.time.Duration;
+ import java.util.HashMap;
+@@ -10,17 +10,16 @@
+ import jakarta.enterprise.context.ApplicationScoped;
+ import jakarta.enterprise.inject.Any;
+ import jakarta.enterprise.inject.spi.Bean;
++import jakarta.inject.Inject;
+ 
+ import org.eclipse.microprofile.health.HealthCheck;
+ import org.eclipse.microprofile.health.HealthCheckResponse;
+ import org.eclipse.microprofile.health.HealthCheckResponseBuilder;
+ import org.eclipse.microprofile.health.Readiness;
+ 
+-import io.quarkus.arc.Arc;
++import io.quarkus.arc.InjectableInstance;
+ import io.quarkus.arc.InstanceHandle;
+ import io.quarkus.redis.client.RedisClientName;
+-import io.quarkus.redis.datasource.ReactiveRedisDataSource;
+-import io.quarkus.redis.datasource.RedisDataSource;
+ import io.quarkus.redis.runtime.client.config.RedisConfig;
+ import io.smallrye.mutiny.TimeoutException;
+ import io.vertx.mutiny.redis.client.Command;
+@@ -33,71 +32,52 @@
+ class RedisHealthCheck implements HealthCheck {
+     private final Map<String, Redis> clients = new HashMap<>();
+ 
+-    private final RedisConfig config;
+-
+-    public RedisHealthCheck(RedisConfig config) {
+-        this.config = config;
+-    }
++    @Inject
++    RedisConfig config;
++    @Inject
++    @Any
++    InjectableInstance<Redis> redis;
+ 
+     @PostConstruct
+     protected void init() {
+-        for (InstanceHandle<Redis> handle : Arc.container().select(Redis.class, Any.Literal.INSTANCE).handles()) {
+-            String clientName = getClientName(handle.getBean());
+-            clients.putIfAbsent(clientName == null ? DEFAULT_CLIENT : clientName, handle.get());
+-        }
+-
+-        for (InstanceHandle<ReactiveRedisDataSource> handle : Arc.container()
+-                .select(ReactiveRedisDataSource.class, Any.Literal.INSTANCE).handles()) {
+-            String clientName = getClientName(handle.getBean());
+-            Redis redis = handle.get().getRedis();
+-            clients.putIfAbsent(clientName == null ? DEFAULT_CLIENT : clientName, redis);
+-        }
+-
+-        for (InstanceHandle<RedisDataSource> handle : Arc.container().select(RedisDataSource.class, Any.Literal.INSTANCE)
+-                .handles()) {
+-            String clientName = getClientName(handle.getBean());
+-            Redis redis = handle.get().getReactive().getRedis();
+-            clients.putIfAbsent(clientName == null ? DEFAULT_CLIENT : clientName, redis);
+-        }
+-    }
+-
+-    private String getClientName(Bean<?> bean) {
+-        for (Object qualifier : bean.getQualifiers()) {
+-            if (qualifier instanceof RedisClientName) {
+-                return ((RedisClientName) qualifier).value();
++        for (InstanceHandle<Redis> handle : redis.handles()) {
++            if (handle.getBean().isActive()) {
++                clients.putIfAbsent(getClientName(handle.getBean()), handle.get());
+             }
+         }
+-        return null;
+-    }
+-
+-    private Duration getTimeout(String name) {
+-        if (RedisConfig.isDefaultClient(name)) {
+-            return config.defaultRedisClient().timeout();
+-        } else {
+-            return config.namedRedisClients().get(name).timeout();
+-        }
+     }
+ 
+     @Override
+     public HealthCheckResponse call() {
+         HealthCheckResponseBuilder builder = HealthCheckResponse.named("Redis connection health check").up();
+         for (Map.Entry<String, Redis> client : clients.entrySet()) {
++            String clientName = client.getKey().equals(DEFAULT_CLIENT_NAME) ? "default" : client.getKey();
++            Redis redisClient = client.getValue();
++            Duration timeout = config.clients().get(clientName).timeout();
+             try {
+-                boolean isDefault = DEFAULT_CLIENT.equals(client.getKey());
+-                Redis redisClient = client.getValue();
+-                String redisClientName = isDefault ? "default" : client.getKey();
+-                Duration timeout = getTimeout(client.getKey());
+                 Response response = redisClient.send(Request.cmd(Command.PING)).await().atMost(timeout);
+-                builder.up().withData(redisClientName, response.toString());
++                builder.up().withData(clientName, response.toString());
+             } catch (TimeoutException e) {
+-                return builder.down().withData("reason", "client [" + client.getKey() + "]: timeout").build();
++                builder.down().withData(clientName,
++                        "Unable to execute the validation check for the Redis Client due to timeout");
+             } catch (Exception e) {
+                 if (e.getMessage() == null) {
+-                    return builder.down().withData("reason", "client [" + client.getKey() + "]: " + e).build();
++                    builder.down().withData(clientName, "Unable to execute the validation check for the Redis Client: " + e);
++                } else {
++                    builder.down().withData(clientName,
++                            "Unable to execute the validation check for the Redis Client: " + e.getMessage());
+                 }
+-                return builder.down().withData("reason", "client [" + client.getKey() + "]: " + e.getMessage()).build();
+             }
+         }
+         return builder.build();
+     }
++
++    private static String getClientName(final Bean<?> bean) {
++        for (Object qualifier : bean.getQualifiers()) {
++            if (qualifier instanceof RedisClientName redisClientName) {
++                return redisClientName.value();
++            }
++        }
++        return DEFAULT_CLIENT_NAME;
++    }
+ }
+diff --git a/extensions/spring-web/resteasy-reactive/deployment/src/main/java/io/quarkus/spring/web/resteasy/reactive/deployment/SpringWebResteasyReactiveProcessor.java b/extensions/spring-web/resteasy-reactive/deployment/src/main/java/io/quarkus/spring/web/resteasy/reactive/deployment/SpringWebResteasyReactiveProcessor.java
+index d4e01042f37..3f3e6b624ed 100644
+--- a/extensions/spring-web/resteasy-reactive/deployment/src/main/java/io/quarkus/spring/web/resteasy/reactive/deployment/SpringWebResteasyReactiveProcessor.java
++++ b/extensions/spring-web/resteasy-reactive/deployment/src/main/java/io/quarkus/spring/web/resteasy/reactive/deployment/SpringWebResteasyReactiveProcessor.java
+@@ -303,6 +303,15 @@ public void transform(TransformationContext transformationContext) {
+                             AnnotationValue defaultValue = annotation.value("defaultValue");
+                             if (defaultValue != null) {
+                                 defaultValueStr = defaultValue.asString();
++                            } else {
++                                AnnotationValue requiredValue = annotation.value("required");
++                                if (requiredValue != null) {
++                                    if (requiredValue.asBoolean()) {
++                                        throw new IllegalArgumentException(
++                                                "Using required @RequestMapping is not supported. Offending method is '"
++                                                        + methodInfo.declaringClass().name() + "#" + methodInfo.name() + "'");
++                                    }
++                                }
+                             }
+                             if (defaultValueStr != null) {
+                                 transform.add(create(DEFAULT_VALUE, annotation.target(),
+diff --git a/independent-projects/bootstrap/maven4-resolver/pom.xml b/independent-projects/bootstrap/maven4-resolver/pom.xml
+index f0f613332de..f42737e1d40 100644
+--- a/independent-projects/bootstrap/maven4-resolver/pom.xml
++++ b/independent-projects/bootstrap/maven4-resolver/pom.xml
+@@ -22,7 +22,7 @@
+         <dependency>
+             <groupId>org.eclipse.sisu</groupId>
+             <artifactId>org.eclipse.sisu.inject</artifactId>
+-            <version>0.9.0.M4</version>
++            <version>0.9.0.M3</version>
+         </dependency>
+         <dependency>
+             <groupId>org.apache.maven</groupId>
+diff --git a/pom.xml b/pom.xml
+index 9bbc302cbda..7a9a9a6bef0 100644
+--- a/pom.xml
++++ b/pom.xml
+@@ -82,7 +82,7 @@
+         <hibernate-tools.version>7.1.6.Final</hibernate-tools.version>
+ 
+         <!-- Make sure to check compatibility between these 2 gRPC components before upgrade -->
+-        <grpc.version>1.76.0</grpc.version> <!-- when updating, verify if following versions should not be updated too: -->
++        <grpc.version>1.75.0</grpc.version> <!-- when updating, verify if following versions should not be updated too: -->
+                                             <!-- com.google.auth -->
+                                             <!-- perfmark.version https://central.sonatype.com/artifact/io.grpc/grpc-core  -->
+         <grpc-jprotoc.version>1.2.2</grpc-jprotoc.version>

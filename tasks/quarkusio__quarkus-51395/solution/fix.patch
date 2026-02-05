@@ -1,0 +1,230 @@
+diff --git a/extensions/mutiny/deployment/src/main/java/io/quarkus/mutiny/deployment/MutinyProcessor.java b/extensions/mutiny/deployment/src/main/java/io/quarkus/mutiny/deployment/MutinyProcessor.java
+index 0802ea01dc8..d31cbfbfd30 100644
+--- a/extensions/mutiny/deployment/src/main/java/io/quarkus/mutiny/deployment/MutinyProcessor.java
++++ b/extensions/mutiny/deployment/src/main/java/io/quarkus/mutiny/deployment/MutinyProcessor.java
+@@ -16,12 +16,13 @@ public class MutinyProcessor {
+ 
+     @BuildStep
+     @Record(ExecutionTime.RUNTIME_INIT)
+-    public void runtimeInit(ExecutorBuildItem executorBuildItem,
++    public MutinyRuntimeInitBuildItem runtimeInit(ExecutorBuildItem executorBuildItem,
+             MutinyInfrastructure recorder,
+             ShutdownContextBuildItem shutdownContext,
+             Optional<ContextHandlerBuildItem> contextHandler) {
+         ContextHandler<Object> handler = contextHandler.map(ContextHandlerBuildItem::contextHandler).orElse(null);
+         recorder.configureMutinyInfrastructure(executorBuildItem.getExecutorProxy(), shutdownContext, handler);
++        return new MutinyRuntimeInitBuildItem();
+     }
+ 
+     @BuildStep
+diff --git a/extensions/mutiny/deployment/src/main/java/io/quarkus/mutiny/deployment/MutinyRuntimeInitBuildItem.java b/extensions/mutiny/deployment/src/main/java/io/quarkus/mutiny/deployment/MutinyRuntimeInitBuildItem.java
+new file mode 100644
+index 00000000000..a17f765530d
+--- /dev/null
++++ b/extensions/mutiny/deployment/src/main/java/io/quarkus/mutiny/deployment/MutinyRuntimeInitBuildItem.java
+@@ -0,0 +1,10 @@
++package io.quarkus.mutiny.deployment;
++
++import io.quarkus.builder.item.SimpleBuildItem;
++
++/**
++ * Marker build item to detect when Mutiny has been initialized at runtime.
++ */
++public final class MutinyRuntimeInitBuildItem extends SimpleBuildItem {
++
++}
+diff --git a/extensions/vertx/deployment/src/main/java/io/quarkus/vertx/core/deployment/VertxCoreProcessor.java b/extensions/vertx/deployment/src/main/java/io/quarkus/vertx/core/deployment/VertxCoreProcessor.java
+index 8f05a445982..39f58e52810 100644
+--- a/extensions/vertx/deployment/src/main/java/io/quarkus/vertx/core/deployment/VertxCoreProcessor.java
++++ b/extensions/vertx/deployment/src/main/java/io/quarkus/vertx/core/deployment/VertxCoreProcessor.java
+@@ -52,6 +52,7 @@
+ import io.quarkus.deployment.builditem.nativeimage.ReflectiveClassBuildItem;
+ import io.quarkus.deployment.logging.LogCleanupFilterBuildItem;
+ import io.quarkus.gizmo.Gizmo;
++import io.quarkus.mutiny.deployment.MutinyRuntimeInitBuildItem;
+ import io.quarkus.netty.deployment.EventLoopSupplierBuildItem;
+ import io.quarkus.vertx.VertxOptionsCustomizer;
+ import io.quarkus.vertx.core.runtime.VertxCoreRecorder;
+@@ -234,7 +235,11 @@ CoreVertxBuildItem build(
+             List<VertxOptionsConsumerBuildItem> vertxOptionsConsumers,
+             BuildProducer<SyntheticBeanBuildItem> syntheticBeans,
+             BuildProducer<EventLoopSupplierBuildItem> eventLoops,
+-            ExecutorBuildItem executorBuildItem) {
++            ExecutorBuildItem executorBuildItem,
++            MutinyRuntimeInitBuildItem mutinyRuntimeInitBuildItem) {
++
++        // Override the Mutiny infrastructure ScheduledExecutorService to dispatch scheduled operations to a Vert.x timer
++        recorder.wrapMainExecutorForMutiny(executorBuildItem.getExecutorProxy());
+ 
+         Collections.sort(vertxOptionsConsumers);
+         List<Consumer<VertxOptions>> consumers = new ArrayList<>(vertxOptionsConsumers.size());
+diff --git a/extensions/vertx/runtime/src/main/java/io/quarkus/vertx/core/runtime/VertxCoreRecorder.java b/extensions/vertx/runtime/src/main/java/io/quarkus/vertx/core/runtime/VertxCoreRecorder.java
+index 45b3927c375..cf7568beb7f 100644
+--- a/extensions/vertx/runtime/src/main/java/io/quarkus/vertx/core/runtime/VertxCoreRecorder.java
++++ b/extensions/vertx/runtime/src/main/java/io/quarkus/vertx/core/runtime/VertxCoreRecorder.java
+@@ -8,11 +8,20 @@
+ import static io.vertx.core.file.impl.FileResolverImpl.CACHE_DIR_BASE_PROP_NAME;
+ 
+ import java.io.File;
+-import java.util.*;
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.HashSet;
++import java.util.List;
++import java.util.Locale;
++import java.util.Map;
++import java.util.Optional;
++import java.util.Random;
++import java.util.Set;
+ import java.util.concurrent.CompletableFuture;
+ import java.util.concurrent.ConcurrentMap;
+ import java.util.concurrent.CountDownLatch;
+ import java.util.concurrent.ExecutorService;
++import java.util.concurrent.ScheduledExecutorService;
+ import java.util.concurrent.ThreadFactory;
+ import java.util.concurrent.TimeUnit;
+ import java.util.concurrent.atomic.AtomicInteger;
+@@ -39,6 +48,7 @@
+ import io.quarkus.vertx.runtime.VertxCurrentContextFactory;
+ import io.quarkus.vertx.runtime.jackson.QuarkusJacksonFactory;
+ import io.smallrye.common.cpu.ProcessorInfo;
++import io.smallrye.mutiny.infrastructure.Infrastructure;
+ import io.vertx.core.AsyncResult;
+ import io.vertx.core.Context;
+ import io.vertx.core.Handler;
+@@ -755,4 +765,9 @@ private static void deleteDirectory(File directory) {
+         }
+         directory.delete();
+     }
++
++    public void wrapMainExecutorForMutiny(ScheduledExecutorService service) {
++        VertxTimerAwareScheduledExecutorService wrapper = new VertxTimerAwareScheduledExecutorService(service);
++        Infrastructure.setDefaultExecutor(wrapper, false);
++    }
+ }
+diff --git a/extensions/vertx/runtime/src/main/java/io/quarkus/vertx/core/runtime/VertxTimerAwareScheduledExecutorService.java b/extensions/vertx/runtime/src/main/java/io/quarkus/vertx/core/runtime/VertxTimerAwareScheduledExecutorService.java
+new file mode 100644
+index 00000000000..e530934382a
+--- /dev/null
++++ b/extensions/vertx/runtime/src/main/java/io/quarkus/vertx/core/runtime/VertxTimerAwareScheduledExecutorService.java
+@@ -0,0 +1,120 @@
++package io.quarkus.vertx.core.runtime;
++
++import java.util.concurrent.Delayed;
++import java.util.concurrent.ExecutionException;
++import java.util.concurrent.ScheduledExecutorService;
++import java.util.concurrent.ScheduledFuture;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.TimeoutException;
++
++import io.quarkus.runtime.util.ForwardingScheduledExecutorService;
++import io.vertx.core.Context;
++import io.vertx.core.Handler;
++import io.vertx.core.Vertx;
++
++/**
++ * A wrapper for {@link ScheduledExecutorService} that dispatches some of the operations using Vert.x timers
++ * when called from Vert.x event-loops, else it just dispatches to a delegate {@link ScheduledExecutorService}.
++ *
++ * This class is used to keep some Mutiny scheduled operations on a Vert.x event-loop thread rather than hop
++ * to a worker thread: delaying items, retries on failures, streams of periodic ticks, etc.
++ */
++public final class VertxTimerAwareScheduledExecutorService extends ForwardingScheduledExecutorService {
++
++    private final ScheduledExecutorService delegate;
++
++    public VertxTimerAwareScheduledExecutorService(ScheduledExecutorService delegate) {
++        this.delegate = delegate;
++    }
++
++    @Override
++    protected ScheduledExecutorService delegate() {
++        return delegate;
++    }
++
++    // ------------------ ScheduledFuture for timers ------------------ //
++
++    private static final class VertxTimerScheduledFuture<T> implements ScheduledFuture<T> {
++
++        final Vertx vertx;
++        final long timerId;
++        volatile boolean cancelled;
++
++        // Minimal wrapper class with just what is need to support cancellation
++        VertxTimerScheduledFuture(Vertx vertx, long timerId) {
++            this.vertx = vertx;
++            this.timerId = timerId;
++        }
++
++        @Override
++        public long getDelay(TimeUnit unit) {
++            throw new UnsupportedOperationException("getDelay is not implemented");
++        }
++
++        @Override
++        public int compareTo(Delayed o) {
++            throw new UnsupportedOperationException("compareTo is not implemented");
++        }
++
++        @Override
++        public boolean cancel(boolean mayInterruptIfRunning) {
++            // No need for C&S, cancelTimer can be called multiple times
++            cancelled = true;
++            return vertx.cancelTimer(timerId);
++        }
++
++        @Override
++        public boolean isCancelled() {
++            return cancelled;
++        }
++
++        @Override
++        public boolean isDone() {
++            throw new UnsupportedOperationException("isDone is not implemented");
++        }
++
++        @Override
++        public T get() throws InterruptedException, ExecutionException {
++            throw new UnsupportedOperationException("get is not implemented");
++        }
++
++        @Override
++        public T get(long timeout, TimeUnit unit) throws InterruptedException, ExecutionException, TimeoutException {
++            throw new UnsupportedOperationException("get is not implemented");
++        }
++    }
++
++    // ------------------ ScheduledExecutorService methods used by Mutiny ------------------ //
++
++    @Override
++    public ScheduledFuture<?> schedule(Runnable command, long delay, TimeUnit unit) {
++        Context context = Vertx.currentContext();
++        if (context != null) {
++            Vertx vertx = context.owner();
++            long timerId = vertx.setTimer(unit.toMillis(delay), new Handler<Long>() {
++                @Override
++                public void handle(Long tick) {
++                    command.run();
++                }
++            });
++            return new VertxTimerScheduledFuture<>(vertx, timerId);
++        }
++        return delegate.schedule(command, delay, unit);
++    }
++
++    @Override
++    public ScheduledFuture<?> scheduleAtFixedRate(Runnable command, long initialDelay, long period, TimeUnit unit) {
++        Context context = Vertx.currentContext();
++        if (context != null) {
++            Vertx vertx = context.owner();
++            long timerId = vertx.setPeriodic(unit.toMillis(initialDelay), unit.toMillis(period), new Handler<Long>() {
++                @Override
++                public void handle(Long tick) {
++                    command.run();
++                }
++            });
++            return new VertxTimerScheduledFuture<Void>(vertx, timerId);
++        }
++        return delegate.scheduleAtFixedRate(command, initialDelay, period, unit);
++    }
++}

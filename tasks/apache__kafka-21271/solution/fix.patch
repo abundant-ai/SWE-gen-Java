@@ -1,0 +1,223 @@
+diff --git a/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupCoordinatorService.java b/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupCoordinatorService.java
+index f8dc5068db..f98738ab80 100644
+--- a/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupCoordinatorService.java
++++ b/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupCoordinatorService.java
+@@ -95,6 +95,7 @@ import org.apache.kafka.coordinator.common.runtime.KRaftCoordinatorMetadataDelta
+ import org.apache.kafka.coordinator.common.runtime.KRaftCoordinatorMetadataImage;
+ import org.apache.kafka.coordinator.common.runtime.MultiThreadedEventProcessor;
+ import org.apache.kafka.coordinator.common.runtime.PartitionWriter;
++import org.apache.kafka.coordinator.group.GroupCoordinatorShard.DeletedTopic;
+ import org.apache.kafka.coordinator.group.api.assignor.ConsumerGroupPartitionAssignor;
+ import org.apache.kafka.coordinator.group.metrics.GroupCoordinatorMetrics;
+ import org.apache.kafka.coordinator.group.streams.StreamsGroupHeartbeatResult;
+@@ -2265,62 +2266,60 @@ public class GroupCoordinatorService implements GroupCoordinator {
+         metadataImage = wrappedImage;
+         runtime.onMetadataUpdate(wrappedDelta, wrappedImage);
+ 
+-        // Handle partition deletions from the delta.
++        // Handle topic deletions from the delta.
+         if (delta.topicsDelta() != null && !delta.topicsDelta().deletedTopicIds().isEmpty()) {
+-            handlePartitionsDeletion(delta.topicsDelta());
++            handleTopicsDeletion(delta.topicsDelta());
+         }
+     }
+ 
+     /**
+-     * Handles the deletion of topic partitions by scheduling write operations
++     * Handles the deletion of topics by scheduling write operations
+      * to delete committed offsets and clean up share group state.
+      *
+      * @param topicsDelta The topics delta containing deleted topic IDs.
+      */
+-    private void handlePartitionsDeletion(TopicsDelta topicsDelta) {
+-        var topicPartitions = new ArrayList<TopicPartition>();
+-        var topicIds = topicsDelta.deletedTopicIds();
++    private void handleTopicsDeletion(TopicsDelta topicsDelta) {
++        var deletedTopicIds = topicsDelta.deletedTopicIds();
++        var deletedTopics = new ArrayList<DeletedTopic>();
+ 
+-        topicIds.forEach(topicId -> {
++        deletedTopicIds.forEach(topicId -> {
+             var topicImage = topicsDelta.image().getTopic(topicId);
+             if (topicImage != null) {
+-                topicImage.partitions().keySet().forEach(partitionId ->
+-                    topicPartitions.add(new TopicPartition(topicImage.name(), partitionId))
+-                );
++                deletedTopics.add(new DeletedTopic(topicId, topicImage.name()));
+             }
+         });
+ 
+         var futures = new ArrayList<CompletableFuture<Void>>();
+ 
+-        if (!topicPartitions.isEmpty()) {
++        if (!deletedTopics.isEmpty()) {
+             // Schedule offset deletion.
+             futures.addAll(
+                 FutureUtils.mapExceptionally(
+                     runtime.scheduleWriteAllOperation(
+-                        "on-partition-deleted",
++                        "on-topics-deleted",
+                         Duration.ofMillis(config.offsetCommitTimeoutMs()),
+-                        coordinator -> coordinator.onPartitionsDeleted(topicPartitions)
++                        coordinator -> coordinator.onTopicsDeleted(deletedTopics)
+                     ),
+                     exception -> {
+-                        log.error("Could not delete offsets for deleted partitions {} due to: {}.",
+-                            topicPartitions, exception.getMessage(), exception);
++                        log.error("Could not delete offsets for deleted topics {} due to: {}.",
++                            deletedTopics, exception.getMessage(), exception);
+                         return null;
+                     }
+                 )
+             );
+         }
+ 
+-        if (!topicIds.isEmpty()) {
++        if (!deletedTopicIds.isEmpty()) {
+             // Schedule share group state cleanup.
+             futures.addAll(
+                 FutureUtils.mapExceptionally(
+                     runtime.scheduleWriteAllOperation(
+                         "maybe-cleanup-share-group-state",
+                         Duration.ofMillis(config.offsetCommitTimeoutMs()),
+-                        coordinator -> coordinator.maybeCleanupShareGroupState(topicIds)
++                        coordinator -> coordinator.maybeCleanupShareGroupState(deletedTopicIds)
+                     ),
+                     exception -> {
+-                        log.error("Unable to cleanup state for the deleted topics {}", topicIds, exception);
++                        log.error("Unable to cleanup state for the deleted topics {}", deletedTopicIds, exception);
+                         return null;
+                     }
+                 )
+diff --git a/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupCoordinatorShard.java b/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupCoordinatorShard.java
+index 0ee486031d..81651f5adf 100644
+--- a/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupCoordinatorShard.java
++++ b/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupCoordinatorShard.java
+@@ -358,6 +358,16 @@ public class GroupCoordinatorShard implements CoordinatorShard<CoordinatorRecord
+         }
+     }
+ 
++    /**
++     * Represents a deleted topic with its ID and name.
++     * Used during offset cleanup to ensure only offsets for the correct
++     * topic incarnation are deleted (preventing race conditions with topic recreation).
++     *
++     * @param id    The topic ID.
++     * @param name  The topic name.
++     */
++    public record DeletedTopic(Uuid id, String name) { }
++
+     /**
+      * The group/offsets expiration key to schedule a timer task.
+      *
+@@ -1008,19 +1018,19 @@ public class GroupCoordinatorShard implements CoordinatorShard<CoordinatorRecord
+     }
+ 
+     /**
+-     * Remove offsets of the partitions that have been deleted.
++     * Remove offsets of the topics that have been deleted.
+      *
+-     * @param topicPartitions   The partitions that have been deleted.
++     * @param deletedTopics   The topics that have been deleted.
+      * @return The list of tombstones (offset commit) to append.
+      */
+-    public CoordinatorResult<Void, CoordinatorRecord> onPartitionsDeleted(
+-        List<TopicPartition> topicPartitions
++    public CoordinatorResult<Void, CoordinatorRecord> onTopicsDeleted(
++        List<DeletedTopic> deletedTopics
+     ) {
+         final long startTimeMs = time.milliseconds();
+-        final List<CoordinatorRecord> records = offsetMetadataManager.onPartitionsDeleted(topicPartitions);
++        final List<CoordinatorRecord> records = offsetMetadataManager.onTopicsDeleted(deletedTopics);
+ 
+-        log.info("Generated {} tombstone records in {} milliseconds while deleting offsets for partitions {}.",
+-            records.size(), time.milliseconds() - startTimeMs, topicPartitions);
++        log.info("Generated {} tombstone records in {} milliseconds while deleting offsets for topics {}.",
++            records.size(), time.milliseconds() - startTimeMs, deletedTopics);
+ 
+         return new CoordinatorResult<>(records, false);
+     }
+diff --git a/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/OffsetMetadataManager.java b/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/OffsetMetadataManager.java
+index c6873581df..5b3dcba3d3 100644
+--- a/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/OffsetMetadataManager.java
++++ b/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/OffsetMetadataManager.java
+@@ -16,7 +16,6 @@
+  */
+ package org.apache.kafka.coordinator.group;
+ 
+-import org.apache.kafka.common.TopicPartition;
+ import org.apache.kafka.common.Uuid;
+ import org.apache.kafka.common.errors.ApiException;
+ import org.apache.kafka.common.errors.GroupIdNotFoundException;
+@@ -41,6 +40,7 @@ import org.apache.kafka.common.utils.LogContext;
+ import org.apache.kafka.common.utils.Time;
+ import org.apache.kafka.coordinator.common.runtime.CoordinatorRecord;
+ import org.apache.kafka.coordinator.common.runtime.CoordinatorResult;
++import org.apache.kafka.coordinator.group.GroupCoordinatorShard.DeletedTopic;
+ import org.apache.kafka.coordinator.group.classic.ClassicGroup;
+ import org.apache.kafka.coordinator.group.classic.ClassicGroupState;
+ import org.apache.kafka.coordinator.group.generated.OffsetCommitKey;
+@@ -56,9 +56,7 @@ import org.apache.kafka.timeline.TimelineHashSet;
+ import org.slf4j.Logger;
+ 
+ import java.util.ArrayList;
+-import java.util.HashMap;
+ import java.util.List;
+-import java.util.Map;
+ import java.util.Optional;
+ import java.util.OptionalLong;
+ import java.util.concurrent.atomic.AtomicBoolean;
+@@ -1079,39 +1077,35 @@ public class OffsetMetadataManager {
+     }
+ 
+     /**
+-     * Remove offsets of the partitions that have been deleted.
++     * Remove offsets of the topics that have been deleted.
+      *
+-     * @param topicPartitions   The partitions that have been deleted.
++     * @param deletedTopics   The topics that have been deleted.
+      * @return The list of tombstones (offset commit) to append.
+      */
+-    public List<CoordinatorRecord> onPartitionsDeleted(
+-        List<TopicPartition> topicPartitions
++    public List<CoordinatorRecord> onTopicsDeleted(
++        List<DeletedTopic> deletedTopics
+     ) {
+         List<CoordinatorRecord> records = new ArrayList<>();
+ 
+-        Map<String, List<Integer>> partitionsByTopic = new HashMap<>();
+-        topicPartitions.forEach(tp -> partitionsByTopic
+-            .computeIfAbsent(tp.topic(), __ -> new ArrayList<>())
+-            .add(tp.partition())
+-        );
+-
+         Consumer<Offsets> delete = offsetsToClean -> {
+             offsetsToClean.offsetsByGroup.forEach((groupId, topicOffsets) -> {
+-                topicOffsets.forEach((topic, partitionOffsets) -> {
+-                    if (partitionsByTopic.containsKey(topic)) {
+-                        partitionsByTopic.get(topic).forEach(partition -> {
+-                            if (partitionOffsets.containsKey(partition)) {
+-                                appendOffsetCommitTombstone(groupId, topic, partition, records);
++                for (DeletedTopic deletedTopic : deletedTopics) {
++                    var partitionOffsets = topicOffsets.get(deletedTopic.name());
++                    if (partitionOffsets != null) {
++                        partitionOffsets.forEach((partition, offsetAndMetadata) -> {
++                            // Delete if the topic ID matches or if the stored topic ID is ZERO_UUID (legacy records).
++                            if (offsetAndMetadata.topicId.equals(Uuid.ZERO_UUID) || offsetAndMetadata.topicId.equals(deletedTopic.id())) {
++                                appendOffsetCommitTombstone(groupId, deletedTopic.name(), partition, records);
+                             }
+                         });
+                     }
+-                });
++                }
+             });
+         };
+ 
+-        // Delete the partitions from the main storage.
++        // Delete the offsets from the main storage.
+         delete.accept(offsets);
+-        // Delete the partitions from the pending transactional offsets.
++        // Delete the offsets from the pending transactional offsets.
+         pendingTransactionalOffsets.forEach((__, offsets) -> delete.accept(offsets));
+ 
+         return records;

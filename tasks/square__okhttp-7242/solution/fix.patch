@@ -1,0 +1,233 @@
+diff --git a/okhttp/api/okhttp.api b/okhttp/api/okhttp.api
+index 3a18a38a3..e7ccc19a4 100644
+--- a/okhttp/api/okhttp.api
++++ b/okhttp/api/okhttp.api
+@@ -1151,6 +1151,7 @@ public class okhttp3/Response$Builder {
+ 	public fun removeHeader (Ljava/lang/String;)Lokhttp3/Response$Builder;
+ 	public fun request (Lokhttp3/Request;)Lokhttp3/Response$Builder;
+ 	public fun sentRequestAtMillis (J)Lokhttp3/Response$Builder;
++	public fun trailers (Lkotlin/jvm/functions/Function0;)Lokhttp3/Response$Builder;
+ }
+ 
+ public abstract class okhttp3/ResponseBody : java/io/Closeable {
+diff --git a/okhttp/src/commonMain/kotlin/okhttp3/Response.kt b/okhttp/src/commonMain/kotlin/okhttp3/Response.kt
+index 20938ba21..8d724a4d6 100644
+--- a/okhttp/src/commonMain/kotlin/okhttp3/Response.kt
++++ b/okhttp/src/commonMain/kotlin/okhttp3/Response.kt
+@@ -104,12 +104,12 @@ expect class Response : Closeable {
+ 
+   fun header(name: String, defaultValue: String? = null): String?
+ 
+-  // /**
+-  //  * Returns the trailers after the HTTP response, which may be empty. It is an error to call this
+-  //  * before the entire HTTP response body has been consumed.
+-  //  */
+-  // @Throws(IOException::class)
+-  // fun trailers(): Headers
++  /**
++   * Returns the trailers after the HTTP response, which may be empty. It is an error to call this
++   * before the entire HTTP response body has been consumed.
++   */
++  @Throws(IOException::class)
++  fun trailers(): Headers
+ 
+   /**
+    * Peeks up to [byteCount] bytes from the response body and returns them as a new response
+@@ -164,13 +164,13 @@ expect class Response : Closeable {
+     internal var protocol: Protocol?
+     internal var code: Int
+     internal var message: String?
+-    // internal var handshake: Handshake? = null
++    // internal var handshake: Handshake?
+     internal var headers: Headers.Builder
+     internal var body: ResponseBody
+     internal var networkResponse: Response?
+     internal var cacheResponse: Response?
+     internal var priorResponse: Response?
+-    // internal var exchange: Exchange? = null
++    internal var trailersFn: (() -> Headers)
+ 
+     constructor()
+ 
+@@ -204,6 +204,8 @@ expect class Response : Closeable {
+     /** Removes all headers on this builder and adds [headers]. */
+     open fun headers(headers: Headers): Builder
+ 
++    open fun trailers(trailersFn: (() -> Headers)): Builder
++
+     open fun body(body: ResponseBody): Builder
+ 
+     open fun networkResponse(networkResponse: Response?): Builder
+diff --git a/okhttp/src/commonMain/kotlin/okhttp3/internal/-ResponseCommon.kt b/okhttp/src/commonMain/kotlin/okhttp3/internal/-ResponseCommon.kt
+index 541b2b1f3..9899dfea5 100644
+--- a/okhttp/src/commonMain/kotlin/okhttp3/internal/-ResponseCommon.kt
++++ b/okhttp/src/commonMain/kotlin/okhttp3/internal/-ResponseCommon.kt
+@@ -144,6 +144,10 @@ fun Response.Builder.commonHeaders(headers: Headers) = apply {
+   this.headers = headers.newBuilder()
+ }
+ 
++fun Response.Builder.commonTrailers(trailersFn: (() -> Headers)) = apply {
++  this.trailersFn = trailersFn
++}
++
+ fun Response.Builder.commonBody(body: ResponseBody) = apply {
+   this.body = body
+ }
+diff --git a/okhttp/src/jvmMain/kotlin/okhttp3/Response.kt b/okhttp/src/jvmMain/kotlin/okhttp3/Response.kt
+index 99d0b4931..2805a4068 100644
+--- a/okhttp/src/jvmMain/kotlin/okhttp3/Response.kt
++++ b/okhttp/src/jvmMain/kotlin/okhttp3/Response.kt
+@@ -39,6 +39,7 @@ import okhttp3.internal.commonProtocol
+ import okhttp3.internal.commonRemoveHeader
+ import okhttp3.internal.commonRequest
+ import okhttp3.internal.commonToString
++import okhttp3.internal.commonTrailers
+ import okhttp3.internal.connection.Exchange
+ import okhttp3.internal.http.parseChallenges
+ import okio.Buffer
+@@ -83,7 +84,9 @@ actual class Response internal constructor(
+    */
+   @get:JvmName("receivedResponseAtMillis") val receivedResponseAtMillis: Long,
+ 
+-  @get:JvmName("exchange") internal val exchange: Exchange?
++  @get:JvmName("exchange") internal val exchange: Exchange?,
++
++  private var trailersFn: (() -> Headers)
+ ) : Closeable {
+ 
+   internal actual var lazyCacheControl: CacheControl? = null
+@@ -142,7 +145,7 @@ actual class Response internal constructor(
+    * before the entire HTTP response body has been consumed.
+    */
+   @Throws(IOException::class)
+-  fun trailers(): Headers = checkNotNull(exchange) { "trailers not available" }.trailers()
++  actual fun trailers(): Headers = trailersFn()
+ 
+   @Throws(IOException::class)
+   actual fun peekBody(byteCount: Long): ResponseBody {
+@@ -249,6 +252,7 @@ actual class Response internal constructor(
+     internal var sentRequestAtMillis: Long = 0
+     internal var receivedResponseAtMillis: Long = 0
+     internal var exchange: Exchange? = null
++    internal actual var trailersFn: (() -> Headers) = { Headers.headersOf() }
+ 
+     actual constructor() {
+       headers = Headers.Builder()
+@@ -268,6 +272,7 @@ actual class Response internal constructor(
+       this.sentRequestAtMillis = response.sentRequestAtMillis
+       this.receivedResponseAtMillis = response.receivedResponseAtMillis
+       this.exchange = response.exchange
++      this.trailersFn = response.trailersFn
+     }
+ 
+     actual open fun request(request: Request) = commonRequest(request)
+@@ -298,6 +303,8 @@ actual class Response internal constructor(
+ 
+     actual open fun priorResponse(priorResponse: Response?) = commonPriorResponse(priorResponse)
+ 
++    actual open fun trailers(trailersFn: (() -> Headers)): Builder = commonTrailers(trailersFn)
++
+     open fun sentRequestAtMillis(sentRequestAtMillis: Long) = apply {
+       this.sentRequestAtMillis = sentRequestAtMillis
+     }
+@@ -306,8 +313,9 @@ actual class Response internal constructor(
+       this.receivedResponseAtMillis = receivedResponseAtMillis
+     }
+ 
+-    internal fun initExchange(deferredTrailers: Exchange) {
+-      this.exchange = deferredTrailers
++    internal fun initExchange(exchange: Exchange) {
++      this.exchange = exchange
++      this.trailersFn = { exchange.trailers() }
+     }
+ 
+     actual open fun build(): Response {
+@@ -325,7 +333,8 @@ actual class Response internal constructor(
+           priorResponse,
+           sentRequestAtMillis,
+           receivedResponseAtMillis,
+-          exchange
++          exchange,
++          trailersFn
+       )
+     }
+   }
+diff --git a/okhttp/src/jvmMain/kotlin/okhttp3/internal/http1/Http1ExchangeCodec.kt b/okhttp/src/jvmMain/kotlin/okhttp3/internal/http1/Http1ExchangeCodec.kt
+index 694173287..7d307d19f 100644
+--- a/okhttp/src/jvmMain/kotlin/okhttp3/internal/http1/Http1ExchangeCodec.kt
++++ b/okhttp/src/jvmMain/kotlin/okhttp3/internal/http1/Http1ExchangeCodec.kt
+@@ -182,6 +182,7 @@ class Http1ExchangeCodec(
+           .code(statusLine.code)
+           .message(statusLine.message)
+           .headers(headersReader.readHeaders())
++          .trailers { error("trailers not available") }
+ 
+       return when {
+         expectContinue && statusLine.code == HTTP_CONTINUE -> {
+diff --git a/okhttp/src/jvmMain/kotlin/okhttp3/internal/http2/Http2ExchangeCodec.kt b/okhttp/src/jvmMain/kotlin/okhttp3/internal/http2/Http2ExchangeCodec.kt
+index 5af7bfa40..2a9b7c008 100644
+--- a/okhttp/src/jvmMain/kotlin/okhttp3/internal/http2/Http2ExchangeCodec.kt
++++ b/okhttp/src/jvmMain/kotlin/okhttp3/internal/http2/Http2ExchangeCodec.kt
+@@ -198,6 +198,7 @@ class Http2ExchangeCodec(
+           .code(statusLine.code)
+           .message(statusLine.message)
+           .headers(headersBuilder.build())
++          .trailers { error("trailers not available") }
+     }
+   }
+ }
+diff --git a/okhttp/src/nonJvmMain/kotlin/okhttp3/Response.kt b/okhttp/src/nonJvmMain/kotlin/okhttp3/Response.kt
+index 2a333606c..a2175f61a 100644
+--- a/okhttp/src/nonJvmMain/kotlin/okhttp3/Response.kt
++++ b/okhttp/src/nonJvmMain/kotlin/okhttp3/Response.kt
+@@ -33,6 +33,7 @@ import okhttp3.internal.commonPriorResponse
+ import okhttp3.internal.commonProtocol
+ import okhttp3.internal.commonRemoveHeader
+ import okhttp3.internal.commonRequest
++import okhttp3.internal.commonTrailers
+ import okio.Closeable
+ 
+ /**
+@@ -101,6 +102,8 @@ actual class Response internal constructor(
+    * client.
+    */
+   actual val priorResponse: Response?,
++
++  private var trailersFn: (() -> Headers) = { Headers.headersOf() }
+ ) : Closeable {
+ 
+   internal actual var lazyCacheControl: CacheControl? = null
+@@ -115,6 +118,8 @@ actual class Response internal constructor(
+ 
+   actual fun header(name: String, defaultValue: String?): String? = commonHeader(name, defaultValue)
+ 
++  actual fun trailers(): Headers = trailersFn.invoke()
++
+   /**
+    * Peeks up to [byteCount] bytes from the response body and returns them as a new response
+    * body. If fewer than [byteCount] bytes are in the response body, the full response body is
+@@ -164,6 +169,7 @@ actual class Response internal constructor(
+     internal actual var networkResponse: Response? = null
+     internal actual var cacheResponse: Response? = null
+     internal actual var priorResponse: Response? = null
++    internal actual var trailersFn: (() -> Headers) = { Headers.headersOf() }
+ 
+     actual constructor() {
+       headers = Headers.Builder()
+@@ -207,6 +213,8 @@ actual class Response internal constructor(
+     /** Removes all headers on this builder and adds [headers]. */
+     actual open fun headers(headers: Headers) = commonHeaders(headers)
+ 
++    actual open fun trailers(trailersFn: (() -> Headers)): Builder = commonTrailers(trailersFn)
++
+     actual open fun body(body: ResponseBody) = commonBody(body)
+ 
+     actual open fun networkResponse(networkResponse: Response?) = commonNetworkResponse(networkResponse)
+@@ -227,6 +235,7 @@ actual class Response internal constructor(
+           networkResponse,
+           cacheResponse,
+           priorResponse,
++          trailersFn
+       )
+     }
+   }

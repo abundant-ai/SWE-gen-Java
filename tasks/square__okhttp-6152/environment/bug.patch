@@ -1,0 +1,456 @@
+diff --git a/okhttp-tls/src/main/kotlin/okhttp3/tls/HeldCertificate.kt b/okhttp-tls/src/main/kotlin/okhttp3/tls/HeldCertificate.kt
+index 148419797..e77f639f2 100644
+--- a/okhttp-tls/src/main/kotlin/okhttp3/tls/HeldCertificate.kt
++++ b/okhttp-tls/src/main/kotlin/okhttp3/tls/HeldCertificate.kt
+@@ -16,7 +16,6 @@
+ package okhttp3.tls
+ 
+ import java.math.BigInteger
+-import java.net.InetAddress
+ import java.security.GeneralSecurityException
+ import java.security.KeyFactory
+ import java.security.KeyPair
+@@ -25,32 +24,27 @@ import java.security.PrivateKey
+ import java.security.PublicKey
+ import java.security.SecureRandom
+ import java.security.Security
+-import java.security.Signature
+ import java.security.cert.X509Certificate
+ import java.security.interfaces.ECPublicKey
+ import java.security.interfaces.RSAPrivateKey
+ import java.security.interfaces.RSAPublicKey
+ import java.security.spec.PKCS8EncodedKeySpec
++import java.util.Date
+ import java.util.UUID
+ import java.util.concurrent.TimeUnit
++import javax.security.auth.x500.X500Principal
+ import okhttp3.internal.canParseAsIpAddress
+-import okhttp3.tls.internal.der.AlgorithmIdentifier
+-import okhttp3.tls.internal.der.AttributeTypeAndValue
+-import okhttp3.tls.internal.der.BasicConstraints
+-import okhttp3.tls.internal.der.BitString
+-import okhttp3.tls.internal.der.Certificate
+-import okhttp3.tls.internal.der.CertificateAdapters
+-import okhttp3.tls.internal.der.CertificateAdapters.generalNameDnsName
+-import okhttp3.tls.internal.der.CertificateAdapters.generalNameIpAddress
+-import okhttp3.tls.internal.der.Extension
+-import okhttp3.tls.internal.der.ObjectIdentifiers
+-import okhttp3.tls.internal.der.TbsCertificate
+-import okhttp3.tls.internal.der.Validity
+ import okio.ByteString
+ import okio.ByteString.Companion.decodeBase64
+ import okio.ByteString.Companion.toByteString
++import org.bouncycastle.asn1.ASN1Encodable
++import org.bouncycastle.asn1.DERSequence
+ import org.bouncycastle.asn1.pkcs.PrivateKeyInfo
++import org.bouncycastle.asn1.x509.BasicConstraints
++import org.bouncycastle.asn1.x509.GeneralName
++import org.bouncycastle.asn1.x509.X509Extensions
+ import org.bouncycastle.jce.provider.BouncyCastleProvider
++import org.bouncycastle.x509.X509V3CertificateGenerator
+ 
+ /**
+  * A certificate and its private key. These are some properties of certificates that are used with
+@@ -321,134 +315,88 @@ class HeldCertificate(
+     }
+ 
+     fun build(): HeldCertificate {
+-      // Subject keys & identity.
+-      val subjectKeyPair = keyPair ?: generateKeyPair()
+-      val subjectPublicKeyInfo = CertificateAdapters.subjectPublicKeyInfo.fromDer(
+-          subjectKeyPair.public.encoded.toByteString()
+-      )
+-      val subject: List<List<AttributeTypeAndValue>> = subject()
+-
+-      // Issuer/signer keys & identity. May be the subject if it is self-signed.
+-      val issuerKeyPair: KeyPair
+-      val issuer: List<List<AttributeTypeAndValue>>
++      // Subject, public & private keys for this certificate.
++      val heldKeyPair = keyPair ?: generateKeyPair()
++      val subject = buildSubject()
++
++      // Subject, public & private keys for this certificate's signer. It may be self signed!
++      val signedByKeyPair: KeyPair
++      val signedByPrincipal: X500Principal
+       if (signedBy != null) {
+-        issuerKeyPair = signedBy!!.keyPair
+-        issuer = CertificateAdapters.rdnSequence.fromDer(
+-            signedBy!!.certificate.subjectX500Principal.encoded.toByteString()
+-        )
++        signedByKeyPair = signedBy!!.keyPair
++        signedByPrincipal = signedBy!!.certificate.subjectX500Principal
+       } else {
+-        issuerKeyPair = subjectKeyPair
+-        issuer = subject
+-      }
+-      val signatureAlgorithm = signatureAlgorithm(issuerKeyPair)
+-
+-      // Subset of certificate data that's covered by the signature.
+-      val tbsCertificate = TbsCertificate(
+-          version = 2L, // v3.
+-          serialNumber = serialNumber ?: BigInteger.ONE,
+-          signature = signatureAlgorithm,
+-          issuer = issuer,
+-          validity = validity(),
+-          subject = subject,
+-          subjectPublicKeyInfo = subjectPublicKeyInfo,
+-          issuerUniqueID = null,
+-          subjectUniqueID = null,
+-          extensions = extensions()
+-      )
+-
+-      // Signature.
+-      val signature = Signature.getInstance(tbsCertificate.signatureAlgorithmName).run {
+-        initSign(issuerKeyPair.private)
+-        update(CertificateAdapters.tbsCertificate.toDer(tbsCertificate).toByteArray())
+-        sign().toByteString()
++        signedByKeyPair = heldKeyPair
++        signedByPrincipal = subject
+       }
+ 
+-      // Complete signed certificate.
+-      val certificate = Certificate(
+-          tbsCertificate = tbsCertificate,
+-          signatureAlgorithm = signatureAlgorithm,
+-          signatureValue = BitString(
+-              byteString = signature,
+-              unusedBitsCount = 0
+-          )
+-      )
+-
+-      return HeldCertificate(subjectKeyPair, certificate.toX509Certificate())
+-    }
+-
+-    private fun subject(): List<List<AttributeTypeAndValue>> {
+-      val result = mutableListOf<List<AttributeTypeAndValue>>()
+-
+-      if (ou != null) {
+-        result += listOf(AttributeTypeAndValue(
+-            type = ObjectIdentifiers.organizationalUnitName,
+-            value = ou
+-        ))
++      // Generate & sign the certificate.
++      val notBefore = if (this.notBefore != -1L) {
++        this.notBefore
++      } else {
++        System.currentTimeMillis()
+       }
+-
+-      result += listOf(AttributeTypeAndValue(
+-          type = ObjectIdentifiers.commonName,
+-          value = cn ?: UUID.randomUUID().toString()
+-      ))
+-
+-      return result
+-    }
+-
+-    private fun validity(): Validity {
+-      val notBefore = if (notBefore != -1L) notBefore else System.currentTimeMillis()
+-      val notAfter = if (notAfter != -1L) notAfter else notBefore + DEFAULT_DURATION_MILLIS
+-      return Validity(
+-          notBefore = notBefore,
+-          notAfter = notAfter
+-      )
+-    }
+-
+-    private fun extensions(): MutableList<Extension> {
+-      val result = mutableListOf<Extension>()
++      val notAfter = if (this.notAfter != -1L) {
++        this.notAfter
++      } else {
++        notBefore + DEFAULT_DURATION_MILLIS
++      }
++      val serialNumber = if (this.serialNumber != null) {
++        this.serialNumber
++      } else {
++        BigInteger.ONE
++      }
++      val signatureAlgorithm = if (signedByKeyPair.private is RSAPrivateKey) {
++        "SHA256WithRSA"
++      } else {
++        "SHA256withECDSA"
++      }
++      val generator = X509V3CertificateGenerator()
++      generator.setSerialNumber(serialNumber)
++      generator.setIssuerDN(signedByPrincipal)
++      generator.setNotBefore(Date(notBefore))
++      generator.setNotAfter(Date(notAfter))
++      generator.setSubjectDN(subject)
++      generator.setPublicKey(heldKeyPair.public)
++      generator.setSignatureAlgorithm(signatureAlgorithm)
+ 
+       if (maxIntermediateCas != -1) {
+-        result += Extension(
+-            extnID = ObjectIdentifiers.basicConstraints,
+-            critical = true,
+-            extnValue = BasicConstraints(
+-                ca = true,
+-                pathLenConstraint = 3
+-            )
+-        )
++        generator.addExtension(X509Extensions.BasicConstraints, true,
++            BasicConstraints(maxIntermediateCas))
+       }
+ 
+       if (altNames.isNotEmpty()) {
+-        val extensionValue = altNames.map {
+-          when {
+-            it.canParseAsIpAddress() -> {
+-              generalNameIpAddress to InetAddress.getByName(it).address.toByteString()
+-            }
+-            else -> {
+-              generalNameDnsName to it
+-            }
++        val encodableAltNames = arrayOfNulls<ASN1Encodable>(altNames.size)
++        for (i in 0 until altNames.size) {
++          val altName = altNames[i]
++          val tag = when {
++            altName.canParseAsIpAddress() -> GeneralName.iPAddress
++            else -> GeneralName.dNSName
+           }
++          encodableAltNames[i] = GeneralName(tag, altName)
+         }
+-        result += Extension(
+-            extnID = ObjectIdentifiers.subjectAlternativeName,
+-            critical = true,
+-            extnValue = extensionValue
+-        )
++        generator.addExtension(X509Extensions.SubjectAlternativeName, true,
++            DERSequence(encodableAltNames))
+       }
+ 
+-      return result
++      val certificate = generator.generate(signedByKeyPair.private)
++      return HeldCertificate(heldKeyPair, certificate)
+     }
+ 
+-    private fun signatureAlgorithm(signedByKeyPair: KeyPair): AlgorithmIdentifier {
+-      return when (signedByKeyPair.private) {
+-        is RSAPrivateKey -> AlgorithmIdentifier(
+-            algorithm = ObjectIdentifiers.sha256WithRSAEncryption,
+-            parameters = null
+-        )
+-        else -> AlgorithmIdentifier(
+-            algorithm = ObjectIdentifiers.sha256withEcdsa,
+-            parameters = ByteString.EMPTY
+-        )
++    private fun buildSubject(): X500Principal {
++      val name = buildString {
++        append("CN=")
++        if (cn != null) {
++          append(cn)
++        } else {
++          append(UUID.randomUUID())
++        }
++        if (ou != null) {
++          append(", OU=")
++          append(ou)
++        }
+       }
++      return X500Principal(name)
+     }
+ 
+     private fun generateKeyPair(): KeyPair {
+diff --git a/okhttp-tls/src/main/kotlin/okhttp3/tls/internal/der/ObjectIdentifiers.kt b/okhttp-tls/src/main/kotlin/okhttp3/tls/internal/der/ObjectIdentifiers.kt
+index 492d20809..99d0ed4f0 100644
+--- a/okhttp-tls/src/main/kotlin/okhttp3/tls/internal/der/ObjectIdentifiers.kt
++++ b/okhttp-tls/src/main/kotlin/okhttp3/tls/internal/der/ObjectIdentifiers.kt
+@@ -22,7 +22,6 @@ internal object ObjectIdentifiers {
+   const val commonName = "2.5.4.3"
+   const val organizationalUnitName = "2.5.4.11"
+   const val rsaEncryption = "1.2.840.113549.1.1.1"
+-  const val ecPublicKey = "1.2.840.10045.2.1"
+   const val sha256WithRSAEncryption = "1.2.840.113549.1.1.11"
+-  const val sha256withEcdsa = "1.2.840.10045.4.3.2"
++  const val ecPublicKey = "1.2.840.10045.2.1"
+ }
+diff --git a/okhttp-tls/src/main/kotlin/okhttp3/tls/internal/der/certificates.kt b/okhttp-tls/src/main/kotlin/okhttp3/tls/internal/der/certificates.kt
+index f525dd434..a79306683 100644
+--- a/okhttp-tls/src/main/kotlin/okhttp3/tls/internal/der/certificates.kt
++++ b/okhttp-tls/src/main/kotlin/okhttp3/tls/internal/der/certificates.kt
+@@ -16,13 +16,6 @@
+ package okhttp3.tls.internal.der
+ 
+ import java.math.BigInteger
+-import java.security.GeneralSecurityException
+-import java.security.PublicKey
+-import java.security.Signature
+-import java.security.SignatureException
+-import java.security.cert.CertificateFactory
+-import java.security.cert.X509Certificate
+-import okio.Buffer
+ 
+ internal data class Certificate(
+   val tbsCertificate: TbsCertificate,
+@@ -58,32 +51,6 @@ internal data class Certificate(
+         it.extnID == ObjectIdentifiers.basicConstraints
+       }
+     }
+-
+-  /** Returns true if the certificate was signed by [issuer]. */
+-  @Throws(SignatureException::class)
+-  fun checkSignature(issuer: PublicKey): Boolean {
+-    val signedData = CertificateAdapters.tbsCertificate.toDer(tbsCertificate)
+-
+-    val signature = Signature.getInstance(tbsCertificate.signatureAlgorithmName)
+-    signature.initVerify(issuer)
+-    signature.update(signedData.toByteArray())
+-    return signature.verify(signatureValue.byteString.toByteArray())
+-  }
+-
+-  fun toX509Certificate(): X509Certificate {
+-    val data = CertificateAdapters.certificate.toDer(this)
+-    try {
+-      val certificateFactory = CertificateFactory.getInstance("X.509")
+-      val certificates = certificateFactory.generateCertificates(Buffer().write(data).inputStream())
+-      return certificates.single() as X509Certificate
+-    } catch (e: NoSuchElementException) {
+-      throw IllegalArgumentException("failed to decode certificate", e)
+-    } catch (e: IllegalArgumentException) {
+-      throw IllegalArgumentException("failed to decode certificate", e)
+-    } catch (e: GeneralSecurityException) {
+-      throw IllegalArgumentException("failed to decode certificate", e)
+-    }
+-  }
+ }
+ 
+ internal data class TbsCertificate(
+@@ -107,19 +74,6 @@ internal data class TbsCertificate(
+   /** Extensions ::= SEQUENCE SIZE (1..MAX) OF Extension */
+   val extensions: List<Extension>
+ ) {
+-  /**
+-   * Returns the standard name of this certificate's signature algorithm as specified by
+-   * [Signature.getInstance]. Typical values are like "SHA256WithRSA".
+-   */
+-  val signatureAlgorithmName: String
+-    get() {
+-      return when (signature.algorithm) {
+-        ObjectIdentifiers.sha256WithRSAEncryption -> "SHA256WithRSA"
+-        ObjectIdentifiers.sha256withEcdsa -> "SHA256withECDSA"
+-        else -> error("unexpected signature algorithm: ${signature.algorithm}")
+-      }
+-    }
+-
+   // Avoid Long.hashCode(long) which isn't available on Android 5.
+   override fun hashCode(): Int {
+     var result = 0
+diff --git a/okhttp-tls/src/test/java/okhttp3/tls/HeldCertificateTest.java b/okhttp-tls/src/test/java/okhttp3/tls/HeldCertificateTest.java
+index 230b6ca9c..b59a49caf 100644
+--- a/okhttp-tls/src/test/java/okhttp3/tls/HeldCertificateTest.java
++++ b/okhttp-tls/src/test/java/okhttp3/tls/HeldCertificateTest.java
+@@ -208,8 +208,8 @@ public final class HeldCertificateTest {
+         .signedBy(root)
+         .build();
+ 
+-    assertThat(root.certificate().getSigAlgName()).isEqualToIgnoringCase("SHA256WITHRSA");
+-    assertThat(leaf.certificate().getSigAlgName()).isEqualToIgnoringCase("SHA256WITHRSA");
++    assertThat(root.certificate().getSigAlgName()).isEqualTo("SHA256WITHRSA");
++    assertThat(leaf.certificate().getSigAlgName()).isEqualTo("SHA256WITHRSA");
+   }
+ 
+   @Test public void rsaSignedByEcdsa() {
+@@ -223,8 +223,8 @@ public final class HeldCertificateTest {
+         .signedBy(root)
+         .build();
+ 
+-    assertThat(root.certificate().getSigAlgName()).isEqualToIgnoringCase("SHA256WITHECDSA");
+-    assertThat(leaf.certificate().getSigAlgName()).isEqualToIgnoringCase("SHA256WITHECDSA");
++    assertThat(root.certificate().getSigAlgName()).isEqualTo("SHA256WITHECDSA");
++    assertThat(leaf.certificate().getSigAlgName()).isEqualTo("SHA256WITHECDSA");
+   }
+ 
+   @Test public void decodeEcdsa256() throws Exception {
+diff --git a/okhttp-tls/src/test/java/okhttp3/tls/internal/der/DerCertificatesTest.kt b/okhttp-tls/src/test/java/okhttp3/tls/internal/der/DerCertificatesTest.kt
+index 981656ef1..ed3f8b493 100644
+--- a/okhttp-tls/src/test/java/okhttp3/tls/internal/der/DerCertificatesTest.kt
++++ b/okhttp-tls/src/test/java/okhttp3/tls/internal/der/DerCertificatesTest.kt
+@@ -23,7 +23,6 @@ import okhttp3.tls.HeldCertificate
+ import okhttp3.tls.decodeCertificatePem
+ import okhttp3.tls.internal.der.ObjectIdentifiers.rsaEncryption
+ import okhttp3.tls.internal.der.ObjectIdentifiers.sha256WithRSAEncryption
+-import okio.Buffer
+ import okio.ByteString
+ import okio.ByteString.Companion.decodeBase64
+ import okio.ByteString.Companion.decodeHex
+@@ -732,67 +731,6 @@ internal class DerCertificatesTest {
+     assertThat(encoded).isEqualTo(certificateByteString)
+   }
+ 
+-  @Test
+-  fun `RSA issuer and signature`() {
+-    val root = HeldCertificate.Builder()
+-        .certificateAuthority(0)
+-        .rsa2048()
+-        .build()
+-    val certificate = HeldCertificate.Builder()
+-        .signedBy(root)
+-        .rsa2048()
+-        .build()
+-
+-    val certificateByteString = certificate.certificate.encoded.toByteString()
+-
+-    // Valid signature.
+-    val okHttpCertificate = CertificateAdapters.certificate
+-        .fromDer(certificateByteString)
+-    println(okHttpCertificate)
+-    assertThat(okHttpCertificate.checkSignature(root.keyPair.public)).isTrue()
+-
+-    // Invalid signature.
+-    val okHttpCertificateWithBadSignature = okHttpCertificate.copy(
+-        signatureValue = okHttpCertificate.signatureValue.copy(
+-            byteString = okHttpCertificate.signatureValue.byteString.offByOneBit()
+-        )
+-    )
+-    assertThat(okHttpCertificateWithBadSignature.checkSignature(root.keyPair.public)).isFalse()
+-
+-    // Wrong public key.
+-    assertThat(okHttpCertificate.checkSignature(certificate.keyPair.public)).isFalse()
+-  }
+-
+-  @Test
+-  fun `EC issuer and signature`() {
+-    val root = HeldCertificate.Builder()
+-        .certificateAuthority(0)
+-        .ecdsa256()
+-        .build()
+-    val certificate = HeldCertificate.Builder()
+-        .signedBy(root)
+-        .ecdsa256()
+-        .build()
+-
+-    val certificateByteString = certificate.certificate.encoded.toByteString()
+-
+-    // Valid signature.
+-    val okHttpCertificate = CertificateAdapters.certificate
+-        .fromDer(certificateByteString)
+-    assertThat(okHttpCertificate.checkSignature(root.keyPair.public)).isTrue()
+-
+-    // Invalid signature.
+-    val okHttpCertificateWithBadSignature = okHttpCertificate.copy(
+-        signatureValue = okHttpCertificate.signatureValue.copy(
+-            byteString = okHttpCertificate.signatureValue.byteString.offByOneBit()
+-        )
+-    )
+-    assertThat(okHttpCertificateWithBadSignature.checkSignature(root.keyPair.public)).isFalse()
+-
+-    // Wrong public key.
+-    assertThat(okHttpCertificate.checkSignature(certificate.keyPair.public)).isFalse()
+-  }
+-
+   /** Converts public key bytes to SubjectPublicKeyInfo bytes. */
+   private fun encodeKey(algorithm: String, publicKeyBytes: ByteString): ByteString {
+     val subjectPublicKeyInfo = SubjectPublicKeyInfo(
+@@ -801,12 +739,4 @@ internal class DerCertificatesTest {
+     )
+     return CertificateAdapters.subjectPublicKeyInfo.toDer(subjectPublicKeyInfo)
+   }
+-
+-  /** Returns a byte string that differs from this one by one bit. */
+-  private fun ByteString.offByOneBit(): ByteString {
+-    return Buffer()
+-        .write(this, 0, size - 1)
+-        .writeByte(this[size - 1].toInt() xor 1)
+-        .readByteString()
+-  }
+ }

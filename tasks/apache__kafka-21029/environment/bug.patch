@@ -1,0 +1,268 @@
+diff --git a/core/src/main/scala/kafka/server/metadata/BrokerMetadataPublisher.scala b/core/src/main/scala/kafka/server/metadata/BrokerMetadataPublisher.scala
+index c233d5f45d..3f6abc5c71 100644
+--- a/core/src/main/scala/kafka/server/metadata/BrokerMetadataPublisher.scala
++++ b/core/src/main/scala/kafka/server/metadata/BrokerMetadataPublisher.scala
+@@ -26,6 +26,7 @@ import kafka.utils.Logging
+ import org.apache.kafka.common.TopicPartition
+ import org.apache.kafka.common.errors.TimeoutException
+ import org.apache.kafka.common.internals.Topic
++import org.apache.kafka.coordinator.common.runtime.{KRaftCoordinatorMetadataDelta, KRaftCoordinatorMetadataImage}
+ import org.apache.kafka.coordinator.group.GroupCoordinator
+ import org.apache.kafka.coordinator.share.ShareCoordinator
+ import org.apache.kafka.coordinator.transaction.TransactionLogConfig
+@@ -241,7 +242,7 @@ class BrokerMetadataPublisher(
+ 
+       try {
+         // Propagate the new image to the share coordinator.
+-        shareCoordinator.onMetadataUpdate(delta, newImage)
++        shareCoordinator.onNewMetadataImage(new KRaftCoordinatorMetadataImage(newImage), newImage.features(), new KRaftCoordinatorMetadataDelta(delta))
+       } catch {
+         case t: Throwable => metadataPublishingFaultHandler.handleFault("Error updating share " +
+           s"coordinator with local changes in $deltaName", t)
+diff --git a/share-coordinator/src/main/java/org/apache/kafka/coordinator/share/ShareCoordinator.java b/share-coordinator/src/main/java/org/apache/kafka/coordinator/share/ShareCoordinator.java
+index ee69827d45..a5c29ff680 100644
+--- a/share-coordinator/src/main/java/org/apache/kafka/coordinator/share/ShareCoordinator.java
++++ b/share-coordinator/src/main/java/org/apache/kafka/coordinator/share/ShareCoordinator.java
+@@ -30,8 +30,9 @@ import org.apache.kafka.common.message.WriteShareGroupStateRequestData;
+ import org.apache.kafka.common.message.WriteShareGroupStateResponseData;
+ import org.apache.kafka.common.requests.RequestContext;
+ import org.apache.kafka.common.utils.BufferSupplier;
+-import org.apache.kafka.image.MetadataDelta;
+-import org.apache.kafka.image.MetadataImage;
++import org.apache.kafka.coordinator.common.runtime.CoordinatorMetadataDelta;
++import org.apache.kafka.coordinator.common.runtime.CoordinatorMetadataImage;
++import org.apache.kafka.image.FeaturesImage;
+ import org.apache.kafka.server.share.SharePartitionKey;
+ 
+ import java.util.OptionalInt;
+@@ -135,11 +136,12 @@ public interface ShareCoordinator {
+     /**
+      * A new metadata image is available.
+      *
+-     * @param delta     The metadata delta.
+-     * @param newImage  The new metadata image.
++     * @param newImage         The new metadata image.
++     * @param newFeaturesImage The features image.
++     * @param delta            The metadata delta.
+      */
+-    void onMetadataUpdate(
+-        MetadataDelta delta,
+-        MetadataImage newImage
++    void onNewMetadataImage(
++        CoordinatorMetadataImage newImage,
++        FeaturesImage newFeaturesImage, CoordinatorMetadataDelta delta
+     );
+ }
+diff --git a/share-coordinator/src/main/java/org/apache/kafka/coordinator/share/ShareCoordinatorService.java b/share-coordinator/src/main/java/org/apache/kafka/coordinator/share/ShareCoordinatorService.java
+index 19d198b8de..4f00e1cb84 100644
+--- a/share-coordinator/src/main/java/org/apache/kafka/coordinator/share/ShareCoordinatorService.java
++++ b/share-coordinator/src/main/java/org/apache/kafka/coordinator/share/ShareCoordinatorService.java
+@@ -45,17 +45,16 @@ import org.apache.kafka.common.utils.Time;
+ import org.apache.kafka.common.utils.Utils;
+ import org.apache.kafka.coordinator.common.runtime.CoordinatorEventProcessor;
+ import org.apache.kafka.coordinator.common.runtime.CoordinatorLoader;
++import org.apache.kafka.coordinator.common.runtime.CoordinatorMetadataDelta;
++import org.apache.kafka.coordinator.common.runtime.CoordinatorMetadataImage;
+ import org.apache.kafka.coordinator.common.runtime.CoordinatorRecord;
+ import org.apache.kafka.coordinator.common.runtime.CoordinatorRuntime;
+ import org.apache.kafka.coordinator.common.runtime.CoordinatorRuntimeMetrics;
+ import org.apache.kafka.coordinator.common.runtime.CoordinatorShardBuilderSupplier;
+-import org.apache.kafka.coordinator.common.runtime.KRaftCoordinatorMetadataDelta;
+-import org.apache.kafka.coordinator.common.runtime.KRaftCoordinatorMetadataImage;
+ import org.apache.kafka.coordinator.common.runtime.MultiThreadedEventProcessor;
+ import org.apache.kafka.coordinator.common.runtime.PartitionWriter;
+ import org.apache.kafka.coordinator.share.metrics.ShareCoordinatorMetrics;
+-import org.apache.kafka.image.MetadataDelta;
+-import org.apache.kafka.image.MetadataImage;
++import org.apache.kafka.image.FeaturesImage;
+ import org.apache.kafka.server.common.ShareVersion;
+ import org.apache.kafka.server.record.BrokerCompressionType;
+ import org.apache.kafka.server.share.SharePartitionKey;
+@@ -70,7 +69,6 @@ import java.util.ArrayList;
+ import java.util.HashMap;
+ import java.util.List;
+ import java.util.Map;
+-import java.util.Objects;
+ import java.util.OptionalInt;
+ import java.util.Properties;
+ import java.util.Set;
+@@ -84,7 +82,7 @@ import java.util.function.Supplier;
+ 
+ import static org.apache.kafka.coordinator.common.runtime.CoordinatorOperationExceptionHelper.handleOperationException;
+ 
+-@SuppressWarnings({"ClassDataAbstractionCoupling", "ClassFanOutComplexity"})
++@SuppressWarnings("ClassDataAbstractionCoupling")
+ public class ShareCoordinatorService implements ShareCoordinator {
+     private final ShareCoordinatorConfig config;
+     private final Logger log;
+@@ -1100,13 +1098,10 @@ public class ShareCoordinatorService implements ShareCoordinator {
+     }
+ 
+     @Override
+-    public void onMetadataUpdate(MetadataDelta delta, MetadataImage newImage) {
++    public void onNewMetadataImage(CoordinatorMetadataImage newImage, FeaturesImage newFeaturesImage, CoordinatorMetadataDelta delta) {
+         throwIfNotActive();
+-        this.runtime.onMetadataUpdate(
+-            new KRaftCoordinatorMetadataDelta(Objects.requireNonNull(delta, "delta must be provided")),
+-            new KRaftCoordinatorMetadataImage(Objects.requireNonNull(newImage, "newImage must be provided"))
+-        );
+-        boolean enabled = isShareGroupsEnabled(newImage);
++        this.runtime.onMetadataUpdate(delta, newImage);
++        boolean enabled = isShareGroupsEnabled(newFeaturesImage);
+         // enabled    shouldRunJob         result (XOR)
+         // 0            0               no op on flag, do not call jobs
+         // 0            1               disable flag, do not call jobs                      => action
+@@ -1134,9 +1129,9 @@ public class ShareCoordinatorService implements ShareCoordinator {
+         }
+     }
+ 
+-    private boolean isShareGroupsEnabled(MetadataImage image) {
++    private boolean isShareGroupsEnabled(FeaturesImage image) {
+         return shareGroupConfigEnabledSupplier.get() || ShareVersion.fromFeatureLevel(
+-            image.features().finalizedVersions().getOrDefault(ShareVersion.FEATURE_NAME, (short) 0)
++            image.finalizedVersions().getOrDefault(ShareVersion.FEATURE_NAME, (short) 0)
+         ).supportsShareGroups();
+     }
+ 
+diff --git a/share-coordinator/src/test/java/org/apache/kafka/coordinator/share/ShareCoordinatorServiceTest.java b/share-coordinator/src/test/java/org/apache/kafka/coordinator/share/ShareCoordinatorServiceTest.java
+index ea9b8f164f..2c3ef63af6 100644
+--- a/share-coordinator/src/test/java/org/apache/kafka/coordinator/share/ShareCoordinatorServiceTest.java
++++ b/share-coordinator/src/test/java/org/apache/kafka/coordinator/share/ShareCoordinatorServiceTest.java
+@@ -41,12 +41,13 @@ import org.apache.kafka.common.utils.BufferSupplier;
+ import org.apache.kafka.common.utils.LogContext;
+ import org.apache.kafka.common.utils.Time;
+ import org.apache.kafka.common.utils.Utils;
++import org.apache.kafka.coordinator.common.runtime.CoordinatorMetadataDelta;
++import org.apache.kafka.coordinator.common.runtime.CoordinatorMetadataImage;
+ import org.apache.kafka.coordinator.common.runtime.CoordinatorRecord;
+ import org.apache.kafka.coordinator.common.runtime.CoordinatorRuntime;
+ import org.apache.kafka.coordinator.common.runtime.PartitionWriter;
+ import org.apache.kafka.coordinator.share.metrics.ShareCoordinatorMetrics;
+-import org.apache.kafka.image.MetadataDelta;
+-import org.apache.kafka.image.MetadataImage;
++import org.apache.kafka.image.FeaturesImage;
+ import org.apache.kafka.server.common.ShareVersion;
+ import org.apache.kafka.server.share.SharePartitionKey;
+ import org.apache.kafka.server.util.FutureUtils;
+@@ -1490,7 +1491,7 @@ class ShareCoordinatorServiceTest {
+         ));
+ 
+         service.startup(() -> 1);
+-        service.onMetadataUpdate(mock(MetadataDelta.class), mock(MetadataImage.class));
++        service.onNewMetadataImage(mock(CoordinatorMetadataImage.class), mock(FeaturesImage.class), mock(CoordinatorMetadataDelta.class));
+         verify(runtime, times(0))
+             .scheduleWriteOperation(
+                 eq("write-state-record-prune"),
+@@ -1585,7 +1586,7 @@ class ShareCoordinatorServiceTest {
+         ));
+ 
+         service.startup(() -> 2);
+-        service.onMetadataUpdate(mock(MetadataDelta.class), mock(MetadataImage.class));
++        service.onNewMetadataImage(mock(CoordinatorMetadataImage.class), mock(FeaturesImage.class), mock(CoordinatorMetadataDelta.class));
+         verify(runtime, times(0))
+             .scheduleWriteOperation(
+                 eq("write-state-record-prune"),
+@@ -1647,7 +1648,7 @@ class ShareCoordinatorServiceTest {
+         ));
+ 
+         service.startup(() -> 1);
+-        service.onMetadataUpdate(mock(MetadataDelta.class), mock(MetadataImage.class));
++        service.onNewMetadataImage(mock(CoordinatorMetadataImage.class), mock(FeaturesImage.class), mock(CoordinatorMetadataDelta.class));
+         verify(runtime, times(0))
+             .scheduleWriteOperation(
+                 eq("write-state-record-prune"),
+@@ -1700,7 +1701,7 @@ class ShareCoordinatorServiceTest {
+         ));
+ 
+         service.startup(() -> 1);
+-        service.onMetadataUpdate(mock(MetadataDelta.class), mock(MetadataImage.class));
++        service.onNewMetadataImage(mock(CoordinatorMetadataImage.class), mock(FeaturesImage.class), mock(CoordinatorMetadataDelta.class));
+         verify(runtime, times(0))
+             .scheduleWriteOperation(
+                 eq("write-state-record-prune"),
+@@ -1751,7 +1752,7 @@ class ShareCoordinatorServiceTest {
+         ));
+ 
+         service.startup(() -> 1);
+-        service.onMetadataUpdate(mock(MetadataDelta.class), mock(MetadataImage.class));
++        service.onNewMetadataImage(mock(CoordinatorMetadataImage.class), mock(FeaturesImage.class), mock(CoordinatorMetadataDelta.class));
+ 
+         verify(runtime, times(0))
+             .scheduleWriteOperation(
+@@ -1815,7 +1816,7 @@ class ShareCoordinatorServiceTest {
+         ));
+ 
+         service.startup(() -> 1);
+-        service.onMetadataUpdate(mock(MetadataDelta.class), mock(MetadataImage.class));
++        service.onNewMetadataImage(mock(CoordinatorMetadataImage.class), mock(FeaturesImage.class), mock(CoordinatorMetadataDelta.class));
+         verify(runtime, times(0))
+             .scheduleWriteOperation(
+                 eq("write-state-record-prune"),
+@@ -1891,7 +1892,7 @@ class ShareCoordinatorServiceTest {
+         ));
+ 
+         service.startup(() -> 1);
+-        service.onMetadataUpdate(mock(MetadataDelta.class), mock(MetadataImage.class));
++        service.onNewMetadataImage(mock(CoordinatorMetadataImage.class), mock(FeaturesImage.class), mock(CoordinatorMetadataDelta.class));
+         verify(runtime, times(0))
+             .scheduleWriteOperation(
+                 eq("write-state-record-prune"),
+@@ -1951,7 +1952,7 @@ class ShareCoordinatorServiceTest {
+         )).thenReturn(List.of(CompletableFuture.completedFuture(null)));
+ 
+         service.startup(() -> 1);
+-        service.onMetadataUpdate(mock(MetadataDelta.class), mock(MetadataImage.class));
++        service.onNewMetadataImage(mock(CoordinatorMetadataImage.class), mock(FeaturesImage.class), mock(CoordinatorMetadataDelta.class));
+         verify(runtime, times(0))
+             .scheduleWriteOperation(
+                 eq("snapshot-cold-partitions"),
+@@ -2009,7 +2010,7 @@ class ShareCoordinatorServiceTest {
+         ));
+ 
+         service.startup(() -> 2);
+-        service.onMetadataUpdate(mock(MetadataDelta.class), mock(MetadataImage.class));
++        service.onNewMetadataImage(mock(CoordinatorMetadataImage.class), mock(FeaturesImage.class), mock(CoordinatorMetadataDelta.class));
+         verify(runtime, times(0))
+             .scheduleWriteAllOperation(
+                 eq("snapshot-cold-partitions"),
+@@ -2074,11 +2075,11 @@ class ShareCoordinatorServiceTest {
+ 
+         service.startup(() -> 1);
+ 
+-        MetadataImage mockedImage = mock(MetadataImage.class, RETURNS_DEEP_STUBS);
++        FeaturesImage mockedFeaturesImage = mock(FeaturesImage.class, RETURNS_DEEP_STUBS);
+ 
+         // Feature disabled on start.
+-        when(mockedImage.features().finalizedVersions().getOrDefault(eq(ShareVersion.FEATURE_NAME), anyShort())).thenReturn((short) 0);
+-        service.onMetadataUpdate(mock(MetadataDelta.class), mockedImage);   // Jobs will not execute as feature is OFF in image.
++        when(mockedFeaturesImage.finalizedVersions().getOrDefault(eq(ShareVersion.FEATURE_NAME), anyShort())).thenReturn((short) 0);
++        service.onNewMetadataImage(mock(CoordinatorMetadataImage.class), mockedFeaturesImage, mock(CoordinatorMetadataDelta.class));   // Jobs will not execute as feature is OFF in image.
+ 
+         verify(timer, times(0)).add(any()); // Timer task not added.
+         verify(runtime, times(0)).scheduleWriteOperation(
+@@ -2095,9 +2096,9 @@ class ShareCoordinatorServiceTest {
+         assertFalse(service.shouldRunPeriodicJob());
+ 
+         // Enable feature.
+-        Mockito.reset(mockedImage);
+-        when(mockedImage.features().finalizedVersions().getOrDefault(eq(ShareVersion.FEATURE_NAME), anyShort())).thenReturn((short) 1);
+-        service.onMetadataUpdate(mock(MetadataDelta.class), mockedImage);   // Jobs will execute as feature is ON in image.
++        Mockito.reset(mockedFeaturesImage);
++        when(mockedFeaturesImage.finalizedVersions().getOrDefault(eq(ShareVersion.FEATURE_NAME), anyShort())).thenReturn((short) 1);
++        service.onNewMetadataImage(mock(CoordinatorMetadataImage.class), mockedFeaturesImage, mock(CoordinatorMetadataDelta.class));   // Jobs will execute as feature is ON in image.
+ 
+         verify(timer, times(2)).add(any()); // Timer task added twice (prune, snapshot).
+         timer.advanceClock(30001L);
+@@ -2115,9 +2116,9 @@ class ShareCoordinatorServiceTest {
+         assertTrue(service.shouldRunPeriodicJob());
+ 
+         // Disable feature
+-        Mockito.reset(mockedImage);
+-        when(mockedImage.features().finalizedVersions().getOrDefault(eq(ShareVersion.FEATURE_NAME), anyShort())).thenReturn((short) 0);
+-        service.onMetadataUpdate(mock(MetadataDelta.class), mockedImage);   // Jobs will not execute as feature is on in image.
++        Mockito.reset(mockedFeaturesImage);
++        when(mockedFeaturesImage.finalizedVersions().getOrDefault(eq(ShareVersion.FEATURE_NAME), anyShort())).thenReturn((short) 0);
++        service.onNewMetadataImage(mock(CoordinatorMetadataImage.class), mockedFeaturesImage, mock(CoordinatorMetadataDelta.class));   // Jobs will not execute as feature is on in image.
+         timer.advanceClock(30001L);
+ 
+         verify(timer, times(4)).add(any()); // Tasks added but will return immediately.

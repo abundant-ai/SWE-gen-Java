@@ -1,0 +1,159 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 722607af..0f019d80 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -8,6 +8,7 @@
+ 
+    The following converters support this feature through a new `withStreaming()` factory method:
+    - Gson
++   - Jackson
+    - Moshi
+    - Protobuf
+    - Wire
+diff --git a/retrofit-converters/jackson/build.gradle b/retrofit-converters/jackson/build.gradle
+index bf1d4d02..7900d02c 100644
+--- a/retrofit-converters/jackson/build.gradle
++++ b/retrofit-converters/jackson/build.gradle
+@@ -9,6 +9,7 @@ dependencies {
+   testImplementation libs.junit
+   testImplementation libs.truth
+   testImplementation libs.okhttp.mockwebserver
++  testImplementation libs.testParameterInjector
+   testImplementation libs.jacksonDataformatCbor
+ }
+ 
+diff --git a/retrofit-converters/jackson/src/main/java/retrofit2/converter/jackson/JacksonConverterFactory.java b/retrofit-converters/jackson/src/main/java/retrofit2/converter/jackson/JacksonConverterFactory.java
+index 0bf0b135..e13e4278 100644
+--- a/retrofit-converters/jackson/src/main/java/retrofit2/converter/jackson/JacksonConverterFactory.java
++++ b/retrofit-converters/jackson/src/main/java/retrofit2/converter/jackson/JacksonConverterFactory.java
+@@ -24,6 +24,7 @@ import java.lang.reflect.Type;
+ import okhttp3.MediaType;
+ import okhttp3.RequestBody;
+ import okhttp3.ResponseBody;
++import retrofit2.Call;
+ import retrofit2.Converter;
+ import retrofit2.Retrofit;
+ 
+@@ -41,7 +42,7 @@ public final class JacksonConverterFactory extends Converter.Factory {
+ 
+   /** Create an instance using a default {@link ObjectMapper} instance for conversion. */
+   public static JacksonConverterFactory create() {
+-    return new JacksonConverterFactory(new ObjectMapper(), DEFAULT_MEDIA_TYPE);
++    return new JacksonConverterFactory(new ObjectMapper(), DEFAULT_MEDIA_TYPE, false);
+   }
+ 
+   /** Create an instance using {@code mapper} for conversion. */
+@@ -54,15 +55,27 @@ public final class JacksonConverterFactory extends Converter.Factory {
+   public static JacksonConverterFactory create(ObjectMapper mapper, MediaType mediaType) {
+     if (mapper == null) throw new NullPointerException("mapper == null");
+     if (mediaType == null) throw new NullPointerException("mediaType == null");
+-    return new JacksonConverterFactory(mapper, mediaType);
++    return new JacksonConverterFactory(mapper, mediaType, false);
+   }
+ 
+   private final ObjectMapper mapper;
+   private final MediaType mediaType;
++  private final boolean streaming;
+ 
+-  private JacksonConverterFactory(ObjectMapper mapper, MediaType mediaType) {
++  private JacksonConverterFactory(ObjectMapper mapper, MediaType mediaType, boolean streaming) {
+     this.mapper = mapper;
+     this.mediaType = mediaType;
++    this.streaming = streaming;
++  }
++
++  /**
++   * Return a new factory which streams serialization of request messages to bytes on the HTTP thread
++   * This is either the calling thread for {@link Call#execute()}, or one of OkHttp's background
++   * threads for {@link Call#enqueue}. Response bytes are always converted to message instances on
++   * one of OkHttp's background threads.
++   */
++  public JacksonConverterFactory withStreaming() {
++    return new JacksonConverterFactory(mapper, mediaType, true);
+   }
+ 
+   @Override
+@@ -81,6 +94,6 @@ public final class JacksonConverterFactory extends Converter.Factory {
+       Retrofit retrofit) {
+     JavaType javaType = mapper.getTypeFactory().constructType(type);
+     ObjectWriter writer = mapper.writerFor(javaType);
+-    return new JacksonRequestBodyConverter<>(writer, mediaType);
++    return new JacksonRequestBodyConverter<>(writer, mediaType, streaming);
+   }
+ }
+diff --git a/retrofit-converters/jackson/src/main/java/retrofit2/converter/jackson/JacksonRequestBodyConverter.java b/retrofit-converters/jackson/src/main/java/retrofit2/converter/jackson/JacksonRequestBodyConverter.java
+index fb1ceb74..ddcabe59 100644
+--- a/retrofit-converters/jackson/src/main/java/retrofit2/converter/jackson/JacksonRequestBodyConverter.java
++++ b/retrofit-converters/jackson/src/main/java/retrofit2/converter/jackson/JacksonRequestBodyConverter.java
+@@ -24,14 +24,20 @@ import retrofit2.Converter;
+ final class JacksonRequestBodyConverter<T> implements Converter<T, RequestBody> {
+   private final ObjectWriter adapter;
+   private final MediaType mediaType;
++  private final boolean streaming;
+ 
+-  JacksonRequestBodyConverter(ObjectWriter adapter, MediaType mediaType) {
++  JacksonRequestBodyConverter(ObjectWriter adapter, MediaType mediaType, boolean streaming) {
+     this.adapter = adapter;
+     this.mediaType = mediaType;
++    this.streaming = streaming;
+   }
+ 
+   @Override
+   public RequestBody convert(T value) throws IOException {
++    if (streaming) {
++      return new JacksonStreamingRequestBody(adapter, value, mediaType);
++    }
++
+     byte[] bytes = adapter.writeValueAsBytes(value);
+     return RequestBody.create(mediaType, bytes);
+   }
+diff --git a/retrofit-converters/jackson/src/main/java/retrofit2/converter/jackson/JacksonStreamingRequestBody.java b/retrofit-converters/jackson/src/main/java/retrofit2/converter/jackson/JacksonStreamingRequestBody.java
+new file mode 100644
+index 00000000..50dabe98
+--- /dev/null
++++ b/retrofit-converters/jackson/src/main/java/retrofit2/converter/jackson/JacksonStreamingRequestBody.java
+@@ -0,0 +1,44 @@
++/*
++ * Copyright (C) 2025 Square, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package retrofit2.converter.jackson;
++
++import com.fasterxml.jackson.databind.ObjectWriter;
++import java.io.IOException;
++import okhttp3.MediaType;
++import okhttp3.RequestBody;
++import okio.BufferedSink;
++
++final class JacksonStreamingRequestBody extends RequestBody {
++  private final ObjectWriter adapter;
++  private final Object value;
++  private final MediaType mediaType;
++
++  public JacksonStreamingRequestBody(ObjectWriter adapter, Object value, MediaType mediaType) {
++    this.adapter = adapter;
++    this.value = value;
++    this.mediaType = mediaType;
++  }
++
++  @Override
++  public MediaType contentType() {
++    return mediaType;
++  }
++
++  @Override
++  public void writeTo(BufferedSink sink) throws IOException {
++    adapter.writeValue(sink.outputStream(), value);
++  }
++}

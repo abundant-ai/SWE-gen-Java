@@ -1,0 +1,805 @@
+diff --git a/core/src/main/java/kafka/server/KRaftTopicCreator.java b/core/src/main/java/kafka/server/KRaftTopicCreator.java
+new file mode 100644
+index 0000000000..6cb0c63cbc
+--- /dev/null
++++ b/core/src/main/java/kafka/server/KRaftTopicCreator.java
+@@ -0,0 +1,167 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements. See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License. You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package kafka.server;
++
++import org.apache.kafka.clients.ClientResponse;
++import org.apache.kafka.common.errors.TimeoutException;
++import org.apache.kafka.common.protocol.ApiKeys;
++import org.apache.kafka.common.protocol.Errors;
++import org.apache.kafka.common.requests.AbstractRequest;
++import org.apache.kafka.common.requests.AbstractResponse;
++import org.apache.kafka.common.requests.CreateTopicsRequest;
++import org.apache.kafka.common.requests.CreateTopicsResponse;
++import org.apache.kafka.common.requests.EnvelopeResponse;
++import org.apache.kafka.common.requests.RequestContext;
++import org.apache.kafka.common.requests.RequestHeader;
++import org.apache.kafka.server.common.ControllerRequestCompletionHandler;
++import org.apache.kafka.server.common.NodeToControllerChannelManager;
++
++import java.io.IOException;
++import java.util.concurrent.CompletableFuture;
++
++/**
++ * KRaft implementation of TopicCreator that forwards CreateTopics requests to the controller.
++ * When creating topics with a principal, requests are wrapped in an envelope to preserve the
++ * original request context for authorization.
++ */
++public class KRaftTopicCreator implements TopicCreator {
++
++    private final NodeToControllerChannelManager channelManager;
++
++    public KRaftTopicCreator(NodeToControllerChannelManager channelManager) {
++        this.channelManager = channelManager;
++    }
++
++    @Override
++    public CompletableFuture<CreateTopicsResponse> createTopicWithPrincipal(
++        RequestContext requestContext,
++        CreateTopicsRequest.Builder createTopicsRequest
++    ) {
++        CompletableFuture<CreateTopicsResponse> responseFuture = new CompletableFuture<>();
++
++        short requestVersion = channelManager.controllerApiVersions()
++            .map(v -> v.latestUsableVersion(ApiKeys.CREATE_TOPICS))
++            .orElse(ApiKeys.CREATE_TOPICS.latestVersion());
++
++        RequestHeader requestHeader = new RequestHeader(
++            ApiKeys.CREATE_TOPICS,
++            requestVersion,
++            requestContext.clientId(),
++            requestContext.correlationId()
++        );
++
++        AbstractRequest.Builder<? extends AbstractRequest> envelopeRequest = ForwardingManager$.MODULE$.buildEnvelopeRequest(
++            requestContext,
++            createTopicsRequest.build(requestHeader.apiVersion())
++                .serializeWithHeader(requestHeader)
++        );
++
++        ControllerRequestCompletionHandler handler = new ControllerRequestCompletionHandler() {
++            @Override
++            public void onTimeout() {
++                responseFuture.completeExceptionally(
++                    new TimeoutException("CreateTopicsRequest to controller timed out")
++                );
++            }
++
++            @Override
++            public void onComplete(ClientResponse response) {
++                if (response.authenticationException() != null) {
++                    responseFuture.completeExceptionally(response.authenticationException());
++                } else if (response.versionMismatch() != null) {
++                    responseFuture.completeExceptionally(response.versionMismatch());
++                } else if (response.wasDisconnected()) {
++                    responseFuture.completeExceptionally(new IOException("Disconnected before receiving CreateTopicsResponse"));
++                } else if (response.hasResponse()) {
++                    if (response.responseBody() instanceof EnvelopeResponse envelopeResponse) {
++                        Errors envelopeError = envelopeResponse.error();
++                        if (envelopeError != Errors.NONE) {
++                            responseFuture.completeExceptionally(envelopeError.exception());
++                        } else {
++                            try {
++                                CreateTopicsResponse createTopicsResponse = (CreateTopicsResponse) AbstractResponse.parseResponse(
++                                    envelopeResponse.responseData(),
++                                    requestHeader
++                                );
++                                responseFuture.complete(createTopicsResponse);
++                            } catch (Exception e) {
++                                responseFuture.completeExceptionally(e);
++                            }
++                        }
++                    } else {
++                        responseFuture.completeExceptionally(
++                            new IllegalStateException("Expected EnvelopeResponse but got: " +
++                                response.responseBody().getClass().getSimpleName())
++                        );
++                    }
++                } else {
++                    responseFuture.completeExceptionally(
++                        new IllegalStateException("Got no response body for EnvelopeResponse")
++                    );
++                }
++            }
++        };
++
++        channelManager.sendRequest(envelopeRequest, handler);
++        return responseFuture;
++    }
++
++    @Override
++    public CompletableFuture<CreateTopicsResponse> createTopicWithoutPrincipal(
++        CreateTopicsRequest.Builder createTopicsRequest
++    ) {
++        CompletableFuture<CreateTopicsResponse> responseFuture = new CompletableFuture<>();
++
++        ControllerRequestCompletionHandler handler = new ControllerRequestCompletionHandler() {
++            @Override
++            public void onTimeout() {
++                responseFuture.completeExceptionally(
++                    new TimeoutException("CreateTopicsRequest to controller timed out")
++                );
++            }
++
++            @Override
++            public void onComplete(ClientResponse response) {
++                if (response.authenticationException() != null) {
++                    responseFuture.completeExceptionally(response.authenticationException());
++                } else if (response.versionMismatch() != null) {
++                    responseFuture.completeExceptionally(response.versionMismatch());
++                } else if (response.wasDisconnected()) {
++                    responseFuture.completeExceptionally(new IOException("Disconnected before receiving CreateTopicsResponse"));
++                } else if (response.hasResponse()) {
++                    if (response.responseBody() instanceof CreateTopicsResponse createTopicsResponse) {
++                        responseFuture.complete(createTopicsResponse);
++                    } else {
++                        responseFuture.completeExceptionally(
++                            new IllegalStateException("Expected CreateTopicsResponse but got: " +
++                                response.responseBody().getClass().getSimpleName())
++                        );
++                    }
++                } else {
++                    responseFuture.completeExceptionally(
++                        new IllegalStateException("Got no response body for CreateTopicsRequest")
++                    );
++                }
++            }
++        };
++
++        channelManager.sendRequest(createTopicsRequest, handler);
++        return responseFuture;
++    }
++
++}
+diff --git a/core/src/main/java/kafka/server/TopicCreator.java b/core/src/main/java/kafka/server/TopicCreator.java
+new file mode 100644
+index 0000000000..236de0f090
+--- /dev/null
++++ b/core/src/main/java/kafka/server/TopicCreator.java
+@@ -0,0 +1,56 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements. See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License. You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package kafka.server;
++
++import org.apache.kafka.common.requests.CreateTopicsRequest;
++import org.apache.kafka.common.requests.CreateTopicsResponse;
++import org.apache.kafka.common.requests.RequestContext;
++
++import java.util.concurrent.CompletableFuture;
++
++/**
++ * Abstraction for creating topics via the controller.
++ * Allows different implementations to be used interchangeably
++ * by the AutoTopicCreationManager, enabling better separation of concerns and testability.
++ */
++public interface TopicCreator {
++
++    /**
++     * Send a create topics request with principal for user-initiated topic creation.
++     * The request context is used to preserve the original client principal for auditing.
++     *
++     * @param requestContext      The request context containing the client principal.
++     * @param createTopicsRequest The topics to be created.
++     * @return A future of the create topics response. This future will be completed on the network thread.
++     */
++    CompletableFuture<CreateTopicsResponse> createTopicWithPrincipal(
++        RequestContext requestContext,
++        CreateTopicsRequest.Builder createTopicsRequest
++    );
++
++    /**
++     * Send a create topics request without principal for internal topic creation (e.g., consumer offsets, transaction state).
++     * No request context is required since these are system-initiated requests.
++     *
++     * @param createTopicsRequest The topics to be created.
++     * @return A future of the create topics response. This future will be completed on the network thread.
++     */
++    CompletableFuture<CreateTopicsResponse> createTopicWithoutPrincipal(
++        CreateTopicsRequest.Builder createTopicsRequest
++    );
++}
+diff --git a/core/src/main/scala/kafka/server/AutoTopicCreationManager.scala b/core/src/main/scala/kafka/server/AutoTopicCreationManager.scala
+index 5ea254fbe7..f66aa7d3c1 100644
+--- a/core/src/main/scala/kafka/server/AutoTopicCreationManager.scala
++++ b/core/src/main/scala/kafka/server/AutoTopicCreationManager.scala
+@@ -22,25 +22,22 @@ import java.util.concurrent.locks.ReentrantLock
+ import java.util.{Collections, Properties}
+ import kafka.coordinator.transaction.TransactionCoordinator
+ import kafka.utils.Logging
+-import org.apache.kafka.clients.ClientResponse
+-import org.apache.kafka.common.errors.InvalidTopicException
++import org.apache.kafka.common.errors.{AuthenticationException, InvalidTopicException, TimeoutException, UnsupportedVersionException}
+ import org.apache.kafka.common.internals.Topic
+ import org.apache.kafka.common.internals.Topic.{GROUP_METADATA_TOPIC_NAME, SHARE_GROUP_STATE_TOPIC_NAME, TRANSACTION_STATE_TOPIC_NAME}
+ import org.apache.kafka.common.message.CreateTopicsRequestData
+ import org.apache.kafka.common.message.CreateTopicsRequestData.{CreatableTopic, CreatableTopicConfig, CreatableTopicConfigCollection}
+ import org.apache.kafka.common.message.MetadataResponseData.MetadataResponseTopic
+-import org.apache.kafka.common.protocol.{ApiKeys, Errors}
+-import org.apache.kafka.common.requests.{AbstractResponse, CreateTopicsRequest, CreateTopicsResponse, EnvelopeResponse, RequestContext, RequestHeader}
++import org.apache.kafka.common.protocol.Errors
++import org.apache.kafka.common.requests.{CreateTopicsRequest, CreateTopicsResponse, RequestContext}
+ import org.apache.kafka.coordinator.group.GroupCoordinator
+ import org.apache.kafka.coordinator.share.ShareCoordinator
+ import org.apache.kafka.coordinator.transaction.TransactionLogConfig
+-import org.apache.kafka.server.common.{ControllerRequestCompletionHandler, NodeToControllerChannelManager}
+ import org.apache.kafka.server.quota.ControllerMutationQuota
+ import org.apache.kafka.common.utils.Time
+ 
+ import scala.collection.{Map, Seq, Set, mutable}
+ import scala.jdk.CollectionConverters._
+-import scala.jdk.OptionConverters.RichOptional
+ 
+ trait AutoTopicCreationManager {
+ 
+@@ -134,11 +131,11 @@ private[server] class ExpiringErrorCache(maxSize: Int, time: Time) {
+ 
+ class DefaultAutoTopicCreationManager(
+   config: KafkaConfig,
+-  channelManager: NodeToControllerChannelManager,
+   groupCoordinator: GroupCoordinator,
+   txnCoordinator: TransactionCoordinator,
+   shareCoordinator: ShareCoordinator,
+   time: Time,
++  topicCreator: TopicCreator,
+   topicErrorCacheCapacity: Int = 1000
+ ) extends AutoTopicCreationManager with Logging {
+ 
+@@ -193,7 +190,7 @@ class DefaultAutoTopicCreationManager(
+     }
+ 
+     if (topicsToCreate.nonEmpty) {
+-      sendCreateTopicRequestWithErrorCaching(topicsToCreate, Some(requestContext), timeoutMs)
++      sendCreateTopicRequestWithErrorCaching(topicsToCreate, requestContext, timeoutMs)
+     }
+   }
+ 
+@@ -208,99 +205,31 @@ class DefaultAutoTopicCreationManager(
+     creatableTopics: Map[String, CreatableTopic],
+     requestContext: Option[RequestContext]
+   ): Seq[MetadataResponseTopic] = {
+-    val topicsToCreate = new CreateTopicsRequestData.CreatableTopicCollection(creatableTopics.size)
+-    topicsToCreate.addAll(creatableTopics.values.asJavaCollection)
+-
+-    val createTopicsRequest = new CreateTopicsRequest.Builder(
+-      new CreateTopicsRequestData()
+-        .setTimeoutMs(config.requestTimeoutMs)
+-        .setTopics(topicsToCreate)
+-    )
++    val createTopicsRequest: CreateTopicsRequest.Builder = makeCreateTopicsRequestBuilder(creatableTopics)
+ 
+-    // Capture request header information for proper envelope response parsing
+-    val requestHeaderForParsing = requestContext.map { context =>
+-      val requestVersion =
+-        channelManager.controllerApiVersions.toScala match {
+-          case None =>
+-            ApiKeys.CREATE_TOPICS.latestVersion()
+-          case Some(nodeApiVersions) =>
+-            nodeApiVersions.latestUsableVersion(ApiKeys.CREATE_TOPICS)
+-        }
+-
+-      new RequestHeader(ApiKeys.CREATE_TOPICS,
+-        requestVersion,
+-        context.clientId,
+-        context.correlationId)
++    val responseFuture = requestContext match {
++      case Some(context) => topicCreator.createTopicWithPrincipal(context, createTopicsRequest)
++      case None => topicCreator.createTopicWithoutPrincipal(createTopicsRequest)
+     }
+ 
+-    val requestCompletionHandler = new ControllerRequestCompletionHandler {
+-      override def onTimeout(): Unit = {
++    responseFuture.whenComplete {
++      (response, throwable) =>
+         clearInflightRequests(creatableTopics)
+-        debug(s"Auto topic creation timed out for ${creatableTopics.keys}.")
+-      }
+-
+-      override def onComplete(response: ClientResponse): Unit = {
+-        clearInflightRequests(creatableTopics)
+-        if (response.authenticationException() != null) {
+-          warn(s"Auto topic creation failed for ${creatableTopics.keys} with authentication exception")
+-        } else if (response.versionMismatch() != null) {
+-          warn(s"Auto topic creation failed for ${creatableTopics.keys} with invalid version exception")
+-        } else {
+-          if (response.hasResponse) {
+-            response.responseBody() match {
+-              case envelopeResponse: EnvelopeResponse =>
+-                // Unwrap the envelope response to get the actual CreateTopicsResponse
+-                val envelopeError = envelopeResponse.error()
+-                if (envelopeError != Errors.NONE) {
+-                  warn(s"Auto topic creation failed for ${creatableTopics.keys} with envelope error: ${envelopeError}")
+-                } else {
+-                  requestHeaderForParsing match {
+-                    case Some(requestHeader) =>
+-                      try {
+-                        // Use the captured request header for proper envelope response parsing
+-                        val createTopicsResponse = AbstractResponse.parseResponse(
+-                          envelopeResponse.responseData(), requestHeader).asInstanceOf[CreateTopicsResponse]
+-
+-                        createTopicsResponse.data().topics().forEach(topicResult => {
+-                          val error = Errors.forCode(topicResult.errorCode)
+-                          if (error != Errors.NONE) {
+-                            warn(s"Auto topic creation failed for ${topicResult.name} with error '${error.name}': ${topicResult.errorMessage}")
+-                          }
+-                        })
+-                      } catch {
+-                        case e: Exception =>
+-                          warn(s"Failed to parse envelope response for auto topic creation of ${creatableTopics.keys}", e)
+-                      }
+-                    case None =>
+-                      warn(s"Cannot parse envelope response without original request header information")
+-                  }
+-                }
+-              case createTopicsResponse: CreateTopicsResponse =>
+-                createTopicsResponse.data().topics().forEach(topicResult => {
+-                  val error = Errors.forCode(topicResult.errorCode)
+-                  if (error != Errors.NONE) {
+-                    warn(s"Auto topic creation failed for ${topicResult.name} with error '${error.name}': ${topicResult.errorMessage}")
+-                  }
+-                })
+-              case other =>
+-                warn(s"Auto topic creation request received unexpected response type: ${other.getClass.getSimpleName}")
++        // Log any errors from the topic creation attempt
++        if (throwable != null) {
++          logError(creatableTopics, throwable)
++        } else if (response != null) {
++          response.data().topics().forEach(topicResult => {
++            val error = Errors.forCode(topicResult.errorCode)
++            if (error != Errors.NONE) {
++              warn(s"Auto topic creation failed for ${topicResult.name} with error '${error.name}': ${topicResult.errorMessage}")
+             }
+-          }
+-          debug(s"Auto topic creation completed for ${creatableTopics.keys} with response ${response.responseBody}.")
++          })
++        } else {
++          warn("CreateTopicsResponse future completed with null response and no exception")
+         }
+-      }
+-    }
+-
+-    val request = (requestContext, requestHeaderForParsing) match {
+-      case (Some(context), Some(requestHeader)) =>
+-        ForwardingManager.buildEnvelopeRequest(context,
+-          createTopicsRequest.build(requestHeader.apiVersion()).serializeWithHeader(requestHeader))
+-      case _ =>
+-        createTopicsRequest
+     }
+ 
+-    channelManager.sendRequest(request, requestCompletionHandler)
+-
+     val creatableTopicResponses = creatableTopics.keySet.toSeq.map { topic =>
+       new MetadataResponseTopic()
+         .setErrorCode(Errors.UNKNOWN_TOPIC_OR_PARTITION.code)
+@@ -401,109 +330,54 @@ class DefaultAutoTopicCreationManager(
+ 
+   private def sendCreateTopicRequestWithErrorCaching(
+     creatableTopics: Map[String, CreatableTopic],
+-    requestContext: Option[RequestContext],
++    requestContext: RequestContext,
+     timeoutMs: Long
+-  ): Seq[MetadataResponseTopic] = {
+-    val topicsToCreate = new CreateTopicsRequestData.CreatableTopicCollection(creatableTopics.size)
+-    topicsToCreate.addAll(creatableTopics.values.asJavaCollection)
+-
+-    val createTopicsRequest = new CreateTopicsRequest.Builder(
+-      new CreateTopicsRequestData()
+-        .setTimeoutMs(config.requestTimeoutMs)
+-        .setTopics(topicsToCreate)
+-    )
+-
+-    // Capture request header information for proper envelope response parsing
+-    val requestHeaderForParsing = requestContext.map { context =>
+-      val requestVersion =
+-        channelManager.controllerApiVersions.toScala match {
+-          case None =>
+-            ApiKeys.CREATE_TOPICS.latestVersion()
+-          case Some(nodeApiVersions) =>
+-            nodeApiVersions.latestUsableVersion(ApiKeys.CREATE_TOPICS)
+-        }
+-
+-      new RequestHeader(ApiKeys.CREATE_TOPICS,
+-        requestVersion,
+-        context.clientId,
+-        context.correlationId)
+-    }
++  ): Unit = {
++    val createTopicsRequest: CreateTopicsRequest.Builder = makeCreateTopicsRequestBuilder(creatableTopics)
+ 
+-    val requestCompletionHandler = new ControllerRequestCompletionHandler {
+-      override def onTimeout(): Unit = {
+-        clearInflightRequests(creatableTopics)
+-        debug(s"Auto topic creation timed out for ${creatableTopics.keys}.")
+-        cacheTopicCreationErrors(creatableTopics.keys.toSet, "Auto topic creation timed out.", timeoutMs)
+-      }
++    val createTopicsResponseFuture = topicCreator.createTopicWithPrincipal(requestContext, createTopicsRequest)
+ 
+-      override def onComplete(response: ClientResponse): Unit = {
++    createTopicsResponseFuture.whenComplete {
++      (response, throwable) =>
+         clearInflightRequests(creatableTopics)
+-        if (response.authenticationException() != null) {
+-          val authException = response.authenticationException()
+-          warn(s"Auto topic creation failed for ${creatableTopics.keys} with authentication exception: ${authException.getMessage}")
+-          cacheTopicCreationErrors(creatableTopics.keys.toSet, authException.getMessage, timeoutMs)
+-        } else if (response.versionMismatch() != null) {
+-          val versionException = response.versionMismatch()
+-          warn(s"Auto topic creation failed for ${creatableTopics.keys} with version mismatch exception: ${versionException.getMessage}")
+-          cacheTopicCreationErrors(creatableTopics.keys.toSet, versionException.getMessage, timeoutMs)
++        // Log any errors from the topic creation attempt
++        if (throwable != null) {
++          logError(creatableTopics, throwable)
++          val errorMessage = Option(throwable.getMessage).getOrElse(throwable.toString)
++          cacheTopicCreationErrors(creatableTopics.keys.toSet, errorMessage, timeoutMs)
++        } else if (response != null) {
++          debug(s"Auto topic creation completed for ${creatableTopics.keys} with response $response.")
++          cacheTopicCreationErrorsFromResponse(response, timeoutMs)
+         } else {
+-          if (response.hasResponse) {
+-            response.responseBody() match {
+-              case envelopeResponse: EnvelopeResponse =>
+-                // Unwrap the envelope response to get the actual CreateTopicsResponse
+-                val envelopeError = envelopeResponse.error()
+-                if (envelopeError != Errors.NONE) {
+-                  warn(s"Auto topic creation failed for ${creatableTopics.keys} with envelope error: ${envelopeError}")
+-                  cacheTopicCreationErrors(creatableTopics.keys.toSet, s"Envelope error: ${envelopeError}", timeoutMs)
+-                } else {
+-                  requestHeaderForParsing match {
+-                    case Some(requestHeader) =>
+-                      try {
+-                        // Use the captured request header for proper envelope response parsing
+-                        val createTopicsResponse = AbstractResponse.parseResponse(
+-                          envelopeResponse.responseData(), requestHeader).asInstanceOf[CreateTopicsResponse]
+-
+-                        cacheTopicCreationErrorsFromResponse(createTopicsResponse, timeoutMs)
+-                      } catch {
+-                        case e: Exception =>
+-                          warn(s"Failed to parse envelope response for auto topic creation of ${creatableTopics.keys}", e)
+-                          cacheTopicCreationErrors(creatableTopics.keys.toSet, s"Response parsing error: ${e.getMessage}", timeoutMs)
+-                      }
+-                    case None =>
+-                      warn(s"Cannot parse envelope response without original request header information")
+-                      cacheTopicCreationErrors(creatableTopics.keys.toSet, "Missing request header for envelope parsing", timeoutMs)
+-                  }
+-                }
+-              case createTopicsResponse: CreateTopicsResponse =>
+-                cacheTopicCreationErrorsFromResponse(createTopicsResponse, timeoutMs)
+-              case unexpectedResponse =>
+-                warn(s"Auto topic creation request received unexpected response type: ${unexpectedResponse.getClass.getSimpleName}")
+-                cacheTopicCreationErrors(creatableTopics.keys.toSet, s"Unexpected response type: ${unexpectedResponse.getClass.getSimpleName}", timeoutMs)
+-            }
+-            debug(s"Auto topic creation completed for ${creatableTopics.keys} with response ${response.responseBody}.")
+-          }
++          val ex = new IllegalStateException("CreateTopicsResponse future completed with null response and no exception")
++          error(s"Auto topic creation failed for ${creatableTopics.keys} due to unexpected future completion state", ex)
++          cacheTopicCreationErrors(creatableTopics.keys.toSet, ex.getMessage, timeoutMs)
+         }
+-      }
+     }
++  }
+ 
+-    val request = (requestContext, requestHeaderForParsing) match {
+-      case (Some(context), Some(requestHeader)) =>
+-        ForwardingManager.buildEnvelopeRequest(context,
+-          createTopicsRequest.build(requestHeader.apiVersion()).serializeWithHeader(requestHeader))
+-      case _ =>
+-        createTopicsRequest
++  private def logError(creatableTopics: Map[String, CreatableTopic], throwable: Throwable): Unit = {
++    throwable match {
++      case _: TimeoutException =>
++        debug(s"Auto topic creation timed out for ${creatableTopics.keys}.")
++      case _: AuthenticationException =>
++        warn(s"Auto topic creation failed for ${creatableTopics.keys} with authentication exception")
++      case _: UnsupportedVersionException =>
++        warn(s"Auto topic creation failed for ${creatableTopics.keys} with invalid version exception")
++      case other =>
++        warn(s"Auto topic creation failed for ${creatableTopics.keys} with exception", other)
+     }
++  }
+ 
+-    channelManager.sendRequest(request, requestCompletionHandler)
+-
+-    val creatableTopicResponses = creatableTopics.keySet.toSeq.map { topic =>
+-      new MetadataResponseTopic()
+-        .setErrorCode(Errors.UNKNOWN_TOPIC_OR_PARTITION.code)
+-        .setName(topic)
+-        .setIsInternal(Topic.isInternal(topic))
+-    }
++  private def makeCreateTopicsRequestBuilder(creatableTopics: Map[String, CreatableTopic]): CreateTopicsRequest.Builder = {
++    val topicsToCreate = new CreateTopicsRequestData.CreatableTopicCollection(creatableTopics.size)
++    topicsToCreate.addAll(creatableTopics.values.asJavaCollection)
+ 
+-    creatableTopicResponses
++    new CreateTopicsRequest.Builder(
++      new CreateTopicsRequestData()
++        .setTimeoutMs(config.requestTimeoutMs)
++        .setTopics(topicsToCreate)
++    )
+   }
+ 
+   private def cacheTopicCreationErrors(topicNames: Set[String], errorMessage: String, ttlMs: Long): Unit = {
+diff --git a/core/src/main/scala/kafka/server/BrokerServer.scala b/core/src/main/scala/kafka/server/BrokerServer.scala
+index 2d21ee59ef..a9e586a627 100644
+--- a/core/src/main/scala/kafka/server/BrokerServer.scala
++++ b/core/src/main/scala/kafka/server/BrokerServer.scala
+@@ -390,9 +390,9 @@ class BrokerServer(
+         new KafkaScheduler(1, true, "transaction-log-manager-"),
+         producerIdManagerSupplier, metrics, metadataCache, Time.SYSTEM)
+ 
++      val topicCreator = new KRaftTopicCreator(clientToControllerChannelManager)
+       autoTopicCreationManager = new DefaultAutoTopicCreationManager(
+-        config, clientToControllerChannelManager, groupCoordinator,
+-        transactionCoordinator, shareCoordinator, time)
++        config, groupCoordinator, transactionCoordinator, shareCoordinator, time, topicCreator)
+ 
+       dynamicConfigHandlers = Map[ConfigType, ConfigHandler](
+         ConfigType.TOPIC -> new TopicConfigHandler(replicaManager, config, quotaManagers),
+diff --git a/core/src/main/scala/kafka/server/metadata/BrokerMetadataPublisher.scala b/core/src/main/scala/kafka/server/metadata/BrokerMetadataPublisher.scala
+index 35c44b9524..afc982aae0 100644
+--- a/core/src/main/scala/kafka/server/metadata/BrokerMetadataPublisher.scala
++++ b/core/src/main/scala/kafka/server/metadata/BrokerMetadataPublisher.scala
+@@ -23,6 +23,7 @@ import kafka.log.LogManager
+ import kafka.server.share.SharePartitionManager
+ import kafka.server.{KafkaConfig, ReplicaManager}
+ import kafka.utils.Logging
++import org.apache.kafka.common.TopicPartition
+ import org.apache.kafka.common.errors.TimeoutException
+ import org.apache.kafka.common.internals.Topic
+ import org.apache.kafka.coordinator.group.GroupCoordinator
+@@ -39,6 +40,7 @@ import org.apache.kafka.server.fault.FaultHandler
+ import org.apache.kafka.storage.internals.log.{LogManager => JLogManager}
+ 
+ import java.util.concurrent.CompletableFuture
++import scala.collection.mutable
+ import scala.jdk.CollectionConverters._
+ 
+ 
+@@ -184,6 +186,22 @@ class BrokerMetadataPublisher(
+           case t: Throwable => metadataPublishingFaultHandler.handleFault("Error updating share " +
+             s"coordinator with local changes in $deltaName", t)
+         }
++        try {
++          // Notify the group coordinator about deleted topics.
++          val deletedTopicPartitions = new mutable.ArrayBuffer[TopicPartition]()
++          topicsDelta.deletedTopicIds().forEach { id =>
++            val topicImage = topicsDelta.image().getTopic(id)
++            topicImage.partitions().keySet().forEach {
++              id => deletedTopicPartitions += new TopicPartition(topicImage.name(), id)
++            }
++          }
++          if (deletedTopicPartitions.nonEmpty) {
++            groupCoordinator.onPartitionsDeleted(deletedTopicPartitions.asJava, RequestLocal.noCaching.bufferSupplier)
++          }
++        } catch {
++          case t: Throwable => metadataPublishingFaultHandler.handleFault("Error updating group " +
++            s"coordinator with deleted partitions in $deltaName", t)
++        }
+         try {
+           // Notify the share coordinator about deleted topics.
+           val deletedTopicIds = topicsDelta.deletedTopicIds()
+diff --git a/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupCoordinator.java b/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupCoordinator.java
+index 9eb6d1cfd3..753d1736f7 100644
+--- a/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupCoordinator.java
++++ b/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupCoordinator.java
+@@ -64,6 +64,7 @@ import java.util.Optional;
+ import java.util.OptionalInt;
+ import java.util.Properties;
+ import java.util.concurrent.CompletableFuture;
++import java.util.concurrent.ExecutionException;
+ import java.util.function.IntSupplier;
+ 
+ /**
+@@ -409,6 +410,17 @@ public interface GroupCoordinator {
+      */
+     int partitionFor(String groupId);
+ 
++    /**
++     * Remove the provided deleted partitions offsets.
++     *
++     * @param topicPartitions   The deleted partitions.
++     * @param bufferSupplier    The buffer supplier tight to the request thread.
++     */
++    void onPartitionsDeleted(
++        List<TopicPartition> topicPartitions,
++        BufferSupplier bufferSupplier
++    ) throws ExecutionException, InterruptedException;
++
+     /**
+      * Group coordinator is now the leader for the given partition at the
+      * given leader epoch. It should load cached state from the partition
+diff --git a/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupCoordinatorService.java b/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupCoordinatorService.java
+index f8dc5068db..701e58f96c 100644
+--- a/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupCoordinatorService.java
++++ b/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupCoordinatorService.java
+@@ -100,7 +100,6 @@ import org.apache.kafka.coordinator.group.metrics.GroupCoordinatorMetrics;
+ import org.apache.kafka.coordinator.group.streams.StreamsGroupHeartbeatResult;
+ import org.apache.kafka.image.MetadataDelta;
+ import org.apache.kafka.image.MetadataImage;
+-import org.apache.kafka.image.TopicsDelta;
+ import org.apache.kafka.server.authorizer.AuthorizableRequestContext;
+ import org.apache.kafka.server.authorizer.Authorizer;
+ import org.apache.kafka.server.record.BrokerCompressionType;
+@@ -137,6 +136,7 @@ import java.util.Properties;
+ import java.util.Set;
+ import java.util.concurrent.CompletableFuture;
+ import java.util.concurrent.CompletionException;
++import java.util.concurrent.ExecutionException;
+ import java.util.concurrent.Executors;
+ import java.util.concurrent.atomic.AtomicBoolean;
+ import java.util.function.IntSupplier;
+@@ -2217,6 +2217,63 @@ public class GroupCoordinatorService implements GroupCoordinator {
+         );
+     }
+ 
++    /**
++     * See {@link GroupCoordinator#onPartitionsDeleted(List, BufferSupplier)}.
++     */
++    @Override
++    public void onPartitionsDeleted(
++        List<TopicPartition> topicPartitions,
++        BufferSupplier bufferSupplier
++    ) throws ExecutionException, InterruptedException {
++        throwIfNotActive();
++
++        var futures = new ArrayList<CompletableFuture<Void>>();
++
++        // Handle the partition deletion for committed offsets.
++        futures.addAll(
++            FutureUtils.mapExceptionally(
++                runtime.scheduleWriteAllOperation(
++                    "on-partition-deleted",
++                    Duration.ofMillis(config.offsetCommitTimeoutMs()),
++                    coordinator -> coordinator.onPartitionsDeleted(topicPartitions)
++                ),
++                exception -> {
++                    log.error("Could not delete offsets for deleted partitions {} due to: {}.",
++                        topicPartitions, exception.getMessage(), exception
++                    );
++                    return null;
++                }
++            )
++        );
++
++        // Handle the topic deletion for share state.
++        if (metadataImage != null) {
++            var topicIds = topicPartitions.stream()
++                .filter(tp -> metadataImage.topicMetadata(tp.topic()).isPresent())
++                .map(tp -> metadataImage.topicMetadata(tp.topic()).get().id())
++                .collect(Collectors.toSet());
++
++            if (!topicIds.isEmpty()) {
++                futures.addAll(
++                    FutureUtils.mapExceptionally(
++                        runtime.scheduleWriteAllOperation(
++                            "maybe-cleanup-share-group-state",
++                            Duration.ofMillis(config.offsetCommitTimeoutMs()),
++                            coordinator -> coordinator.maybeCleanupShareGroupState(topicIds)
++                        ),
++                        exception -> {
++                            log.error("Unable to cleanup state for the deleted topics {}", topicIds, exception);
++                            return null;
++                        }
++                    )
++                );
++            }
++        }
++
++        // Wait on the results.
++        CompletableFuture.allOf(futures.toArray(new CompletableFuture<?>[0]));
++    }
++
+     /**
+      * See {@link GroupCoordinator#onElection(int, int)}.
+      */
+@@ -2258,77 +2315,10 @@ public class GroupCoordinatorService implements GroupCoordinator {
+         throwIfNotActive();
+         Objects.requireNonNull(delta, "delta must be provided");
+         Objects.requireNonNull(newImage, "newImage must be provided");
+-
+-        // Update the metadata image and propagate to runtime.
+         var wrappedImage = new KRaftCoordinatorMetadataImage(newImage);
+         var wrappedDelta = new KRaftCoordinatorMetadataDelta(delta);
+         metadataImage = wrappedImage;
+         runtime.onMetadataUpdate(wrappedDelta, wrappedImage);
+-
+-        // Handle partition deletions from the delta.
+-        if (delta.topicsDelta() != null && !delta.topicsDelta().deletedTopicIds().isEmpty()) {
+-            handlePartitionsDeletion(delta.topicsDelta());
+-        }
+-    }
+-
+-    /**
+-     * Handles the deletion of topic partitions by scheduling write operations
+-     * to delete committed offsets and clean up share group state.
+-     *
+-     * @param topicsDelta The topics delta containing deleted topic IDs.
+-     */
+-    private void handlePartitionsDeletion(TopicsDelta topicsDelta) {
+-        var topicPartitions = new ArrayList<TopicPartition>();
+-        var topicIds = topicsDelta.deletedTopicIds();
+-
+-        topicIds.forEach(topicId -> {
+-            var topicImage = topicsDelta.image().getTopic(topicId);
+-            if (topicImage != null) {
+-                topicImage.partitions().keySet().forEach(partitionId ->
+-                    topicPartitions.add(new TopicPartition(topicImage.name(), partitionId))
+-                );
+-            }
+-        });
+-
+-        var futures = new ArrayList<CompletableFuture<Void>>();
+-
+-        if (!topicPartitions.isEmpty()) {
+-            // Schedule offset deletion.
+-            futures.addAll(
+-                FutureUtils.mapExceptionally(
+-                    runtime.scheduleWriteAllOperation(
+-                        "on-partition-deleted",
+-                        Duration.ofMillis(config.offsetCommitTimeoutMs()),
+-                        coordinator -> coordinator.onPartitionsDeleted(topicPartitions)
+-                    ),
+-                    exception -> {
+-                        log.error("Could not delete offsets for deleted partitions {} due to: {}.",
+-                            topicPartitions, exception.getMessage(), exception);
+-                        return null;
+-                    }
+-                )
+-            );
+-        }
+-
+-        if (!topicIds.isEmpty()) {
+-            // Schedule share group state cleanup.
+-            futures.addAll(
+-                FutureUtils.mapExceptionally(
+-                    runtime.scheduleWriteAllOperation(
+-                        "maybe-cleanup-share-group-state",
+-                        Duration.ofMillis(config.offsetCommitTimeoutMs()),
+-                        coordinator -> coordinator.maybeCleanupShareGroupState(topicIds)
+-                    ),
+-                    exception -> {
+-                        log.error("Unable to cleanup state for the deleted topics {}", topicIds, exception);
+-                        return null;
+-                    }
+-                )
+-            );
+-        }
+-
+-        // Wait for all operations to complete.
+-        CompletableFuture.allOf(futures.toArray(new CompletableFuture<?>[0])).join();
+     }
+ 
+     /**

@@ -1,0 +1,171 @@
+diff --git a/docs/src/main/asciidoc/rest.adoc b/docs/src/main/asciidoc/rest.adoc
+index 7967fb8452b..66499d88099 100644
+--- a/docs/src/main/asciidoc/rest.adoc
++++ b/docs/src/main/asciidoc/rest.adoc
+@@ -1465,14 +1465,14 @@ There are situations where various Jackson related exceptions need to handled in
+ This becomes a problem when taking JAX-RS / Jakarta REST rules into account, because the exception mapper `ExceptionMapper` for `MismatchedInputException` would be used instead of the user provide
+ `ExceptionMapper` for `JsonMappingException` (as `MismatchedInputException` is a subtype of `JsonMappingException`).
+ 
+-One solution for this case is to configure the following:
++To handle this, you can disable the built-in exception mapper:
+ 
+ [source,properties]
+ ----
+-quarkus.class-loading.removed-resources."io.quarkus\:quarkus-rest-jackson"=io/quarkus/resteasy/reactive/jackson/runtime/mappers/BuiltinMismatchedInputExceptionMapper.class
++quarkus.rest.exception-mapping.disable-mapper-for=io.quarkus.resteasy.reactive.jackson.runtime.mappers.BuiltinMismatchedInputExceptionMapper
+ ----
+ 
+-which essentially makes Quarkus ignore the `ExceptionMapper` for `MismatchedInputException` completely.
++This allows your custom `ExceptionMapper` for `JsonMappingException` to handle all its subclasses, including `MismatchedInputException`.
+ ====
+ 
+ [[secure-serialization]]
+diff --git a/extensions/resteasy-reactive/rest-common/runtime/src/main/java/io/quarkus/resteasy/reactive/common/runtime/ResteasyReactiveConfig.java b/extensions/resteasy-reactive/rest-common/runtime/src/main/java/io/quarkus/resteasy/reactive/common/runtime/ResteasyReactiveConfig.java
+index 94db6a36c9b..cbff8c36f92 100644
+--- a/extensions/resteasy-reactive/rest-common/runtime/src/main/java/io/quarkus/resteasy/reactive/common/runtime/ResteasyReactiveConfig.java
++++ b/extensions/resteasy-reactive/rest-common/runtime/src/main/java/io/quarkus/resteasy/reactive/common/runtime/ResteasyReactiveConfig.java
+@@ -1,5 +1,8 @@
+ package io.quarkus.resteasy.reactive.common.runtime;
+ 
++import java.util.List;
++import java.util.Optional;
++
+ import io.quarkus.runtime.annotations.ConfigPhase;
+ import io.quarkus.runtime.annotations.ConfigRoot;
+ import io.quarkus.runtime.configuration.MemorySize;
+@@ -11,6 +14,11 @@
+ @ConfigRoot(phase = ConfigPhase.BUILD_AND_RUN_TIME_FIXED)
+ public interface ResteasyReactiveConfig {
+ 
++    /**
++     * Exception mapping configuration.
++     */
++    ExceptionMappingConfig exceptionMapping();
++
+     /**
+      * The amount of memory that can be used to buffer input before switching to
+      * blocking IO, up to {@code Long.MAX_VALUE} bytes.
+@@ -81,4 +89,15 @@ public interface ResteasyReactiveConfig {
+      */
+     @WithDefault("true")
+     boolean removesTrailingSlash();
++
++    /**
++     * Configuration for exception mapping.
++     */
++    interface ExceptionMappingConfig {
++        /**
++         * A list of exception mapper classes that should be disabled.
++         * This allows users to override the default built-in exception mappers provided by Quarkus extensions.
++         */
++        Optional<List<String>> disableMapperFor();
++    }
+ }
+diff --git a/extensions/resteasy-reactive/rest/deployment/src/main/java/io/quarkus/resteasy/reactive/server/deployment/ResteasyReactiveScanningProcessor.java b/extensions/resteasy-reactive/rest/deployment/src/main/java/io/quarkus/resteasy/reactive/server/deployment/ResteasyReactiveScanningProcessor.java
+index ef7923b16eb..a36a63a30c6 100644
+--- a/extensions/resteasy-reactive/rest/deployment/src/main/java/io/quarkus/resteasy/reactive/server/deployment/ResteasyReactiveScanningProcessor.java
++++ b/extensions/resteasy-reactive/rest/deployment/src/main/java/io/quarkus/resteasy/reactive/server/deployment/ResteasyReactiveScanningProcessor.java
+@@ -65,6 +65,7 @@
+ import io.quarkus.resteasy.reactive.common.deployment.ApplicationResultBuildItem;
+ import io.quarkus.resteasy.reactive.common.deployment.ResourceInterceptorsContributorBuildItem;
+ import io.quarkus.resteasy.reactive.common.deployment.ResourceScanningResultBuildItem;
++import io.quarkus.resteasy.reactive.common.runtime.ResteasyReactiveConfig;
+ import io.quarkus.resteasy.reactive.server.spi.MethodScannerBuildItem;
+ import io.quarkus.resteasy.reactive.server.spi.UnwrappedExceptionBuildItem;
+ import io.quarkus.resteasy.reactive.spi.ContainerRequestFilterBuildItem;
+@@ -189,11 +190,20 @@ public ExceptionMappersBuildItem scanForExceptionMappers(CombinedIndexBuildItem
+             BuildProducer<AdditionalBeanBuildItem> additionalBeanBuildItemBuildProducer,
+             BuildProducer<ReflectiveClassBuildItem> reflectiveClassBuildItemBuildProducer,
+             List<ExceptionMapperBuildItem> mappers, List<UnwrappedExceptionBuildItem> unwrappedExceptions,
+-            Capabilities capabilities) {
++            Capabilities capabilities,
++            ResteasyReactiveConfig config) {
+         AdditionalBeanBuildItem.Builder beanBuilder = AdditionalBeanBuildItem.builder().setUnremovable();
+         ExceptionMapping exceptions = ResteasyReactiveExceptionMappingScanner
+                 .scanForExceptionMappers(combinedIndexBuildItem.getComputingIndex(), applicationResultBuildItem.getResult());
+ 
++        if (config.exceptionMapping().disableMapperFor().isPresent()) {
++            for (String disabledMapper : config.exceptionMapping().disableMapperFor().get()) {
++                if (disabledMapper != null && !disabledMapper.isEmpty()) {
++                    exceptions.addDisabledMapper(disabledMapper);
++                }
++            }
++        }
++
+         exceptions.addBlockingProblem(BlockingOperationNotAllowedException.class);
+         exceptions.addBlockingProblem(BlockingNotAllowedException.class);
+         for (UnwrappedExceptionBuildItem bi : unwrappedExceptions) {
+diff --git a/independent-projects/resteasy-reactive/server/runtime/src/main/java/org/jboss/resteasy/reactive/server/core/ExceptionMapping.java b/independent-projects/resteasy-reactive/server/runtime/src/main/java/org/jboss/resteasy/reactive/server/core/ExceptionMapping.java
+index b300a0bf1c1..0970800b2f7 100644
+--- a/independent-projects/resteasy-reactive/server/runtime/src/main/java/org/jboss/resteasy/reactive/server/core/ExceptionMapping.java
++++ b/independent-projects/resteasy-reactive/server/runtime/src/main/java/org/jboss/resteasy/reactive/server/core/ExceptionMapping.java
+@@ -3,8 +3,10 @@
+ import java.util.ArrayList;
+ import java.util.Collections;
+ import java.util.HashMap;
++import java.util.HashSet;
+ import java.util.List;
+ import java.util.Map;
++import java.util.Set;
+ import java.util.function.Function;
+ import java.util.function.Predicate;
+ import java.util.function.Supplier;
+@@ -31,6 +33,11 @@ public class ExceptionMapping {
+     // this is going to be used when there are mappers that are removable at runtime
+     final Map<String, List<ResourceExceptionMapper<? extends Throwable>>> runtimeCheckMappers = new HashMap<>();
+ 
++    /**
++     * Exception mapper class names that should be disabled.
++     */
++    final Set<String> disabledMappers = new HashSet<>();
++
+     /**
+      * Exceptions that indicate an blocking operation was performed on an IO thread.
+      * <p>
+@@ -126,9 +133,17 @@ public Map<String, List<ResourceExceptionMapper<? extends Throwable>>> getRuntim
+         return runtimeCheckMappers;
+     }
+ 
++    public Set<String> getDisabledMappers() {
++        return disabledMappers;
++    }
++
++    public void addDisabledMapper(String mapperClassName) {
++        disabledMappers.add(mapperClassName);
++    }
++
+     public Map<String, ResourceExceptionMapper<? extends Throwable>> effectiveMappers() {
+         if (runtimeCheckMappers.isEmpty()) {
+-            return mappers;
++            return filterDisabledMappers(mappers);
+         }
+         Map<String, ResourceExceptionMapper<? extends Throwable>> result = new HashMap<>();
+         for (var entry : runtimeCheckMappers.entrySet()) {
+@@ -147,6 +162,20 @@ public Map<String, ResourceExceptionMapper<? extends Throwable>> effectiveMapper
+             }
+         }
+         result.putAll(mappers);
++        return filterDisabledMappers(result);
++    }
++
++    private Map<String, ResourceExceptionMapper<? extends Throwable>> filterDisabledMappers(
++            Map<String, ResourceExceptionMapper<? extends Throwable>> mappers) {
++        if (disabledMappers.isEmpty()) {
++            return mappers;
++        }
++        Map<String, ResourceExceptionMapper<? extends Throwable>> result = new HashMap<>();
++        for (Map.Entry<String, ResourceExceptionMapper<? extends Throwable>> entry : mappers.entrySet()) {
++            if (!disabledMappers.contains(entry.getValue().getClassName())) {
++                result.put(entry.getKey(), entry.getValue());
++            }
++        }
+         return result;
+     }
+ 
+diff --git a/test-framework/junit5/src/main/resources/META-INF/services/org.junit.platform.launcher.TestExecutionListener b/test-framework/junit5/src/main/resources/META-INF/services/org.junit.platform.launcher.TestExecutionListener
+index ee90026f68b..364aa0dd9cf 100644
+--- a/test-framework/junit5/src/main/resources/META-INF/services/org.junit.platform.launcher.TestExecutionListener
++++ b/test-framework/junit5/src/main/resources/META-INF/services/org.junit.platform.launcher.TestExecutionListener
+@@ -1,2 +1 @@
+ io.quarkus.test.junit.launcher.ExecutionListener
+-io.quarkus.test.junit.launcher.CustomLauncherInterceptor

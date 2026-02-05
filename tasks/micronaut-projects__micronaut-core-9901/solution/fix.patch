@@ -1,0 +1,130 @@
+diff --git a/context/src/main/java/io/micronaut/scheduling/processor/ScheduledMethodProcessor.java b/context/src/main/java/io/micronaut/scheduling/processor/ScheduledMethodProcessor.java
+index dba29045a5..5e576074fe 100644
+--- a/context/src/main/java/io/micronaut/scheduling/processor/ScheduledMethodProcessor.java
++++ b/context/src/main/java/io/micronaut/scheduling/processor/ScheduledMethodProcessor.java
+@@ -93,7 +93,6 @@ public class ScheduledMethodProcessor implements ExecutableMethodProcessor<Sched
+         if (!(beanContext instanceof ApplicationContext)) {
+             return;
+         }
+-
+         List<AnnotationValue<Scheduled>> scheduledAnnotations = method.getAnnotationValuesByType(Scheduled.class);
+         for (AnnotationValue<Scheduled> scheduledAnnotation : scheduledAnnotations) {
+             String fixedRate = scheduledAnnotation.stringValue(MEMBER_FIXED_RATE).orElse(null);
+diff --git a/core-processor/src/main/java/io/micronaut/aop/writer/AopProxyWriter.java b/core-processor/src/main/java/io/micronaut/aop/writer/AopProxyWriter.java
+index 74e79fa9f5..b128597b9b 100644
+--- a/core-processor/src/main/java/io/micronaut/aop/writer/AopProxyWriter.java
++++ b/core-processor/src/main/java/io/micronaut/aop/writer/AopProxyWriter.java
+@@ -1337,7 +1337,7 @@ public class AopProxyWriter extends AbstractClassFileWriter implements ProxyingB
+ 
+     @Override
+     public boolean requiresMethodProcessing() {
+-        return proxyBeanDefinitionWriter.requiresMethodProcessing();
++        return proxyBeanDefinitionWriter.requiresMethodProcessing() || (parentWriter != null && parentWriter.requiresMethodProcessing());
+     }
+ 
+     @Override
+diff --git a/inject-groovy/build.gradle b/inject-groovy/build.gradle
+index 0edc236dab..774f5d66fa 100644
+--- a/inject-groovy/build.gradle
++++ b/inject-groovy/build.gradle
+@@ -20,6 +20,7 @@ dependencies {
+     testRuntimeOnly libs.jakarta.el
+     testImplementation project(":http-server-netty")
+     testImplementation project(":http-client")
++    testImplementation project(":retry")
+     testImplementation project(":jackson-databind")
+     testImplementation project(":inject-test-utils")
+     testImplementation project(":inject-groovy-test")
+diff --git a/inject/src/main/java/io/micronaut/context/DefaultBeanContext.java b/inject/src/main/java/io/micronaut/context/DefaultBeanContext.java
+index 784bb71c29..3e1d7cd378 100644
+--- a/inject/src/main/java/io/micronaut/context/DefaultBeanContext.java
++++ b/inject/src/main/java/io/micronaut/context/DefaultBeanContext.java
+@@ -3293,9 +3293,6 @@ public class DefaultBeanContext implements InitializableBeanContext {
+             if (beanDefinitionReference.isProxiedBean()) {
+                 beanDefinitionProducer.referenceEnabled = false;
+                 BeanDefinitionProducer proxyBeanProducer = new BeanDefinitionProducer(beanDefinitionReference);
+-                if (beanDefinitionReference.requiresMethodProcessing()) {
+-                    processedBeans.add(proxyBeanProducer);
+-                }
+                 // retain only if proxy target otherwise the target is never used
+                 if (beanDefinitionReference.isProxyTarget()) {
+                     proxyTargetBeans.add(proxyBeanProducer);
+diff --git a/management/src/main/java/io/micronaut/management/health/monitor/HealthMonitorTask.java b/management/src/main/java/io/micronaut/management/health/monitor/HealthMonitorTask.java
+index 0dbf946e15..2f120bf0ab 100644
+--- a/management/src/main/java/io/micronaut/management/health/monitor/HealthMonitorTask.java
++++ b/management/src/main/java/io/micronaut/management/health/monitor/HealthMonitorTask.java
+@@ -27,6 +27,8 @@ import io.micronaut.scheduling.annotation.Scheduled;
+ import jakarta.inject.Inject;
+ import jakarta.inject.Singleton;
+ import org.reactivestreams.Publisher;
++import org.reactivestreams.Subscriber;
++import org.reactivestreams.Subscription;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ import reactor.core.publisher.Flux;
+@@ -80,29 +82,51 @@ public class HealthMonitorTask {
+         if (LOG.isDebugEnabled()) {
+             LOG.debug("Starting health monitor check");
+         }
+-        List<Publisher<HealthResult>> resultPublishers = healthIndicators
++        List<Publisher<HealthResult>> healthResults = healthIndicators
+             .stream()
+             .map(HealthIndicator::getResult)
+             .collect(Collectors.toList());
+ 
+-        Flux
+-            .merge(resultPublishers)
+-            .collectList()
+-            .doOnError((e) -> {
++        Flux<HealthResult> reactiveSequence = Flux
++            .merge(healthResults)
++            .filter(healthResult -> {
++                    HealthStatus status = healthResult.getStatus();
++                    return status.equals(HealthStatus.DOWN) || !status.getOperational().orElse(true);
++                }
++            );
++
++        reactiveSequence.next().subscribe(new Subscriber<HealthResult>() {
++            @Override
++            public void onSubscribe(Subscription s) {
++
++            }
++
++            @Override
++            public void onNext(HealthResult healthResult) {
++                HealthStatus status = healthResult.getStatus();
++                if (LOG.isDebugEnabled()) {
++                    LOG.debug("Health monitor check with status {}", status);
++                }
++                currentHealthStatus.update(status);
++            }
++
++            @Override
++            public void onError(Throwable e) {
+                 if (LOG.isErrorEnabled()) {
+                     LOG.error("Health monitor check failed with exception: " + e.getMessage(), e);
+                 }
++
+                 currentHealthStatus.update(HealthStatus.DOWN.describe("Error occurred running health check: " + e.getMessage()));
+-            })
+-            .subscribe(healthResults -> {
+-                java.util.Optional<HealthResult> firstDown = healthResults.stream().filter(r -> r.getStatus().equals(io.micronaut.health.HealthStatus.DOWN) || !r.getStatus().getOperational().orElse(true))
+-                    .findFirst();
+-                if (firstDown.isPresent()) {
+-                    currentHealthStatus.update(firstDown.get().getStatus());
+-                } else {
+-                    currentHealthStatus.update(HealthStatus.UP);
++            }
++
++            @Override
++            public void onComplete() {
++                if (LOG.isDebugEnabled()) {
++                    LOG.debug("Health monitor check passed.");
+                 }
+-            });
+ 
++                currentHealthStatus.update(HealthStatus.UP);
++            }
++        });
+     }
+ }

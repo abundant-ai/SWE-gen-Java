@@ -1,0 +1,561 @@
+diff --git a/mockwebserver/api/mockwebserver3.api b/mockwebserver/api/mockwebserver3.api
+index ff41ce1f9..1b1d76c0b 100644
+--- a/mockwebserver/api/mockwebserver3.api
++++ b/mockwebserver/api/mockwebserver3.api
+@@ -16,7 +16,7 @@ public final class mockwebserver3/MockResponse {
+ 	public fun <init> (ILokhttp3/Headers;Ljava/lang/String;ZLmockwebserver3/SocketPolicy;I)V
+ 	public synthetic fun <init> (ILokhttp3/Headers;Ljava/lang/String;ZLmockwebserver3/SocketPolicy;IILkotlin/jvm/internal/DefaultConstructorMarker;)V
+ 	public synthetic fun <init> (Lmockwebserver3/MockResponse$Builder;Lkotlin/jvm/internal/DefaultConstructorMarker;)V
+-	public final fun getBody ()Lokio/Buffer;
++	public final fun getBody ()Lmockwebserver3/MockResponseBody;
+ 	public final fun getBodyDelayNanos ()J
+ 	public final fun getCode ()I
+ 	public final fun getDuplexResponseBody ()Lmockwebserver3/internal/duplex/DuplexResponseBody;
+@@ -58,6 +58,7 @@ public final class mockwebserver3/MockResponse$Builder : java/lang/Cloneable {
+ 	public synthetic fun clone ()Ljava/lang/Object;
+ 	public fun clone ()Lmockwebserver3/MockResponse$Builder;
+ 	public final fun code (I)Lmockwebserver3/MockResponse$Builder;
++	public final fun getBody ()Lmockwebserver3/MockResponseBody;
+ 	public final fun getCode ()I
+ 	public final fun getDuplexResponseBody ()Lmockwebserver3/internal/duplex/DuplexResponseBody;
+ 	public final fun getHttp2ErrorCode ()I
+@@ -74,6 +75,7 @@ public final class mockwebserver3/MockResponse$Builder : java/lang/Cloneable {
+ 	public final fun http2ErrorCode (I)Lmockwebserver3/MockResponse$Builder;
+ 	public final fun inTunnel ()Lmockwebserver3/MockResponse$Builder;
+ 	public final fun removeHeader (Ljava/lang/String;)Lmockwebserver3/MockResponse$Builder;
++	public final fun setBody (Lmockwebserver3/MockResponseBody;)V
+ 	public final fun setCode (I)V
+ 	public final fun setHeader (Ljava/lang/String;Ljava/lang/Object;)Lmockwebserver3/MockResponse$Builder;
+ 	public final fun setHttp2ErrorCode (I)V
+@@ -90,6 +92,11 @@ public final class mockwebserver3/MockResponse$Builder : java/lang/Cloneable {
+ public final class mockwebserver3/MockResponse$Companion {
+ }
+ 
++public abstract interface class mockwebserver3/MockResponseBody {
++	public abstract fun getContentLength ()J
++	public abstract fun writeTo (Lokio/BufferedSink;)V
++}
++
+ public final class mockwebserver3/MockWebServer : java/io/Closeable {
+ 	public static final field Companion Lmockwebserver3/MockWebServer$Companion;
+ 	public fun <init> ()V
+diff --git a/mockwebserver/src/main/kotlin/mockwebserver3/MockResponse.kt b/mockwebserver/src/main/kotlin/mockwebserver3/MockResponse.kt
+index da7c2f240..91ed9785c 100644
+--- a/mockwebserver/src/main/kotlin/mockwebserver3/MockResponse.kt
++++ b/mockwebserver/src/main/kotlin/mockwebserver3/MockResponse.kt
+@@ -17,6 +17,7 @@ package mockwebserver3
+ 
+ import java.util.concurrent.TimeUnit
+ import mockwebserver3.internal.duplex.DuplexResponseBody
++import mockwebserver3.internal.toMockResponseBody
+ import okhttp3.Headers
+ import okhttp3.Headers.Companion.headersOf
+ import okhttp3.WebSocketListener
+@@ -47,8 +48,7 @@ class MockResponse {
+   val headers: Headers
+   val trailers: Headers
+ 
+-  val body: Buffer?
+-    get() { return field?.clone() }
++  val body: MockResponseBody?
+ 
+   val inTunnel: Boolean
+   val informationalResponses: List<MockResponse>
+@@ -101,7 +101,7 @@ class MockResponse {
+     this.status = builder.status
+     this.headers = builder.headers.build()
+     this.trailers = builder.trailers.build()
+-    this.body = builder.body?.clone()
++    this.body = builder.body
+     this.inTunnel = builder.inTunnel
+     this.informationalResponses = builder.informationalResponses.toList()
+     this.throttleBytesPerPeriod = builder.throttleBytesPerPeriod
+@@ -152,7 +152,7 @@ class MockResponse {
+ 
+     internal var trailers: Headers.Builder
+ 
+-    internal var body: Buffer?
++    var body: MockResponseBody?
+ 
+     var throttleBytesPerPeriod: Long
+       private set
+@@ -271,7 +271,7 @@ class MockResponse {
+ 
+     fun body(body: Buffer) = apply {
+       setHeader("Content-Length", body.size)
+-      this.body = body.clone() // Defensive copy.
++      this.body = body.toMockResponseBody()
+     }
+ 
+     /** Sets the response body to the UTF-8 encoded bytes of [body]. */
+@@ -297,7 +297,7 @@ class MockResponse {
+         bytesOut.writeUtf8("\r\n")
+       }
+       bytesOut.writeUtf8("0\r\n") // Last chunk. Trailers follow!
+-      this.body = bytesOut
++      this.body = bytesOut.toMockResponseBody()
+     }
+ 
+     /**
+diff --git a/mockwebserver/src/main/kotlin/mockwebserver3/MockResponseBody.kt b/mockwebserver/src/main/kotlin/mockwebserver3/MockResponseBody.kt
+new file mode 100644
+index 000000000..2d0c1b2b3
+--- /dev/null
++++ b/mockwebserver/src/main/kotlin/mockwebserver3/MockResponseBody.kt
+@@ -0,0 +1,34 @@
++/*
++ * Copyright (c) 2022 Block, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ *
++ */
++package mockwebserver3
++
++import java.io.IOException
++import okio.BufferedSink
++
++/**
++ * The body of a [MockResponse].
++ *
++ * Unlike [okhttp3.ResponseBody], this interface is designed to be implemented by writers and not
++ * called by readers.
++ */
++interface MockResponseBody {
++  /** The length of this response in bytes, or -1 if unknown. */
++  val contentLength: Long
++
++  @Throws(IOException::class)
++  fun writeTo(sink: BufferedSink)
++}
+diff --git a/mockwebserver/src/main/kotlin/mockwebserver3/MockWebServer.kt b/mockwebserver/src/main/kotlin/mockwebserver3/MockWebServer.kt
+index a6c5fdb17..652f7904b 100644
+--- a/mockwebserver/src/main/kotlin/mockwebserver3/MockWebServer.kt
++++ b/mockwebserver/src/main/kotlin/mockwebserver3/MockWebServer.kt
+@@ -58,7 +58,10 @@ import mockwebserver3.SocketPolicy.SHUTDOWN_INPUT_AT_END
+ import mockwebserver3.SocketPolicy.SHUTDOWN_OUTPUT_AT_END
+ import mockwebserver3.SocketPolicy.SHUTDOWN_SERVER_AFTER_RESPONSE
+ import mockwebserver3.SocketPolicy.STALL_SOCKET_AT_START
++import mockwebserver3.internal.ThrottledSink
++import mockwebserver3.internal.TriggerSink
+ import mockwebserver3.internal.duplex.DuplexResponseBody
++import mockwebserver3.internal.sleepNanos
+ import okhttp3.Headers
+ import okhttp3.Headers.Companion.headersOf
+ import okhttp3.HttpUrl
+@@ -672,29 +675,38 @@ class MockWebServer : Closeable {
+ 
+       var hasBody = false
+       val policy = dispatcher.peek()
+-      if (policy.socketPolicy == DO_NOT_READ_REQUEST_BODY) {
+-        // Ignore the body completely.
+-      } else if (contentLength != -1L) {
+-        hasBody = contentLength > 0L
+-        throttledTransfer(policy, socket, source, requestBody.buffer(), contentLength, true)
+-      } else if (chunked) {
+-        hasBody = true
+-        while (true) {
+-          val chunkSize = source.readUtf8LineStrict().trim().toInt(16)
+-          if (chunkSize == 0) {
+-            readEmptyLine(source)
+-            break
++      val requestBodySink = requestBody.withThrottlingAndSocketPolicy(
++        policy = policy,
++        disconnectHalfway = policy.socketPolicy == DISCONNECT_DURING_REQUEST_BODY,
++        expectedByteCount = contentLength,
++        socket = socket,
++      ).buffer()
++      requestBodySink.use {
++        when {
++          policy.socketPolicy == DO_NOT_READ_REQUEST_BODY -> {
++            // Ignore the body completely.
+           }
+-          chunkSizes.add(chunkSize)
+-          throttledTransfer(
+-            policy = policy,
+-            socket = socket,
+-            source = source,
+-            sink = requestBody.buffer(),
+-            byteCount = chunkSize.toLong(),
+-            isRequest = true
+-          )
+-          readEmptyLine(source)
++
++          contentLength != -1L -> {
++            hasBody = contentLength > 0L
++            requestBodySink.write(source, contentLength)
++          }
++
++          chunked -> {
++            hasBody = true
++            while (true) {
++              val chunkSize = source.readUtf8LineStrict().trim().toInt(16)
++              if (chunkSize == 0) {
++                readEmptyLine(source)
++                break
++              }
++              chunkSizes.add(chunkSize)
++              requestBodySink.write(source, chunkSize.toLong())
++              readEmptyLine(source)
++            }
++          }
++
++          else -> Unit // No request body.
+         }
+       }
+ 
+@@ -785,7 +797,14 @@ class MockWebServer : Closeable {
+ 
+     val body = response.body ?: return
+     sleepNanos(response.bodyDelayNanos)
+-    throttledTransfer(response, socket, body, sink, body.size, false)
++    val responseBodySink = sink.withThrottlingAndSocketPolicy(
++      policy = response,
++      disconnectHalfway = response.socketPolicy == DISCONNECT_DURING_RESPONSE_BODY,
++      expectedByteCount = body.contentLength,
++      socket = socket,
++    ).buffer()
++    body.writeTo(responseBodySink)
++    responseBodySink.emit()
+ 
+     if ("chunked".equals(response.headers["Transfer-Encoding"], ignoreCase = true)) {
+       writeHeaders(sink, response.trailers)
+@@ -804,69 +823,38 @@ class MockWebServer : Closeable {
+     sink.flush()
+   }
+ 
+-  private fun sleepNanos(nanos: Long) {
+-    val ms = nanos / 1_000_000L
+-    val ns = nanos - (ms * 1_000_000L)
+-    if (ms > 0L || nanos > 0) {
+-      Thread.sleep(ms, ns.toInt())
+-    }
+-  }
+-
+-  /**
+-   * Transfer bytes from [source] to [sink] until either [byteCount] bytes have
+-   * been transferred or [source] is exhausted. The transfer is throttled according to [policy].
+-   */
+-  @Throws(IOException::class)
+-  private fun throttledTransfer(
++  /** Returns a sink that applies throttling and disconnecting. */
++  private fun Sink.withThrottlingAndSocketPolicy(
+     policy: MockResponse,
++    disconnectHalfway: Boolean,
++    expectedByteCount: Long,
+     socket: Socket,
+-    source: BufferedSource,
+-    sink: BufferedSink,
+-    byteCount: Long,
+-    isRequest: Boolean
+-  ) {
+-    var byteCountNum = byteCount
+-    if (byteCountNum == 0L) return
+-
+-    val buffer = Buffer()
+-    val bytesPerPeriod = policy.throttleBytesPerPeriod
+-    val periodDelayNanos = policy.throttlePeriodNanos
+-
+-    val halfByteCount = byteCountNum / 2
+-    val disconnectHalfway = if (isRequest) {
+-      policy.socketPolicy === DISCONNECT_DURING_REQUEST_BODY
+-    } else {
+-      policy.socketPolicy === DISCONNECT_DURING_RESPONSE_BODY
++  ): Sink {
++    var result: Sink = this
++
++    if (policy.throttlePeriodNanos > 0L) {
++      result = ThrottledSink(
++        delegate = result,
++        bytesPerPeriod = policy.throttleBytesPerPeriod,
++        periodDelayNanos = policy.throttlePeriodNanos,
++      )
+     }
+ 
+-    while (!socket.isClosed) {
+-      var b = 0L
+-      while (b < bytesPerPeriod) {
+-        // Ensure we do not read past the allotted bytes in this period.
+-        var toRead = minOf(byteCountNum, bytesPerPeriod - b)
+-        // Ensure we do not read past halfway if the policy will kill the connection.
+-        if (disconnectHalfway) {
+-          toRead = minOf(toRead, byteCountNum - halfByteCount)
+-        }
+-
+-        val read = source.read(buffer, toRead)
+-        if (read == -1L) return
+-
+-        sink.write(buffer, read)
+-        sink.flush()
+-        b += read
+-        byteCountNum -= read
+-
+-        if (disconnectHalfway && byteCountNum == halfByteCount) {
+-          socket.close()
+-          return
+-        }
+-
+-        if (byteCountNum == 0L) return
++    if (disconnectHalfway) {
++      val halfwayByteCount = when {
++        expectedByteCount != -1L -> expectedByteCount / 2
++        else -> 0L
++      }
++      result = TriggerSink(
++        delegate = result,
++        triggerByteCount = halfwayByteCount,
++      ) {
++        result.flush()
++        socket.close()
+       }
+-
+-      sleepNanos(periodDelayNanos)
+     }
++
++    return result
+   }
+ 
+   @Throws(IOException::class)
+@@ -998,18 +986,18 @@ class MockWebServer : Closeable {
+       val body = Buffer()
+       val requestLine = "$method $path HTTP/1.1"
+       var exception: IOException? = null
+-      if (readBody && !peek.isDuplex && peek.socketPolicy !== DO_NOT_READ_REQUEST_BODY) {
++      if (readBody && !peek.isDuplex && peek.socketPolicy != DO_NOT_READ_REQUEST_BODY) {
+         try {
+           val contentLengthString = headers["content-length"]
+-          val byteCount = contentLengthString?.toLong() ?: Long.MAX_VALUE
+-          throttledTransfer(
++          val requestBodySink = body.withThrottlingAndSocketPolicy(
+             policy = peek,
++            disconnectHalfway = peek.socketPolicy == DISCONNECT_DURING_REQUEST_BODY,
++            expectedByteCount = contentLengthString?.toLong() ?: Long.MAX_VALUE,
+             socket = socket,
+-            source = stream.getSource().buffer(),
+-            sink = body,
+-            byteCount = byteCount,
+-            isRequest = true
+-          )
++          ).buffer()
++          requestBodySink.use {
++            it.writeAll(stream.getSource())
++          }
+         } catch (e: IOException) {
+           exception = e
+         }
+@@ -1068,9 +1056,15 @@ class MockWebServer : Closeable {
+       }
+       pushPromises(stream, request, response.pushPromises)
+       if (body != null) {
+-        stream.getSink().buffer().use { sink ->
+-          sleepNanos(bodyDelayNanos)
+-          throttledTransfer(response, socket, body, sink, body.size, false)
++        sleepNanos(bodyDelayNanos)
++        val responseBodySink = stream.getSink().withThrottlingAndSocketPolicy(
++          policy = response,
++          disconnectHalfway = response.socketPolicy == DISCONNECT_DURING_RESPONSE_BODY,
++          expectedByteCount = body.contentLength,
++          socket = socket
++        ).buffer()
++        responseBodySink.use {
++          body.writeTo(responseBodySink)
+         }
+       } else if (response.isDuplex) {
+         val duplexResponseBody = response.duplexResponseBody!!
+diff --git a/mockwebserver/src/main/kotlin/mockwebserver3/internal/ThrottledSink.kt b/mockwebserver/src/main/kotlin/mockwebserver3/internal/ThrottledSink.kt
+new file mode 100644
+index 000000000..f75bf7761
+--- /dev/null
++++ b/mockwebserver/src/main/kotlin/mockwebserver3/internal/ThrottledSink.kt
+@@ -0,0 +1,48 @@
++/*
++ * Copyright (c) 2022 Block, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ *
++ */
++package mockwebserver3.internal
++
++import okio.Buffer
++import okio.Sink
++
++/**
++ * A sink that sleeps [periodDelayNanos] every [bytesPerPeriod] bytes. Unlike [okio.Throttler],
++ * this permits any interval to be used.
++ */
++internal class ThrottledSink(
++  private val delegate: Sink,
++  private val bytesPerPeriod: Long,
++  private val periodDelayNanos: Long,
++) : Sink by delegate {
++  private var bytesWrittenSinceLastDelay = 0L
++  override fun write(source: Buffer, byteCount: Long) {
++    var bytesLeft = byteCount
++
++    while (bytesLeft > 0) {
++      if (bytesWrittenSinceLastDelay == bytesPerPeriod) {
++        flush()
++        sleepNanos(periodDelayNanos)
++        bytesWrittenSinceLastDelay = 0
++      }
++
++      val toWrite = minOf(bytesLeft, bytesPerPeriod - bytesWrittenSinceLastDelay)
++      bytesWrittenSinceLastDelay += toWrite
++      bytesLeft -= toWrite
++      delegate.write(source, toWrite)
++    }
++  }
++}
+diff --git a/mockwebserver/src/main/kotlin/mockwebserver3/internal/TriggerSink.kt b/mockwebserver/src/main/kotlin/mockwebserver3/internal/TriggerSink.kt
+new file mode 100644
+index 000000000..4de875525
+--- /dev/null
++++ b/mockwebserver/src/main/kotlin/mockwebserver3/internal/TriggerSink.kt
+@@ -0,0 +1,52 @@
++/*
++ * Copyright (c) 2022 Block, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ *
++ */
++package mockwebserver3.internal
++
++import okio.Buffer
++import okio.Sink
++
++/**
++ * A sink that executes [trigger] after [triggerByteCount] bytes are written, and then skips all
++ * subsequent bytes.
++ */
++internal class TriggerSink(
++  private val delegate: Sink,
++  private val triggerByteCount: Long,
++  private val trigger: () -> Unit,
++) : Sink by delegate {
++  private var bytesWritten = 0L
++
++  override fun write(source: Buffer, byteCount: Long) {
++    if (byteCount == 0L) return // Avoid double-triggering.
++
++    if (bytesWritten == triggerByteCount) {
++      source.skip(byteCount)
++      return
++    }
++
++    val toWrite = minOf(byteCount, triggerByteCount - bytesWritten)
++    bytesWritten += toWrite
++
++    delegate.write(source, toWrite)
++
++    if (bytesWritten == triggerByteCount) {
++      trigger()
++    }
++
++    source.skip(byteCount - toWrite)
++  }
++}
+diff --git a/mockwebserver/src/main/kotlin/mockwebserver3/internal/mockResponseBodies.kt b/mockwebserver/src/main/kotlin/mockwebserver3/internal/mockResponseBodies.kt
+new file mode 100644
+index 000000000..6c1a7cd5f
+--- /dev/null
++++ b/mockwebserver/src/main/kotlin/mockwebserver3/internal/mockResponseBodies.kt
+@@ -0,0 +1,39 @@
++/*
++ * Copyright (c) 2022 Block, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ *
++ */
++@file:JvmName("MockResponseBodiesKt")
++
++package mockwebserver3.internal
++
++import mockwebserver3.MockResponseBody
++import okio.Buffer
++import okio.BufferedSink
++
++internal fun Buffer.toMockResponseBody(): MockResponseBody {
++  val defensiveCopy = clone()
++  return BufferMockResponseBody(defensiveCopy)
++}
++
++internal class BufferMockResponseBody(
++  val buffer: Buffer,
++) : MockResponseBody {
++  override val contentLength = buffer.size
++
++  override fun writeTo(sink: BufferedSink) {
++    buffer.copyTo(sink.buffer)
++    sink.emitCompleteSegments()
++  }
++}
+diff --git a/mockwebserver/src/main/kotlin/mockwebserver3/internal/sleep.kt b/mockwebserver/src/main/kotlin/mockwebserver3/internal/sleep.kt
+new file mode 100644
+index 000000000..059d7bc2e
+--- /dev/null
++++ b/mockwebserver/src/main/kotlin/mockwebserver3/internal/sleep.kt
+@@ -0,0 +1,25 @@
++/*
++ * Copyright (c) 2022 Block, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ *
++ */
++package mockwebserver3.internal
++
++internal fun sleepNanos(nanos: Long) {
++  val ms = nanos / 1_000_000L
++  val ns = nanos - (ms * 1_000_000L)
++  if (ms > 0L || nanos > 0) {
++    Thread.sleep(ms, ns.toInt())
++  }
++}

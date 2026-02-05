@@ -1,0 +1,1446 @@
+diff --git a/bom/application/pom.xml b/bom/application/pom.xml
+index 9ee70e0d542..c5a3c66bfee 100644
+--- a/bom/application/pom.xml
++++ b/bom/application/pom.xml
+@@ -56,7 +56,7 @@
+         <smallrye-reactive-streams-operators.version>1.0.13</smallrye-reactive-streams-operators.version>
+         <smallrye-reactive-types-converter.version>3.0.3</smallrye-reactive-types-converter.version>
+         <smallrye-mutiny-vertx-binding.version>3.21.3</smallrye-mutiny-vertx-binding.version>
+-        <smallrye-reactive-messaging.version>4.32.0</smallrye-reactive-messaging.version>
++        <smallrye-reactive-messaging.version>4.31.0</smallrye-reactive-messaging.version>
+         <smallrye-stork.version>2.7.3</smallrye-stork.version>
+         <jakarta.activation.version>2.1.4</jakarta.activation.version>
+         <jakarta.annotation-api.version>3.0.0</jakarta.annotation-api.version>
+@@ -166,7 +166,7 @@
+         <osgi.version>6.0.0</osgi.version>
+         <mongo-client.version>5.6.2</mongo-client.version>
+         <proton-j.version>0.34.1</proton-j.version>
+-        <javaparser.version>3.28.0</javaparser.version>
++        <javaparser.version>3.27.1</javaparser.version>
+         <hibernate-quarkus-local-cache.version>0.5.0</hibernate-quarkus-local-cache.version>
+         <flapdoodle.mongo.version>4.22.0</flapdoodle.mongo.version>
+         <quarkus-spring-api.version>6.2.SP3</quarkus-spring-api.version>
+diff --git a/core/deployment/src/main/java/io/quarkus/deployment/builditem/DevServicesRegistryBuildItem.java b/core/deployment/src/main/java/io/quarkus/deployment/builditem/DevServicesRegistryBuildItem.java
+index 656d0d38ead..c01c2953e16 100644
+--- a/core/deployment/src/main/java/io/quarkus/deployment/builditem/DevServicesRegistryBuildItem.java
++++ b/core/deployment/src/main/java/io/quarkus/deployment/builditem/DevServicesRegistryBuildItem.java
+@@ -7,10 +7,7 @@
+ import java.util.Set;
+ import java.util.UUID;
+ import java.util.concurrent.CompletableFuture;
+-import java.util.concurrent.ConcurrentHashMap;
+-import java.util.function.BiConsumer;
+ import java.util.function.Consumer;
+-import java.util.function.Predicate;
+ import java.util.function.Supplier;
+ import java.util.stream.Collectors;
+ 
+@@ -86,25 +83,8 @@ public void startAll(Collection<DevServicesResultBuildItem> services,
+             List<DevServicesCustomizerBuildItem> customizers,
+             ClassLoader augmentClassLoader) {
+         closeRemainingRunningServices(services);
+-        Map<String, String> config = new ConcurrentHashMap<>();
+-        startSelectedServices(services, customizers, augmentClassLoader, dr -> !dr.hasDependencies(), config);
+-
+-        // Now start everything with a dependency
+-        // This won't handle the case where the dependencies also have dependencies, but that can be a follow-on work item if people ask for it
+-        // I think we could implement it by getting the actual dependencies and seeing if any of them are also in the list of things we're starting, and then recursing
+-        startSelectedServices(services, customizers, augmentClassLoader,
+-                DevServicesResultBuildItem::hasDependencies, config);
+-
+-    }
+-
+-    private void startSelectedServices(Collection<DevServicesResultBuildItem> services,
+-            List<DevServicesCustomizerBuildItem> customizers, ClassLoader augmentClassLoader,
+-            Predicate<? super DevServicesResultBuildItem> filter, Map<String, String> config) {
+-        // TODO Note that this does not handle chained dependencies; dependencies can only be one level deep for now
+-        // It would be easy to fix that, but let's wait until we need to
+         CompletableFuture.allOf(services.stream()
+                 .filter(DevServicesResultBuildItem::isStartable)
+-                .filter(filter)
+                 .map(serv -> CompletableFuture.runAsync(() -> {
+                     // We need to set the context classloader to the augment classloader, so that the dev services can be started with the right classloader
+                     if (augmentClassLoader != null) {
+@@ -112,28 +92,25 @@ private void startSelectedServices(Collection<DevServicesResultBuildItem> servic
+                     } else {
+                         Thread.currentThread().setContextClassLoader(serv.getClass().getClassLoader());
+                     }
+-                    this.start(serv, customizers, config);
++                    this.start(serv, customizers);
+                 }))
+                 .toArray(CompletableFuture[]::new)).join();
+     }
+ 
+-    public void start(DevServicesResultBuildItem request, List<DevServicesCustomizerBuildItem> customizers,
+-            Map<String, String> config) {
++    public void start(DevServicesResultBuildItem request, List<DevServicesCustomizerBuildItem> customizers) {
+         // RunningService class is loaded on parent classloader
+         RunningService matchedDevService = this.getRunningServices(request.getName(), request.getServiceName(),
+                 request.getServiceConfig());
+-
+         if (matchedDevService == null) {
+             // There isn't a running container that has the right config, we need to do work
+             // Let's get all the running dev services associated with this feature (+ launch mode plus named section), so we can close them
+             closeAllRunningServices(request.getName(), request.getServiceName());
+ 
+-            reallyStart(request, customizers, config);
++            reallyStart(request, customizers);
+         }
+     }
+ 
+-    private void reallyStart(DevServicesResultBuildItem request, List<DevServicesCustomizerBuildItem> customizers,
+-            Map<String, String> configs) {
++    private void reallyStart(DevServicesResultBuildItem request, List<DevServicesCustomizerBuildItem> customizers) {
+         StartupLogCompressor compressor = new StartupLogCompressor("Dev Services Startup", null, null);
+         try {
+             Supplier<Startable> startableSupplier = request.getStartableSupplier();
+@@ -145,64 +122,25 @@ private void reallyStart(DevServicesResultBuildItem request, List<DevServicesCus
+             for (DevServicesCustomizerBuildItem customizer : customizers) {
+                 startable = customizer.apply(request, startable);
+             }
++            startable.start();
+ 
+-            String missingDependency = null;
+-
+-            // The config from the new sources isn't easily available via ConfigProvider.getConfig(), so directly inject it into services which depend on it
+-            var dependencies = request.getDependencies();
+-            if (dependencies != null && !dependencies.isEmpty()) {
+-                for (DevServicesResultBuildItem.DevServiceConfigDependency<? extends Startable> dependency : dependencies) {
+-
+-                    var value = configs.get(dependency.requiredConfigKey());
+-                    if (value != null) {
+-                        ((BiConsumer<Startable, String>) dependency.valueInjector()).accept(startable, value);
+-                    } else {
+-                        missingDependency = dependency.requiredConfigKey();
+-                    }
+-                }
+-            }
+-
+-            var optionalDependencies = request.getOptionalDependencies();
+-            if (optionalDependencies != null && !optionalDependencies.isEmpty()) {
+-                for (DevServicesResultBuildItem.DevServiceConfigDependency<? extends Startable> dependency : optionalDependencies) {
+-                    var value = configs.get(dependency.requiredConfigKey());
+-                    if (value != null) {
+-                        ((BiConsumer<Startable, String>) dependency.valueInjector()).accept(startable, value);
+-                    }
+-                }
+-            }
+-
+-            if (missingDependency == null) {
+-
+-                startable.start();
+-
+-                Map<String, String> config = request.getConfig(startable);
+-                Map<String, String> overrideConfig = request.getOverrideConfig(startable);
+-                configs.putAll(config);
+-                configs.putAll(overrideConfig);
++            RunningService service = new RunningService(request.getName(), request.getDescription(),
++                    request.getConfig(startable), request.getOverrideConfig(startable), startable.getContainerId(), startable);
++            this.addRunningService(request.getName(), request.getServiceName(), request.getServiceConfig(), service);
+ 
+-                RunningService service = new RunningService(request.getName(), request.getDescription(),
+-                        config, overrideConfig, startable.getContainerId(), startable);
+-                this.addRunningService(request.getName(), request.getServiceName(), request.getServiceConfig(), service);
++            compressor.close();
+ 
+-                compressor.close();
+-
+-                Consumer<Startable> postStartAction = request.getPostStartAction();
+-                if (postStartAction != null) {
+-                    try {
+-                        postStartAction.accept(startable);
+-                    } catch (Throwable t) {
+-                        log.errorf(t, "An error occurred while executing the post-start action for %s dev service: %s",
+-                                request.getName(), t.getMessage());
+-                    }
+-                } else {
+-                    log.infof("The %s dev service is ready to accept connections on %s", request.getName(),
+-                            startable.getConnectionInfo());
++            Consumer<Startable> postStartAction = request.getPostStartAction();
++            if (postStartAction != null) {
++                try {
++                    postStartAction.accept(startable);
++                } catch (Throwable t) {
++                    log.errorf(t, "An error occurred while executing the post-start action for %s dev service: %s",
++                            request.getName(), t.getMessage());
+                 }
+             } else {
+-                log.infof("The %s dev service did not start because the configuration with key %s did not become available",
+-                        request.getName(),
+-                        missingDependency);
++                log.infof("The %s dev service is ready to accept connections on %s", request.getName(),
++                        startable.getConnectionInfo());
+             }
+         } catch (Throwable t) {
+             compressor.closeAndDumpCaptured();
+diff --git a/core/deployment/src/main/java/io/quarkus/deployment/builditem/DevServicesResultBuildItem.java b/core/deployment/src/main/java/io/quarkus/deployment/builditem/DevServicesResultBuildItem.java
+index d215c57ea62..25bfe02f71d 100644
+--- a/core/deployment/src/main/java/io/quarkus/deployment/builditem/DevServicesResultBuildItem.java
++++ b/core/deployment/src/main/java/io/quarkus/deployment/builditem/DevServicesResultBuildItem.java
+@@ -4,11 +4,9 @@
+ import java.io.IOException;
+ import java.util.Collections;
+ import java.util.HashMap;
+-import java.util.HashSet;
+ import java.util.Map;
+ import java.util.Objects;
+ import java.util.Set;
+-import java.util.function.BiConsumer;
+ import java.util.function.Consumer;
+ import java.util.function.Function;
+ import java.util.function.Supplier;
+@@ -81,27 +79,6 @@ public final class DevServicesResultBuildItem extends MultiBuildItem {
+      */
+     private final Map<String, Function<Startable, String>> applicationConfigProvider;
+     private final Set<String> highPriorityConfig;
+-    private final Set<DevServiceConfigDependency<? extends Startable>> dependencies;
+-    private final Set<DevServiceConfigDependency<? extends Startable>> optionalDependencies;
+-
+-    private DevServicesResultBuildItem(String name, String description, String serviceName, Object serviceConfig,
+-            Map<String, String> config, Supplier<Startable> startableSupplier, Consumer<Startable> postStartAction,
+-            Map<String, Function<Startable, String>> applicationConfigProvider, Set<String> highPriorityConfig,
+-            Set<DevServiceConfigDependency<? extends Startable>> dependencies,
+-            Set<DevServiceConfigDependency<? extends Startable>> optionalDependencies) {
+-        this.name = name;
+-        this.description = description;
+-        this.containerId = null;
+-        this.config = config == null ? Collections.emptyMap() : Collections.unmodifiableMap(config);
+-        this.serviceName = serviceName;
+-        this.serviceConfig = serviceConfig;
+-        this.startableSupplier = startableSupplier;
+-        this.postStartAction = postStartAction;
+-        this.applicationConfigProvider = applicationConfigProvider;
+-        this.highPriorityConfig = highPriorityConfig;
+-        this.dependencies = dependencies;
+-        this.optionalDependencies = optionalDependencies;
+-    }
+ 
+     public static DiscoveredServiceBuilder discovered() {
+         return new DiscoveredServiceBuilder();
+@@ -134,8 +111,6 @@ public DevServicesResultBuildItem(String name, String description, String contai
+         this.highPriorityConfig = null;
+         this.startableSupplier = null;
+         this.postStartAction = null;
+-        this.dependencies = null;
+-        this.optionalDependencies = null;
+     }
+ 
+     /**
+@@ -160,9 +135,6 @@ public DevServicesResultBuildItem(String name,
+         this.postStartAction = postStartAction;
+         this.applicationConfigProvider = applicationConfigProvider;
+         this.highPriorityConfig = highPriorityConfig;
+-        this.dependencies = null;
+-        this.optionalDependencies = null;
+-
+     }
+ 
+     public String getName() {
+@@ -240,19 +212,6 @@ public Map<String, String> getOverrideConfig(Startable startable) {
+         return map;
+     }
+ 
+-    public boolean hasDependencies() {
+-        return (dependencies != null && !dependencies.isEmpty())
+-                || (optionalDependencies != null && !optionalDependencies.isEmpty());
+-    }
+-
+-    public Set<DevServiceConfigDependency<? extends Startable>> getDependencies() {
+-        return dependencies;
+-    }
+-
+-    public Set<DevServiceConfigDependency<? extends Startable>> getOptionalDependencies() {
+-        return optionalDependencies;
+-    }
+-
+     public static class DiscoveredServiceBuilder {
+         private String name;
+         private String containerId;
+@@ -305,8 +264,6 @@ public DevServicesResultBuildItem build() {
+         private Consumer<? extends Startable> postStartAction;
+         private Map<String, Function<Startable, String>> applicationConfigProvider;
+         private Set<String> highPriorityConfig;
+-        private final Set<DevServiceConfigDependency<? extends Startable>> dependencies = new HashSet<>();
+-        private final Set<DevServiceConfigDependency<? extends Startable>> optionalDependencies = new HashSet<>();
+ 
+         /**
+          * Use {@link #feature(String)} instead
+@@ -410,49 +367,6 @@ public OwnedServiceBuilder<T> serviceConfig(Object serviceConfig) {
+             return this;
+         }
+ 
+-        /**
+-         * Declares that this dev service should not be started until config from a dependency dev service is available.
+-         * Before service start, the `DevServiceConfigDependency`` will be given an opportunity to inject the required config
+-         * into the `Startable`.
+-         * <p>
+-         * If the config key never becomes available, the service will not be started.
+-         * </p>
+-         * <p>
+-         * This method can be called multiple times, and all of the config values will be injected.
+-         *
+-         * @param key the config key which should be waited for; will never be null
+-         * @param function a function which should be invoked on the startable to pass in the config
+-         * @return a builder, for chaining
+-         */
+-        public OwnedServiceBuilder<T> dependsOnConfig(String key, BiConsumer<T, String> function) {
+-            this.dependencies.add(new DevServiceConfigDependency<>(key, function));
+-            return this;
+-        }
+-
+-        /**
+-         * Declares that this dev service should not be started until config from a dependency dev service has a chance to
+-         * become available.
+-         * Before service start, the `DevServiceConfigDependency`` will be given an opportunity to inject the required config
+-         * into the `Startable`.
+-         * <p>
+-         * This method can be called multiple times, and all of the config values will be injected.
+-         *
+-         * @param key the config key which should be waited for
+-         * @param function a function which should be invoked on the startable to pass in the config; will not be called if the
+-         *        config never becomes available
+-         * @param optional whether to start the service if the config never becomes availbale
+-         *
+-         * @return a builder, for chaining
+-         */
+-        public OwnedServiceBuilder<T> dependsOnConfig(String key, BiConsumer<T, String> function, boolean optional) {
+-            if (optional) {
+-                this.optionalDependencies.add(new DevServiceConfigDependency<>(key, function));
+-                return this;
+-            } else {
+-                return dependsOnConfig(key, function);
+-            }
+-        }
+-
+         @SuppressWarnings("unchecked")
+         public <S extends Startable> OwnedServiceBuilder<S> startable(Supplier<S> startableSupplier) {
+             this.startableSupplier = startableSupplier;
+@@ -502,7 +416,7 @@ public DevServicesResultBuildItem build() {
+             return new DevServicesResultBuildItem(name, description, serviceName, serviceConfig, config,
+                     (Supplier<Startable>) startableSupplier,
+                     (Consumer<Startable>) postStartAction,
+-                    applicationConfigProvider, highPriorityConfig, dependencies, optionalDependencies);
++                    applicationConfigProvider, highPriorityConfig);
+         }
+ 
+         private static boolean isClassAvailable(String className) {
+@@ -513,7 +427,6 @@ private static boolean isClassAvailable(String className) {
+                 return false;
+             }
+         }
+-
+     }
+ 
+     /**
+@@ -604,8 +517,4 @@ public DevServicesResultBuildItem toBuildItem() {
+         }
+     }
+ 
+-    record DevServiceConfigDependency<T extends Startable>(String requiredConfigKey,
+-            BiConsumer<T, String> valueInjector) {
+-    }
+-
+ }
+diff --git a/core/deployment/src/main/java/io/quarkus/deployment/builditem/nativeimage/ReflectiveHierarchyBuildItem.java b/core/deployment/src/main/java/io/quarkus/deployment/builditem/nativeimage/ReflectiveHierarchyBuildItem.java
+index 6f4dc9611ac..d168d9cefcd 100644
+--- a/core/deployment/src/main/java/io/quarkus/deployment/builditem/nativeimage/ReflectiveHierarchyBuildItem.java
++++ b/core/deployment/src/main/java/io/quarkus/deployment/builditem/nativeimage/ReflectiveHierarchyBuildItem.java
+@@ -25,7 +25,6 @@
+  *
+  * <ul>
+  * <li>Superclasses</li>
+- * <li>Interfaces</li>
+  * <li>Component types of collections</li>
+  * <li>Types used in bean properties (if method reflection is enabled)</li>
+  * <li>Field types (if field reflection is enabled)</li>
+diff --git a/core/deployment/src/main/java/io/quarkus/deployment/steps/ReflectiveHierarchyStep.java b/core/deployment/src/main/java/io/quarkus/deployment/steps/ReflectiveHierarchyStep.java
+index 9cd356ea98e..c2d97fde595 100644
+--- a/core/deployment/src/main/java/io/quarkus/deployment/steps/ReflectiveHierarchyStep.java
++++ b/core/deployment/src/main/java/io/quarkus/deployment/steps/ReflectiveHierarchyStep.java
+@@ -125,57 +125,41 @@ private void addReflectiveHierarchy(NativeConfig nativeConfig, CombinedIndexBuil
+             Set<DotName> processedReflectiveHierarchies, Map<DotName, Set<String>> unindexedClasses,
+             BuildProducer<ReflectiveClassBuildItem> reflectiveClass,
+             Deque<ReflectiveHierarchyVisitor> visits) {
+-        if (type instanceof ClassType) {
++        final String newSource = source + " > " + type.name().toString();
++        if (type instanceof VoidType ||
++                type instanceof PrimitiveType ||
++                type instanceof UnresolvedTypeVariable ||
++                type instanceof TypeVariableReference) {
++            return;
++        } else if (type instanceof ClassType) {
+             if (reflectiveHierarchyBuildItem.getIgnoreTypePredicate().test(type.name())) {
+                 return;
+             }
+-            // If the registered entity is a class make sure to register all its subclasses.
++
++            addClassTypeHierarchy(nativeConfig, combinedIndexBuildItem, capabilities, reflectiveHierarchyBuildItem, newSource,
++                    type.name(),
++                    type.name(),
++                    processedReflectiveHierarchies, unindexedClasses,
++                    reflectiveClass, visits);
++
+             for (ClassInfo subclass : combinedIndexBuildItem.getIndex().getAllKnownSubclasses(type.name())) {
+                 addClassTypeHierarchy(nativeConfig, combinedIndexBuildItem, capabilities, reflectiveHierarchyBuildItem,
+-                        source + " > " + subclass.name().toString(),
++                        newSource,
+                         subclass.name(),
+                         subclass.name(),
+                         processedReflectiveHierarchies,
+                         unindexedClasses, reflectiveClass, visits);
+             }
+-            // If the registered entity is an interface make sure to register all its implementors.
+             for (ClassInfo subclass : combinedIndexBuildItem.getIndex().getAllKnownImplementors(type.name())) {
+                 addClassTypeHierarchy(nativeConfig, combinedIndexBuildItem, capabilities, reflectiveHierarchyBuildItem,
+-                        source + " > " + subclass.name().toString(),
++                        newSource,
+                         subclass.name(),
+                         subclass.name(),
+                         processedReflectiveHierarchies,
+                         unindexedClasses, reflectiveClass, visits);
+             }
+-        }
+-        // Recursively register reachable types (excluding their subclasses and implementors)
+-        addReflectiveHierarchyRecursively(nativeConfig, combinedIndexBuildItem, capabilities, reflectiveHierarchyBuildItem,
+-                source, type, processedReflectiveHierarchies, unindexedClasses, reflectiveClass, visits);
+-    }
+-
+-    private void addReflectiveHierarchyRecursively(NativeConfig nativeConfig, CombinedIndexBuildItem combinedIndexBuildItem,
+-            Capabilities capabilities, ReflectiveHierarchyBuildItem reflectiveHierarchyBuildItem, String source, Type type,
+-            Set<DotName> processedReflectiveHierarchies, Map<DotName, Set<String>> unindexedClasses,
+-            BuildProducer<ReflectiveClassBuildItem> reflectiveClass,
+-            Deque<ReflectiveHierarchyVisitor> visits) {
+-        final String newSource = source + " > " + type.name().toString();
+-        if (type instanceof VoidType ||
+-                type instanceof PrimitiveType ||
+-                type instanceof UnresolvedTypeVariable ||
+-                type instanceof TypeVariableReference) {
+-            return;
+-        } else if (type instanceof ClassType) {
+-            if (reflectiveHierarchyBuildItem.getIgnoreTypePredicate().test(type.name())) {
+-                return;
+-            }
+-
+-            addClassTypeHierarchy(nativeConfig, combinedIndexBuildItem, capabilities, reflectiveHierarchyBuildItem, newSource,
+-                    type.name(),
+-                    type.name(),
+-                    processedReflectiveHierarchies, unindexedClasses,
+-                    reflectiveClass, visits);
+         } else if (type instanceof ArrayType) {
+-            visits.addLast(() -> addReflectiveHierarchyRecursively(nativeConfig, combinedIndexBuildItem, capabilities,
++            visits.addLast(() -> addReflectiveHierarchy(nativeConfig, combinedIndexBuildItem, capabilities,
+                     reflectiveHierarchyBuildItem, newSource,
+                     type.asArrayType().constituent(),
+                     processedReflectiveHierarchies,
+@@ -191,7 +175,7 @@ private void addReflectiveHierarchyRecursively(NativeConfig nativeConfig, Combin
+             }
+             for (Type typeArgument : parameterizedType.arguments()) {
+                 visits.addLast(
+-                        () -> addReflectiveHierarchyRecursively(nativeConfig, combinedIndexBuildItem, capabilities,
++                        () -> addReflectiveHierarchy(nativeConfig, combinedIndexBuildItem, capabilities,
+                                 reflectiveHierarchyBuildItem,
+                                 newSource,
+                                 typeArgument,
+@@ -254,7 +238,7 @@ private void addClassTypeHierarchy(NativeConfig nativeConfig, CombinedIndexBuild
+                 processedReflectiveHierarchies,
+                 unindexedClasses, reflectiveClass, visits));
+         for (Type interfaceType : info.interfaceTypes()) {
+-            visits.addLast(() -> addReflectiveHierarchyRecursively(nativeConfig, combinedIndexBuildItem, capabilities,
++            visits.addLast(() -> addReflectiveHierarchy(nativeConfig, combinedIndexBuildItem, capabilities,
+                     reflectiveHierarchyBuildItem,
+                     source, interfaceType, processedReflectiveHierarchies, unindexedClasses,
+                     reflectiveClass, visits));
+@@ -269,7 +253,7 @@ private void addClassTypeHierarchy(NativeConfig nativeConfig, CombinedIndexBuild
+             }
+             final Type fieldType = getFieldType(combinedIndexBuildItem, initialName, info, field);
+             visits.addLast(
+-                    () -> addReflectiveHierarchyRecursively(nativeConfig, combinedIndexBuildItem, capabilities,
++                    () -> addReflectiveHierarchy(nativeConfig, combinedIndexBuildItem, capabilities,
+                             reflectiveHierarchyBuildItem, source,
+                             fieldType,
+                             processedReflectiveHierarchies,
+@@ -283,7 +267,7 @@ private void addClassTypeHierarchy(NativeConfig nativeConfig, CombinedIndexBuild
+                     method.returnType().kind() == Kind.VOID) {
+                 continue;
+             }
+-            visits.addLast(() -> addReflectiveHierarchyRecursively(nativeConfig, combinedIndexBuildItem, capabilities,
++            visits.addLast(() -> addReflectiveHierarchy(nativeConfig, combinedIndexBuildItem, capabilities,
+                     reflectiveHierarchyBuildItem, source,
+                     method.returnType(),
+                     processedReflectiveHierarchies,
+diff --git a/core/processor/src/main/java/io/quarkus/annotation/processor/documentation/config/formatter/JavadocToAsciidocTransformer.java b/core/processor/src/main/java/io/quarkus/annotation/processor/documentation/config/formatter/JavadocToAsciidocTransformer.java
+index 5ef1f9f09d4..68767e47c9c 100644
+--- a/core/processor/src/main/java/io/quarkus/annotation/processor/documentation/config/formatter/JavadocToAsciidocTransformer.java
++++ b/core/processor/src/main/java/io/quarkus/annotation/processor/documentation/config/formatter/JavadocToAsciidocTransformer.java
+@@ -96,7 +96,7 @@ public static String toAsciidoc(String javadoc, JavadocFormat format, boolean in
+ 
+         // the parser expects all the lines to start with "* "
+         // we add it as it has been previously removed
+-        Javadoc parsedJavadoc = StaticJavaParser.parseJavadoc(START_OF_LINE.matcher(javadoc).replaceAll("* "), false);
++        Javadoc parsedJavadoc = StaticJavaParser.parseJavadoc(START_OF_LINE.matcher(javadoc).replaceAll("* "));
+ 
+         StringBuilder htmlJavadoc = new StringBuilder(javadoc.length());
+ 
+diff --git a/core/processor/src/main/java/io/quarkus/annotation/processor/documentation/config/formatter/JavadocToMarkdownTransformer.java b/core/processor/src/main/java/io/quarkus/annotation/processor/documentation/config/formatter/JavadocToMarkdownTransformer.java
+index 8cde81b4d75..6bbbdcfae74 100644
+--- a/core/processor/src/main/java/io/quarkus/annotation/processor/documentation/config/formatter/JavadocToMarkdownTransformer.java
++++ b/core/processor/src/main/java/io/quarkus/annotation/processor/documentation/config/formatter/JavadocToMarkdownTransformer.java
+@@ -24,7 +24,7 @@ public static String toMarkdown(String javadoc, JavadocFormat format) {
+         } else if (format == JavadocFormat.JAVADOC) {
+             // the parser expects all the lines to start with "* "
+             // we add it as it has been previously removed
+-            Javadoc parsedJavadoc = StaticJavaParser.parseJavadoc(START_OF_LINE.matcher(javadoc).replaceAll("* "), false);
++            Javadoc parsedJavadoc = StaticJavaParser.parseJavadoc(START_OF_LINE.matcher(javadoc).replaceAll("* "));
+ 
+             // HTML is valid Javadoc but we need to drop the Javadoc tags e.g. {@link ...}
+             return simplifyJavadoc(parsedJavadoc.getDescription());
+diff --git a/core/processor/src/main/java/io/quarkus/annotation/processor/documentation/config/util/JavadocUtil.java b/core/processor/src/main/java/io/quarkus/annotation/processor/documentation/config/util/JavadocUtil.java
+index d00d75b3c7a..2bed8914e4c 100644
+--- a/core/processor/src/main/java/io/quarkus/annotation/processor/documentation/config/util/JavadocUtil.java
++++ b/core/processor/src/main/java/io/quarkus/annotation/processor/documentation/config/util/JavadocUtil.java
+@@ -51,7 +51,7 @@ public static ParsedJavadoc parseConfigItemJavadoc(String rawJavadoc) {
+ 
+         // the parser expects all the lines to start with "* "
+         // we add it as it has been previously removed
+-        Javadoc javadoc = StaticJavaParser.parseJavadoc(START_OF_LINE.matcher(rawJavadoc).replaceAll("* "), false);
++        Javadoc javadoc = StaticJavaParser.parseJavadoc(START_OF_LINE.matcher(rawJavadoc).replaceAll("* "));
+ 
+         String description;
+         JavadocFormat format;
+@@ -96,7 +96,7 @@ public static ParsedJavadocSection parseConfigSectionJavadoc(String javadocComme
+         // the parser expects all the lines to start with "* "
+         // we add it as it has been previously removed
+         javadocComment = START_OF_LINE.matcher(javadocComment).replaceAll("* ");
+-        Javadoc javadoc = StaticJavaParser.parseJavadoc(javadocComment, false);
++        Javadoc javadoc = StaticJavaParser.parseJavadoc(javadocComment);
+ 
+         Optional<String> deprecated = javadoc.getBlockTags().stream()
+                 .filter(t -> t.getType() == Type.DEPRECATED)
+diff --git a/extensions/hibernate-orm/deployment/src/main/java/io/quarkus/hibernate/orm/deployment/dev/HibernateOrmDevUIProcessor.java b/extensions/hibernate-orm/deployment/src/main/java/io/quarkus/hibernate/orm/deployment/dev/HibernateOrmDevUIProcessor.java
+index cd0893516d9..cf04d74a7b3 100644
+--- a/extensions/hibernate-orm/deployment/src/main/java/io/quarkus/hibernate/orm/deployment/dev/HibernateOrmDevUIProcessor.java
++++ b/extensions/hibernate-orm/deployment/src/main/java/io/quarkus/hibernate/orm/deployment/dev/HibernateOrmDevUIProcessor.java
+@@ -26,7 +26,7 @@ public class HibernateOrmDevUIProcessor {
+     public CardPageBuildItem create(HibernateOrmConfig config) {
+         CardPageBuildItem card = new CardPageBuildItem();
+         card.setLogo("hibernate_icon_dark.svg", "hibernate_icon_light.svg");
+-        card.addLibraryVersion("org.hibernate.orm", "hibernate-core", "Hibernate ORM", "https://hibernate.org/orm/");
++        card.addLibraryVersion("org.hibernate.orm", "hibernate-core", "Hibernate", "https://hibernate.org/orm/");
+         card.addLibraryVersion("jakarta.persistence", "jakarta.persistence-api", "Jakarta Persistence",
+                 "https://jakarta.ee/specifications/persistence/");
+ 
+diff --git a/extensions/kafka-client/deployment/src/main/java/io/quarkus/kafka/client/deployment/DevServicesKafkaProcessor.java b/extensions/kafka-client/deployment/src/main/java/io/quarkus/kafka/client/deployment/DevServicesKafkaProcessor.java
+index bea41eb8a0f..39f2f5e694c 100644
+--- a/extensions/kafka-client/deployment/src/main/java/io/quarkus/kafka/client/deployment/DevServicesKafkaProcessor.java
++++ b/extensions/kafka-client/deployment/src/main/java/io/quarkus/kafka/client/deployment/DevServicesKafkaProcessor.java
+@@ -121,7 +121,6 @@ private Startable createContainer(DevServicesComposeProjectBuildItem composeProj
+                     strimzi.withPort(config.port().get());
+                 }
+                 strimzi.withEnv(config.containerEnv());
+-                strimzi.withKafkaConfigurationMap(config.strimzi().serverConfigs());
+                 configureSharedServiceLabel(strimzi, launchMode.getLaunchMode(), DEV_SERVICE_LABEL, config.serviceName());
+                 yield new StartableContainer<>(strimzi, StrimziKafkaContainer::getBootstrapServers);
+             }
+diff --git a/extensions/kafka-client/deployment/src/main/java/io/quarkus/kafka/client/deployment/KafkaDevServicesBuildTimeConfig.java b/extensions/kafka-client/deployment/src/main/java/io/quarkus/kafka/client/deployment/KafkaDevServicesBuildTimeConfig.java
+index 9a111580bb8..1f7d8b7b7d5 100644
+--- a/extensions/kafka-client/deployment/src/main/java/io/quarkus/kafka/client/deployment/KafkaDevServicesBuildTimeConfig.java
++++ b/extensions/kafka-client/deployment/src/main/java/io/quarkus/kafka/client/deployment/KafkaDevServicesBuildTimeConfig.java
+@@ -123,11 +123,6 @@ public String getDefaultImageName() {
+      */
+     RedpandaBuildTimeConfig redpanda();
+ 
+-    /**
+-     * Allows configuring the Strimzi broker.
+-     */
+-    StrimziBuildTimeConfig strimzi();
+-
+     /**
+      * @return the image name if set, otherwise the default image name for the provider.
+      */
+diff --git a/extensions/kafka-client/deployment/src/main/java/io/quarkus/kafka/client/deployment/StrimziBuildTimeConfig.java b/extensions/kafka-client/deployment/src/main/java/io/quarkus/kafka/client/deployment/StrimziBuildTimeConfig.java
+deleted file mode 100644
+index 96221a326e0..00000000000
+--- a/extensions/kafka-client/deployment/src/main/java/io/quarkus/kafka/client/deployment/StrimziBuildTimeConfig.java
++++ /dev/null
+@@ -1,15 +0,0 @@
+-package io.quarkus.kafka.client.deployment;
+-
+-import java.util.Map;
+-
+-/**
+- * Allows configuring the Strimzi dev services broker.
+- */
+-public interface StrimziBuildTimeConfig {
+-
+-    /**
+-     * Configuration properties that will be added to the server properties
+-     * file provided to the Kafka broker by the Strimzi provider.
+-     */
+-    Map<String, String> serverConfigs();
+-}
+diff --git a/extensions/observability-devservices/testlibs/devresource-lgtm/src/main/java/io/quarkus/observability/devresource/lgtm/LgtmResource.java b/extensions/observability-devservices/testlibs/devresource-lgtm/src/main/java/io/quarkus/observability/devresource/lgtm/LgtmResource.java
+index 9d22b59c38b..b41947d4791 100644
+--- a/extensions/observability-devservices/testlibs/devresource-lgtm/src/main/java/io/quarkus/observability/devresource/lgtm/LgtmResource.java
++++ b/extensions/observability-devservices/testlibs/devresource-lgtm/src/main/java/io/quarkus/observability/devresource/lgtm/LgtmResource.java
+@@ -67,7 +67,7 @@ private boolean isScrapingRequired(Function<String, Boolean> checker) {
+         }
+ 
+         if (result && (catalog != null && catalog.hasMicrometerOtlp())) {
+-            log.warnf("Multiple Micrometer registries found - OTLP and %s, no Prometheus scraping required.", foundRegistry);
++            log.warnf("Multiple Micrometer registries found - OTLP and %s, no Prometheus scrapping required.", foundRegistry);
+             return false;
+         }
+ 
+diff --git a/extensions/opentelemetry/runtime/src/main/java/io/quarkus/opentelemetry/runtime/OpenTelemetryUtil.java b/extensions/opentelemetry/runtime/src/main/java/io/quarkus/opentelemetry/runtime/OpenTelemetryUtil.java
+index aa8d4f7a12e..f74f6689fdd 100644
+--- a/extensions/opentelemetry/runtime/src/main/java/io/quarkus/opentelemetry/runtime/OpenTelemetryUtil.java
++++ b/extensions/opentelemetry/runtime/src/main/java/io/quarkus/opentelemetry/runtime/OpenTelemetryUtil.java
+@@ -5,8 +5,10 @@
+ import java.util.LinkedHashMap;
+ import java.util.List;
+ import java.util.Map;
++import java.util.Set;
+ 
+ import org.jboss.logging.Logger;
++import org.slf4j.MDC;
+ 
+ import io.opentelemetry.api.trace.Span;
+ import io.opentelemetry.api.trace.SpanContext;
+@@ -22,6 +24,7 @@ public final class OpenTelemetryUtil {
+     public static final String SPAN_ID = "spanId";
+     public static final String SAMPLED = "sampled";
+     public static final String PARENT_ID = "parentId";
++    private static final Set<String> TRACING_MDC_KEYS = Set.of(TRACE_ID, SPAN_ID, SAMPLED, PARENT_ID);
+ 
+     private OpenTelemetryUtil() {
+     }
+@@ -74,7 +77,7 @@ public static void setMDCData(Context otelContext, io.vertx.core.Context vertxCo
+                         getSpanData(QuarkusContextStorage.getOtelContext(vertxContext)));
+             }
+             // clear the object ref to force a new one and prevent crosstalk
+-            VertxMDC.INSTANCE.clearVertxMdcFromContext(vertxContext);
++            VertxMDC.INSTANCE.reinitializeVertxMdc(vertxContext, TRACING_MDC_KEYS);
+             SpanContext spanContext = span.getSpanContext();
+             VertxMDC.INSTANCE.put(SPAN_ID, spanContext.getSpanId(), vertxContext);
+             VertxMDC.INSTANCE.put(TRACE_ID, spanContext.getTraceId(), vertxContext);
+diff --git a/extensions/opentelemetry/runtime/src/main/java/io/quarkus/opentelemetry/runtime/QuarkusContextStorage.java b/extensions/opentelemetry/runtime/src/main/java/io/quarkus/opentelemetry/runtime/QuarkusContextStorage.java
+index f007a88467a..273a95f1592 100644
+--- a/extensions/opentelemetry/runtime/src/main/java/io/quarkus/opentelemetry/runtime/QuarkusContextStorage.java
++++ b/extensions/opentelemetry/runtime/src/main/java/io/quarkus/opentelemetry/runtime/QuarkusContextStorage.java
+@@ -3,6 +3,8 @@
+ import static io.quarkus.vertx.core.runtime.context.VertxContextSafetyToggle.setContextSafe;
+ import static io.smallrye.common.vertx.VertxContext.isDuplicatedContext;
+ 
++import java.util.Map;
++
+ import org.jboss.logging.Logger;
+ 
+ import io.opentelemetry.api.trace.Span;
+@@ -83,10 +85,18 @@ public void close() {
+                     log.debugv("Closing Otel context: {0}", OpenTelemetryUtil.getSpanData(otelToAttach));
+                 }
+ 
+-                if (otelBefore != otelToAttach) {
+-                    log.info("Context in storage not the expected context, Scope.close was not called correctly. Details:" +
+-                            " OTel context otelBefore: " + OpenTelemetryUtil.getSpanData(otelBefore) +
+-                            ". OTel context otelToAttach: " + OpenTelemetryUtil.getSpanData(otelToAttach));
++                if (otelBefore != otelToAttach && log.isDebugEnabled()) {
++                    // Different references can contain the same span data.
++                    // Duplicated contexts can be duplicated.
++                    Map<String, String> spanDataBefore = OpenTelemetryUtil.getSpanData(otelBefore);
++                    if (spanDataBefore != null && !spanDataBefore.isEmpty()) {
++                        log.debug(
++                                "Context in storage not the expected context, Scope.close was not called correctly. Details:" +
++                                        " OTel context otelBefore: ref: " + System.identityHashCode(otelBefore) +
++                                        " Content: " + spanDataBefore +
++                                        ". OTel context otelToAttach: ref: " + System.identityHashCode(otelToAttach) +
++                                        " Content: " + OpenTelemetryUtil.getSpanData(otelToAttach));
++                    }
+                 }
+ 
+                 if (otelBeforeAttach == null) {
+diff --git a/extensions/resteasy-reactive/rest-client-jaxrs/deployment/src/main/java/io/quarkus/jaxrs/client/reactive/deployment/JaxrsClientReactiveProcessor.java b/extensions/resteasy-reactive/rest-client-jaxrs/deployment/src/main/java/io/quarkus/jaxrs/client/reactive/deployment/JaxrsClientReactiveProcessor.java
+index 354e3f94505..33cc4739842 100644
+--- a/extensions/resteasy-reactive/rest-client-jaxrs/deployment/src/main/java/io/quarkus/jaxrs/client/reactive/deployment/JaxrsClientReactiveProcessor.java
++++ b/extensions/resteasy-reactive/rest-client-jaxrs/deployment/src/main/java/io/quarkus/jaxrs/client/reactive/deployment/JaxrsClientReactiveProcessor.java
+@@ -34,7 +34,6 @@
+ import java.nio.file.Path;
+ import java.util.AbstractMap;
+ import java.util.ArrayList;
+-import java.util.Arrays;
+ import java.util.Collection;
+ import java.util.Collections;
+ import java.util.Comparator;
+@@ -47,7 +46,6 @@
+ import java.util.Map;
+ import java.util.Optional;
+ import java.util.Set;
+-import java.util.TreeSet;
+ import java.util.concurrent.CompletionStage;
+ import java.util.function.BiFunction;
+ import java.util.function.Consumer;
+@@ -2654,7 +2652,7 @@ private void handleReturn(ClassInfo restClientInterface, String defaultMediaType
+             if (consumes != null && consumes.length > 0) {
+ 
+                 if (consumes.length > 1) {
+-                    Set<String> uniqueConsumes = new TreeSet<>(Arrays.asList(consumes));
++                    Set<String> uniqueConsumes = Set.of(consumes);
+                     mediaTypeValue = uniqueConsumes.iterator().next();
+                     if (uniqueConsumes.size() > 1) {
+                         log.debugf("MicroProfile Rest Client `%s`'s method `%s` has multiple `@Consumes` values `%s`,"
+diff --git a/extensions/security-webauthn/deployment/src/main/java/io/quarkus/security/webauthn/deployment/QuarkusSecurityWebAuthnProcessor.java b/extensions/security-webauthn/deployment/src/main/java/io/quarkus/security/webauthn/deployment/QuarkusSecurityWebAuthnProcessor.java
+index 812e53064e5..a624fdf8727 100644
+--- a/extensions/security-webauthn/deployment/src/main/java/io/quarkus/security/webauthn/deployment/QuarkusSecurityWebAuthnProcessor.java
++++ b/extensions/security-webauthn/deployment/src/main/java/io/quarkus/security/webauthn/deployment/QuarkusSecurityWebAuthnProcessor.java
+@@ -8,18 +8,17 @@
+ import org.jboss.jandex.DotName;
+ 
+ import com.webauthn4j.data.AuthenticationRequest;
+-import com.webauthn4j.data.AuthenticatorResponse;
++import com.webauthn4j.data.AuthenticatorAssertionResponse;
++import com.webauthn4j.data.AuthenticatorAttestationResponse;
+ import com.webauthn4j.data.PublicKeyCredential;
+ import com.webauthn4j.data.PublicKeyCredentialCreationOptions;
+-import com.webauthn4j.data.PublicKeyCredentialEntity;
+ import com.webauthn4j.data.PublicKeyCredentialParameters;
+ import com.webauthn4j.data.PublicKeyCredentialRequestOptions;
++import com.webauthn4j.data.PublicKeyCredentialRpEntity;
+ import com.webauthn4j.data.PublicKeyCredentialType;
++import com.webauthn4j.data.PublicKeyCredentialUserEntity;
+ import com.webauthn4j.data.RegistrationRequest;
+ import com.webauthn4j.data.attestation.AttestationObject;
+-import com.webauthn4j.data.attestation.authenticator.COSEKey;
+-import com.webauthn4j.data.attestation.authenticator.Curve;
+-import com.webauthn4j.data.attestation.statement.AttestationStatement;
+ import com.webauthn4j.data.client.CollectedClientData;
+ 
+ import io.quarkus.arc.deployment.AdditionalBeanBuildItem;
+@@ -55,33 +54,30 @@ public IndexDependencyBuildItem addTypesToJandex() {
+ 
+     @BuildStep
+     public void registerJacksonTypes(BuildProducer<ReflectiveHierarchyBuildItem> reflection) {
+-        String source = QuarkusSecurityWebAuthnProcessor.class.getSimpleName();
+         reflection.produce(
+-                ReflectiveHierarchyBuildItem.builder(AuthenticatorResponse.class).source(source).build());
+-        reflection.produce(ReflectiveHierarchyBuildItem.builder(AuthenticationRequest.class).source(source).build());
+-        reflection.produce(ReflectiveHierarchyBuildItem.builder(RegistrationRequest.class).source(source).build());
++                ReflectiveHierarchyBuildItem.builder(AuthenticatorAssertionResponse.class).build());
+         reflection.produce(
+-                ReflectiveHierarchyBuildItem.builder(PublicKeyCredentialCreationOptions.class).source(source).build());
++                ReflectiveHierarchyBuildItem.builder(AuthenticatorAttestationResponse.class).build());
++        reflection.produce(ReflectiveHierarchyBuildItem.builder(AuthenticationRequest.class).build());
++        reflection.produce(ReflectiveHierarchyBuildItem.builder(RegistrationRequest.class).build());
+         reflection.produce(
+-                ReflectiveHierarchyBuildItem.builder(PublicKeyCredentialRequestOptions.class).source(source).build());
++                ReflectiveHierarchyBuildItem.builder(PublicKeyCredentialCreationOptions.class).build());
+         reflection.produce(
+-                ReflectiveHierarchyBuildItem.builder(PublicKeyCredentialEntity.class).source(source).build());
++                ReflectiveHierarchyBuildItem.builder(PublicKeyCredentialRequestOptions.class).build());
+         reflection.produce(
+-                ReflectiveHierarchyBuildItem.builder(PublicKeyCredentialParameters.class).source(source).build());
++                ReflectiveHierarchyBuildItem.builder(PublicKeyCredentialRpEntity.class).build());
+         reflection.produce(
+-                ReflectiveHierarchyBuildItem.builder(PublicKeyCredentialType.class).source(source).build());
++                ReflectiveHierarchyBuildItem.builder(PublicKeyCredentialUserEntity.class).build());
+         reflection.produce(
+-                ReflectiveHierarchyBuildItem.builder(PublicKeyCredential.class).source(source).build());
++                ReflectiveHierarchyBuildItem.builder(PublicKeyCredentialParameters.class).build());
+         reflection.produce(
+-                ReflectiveHierarchyBuildItem.builder(AttestationObject.class).source(source).build());
++                ReflectiveHierarchyBuildItem.builder(PublicKeyCredentialType.class).build());
+         reflection.produce(
+-                ReflectiveHierarchyBuildItem.builder(CollectedClientData.class).source(source).build());
++                ReflectiveHierarchyBuildItem.builder(PublicKeyCredential.class).build());
+         reflection.produce(
+-                ReflectiveHierarchyBuildItem.builder(Curve.class).source(source).build());
++                ReflectiveHierarchyBuildItem.builder(AttestationObject.class).build());
+         reflection.produce(
+-                ReflectiveHierarchyBuildItem.builder(AttestationStatement.class).source(source).build());
+-        reflection.produce(
+-                ReflectiveHierarchyBuildItem.builder(COSEKey.class).source(source).build());
++                ReflectiveHierarchyBuildItem.builder(CollectedClientData.class).build());
+     }
+ 
+     @BuildStep
+diff --git a/extensions/vertx/runtime/src/main/java/io/quarkus/vertx/core/runtime/VertxMDC.java b/extensions/vertx/runtime/src/main/java/io/quarkus/vertx/core/runtime/VertxMDC.java
+index 1641eec2de1..f83e645c72f 100644
+--- a/extensions/vertx/runtime/src/main/java/io/quarkus/vertx/core/runtime/VertxMDC.java
++++ b/extensions/vertx/runtime/src/main/java/io/quarkus/vertx/core/runtime/VertxMDC.java
+@@ -4,8 +4,10 @@
+ import static io.smallrye.common.vertx.VertxContext.getOrCreateDuplicatedContext;
+ 
+ import java.util.HashMap;
++import java.util.HashSet;
+ import java.util.Map;
+ import java.util.Objects;
++import java.util.Set;
+ import java.util.concurrent.ConcurrentHashMap;
+ import java.util.concurrent.ConcurrentMap;
+ 
+@@ -148,6 +150,23 @@ public Object putObject(String key, Object value, Context vertxContext) {
+         return contextualDataMap(vertxContext).put(key, value);
+     }
+ 
++    /**
++     * Sets several entries.
++     * <p>
++     * Tries to use the current Vert.x Context, if the context is non-existent
++     * meaning that it was called out of a Vert.x thread it will fall back to
++     * the thread local context map.
++     *
++     * Will look up the contextual data map just once.
++     *
++     * @param map contents to add
++     * @param vertxContext
++     */
++    public void putAll(Map<String, String> map, Context vertxContext) {
++        Objects.requireNonNull(map);
++        contextualDataMap(vertxContext).putAll(map);
++    }
++
+     /**
+      * Removes a key.
+      *
+@@ -239,6 +258,20 @@ public boolean isEmpty() {
+         return contextualDataMap(getContext()).isEmpty();
+     }
+ 
++    /**
++     * Determine whether the current MDC map is empty on the provided context
++     *
++     * @param vertxContext
++     * @return
++     */
++    public boolean isEmpty(Context vertxContext) {
++        return contextualDataMap(vertxContext).isEmpty();
++    }
++
++    public Set<String> getKeys() {
++        return new HashSet<>(contextualDataMap(getContext()).keySet());
++    }
++
+     /**
+      * Get a copy of the MDC map. This is a relatively expensive operation.
+      * If the informed context is null it falls back to the thread local context map.
+@@ -289,12 +322,45 @@ public void clear(Context vertxContext) {
+      *
+      * @param vertxContext
+      */
+-    public void clearVertxMdcFromContext(Context vertxContext) {
++    void clearVertxMdcFromContext(Context vertxContext) {
+         if (vertxContext != null) {
+             vertxContext.removeLocal(VertxMDC.class.getName());
+         }
+     }
+ 
++    /**
++     * Clears out the object ref from the context to force a new one to be created and prevent thread crosstalk.
++     * Also copies to the new reference any previous data not in the set of MDC keys to discard.
++     *
++     * @param vertxContext
++     * @param discardMdcKeys Entries not to be copied over to the new MDC
++     */
++    public void reinitializeVertxMdc(Context vertxContext, Set<String> discardMdcKeys) {
++        if (vertxContext == null || vertxContext.getLocal(VertxMDC.class.getName()) == null) {
++            // nothing to do
++            return;
++        }
++
++        if (VertxMDC.INSTANCE.isEmpty(vertxContext)) {
++            // clear the object ref to force a new one and prevent crosstalk
++            VertxMDC.INSTANCE.clearVertxMdcFromContext(vertxContext);
++            return;
++        }
++
++        final Map<String, String> carryover = new HashMap<>();
++        final boolean hasDiscardKeys = discardMdcKeys == null || discardMdcKeys.isEmpty();
++        for (String key : VertxMDC.INSTANCE.getKeys()) {
++            if (hasDiscardKeys || !discardMdcKeys.contains(key)) {
++                carryover.put(key, VertxMDC.INSTANCE.get(key));
++            }
++        }
++
++        // clear the object ref to force a new one and prevent crosstalk
++        VertxMDC.INSTANCE.clearVertxMdcFromContext(vertxContext);
++        // Preserving relevant data
++        VertxMDC.INSTANCE.putAll(carryover, vertxContext);
++    }
++
+     /**
+      * Gets the current duplicated context or a new duplicated context if a Vert.x Context exists. Multiple invocations
+      * of this method may return the same or different context. If the current context is a duplicate one, multiple
+diff --git a/independent-projects/enforcer-rules/pom.xml b/independent-projects/enforcer-rules/pom.xml
+index fcacadb7630..f67d412d068 100644
+--- a/independent-projects/enforcer-rules/pom.xml
++++ b/independent-projects/enforcer-rules/pom.xml
+@@ -40,7 +40,7 @@
+         <!--
+            Supported Maven versions, interpreted as a version range (Also defined in build-parent)
+         -->
+-        <supported-maven-versions>[3.9.0,)</supported-maven-versions>
++        <supported-maven-versions>[3.6.2,)</supported-maven-versions>
+     </properties>
+ 
+     <dependencies>
+diff --git a/independent-projects/tools/base-codestarts/src/main/resources/codestarts/quarkus-extension/code/extension-base/java/pom.tpl.qute.xml b/independent-projects/tools/base-codestarts/src/main/resources/codestarts/quarkus-extension/code/extension-base/java/pom.tpl.qute.xml
+index b8da17b31a2..b5fd509491d 100644
+--- a/independent-projects/tools/base-codestarts/src/main/resources/codestarts/quarkus-extension/code/extension-base/java/pom.tpl.qute.xml
++++ b/independent-projects/tools/base-codestarts/src/main/resources/codestarts/quarkus-extension/code/extension-base/java/pom.tpl.qute.xml
+@@ -84,6 +84,7 @@
+                     <artifactId>maven-surefire-plugin</artifactId>
+                     <version>$\{surefire-plugin.version}</version>
+                     <configuration>
++                        <argLine>@\{argLine}</argLine>
+                         <systemPropertyVariables>
+                             <java.util.logging.manager>org.jboss.logmanager.LogManager</java.util.logging.manager>
+                             <maven.home>$\{maven.home}</maven.home>
+@@ -96,6 +97,7 @@
+                     <artifactId>maven-failsafe-plugin</artifactId>
+                     <version>$\{failsafe-plugin.version}</version>
+                     <configuration>
++                        <argLine>@\{argLine}</argLine>
+                         <systemPropertyVariables>
+                             <java.util.logging.manager>org.jboss.logmanager.LogManager</java.util.logging.manager>
+                             <maven.home>$\{maven.home}</maven.home>
+diff --git a/independent-projects/tools/base-codestarts/src/main/resources/codestarts/quarkus/buildtool/maven/base/pom.tpl.qute.xml b/independent-projects/tools/base-codestarts/src/main/resources/codestarts/quarkus/buildtool/maven/base/pom.tpl.qute.xml
+index a58fa4aa54d..d622551385a 100644
+--- a/independent-projects/tools/base-codestarts/src/main/resources/codestarts/quarkus/buildtool/maven/base/pom.tpl.qute.xml
++++ b/independent-projects/tools/base-codestarts/src/main/resources/codestarts/quarkus/buildtool/maven/base/pom.tpl.qute.xml
+@@ -170,9 +170,7 @@
+                 <artifactId>maven-surefire-plugin</artifactId>
+                 <version>$\{surefire-plugin.version}</version>
+                 <configuration>
+-                    {#if quarkus.platform.version.compareVersionTo("3.30.999") > 0}
+                     <argLine>@\{argLine}</argLine>
+-                    {/if}
+                     <systemPropertyVariables>
+                         <java.util.logging.manager>org.jboss.logmanager.LogManager</java.util.logging.manager>
+                         <maven.home>$\{maven.home}</maven.home>
+@@ -193,9 +191,7 @@
+                     </execution>
+                 </executions>
+                 <configuration>
+-                    {#if quarkus.platform.version.compareVersionTo("3.30.999") > 0}
+                     <argLine>@\{argLine}</argLine>
+-                    {/if}
+                     <systemPropertyVariables>
+                         {#if generate-native}
+                         <native.image.path>$\{project.build.directory}/$\{project.build.finalName}-runner</native.image.path>
+diff --git a/integration-tests/devservices/dependent-extension/deployment/pom.xml b/integration-tests/devservices/dependent-extension/deployment/pom.xml
+deleted file mode 100644
+index 59dcbe3dbfe..00000000000
+--- a/integration-tests/devservices/dependent-extension/deployment/pom.xml
++++ /dev/null
+@@ -1,74 +0,0 @@
+-<?xml version="1.0" encoding="UTF-8"?>
+-<project xmlns="http://maven.apache.org/POM/4.0.0"
+-         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+-         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+-    <parent>
+-        <artifactId>quarkus-integration-test-devservices-dependent-extension-parent</artifactId>
+-        <groupId>io.quarkus</groupId>
+-        <version>999-SNAPSHOT</version>
+-    </parent>
+-    <modelVersion>4.0.0</modelVersion>
+-
+-    <artifactId>quarkus-integration-test-devservices-dependent-extension-deployment</artifactId>
+-
+-    <dependencies>
+-        <dependency>
+-            <groupId>io.quarkus</groupId>
+-            <artifactId>quarkus-integration-test-devservices-dependent-extension</artifactId>
+-            <version>${project.version}</version>
+-        </dependency>
+-        <dependency>
+-            <groupId>io.quarkus</groupId>
+-            <artifactId>quarkus-devservices-deployment</artifactId>
+-        </dependency>
+-
+-        <!-- test dependencies -->
+-        <dependency>
+-            <groupId>io.quarkus</groupId>
+-            <artifactId>quarkus-junit</artifactId>
+-            <scope>test</scope>
+-        </dependency>
+-        <dependency>
+-            <groupId>org.assertj</groupId>
+-            <artifactId>assertj-core</artifactId>
+-            <scope>test</scope>
+-        </dependency>
+-        <dependency>
+-            <groupId>io.rest-assured</groupId>
+-            <artifactId>rest-assured</artifactId>
+-            <scope>test</scope>
+-            <exclusions>
+-                <exclusion>
+-                    <groupId>org.apache.commons</groupId>
+-                    <artifactId>commons-lang3</artifactId>
+-                </exclusion>
+-            </exclusions>
+-        </dependency>
+-    </dependencies>
+-
+-    <build>
+-        <plugins>
+-            <plugin>
+-                <artifactId>maven-compiler-plugin</artifactId>
+-                <executions>
+-                    <execution>
+-                        <id>default-compile</id>
+-                        <configuration>
+-                            <annotationProcessorPaths>
+-                                <path>
+-                                    <groupId>io.quarkus</groupId>
+-                                    <artifactId>quarkus-extension-processor</artifactId>
+-                                    <version>${project.version}</version>
+-                                </path>
+-                            </annotationProcessorPaths>
+-                            <compilerArgs>
+-                                <arg>-AgenerateDoc=false</arg>
+-                            </compilerArgs>
+-                        </configuration>
+-                    </execution>
+-                </executions>
+-            </plugin>
+-        </plugins>
+-    </build>
+-
+-</project>
+diff --git a/integration-tests/devservices/dependent-extension/pom.xml b/integration-tests/devservices/dependent-extension/pom.xml
+deleted file mode 100644
+index de6361c72c6..00000000000
+--- a/integration-tests/devservices/dependent-extension/pom.xml
++++ /dev/null
+@@ -1,21 +0,0 @@
+-<?xml version="1.0" encoding="UTF-8"?>
+-<project xmlns="http://maven.apache.org/POM/4.0.0"
+-         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+-         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+-    <parent>
+-        <artifactId>quarkus-integration-test-devservices</artifactId>
+-        <groupId>io.quarkus</groupId>
+-        <version>999-SNAPSHOT</version>
+-    </parent>
+-    <modelVersion>4.0.0</modelVersion>
+-
+-    <artifactId>quarkus-integration-test-devservices-dependent-extension-parent</artifactId>
+-    <name>Quarkus - Integration Tests - Dev Services - Extension A</name>
+-    <packaging>pom</packaging>
+-
+-
+-    <modules>
+-        <module>deployment</module>
+-        <module>runtime</module>
+-    </modules>
+-</project>
+diff --git a/integration-tests/devservices/dependent-extension/runtime/pom.xml b/integration-tests/devservices/dependent-extension/runtime/pom.xml
+deleted file mode 100644
+index 1bed9368ded..00000000000
+--- a/integration-tests/devservices/dependent-extension/runtime/pom.xml
++++ /dev/null
+@@ -1,106 +0,0 @@
+-<?xml version="1.0" encoding="UTF-8"?>
+-<project xmlns="http://maven.apache.org/POM/4.0.0"
+-         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+-         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+-    <parent>
+-        <artifactId>quarkus-integration-test-devservices-dependent-extension-parent</artifactId>
+-        <groupId>io.quarkus</groupId>
+-        <version>999-SNAPSHOT</version>
+-    </parent>
+-    <modelVersion>4.0.0</modelVersion>
+-
+-    <artifactId>quarkus-integration-test-devservices-dependent-extension</artifactId>
+-
+-    <dependencies>
+-        <dependency>
+-            <groupId>io.quarkus</groupId>
+-            <artifactId>quarkus-arc</artifactId>
+-        </dependency>
+-
+-        <dependency>
+-            <groupId>io.quarkus</groupId>
+-            <artifactId>quarkus-core</artifactId>
+-        </dependency>
+-        <dependency>
+-            <groupId>io.quarkus</groupId>
+-            <artifactId>quarkus-devservices</artifactId>
+-        </dependency>
+-
+-        <!-- Minimal test dependencies to *-deployment artifacts for consistent build order -->
+-        <dependency>
+-            <groupId>io.quarkus</groupId>
+-            <artifactId>quarkus-arc-deployment</artifactId>
+-            <version>${project.version}</version>
+-            <type>pom</type>
+-            <scope>test</scope>
+-            <exclusions>
+-                <exclusion>
+-                    <groupId>*</groupId>
+-                    <artifactId>*</artifactId>
+-                </exclusion>
+-            </exclusions>
+-        </dependency>
+-        <dependency>
+-            <groupId>io.quarkus</groupId>
+-            <artifactId>quarkus-core-deployment</artifactId>
+-            <version>${project.version}</version>
+-            <type>pom</type>
+-            <scope>test</scope>
+-            <exclusions>
+-                <exclusion>
+-                    <groupId>*</groupId>
+-                    <artifactId>*</artifactId>
+-                </exclusion>
+-            </exclusions>
+-        </dependency>
+-        <!-- Minimal test dependencies to *-deployment artifacts for consistent build order -->
+-        <dependency>
+-            <groupId>io.quarkus</groupId>
+-            <artifactId>quarkus-devservices-deployment</artifactId>
+-            <version>${project.version}</version>
+-            <type>pom</type>
+-            <scope>test</scope>
+-            <exclusions>
+-                <exclusion>
+-                    <groupId>*</groupId>
+-                    <artifactId>*</artifactId>
+-                </exclusion>
+-            </exclusions>
+-        </dependency>
+-    </dependencies>
+-
+-    <build>
+-        <plugins>
+-            <plugin>
+-                <groupId>io.quarkus</groupId>
+-                <artifactId>quarkus-extension-maven-plugin</artifactId>
+-                <configuration>
+-                    <capabilities>
+-                        <provides>io.quarkus.dependent-extension</provides>
+-                    </capabilities>
+-                </configuration>
+-            </plugin>
+-            <plugin>
+-                <artifactId>maven-compiler-plugin</artifactId>
+-                <executions>
+-                    <execution>
+-                        <id>default-compile</id>
+-                        <configuration>
+-                            <annotationProcessorPaths>
+-                                <path>
+-                                    <groupId>io.quarkus</groupId>
+-                                    <artifactId>quarkus-extension-processor</artifactId>
+-                                    <version>${project.version}</version>
+-                                </path>
+-                            </annotationProcessorPaths>
+-                            <compilerArgs>
+-                                <arg>-AgenerateDoc=false</arg>
+-                            </compilerArgs>
+-                        </configuration>
+-                    </execution>
+-                </executions>
+-            </plugin>
+-        </plugins>
+-    </build>
+-</project>
+-
+diff --git a/integration-tests/devservices/pom.xml b/integration-tests/devservices/pom.xml
+deleted file mode 100644
+index 66c07ab9a1b..00000000000
+--- a/integration-tests/devservices/pom.xml
++++ /dev/null
+@@ -1,21 +0,0 @@
+-<?xml version="1.0" encoding="UTF-8"?>
+-<project xmlns="http://maven.apache.org/POM/4.0.0"
+-         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+-         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+-    <parent>
+-        <artifactId>quarkus-integration-tests-parent</artifactId>
+-        <groupId>io.quarkus</groupId>
+-        <version>999-SNAPSHOT</version>
+-    </parent>
+-    <modelVersion>4.0.0</modelVersion>
+-
+-    <artifactId>quarkus-integration-test-devservices</artifactId>
+-    <name>Quarkus - Integration Tests - Dev services</name>
+-    <packaging>pom</packaging>
+-
+-    <modules>
+-        <module>simple-extension</module>
+-        <module>dependent-extension</module>
+-        <module>tests</module>
+-    </modules>
+-</project>
+diff --git a/integration-tests/devservices/simple-extension/deployment/pom.xml b/integration-tests/devservices/simple-extension/deployment/pom.xml
+deleted file mode 100644
+index 5c2f02b69e6..00000000000
+--- a/integration-tests/devservices/simple-extension/deployment/pom.xml
++++ /dev/null
+@@ -1,74 +0,0 @@
+-<?xml version="1.0" encoding="UTF-8"?>
+-<project xmlns="http://maven.apache.org/POM/4.0.0"
+-         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+-         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+-    <parent>
+-        <artifactId>quarkus-integration-test-devservices-simple-extension-parent</artifactId>
+-        <groupId>io.quarkus</groupId>
+-        <version>999-SNAPSHOT</version>
+-    </parent>
+-    <modelVersion>4.0.0</modelVersion>
+-
+-    <artifactId>quarkus-integration-test-devservices-simple-extension-deployment</artifactId>
+-
+-    <dependencies>
+-        <dependency>
+-            <groupId>io.quarkus</groupId>
+-            <artifactId>quarkus-integration-test-devservices-simple-extension</artifactId>
+-            <version>${project.version}</version>
+-        </dependency>
+-        <dependency>
+-            <groupId>io.quarkus</groupId>
+-            <artifactId>quarkus-devservices-deployment</artifactId>
+-        </dependency>
+-
+-        <!-- test dependencies -->
+-        <dependency>
+-            <groupId>io.quarkus</groupId>
+-            <artifactId>quarkus-junit</artifactId>
+-            <scope>test</scope>
+-        </dependency>
+-        <dependency>
+-            <groupId>org.assertj</groupId>
+-            <artifactId>assertj-core</artifactId>
+-            <scope>test</scope>
+-        </dependency>
+-        <dependency>
+-            <groupId>io.rest-assured</groupId>
+-            <artifactId>rest-assured</artifactId>
+-            <scope>test</scope>
+-            <exclusions>
+-                <exclusion>
+-                    <groupId>org.apache.commons</groupId>
+-                    <artifactId>commons-lang3</artifactId>
+-                </exclusion>
+-            </exclusions>
+-        </dependency>
+-    </dependencies>
+-
+-    <build>
+-        <plugins>
+-            <plugin>
+-                <artifactId>maven-compiler-plugin</artifactId>
+-                <executions>
+-                    <execution>
+-                        <id>default-compile</id>
+-                        <configuration>
+-                            <annotationProcessorPaths>
+-                                <path>
+-                                    <groupId>io.quarkus</groupId>
+-                                    <artifactId>quarkus-extension-processor</artifactId>
+-                                    <version>${project.version}</version>
+-                                </path>
+-                            </annotationProcessorPaths>
+-                            <compilerArgs>
+-                                <arg>-AgenerateDoc=false</arg>
+-                            </compilerArgs>
+-                        </configuration>
+-                    </execution>
+-                </executions>
+-            </plugin>
+-        </plugins>
+-    </build>
+-
+-</project>
+diff --git a/integration-tests/devservices/simple-extension/pom.xml b/integration-tests/devservices/simple-extension/pom.xml
+deleted file mode 100644
+index d188fd36d64..00000000000
+--- a/integration-tests/devservices/simple-extension/pom.xml
++++ /dev/null
+@@ -1,21 +0,0 @@
+-<?xml version="1.0" encoding="UTF-8"?>
+-<project xmlns="http://maven.apache.org/POM/4.0.0"
+-         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+-         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+-    <parent>
+-        <artifactId>quarkus-integration-test-devservices</artifactId>
+-        <groupId>io.quarkus</groupId>
+-        <version>999-SNAPSHOT</version>
+-    </parent>
+-    <modelVersion>4.0.0</modelVersion>
+-
+-    <artifactId>quarkus-integration-test-devservices-simple-extension-parent</artifactId>
+-    <name>Quarkus - Integration Tests - Dev Services - Extension A</name>
+-    <packaging>pom</packaging>
+-
+-
+-    <modules>
+-        <module>deployment</module>
+-        <module>runtime</module>
+-    </modules>
+-</project>
+diff --git a/integration-tests/devservices/simple-extension/runtime/pom.xml b/integration-tests/devservices/simple-extension/runtime/pom.xml
+deleted file mode 100644
+index 7cf3369b950..00000000000
+--- a/integration-tests/devservices/simple-extension/runtime/pom.xml
++++ /dev/null
+@@ -1,106 +0,0 @@
+-<?xml version="1.0" encoding="UTF-8"?>
+-<project xmlns="http://maven.apache.org/POM/4.0.0"
+-         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+-         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+-    <parent>
+-        <artifactId>quarkus-integration-test-devservices-simple-extension-parent</artifactId>
+-        <groupId>io.quarkus</groupId>
+-        <version>999-SNAPSHOT</version>
+-    </parent>
+-    <modelVersion>4.0.0</modelVersion>
+-
+-    <artifactId>quarkus-integration-test-devservices-simple-extension</artifactId>
+-
+-    <dependencies>
+-        <dependency>
+-            <groupId>io.quarkus</groupId>
+-            <artifactId>quarkus-arc</artifactId>
+-        </dependency>
+-
+-        <dependency>
+-            <groupId>io.quarkus</groupId>
+-            <artifactId>quarkus-core</artifactId>
+-        </dependency>
+-        <dependency>
+-            <groupId>io.quarkus</groupId>
+-            <artifactId>quarkus-devservices</artifactId>
+-        </dependency>
+-
+-        <!-- Minimal test dependencies to *-deployment artifacts for consistent build order -->
+-        <dependency>
+-            <groupId>io.quarkus</groupId>
+-            <artifactId>quarkus-arc-deployment</artifactId>
+-            <version>${project.version}</version>
+-            <type>pom</type>
+-            <scope>test</scope>
+-            <exclusions>
+-                <exclusion>
+-                    <groupId>*</groupId>
+-                    <artifactId>*</artifactId>
+-                </exclusion>
+-            </exclusions>
+-        </dependency>
+-        <dependency>
+-            <groupId>io.quarkus</groupId>
+-            <artifactId>quarkus-core-deployment</artifactId>
+-            <version>${project.version}</version>
+-            <type>pom</type>
+-            <scope>test</scope>
+-            <exclusions>
+-                <exclusion>
+-                    <groupId>*</groupId>
+-                    <artifactId>*</artifactId>
+-                </exclusion>
+-            </exclusions>
+-        </dependency>
+-        <!-- Minimal test dependencies to *-deployment artifacts for consistent build order -->
+-        <dependency>
+-            <groupId>io.quarkus</groupId>
+-            <artifactId>quarkus-devservices-deployment</artifactId>
+-            <version>${project.version}</version>
+-            <type>pom</type>
+-            <scope>test</scope>
+-            <exclusions>
+-                <exclusion>
+-                    <groupId>*</groupId>
+-                    <artifactId>*</artifactId>
+-                </exclusion>
+-            </exclusions>
+-        </dependency>
+-    </dependencies>
+-
+-    <build>
+-        <plugins>
+-            <plugin>
+-                <groupId>io.quarkus</groupId>
+-                <artifactId>quarkus-extension-maven-plugin</artifactId>
+-                <configuration>
+-                    <capabilities>
+-                        <provides>io.quarkus.simple-extension</provides>
+-                    </capabilities>
+-                </configuration>
+-            </plugin>
+-            <plugin>
+-                <artifactId>maven-compiler-plugin</artifactId>
+-                <executions>
+-                    <execution>
+-                        <id>default-compile</id>
+-                        <configuration>
+-                            <annotationProcessorPaths>
+-                                <path>
+-                                    <groupId>io.quarkus</groupId>
+-                                    <artifactId>quarkus-extension-processor</artifactId>
+-                                    <version>${project.version}</version>
+-                                </path>
+-                            </annotationProcessorPaths>
+-                            <compilerArgs>
+-                                <arg>-AgenerateDoc=false</arg>
+-                            </compilerArgs>
+-                        </configuration>
+-                    </execution>
+-                </executions>
+-            </plugin>
+-        </plugins>
+-    </build>
+-</project>
+-
+diff --git a/integration-tests/main/src/main/java/io/quarkus/it/rest/TestResource.java b/integration-tests/main/src/main/java/io/quarkus/it/rest/TestResource.java
+index add61929ef9..bb58c4aaf77 100644
+--- a/integration-tests/main/src/main/java/io/quarkus/it/rest/TestResource.java
++++ b/integration-tests/main/src/main/java/io/quarkus/it/rest/TestResource.java
+@@ -224,17 +224,6 @@ public ParentClass subclass() {
+         return child;
+     }
+ 
+-    @GET
+-    @Path("/subsubclass")
+-    @Produces("application/json")
+-    public ParentClass subsubclass() {
+-        GrandChildClass grandChild = new GrandChildClass();
+-        grandChild.setName("your name");
+-        grandChild.setValue("your value");
+-        grandChild.setToy("your toy");
+-        return grandChild;
+-    }
+-
+     @GET
+     @Path("/implementor")
+     @Produces("application/json")
+@@ -500,18 +489,6 @@ public void setValue(String value) {
+         }
+     }
+ 
+-    public static class GrandChildClass extends ChildClass {
+-        private String toy;
+-
+-        public String getToy() {
+-            return toy;
+-        }
+-
+-        public void setToy(String toy) {
+-            this.toy = toy;
+-        }
+-    }
+-
+     public static class MyImplementor implements MyInterface {
+         private String name;
+         private String value;
+diff --git a/integration-tests/pom.xml b/integration-tests/pom.xml
+index 8f26e365822..c2e851f69cc 100644
+--- a/integration-tests/pom.xml
++++ b/integration-tests/pom.xml
+@@ -284,7 +284,6 @@
+                 <module>reactive-mysql-client</module>
+                 <module>reactive-mssql-client</module>
+                 <module>reactive-oracle-client</module>
+-<!--   disabled because of incremental build problems             <module>devservices</module>-->
+                 <module>test-extension</module>
+                 <module>amazon-lambda</module>
+                 <module>amazon-lambda-s3event</module>

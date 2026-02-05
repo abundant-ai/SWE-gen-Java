@@ -1,0 +1,163 @@
+diff --git a/core-processor/src/main/java/io/micronaut/context/visitor/VisitorUtils.java b/core-processor/src/main/java/io/micronaut/context/visitor/VisitorUtils.java
+index d16de4ecda..5759fe168a 100644
+--- a/core-processor/src/main/java/io/micronaut/context/visitor/VisitorUtils.java
++++ b/core-processor/src/main/java/io/micronaut/context/visitor/VisitorUtils.java
+@@ -61,8 +61,7 @@ public class VisitorUtils {
+         if (ArrayUtils.isNotEmpty(classNames)) {
+             for (String className : classNames) {
+                 ClassElement classElement = context.getClassElement(className).orElse(null);
+-                if (classElement == null) {
+-                    context.fail("Cannot access class [" + className + "]", element);
++                if (classElement == null || classElement.isAbstract()) {
+                     continue;
+                 }
+                 importedElements.add(classElement);
+@@ -75,6 +74,9 @@ public class VisitorUtils {
+                 final ClassElement[] classElements = context.getClassElements(aPackage, includedAnnotations);
+                 classes:
+                 for (ClassElement classElement : classElements) {
++                    if (classElement.isAbstract()) {
++                        continue;
++                    }
+                     for (String excludedAnnotation : excludedAnnotations) {
+                         if (classElement.hasAnnotation(excludedAnnotation)) {
+                             continue classes;
+@@ -105,9 +107,8 @@ public class VisitorUtils {
+      * @param mixinAnnotation The {@code AnnotationValue} representing the {@code @Mixin} annotation applied to the mixin class, used to retrieve filter settings.
+      * @param mixin           The {@code ClassElement} representing the mixin class, which contains the annotations, methods, fields, and properties to be applied.
+      * @param mixinTarget     The {@code ClassElement} representing the target class to which the mixin is applied, which will be augmented with elements from the mixin class.
+-     * @param visitorContext  The visitorContext
+      */
+-    public static void applyMixin(AnnotationValue<Mixin> mixinAnnotation, ClassElement mixin, ClassElement mixinTarget, VisitorContext visitorContext) {
++    public static void applyMixin(AnnotationValue<Mixin> mixinAnnotation, ClassElement mixin, ClassElement mixinTarget) {
+         copyAnnotations(mixin, mixinTarget, createPredicate(mixin), findAnnotationsToRemove(mixin));
+ 
+         final Map<String, FieldElement> mixinFields = mixin.getEnclosedElements(
+@@ -203,9 +204,6 @@ public class VisitorUtils {
+             ).ifPresent(targetMethod -> copyAnnotations(mixinMethod, targetMethod, createPredicate(new AnnotationMetadataHierarchy(mixinMethod, mixin))));
+         }
+ 
+-        if (mixin.hasAnnotation(ClassImport.class)) {
+-            visitorContext.warn("Mixin shouldn't be used with @ClassImport", mixin);
+-        }
+         mixin.removeAnnotationIf(annotationValue -> true);
+         mixin.annotate(Vetoed.class);
+     }
+diff --git a/inject-java/src/main/java/io/micronaut/annotation/processing/MixinVisitorProcessor.java b/inject-java/src/main/java/io/micronaut/annotation/processing/MixinVisitorProcessor.java
+index a9c88e00b0..af4d146675 100644
+--- a/inject-java/src/main/java/io/micronaut/annotation/processing/MixinVisitorProcessor.java
++++ b/inject-java/src/main/java/io/micronaut/annotation/processing/MixinVisitorProcessor.java
+@@ -23,7 +23,6 @@ import io.micronaut.context.visitor.VisitorUtils;
+ import io.micronaut.core.annotation.AnnotationValue;
+ import io.micronaut.core.annotation.Generated;
+ import io.micronaut.inject.annotation.AbstractAnnotationMetadataBuilder;
+-import io.micronaut.inject.ast.ClassElement;
+ import io.micronaut.inject.processing.ProcessingException;
+ import io.micronaut.inject.visitor.ElementPostponedToNextRoundException;
+ import io.micronaut.inject.visitor.VisitorContext;
+@@ -93,12 +92,12 @@ public class MixinVisitorProcessor extends AbstractInjectAnnotationProcessor {
+                     if (target == null || Object.class.getName().equals(target)) {
+                         continue;
+                     }
+-                    ClassElement mixinTarget = javaVisitorContext.getClassElement(target, elementAnnotationMetadataFactory).orElse(null);
+-                    if (mixinTarget == null) {
+-                        javaVisitorContext.warn("Cannot access class: " + target, mixin);
++                    TypeElement targetTypeElement = elementUtils.getTypeElement(target);
++                    if (targetTypeElement == null) {
+                         continue;
+                     }
+-                    VisitorUtils.applyMixin(mixinAnnotation, mixin, mixinTarget, javaVisitorContext);
++                    JavaClassElement mixinTarget = elementFactory.newSourceClassElement(targetTypeElement, elementAnnotationMetadataFactory);
++                    VisitorUtils.applyMixin(mixinAnnotation, mixin, mixinTarget);
+                 } catch (ProcessingException e) {
+                     var originatingElement = (JavaNativeElement) e.getOriginatingElement();
+                     if (originatingElement == null) {
+diff --git a/inject-java/src/test/groovy/io/micronaut/visitors/ImportTypeElementSpec.groovy b/inject-java/src/test/groovy/io/micronaut/visitors/ImportTypeElementSpec.groovy
+index 811698ff9f..272b56efd7 100644
+--- a/inject-java/src/test/groovy/io/micronaut/visitors/ImportTypeElementSpec.groovy
++++ b/inject-java/src/test/groovy/io/micronaut/visitors/ImportTypeElementSpec.groovy
+@@ -14,29 +14,6 @@ import io.micronaut.inject.visitor.VisitorContext
+ 
+ class ImportTypeElementSpec extends AbstractTypeElementSpec {
+ 
+-    void "test bean introspection annotate interface"() {
+-        given:
+-            ApplicationContext context = buildContext('test.Test', '''
+-package test;
+-
+-import io.micronaut.context.annotation.ClassImport;
+-import io.micronaut.core.annotation.Introspected;
+-
+-@ClassImport(classes = io.micronaut.visitors.MySimpleInterface.class, annotate = Introspected.class)
+-class Test {}
+-''')
+-
+-        when:"the reference is loaded"
+-            def clazz = context.classLoader.loadClass('test.$io_micronaut_visitors_MySimpleInterface$Introspection')
+-            BeanIntrospectionReference reference = clazz.newInstance()
+-
+-        then:"The reference is generated"
+-            reference != null
+-
+-        cleanup:
+-            context?.close()
+-    }
+-
+     void "test bean introspection annotate"() {
+         given:
+             ApplicationContext context = buildContext('test.Test', '''
+diff --git a/inject-java/src/test/groovy/io/micronaut/visitors/MixinSpec.groovy b/inject-java/src/test/groovy/io/micronaut/visitors/MixinSpec.groovy
+index cb5a601c9a..fdbb3eb329 100644
+--- a/inject-java/src/test/groovy/io/micronaut/visitors/MixinSpec.groovy
++++ b/inject-java/src/test/groovy/io/micronaut/visitors/MixinSpec.groovy
+@@ -6,38 +6,6 @@ import io.micronaut.annotation.processing.test.AbstractTypeElementSpec
+ 
+ class MixinSpec extends AbstractTypeElementSpec {
+ 
+-    void 'test inner class'() {
+-        when:
+-            def myBean = buildBeanIntrospection('mixin.$mixin_MyBean$Inner', '''
+-package mixin;
+-
+-import com.fasterxml.jackson.annotation.JsonProperty;
+-import io.micronaut.context.annotation.ClassImport;
+-import io.micronaut.context.annotation.Mixin;
+-import io.micronaut.core.annotation.Introspected;
+-
+-class MyBean {
+-    static final class Inner {
+-        String name;
+-    }
+-}
+-
+-@Mixin(MyBean.Inner.class)
+-@Introspected(accessKind = Introspected.AccessKind.FIELD)
+-class MyBeanMixin {
+-    @JsonProperty("hello")
+-    String name;
+-}
+-
+-@ClassImport(classes = MyBean.Inner.class)
+-class Import {
+-}
+-
+-''')
+-        then:
+-            myBean.getProperty("name").get().stringValue(JsonProperty).get() == "hello"
+-    }
+-
+     void 'test field'() {
+         when:
+             def myBean = buildBeanIntrospection('mixin.MyBean', '''
+diff --git a/inject-java/src/test/groovy/io/micronaut/visitors/MySimpleInterface.java b/inject-java/src/test/groovy/io/micronaut/visitors/MySimpleInterface.java
+deleted file mode 100644
+index 71c7cc4679..0000000000
+--- a/inject-java/src/test/groovy/io/micronaut/visitors/MySimpleInterface.java
++++ /dev/null
+@@ -1,6 +0,0 @@
+-package io.micronaut.visitors;
+-
+-public interface MySimpleInterface {
+-
+-    String getName();
+-}

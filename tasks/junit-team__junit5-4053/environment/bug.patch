@@ -1,0 +1,588 @@
+diff --git a/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/descriptor/ClassBasedTestDescriptor.java b/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/descriptor/ClassBasedTestDescriptor.java
+index 6b3b524e6..ddfbe7ef3 100644
+--- a/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/descriptor/ClassBasedTestDescriptor.java
++++ b/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/descriptor/ClassBasedTestDescriptor.java
+@@ -74,6 +74,7 @@ import org.junit.platform.engine.TestDescriptor;
+ import org.junit.platform.engine.TestTag;
+ import org.junit.platform.engine.UniqueId;
+ import org.junit.platform.engine.support.descriptor.ClassSource;
++import org.junit.platform.engine.support.hierarchical.ExclusiveResource;
+ import org.junit.platform.engine.support.hierarchical.ThrowableCollector;
+ 
+ /**
+@@ -82,14 +83,13 @@ import org.junit.platform.engine.support.hierarchical.ThrowableCollector;
+  * @since 5.5
+  */
+ @API(status = INTERNAL, since = "5.5")
+-public abstract class ClassBasedTestDescriptor extends JupiterTestDescriptor implements ResourceLockAware {
++public abstract class ClassBasedTestDescriptor extends JupiterTestDescriptor {
+ 
+ 	private static final InterceptingExecutableInvoker executableInvoker = new InterceptingExecutableInvoker();
+ 
+ 	private final Class<?> testClass;
+ 	protected final Set<TestTag> tags;
+ 	protected final Lifecycle lifecycle;
+-	private final ExclusiveResourceCollector exclusiveResourceCollector;
+ 
+ 	private ExecutionMode defaultChildExecutionMode;
+ 	private TestInstanceFactory testInstanceFactory;
+@@ -104,7 +104,6 @@ public abstract class ClassBasedTestDescriptor extends JupiterTestDescriptor imp
+ 		this.tags = getTags(testClass);
+ 		this.lifecycle = getTestInstanceLifecycle(testClass, configuration);
+ 		this.defaultChildExecutionMode = (this.lifecycle == Lifecycle.PER_CLASS ? ExecutionMode.SAME_THREAD : null);
+-		this.exclusiveResourceCollector = ExclusiveResourceCollector.from(testClass);
+ 	}
+ 
+ 	// --- TestDescriptor ------------------------------------------------------
+@@ -113,8 +112,6 @@ public abstract class ClassBasedTestDescriptor extends JupiterTestDescriptor imp
+ 		return this.testClass;
+ 	}
+ 
+-	public abstract List<Class<?>> getEnclosingTestClasses();
+-
+ 	@Override
+ 	public Type getType() {
+ 		return Type.CONTAINER;
+@@ -142,8 +139,13 @@ public abstract class ClassBasedTestDescriptor extends JupiterTestDescriptor imp
+ 	}
+ 
+ 	@Override
+-	public final ExclusiveResourceCollector getExclusiveResourceCollector() {
+-		return exclusiveResourceCollector;
++	public Set<ExclusiveResource> getExclusiveResources() {
++		// @formatter:off
++		return getExclusiveResourcesFromAnnotations(
++				getTestClass(),
++				provider -> provider.provideForClass(getTestClass())
++		);
++		// @formatter:on
+ 	}
+ 
+ 	@Override
+diff --git a/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/descriptor/ClassTestDescriptor.java b/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/descriptor/ClassTestDescriptor.java
+index e644518fb..a7c3034a8 100644
+--- a/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/descriptor/ClassTestDescriptor.java
++++ b/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/descriptor/ClassTestDescriptor.java
+@@ -10,19 +10,16 @@
+ 
+ package org.junit.jupiter.engine.descriptor;
+ 
+-import static java.util.Collections.emptyList;
+ import static org.apiguardian.api.API.Status.INTERNAL;
+ import static org.junit.jupiter.engine.descriptor.DisplayNameUtils.createDisplayNameSupplierForClass;
+ 
+ import java.util.LinkedHashSet;
+-import java.util.List;
+ import java.util.Optional;
+ import java.util.Set;
+ 
+ import org.apiguardian.api.API;
+ import org.junit.jupiter.api.extension.ExtensionContext;
+ import org.junit.jupiter.api.extension.TestInstances;
+-import org.junit.jupiter.api.parallel.ResourceLocksProvider;
+ import org.junit.jupiter.engine.config.JupiterConfiguration;
+ import org.junit.jupiter.engine.execution.JupiterEngineExecutionContext;
+ import org.junit.jupiter.engine.extension.ExtensionRegistrar;
+@@ -60,11 +57,6 @@ public class ClassTestDescriptor extends ClassBasedTestDescriptor {
+ 		return new LinkedHashSet<>(this.tags);
+ 	}
+ 
+-	@Override
+-	public List<Class<?>> getEnclosingTestClasses() {
+-		return emptyList();
+-	}
+-
+ 	// --- Node ----------------------------------------------------------------
+ 
+ 	@Override
+@@ -80,9 +72,4 @@ public class ClassTestDescriptor extends ClassBasedTestDescriptor {
+ 		return instantiateTestClass(Optional.empty(), registry, extensionContext);
+ 	}
+ 
+-	@Override
+-	public Set<ResourceLocksProvider.Lock> evaluateResourceLocksProvider(ResourceLocksProvider provider) {
+-		return provider.provideForClass(getTestClass());
+-	}
+-
+ }
+diff --git a/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/descriptor/ExclusiveResourceCollector.java b/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/descriptor/ExclusiveResourceCollector.java
+deleted file mode 100644
+index 42b1295b2..000000000
+--- a/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/descriptor/ExclusiveResourceCollector.java
++++ /dev/null
+@@ -1,119 +0,0 @@
+-/*
+- * Copyright 2015-2024 the original author or authors.
+- *
+- * All rights reserved. This program and the accompanying materials are
+- * made available under the terms of the Eclipse Public License v2.0 which
+- * accompanies this distribution and is available at
+- *
+- * https://www.eclipse.org/legal/epl-v20.html
+- */
+-
+-package org.junit.jupiter.engine.descriptor;
+-
+-import static org.junit.platform.commons.support.AnnotationSupport.findRepeatableAnnotations;
+-import static org.junit.platform.commons.util.CollectionUtils.toUnmodifiableList;
+-
+-import java.lang.reflect.AnnotatedElement;
+-import java.util.Collection;
+-import java.util.List;
+-import java.util.Set;
+-import java.util.function.Function;
+-import java.util.stream.Stream;
+-
+-import org.junit.jupiter.api.parallel.ResourceAccessMode;
+-import org.junit.jupiter.api.parallel.ResourceLock;
+-import org.junit.jupiter.api.parallel.ResourceLocksProvider;
+-import org.junit.platform.commons.JUnitException;
+-import org.junit.platform.commons.util.ReflectionUtils;
+-import org.junit.platform.commons.util.StringUtils;
+-import org.junit.platform.engine.support.hierarchical.ExclusiveResource;
+-
+-/**
+- * @since 5.12
+- */
+-abstract class ExclusiveResourceCollector {
+-
+-	private static final ExclusiveResourceCollector NO_EXCLUSIVE_RESOURCES = new ExclusiveResourceCollector() {
+-
+-		@Override
+-		Stream<ExclusiveResource> getAllExclusiveResources(
+-				Function<ResourceLocksProvider, Set<ResourceLocksProvider.Lock>> providerToLocks) {
+-			return Stream.empty();
+-		}
+-
+-		@Override
+-		public Stream<ExclusiveResource> getStaticResources() {
+-			return Stream.empty();
+-		}
+-
+-		@Override
+-		Stream<ExclusiveResource> getDynamicResources(
+-				Function<ResourceLocksProvider, Set<ResourceLocksProvider.Lock>> providerToLocks) {
+-			return Stream.empty();
+-		}
+-	};
+-
+-	Stream<ExclusiveResource> getAllExclusiveResources(
+-			Function<ResourceLocksProvider, Set<ResourceLocksProvider.Lock>> providerToLocks) {
+-		return Stream.concat(getStaticResources(), getDynamicResources(providerToLocks));
+-	}
+-
+-	abstract Stream<ExclusiveResource> getStaticResources();
+-
+-	abstract Stream<ExclusiveResource> getDynamicResources(
+-			Function<ResourceLocksProvider, Set<ResourceLocksProvider.Lock>> providerToLocks);
+-
+-	static ExclusiveResourceCollector from(AnnotatedElement element) {
+-		List<ResourceLock> annotations = findRepeatableAnnotations(element, ResourceLock.class);
+-		return annotations.isEmpty() ? NO_EXCLUSIVE_RESOURCES : new DefaultExclusiveResourceCollector(annotations);
+-	}
+-
+-	private static class DefaultExclusiveResourceCollector extends ExclusiveResourceCollector {
+-
+-		private final List<ResourceLock> annotations;
+-		private List<ResourceLocksProvider> providers;
+-
+-		DefaultExclusiveResourceCollector(List<ResourceLock> annotations) {
+-			this.annotations = annotations;
+-		}
+-
+-		@Override
+-		public Stream<ExclusiveResource> getStaticResources() {
+-			return annotations.stream() //
+-					.filter(annotation -> StringUtils.isNotBlank(annotation.value())) //
+-					.map(annotation -> new ExclusiveResource(annotation.value(), toLockMode(annotation.mode())));
+-		}
+-
+-		@Override
+-		Stream<ExclusiveResource> getDynamicResources(
+-				Function<ResourceLocksProvider, Set<ResourceLocksProvider.Lock>> providerToLocks) {
+-			List<ResourceLocksProvider> providers = getProviders();
+-			if (providers.isEmpty()) {
+-				return Stream.empty();
+-			}
+-			return providers.stream() //
+-					.map(providerToLocks) //
+-					.flatMap(Collection::stream) //
+-					.map(lock -> new ExclusiveResource(lock.getKey(), toLockMode(lock.getAccessMode())));
+-		}
+-
+-		private List<ResourceLocksProvider> getProviders() {
+-			if (this.providers == null) {
+-				this.providers = annotations.stream() //
+-						.flatMap(annotation -> Stream.of(annotation.providers()).map(ReflectionUtils::newInstance)) //
+-						.collect(toUnmodifiableList());
+-			}
+-			return providers;
+-		}
+-
+-		private static ExclusiveResource.LockMode toLockMode(ResourceAccessMode mode) {
+-			switch (mode) {
+-				case READ:
+-					return ExclusiveResource.LockMode.READ;
+-				case READ_WRITE:
+-					return ExclusiveResource.LockMode.READ_WRITE;
+-			}
+-			throw new JUnitException("Unknown ResourceAccessMode: " + mode);
+-		}
+-	}
+-}
+diff --git a/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/descriptor/JupiterTestDescriptor.java b/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/descriptor/JupiterTestDescriptor.java
+index 86fecaf73..54673dcb9 100644
+--- a/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/descriptor/JupiterTestDescriptor.java
++++ b/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/descriptor/JupiterTestDescriptor.java
+@@ -10,9 +10,10 @@
+ 
+ package org.junit.jupiter.engine.descriptor;
+ 
+-import static java.util.Collections.emptySet;
++import static java.util.Collections.emptyList;
+ import static java.util.stream.Collectors.collectingAndThen;
+ import static java.util.stream.Collectors.toCollection;
++import static java.util.stream.Collectors.toList;
+ import static java.util.stream.Collectors.toSet;
+ import static org.apiguardian.api.API.Status.INTERNAL;
+ import static org.junit.jupiter.engine.descriptor.DisplayNameUtils.determineDisplayName;
+@@ -20,18 +21,25 @@ import static org.junit.platform.commons.support.AnnotationSupport.findAnnotatio
+ import static org.junit.platform.commons.support.AnnotationSupport.findRepeatableAnnotations;
+ 
+ import java.lang.reflect.AnnotatedElement;
++import java.util.ArrayList;
++import java.util.Collection;
+ import java.util.Collections;
+ import java.util.LinkedHashSet;
+ import java.util.List;
+ import java.util.Optional;
+ import java.util.Set;
++import java.util.function.Function;
+ import java.util.function.Supplier;
++import java.util.stream.Stream;
+ 
+ import org.apiguardian.api.API;
+ import org.junit.jupiter.api.Tag;
+ import org.junit.jupiter.api.extension.ConditionEvaluationResult;
+ import org.junit.jupiter.api.extension.Extension;
+ import org.junit.jupiter.api.parallel.Execution;
++import org.junit.jupiter.api.parallel.ResourceAccessMode;
++import org.junit.jupiter.api.parallel.ResourceLock;
++import org.junit.jupiter.api.parallel.ResourceLocksProvider;
+ import org.junit.jupiter.engine.config.JupiterConfiguration;
+ import org.junit.jupiter.engine.execution.ConditionEvaluator;
+ import org.junit.jupiter.engine.execution.JupiterEngineExecutionContext;
+@@ -40,6 +48,8 @@ import org.junit.platform.commons.JUnitException;
+ import org.junit.platform.commons.logging.Logger;
+ import org.junit.platform.commons.logging.LoggerFactory;
+ import org.junit.platform.commons.util.ExceptionUtils;
++import org.junit.platform.commons.util.ReflectionUtils;
++import org.junit.platform.commons.util.StringUtils;
+ import org.junit.platform.commons.util.UnrecoverableExceptions;
+ import org.junit.platform.engine.TestDescriptor;
+ import org.junit.platform.engine.TestSource;
+@@ -47,6 +57,7 @@ import org.junit.platform.engine.TestTag;
+ import org.junit.platform.engine.UniqueId;
+ import org.junit.platform.engine.support.descriptor.AbstractTestDescriptor;
+ import org.junit.platform.engine.support.hierarchical.ExclusiveResource;
++import org.junit.platform.engine.support.hierarchical.ExclusiveResource.LockMode;
+ import org.junit.platform.engine.support.hierarchical.Node;
+ 
+ /**
+@@ -98,6 +109,17 @@ public abstract class JupiterTestDescriptor extends AbstractTestDescriptor
+ 		// @formatter:on
+ 	}
+ 
++	public List<Class<?>> getEnclosingTestClasses() {
++		TestDescriptor parent = getParent().orElse(null);
++		if (parent instanceof ClassBasedTestDescriptor) {
++			ClassBasedTestDescriptor parentClassDescriptor = (ClassBasedTestDescriptor) parent;
++			List<Class<?>> result = new ArrayList<>(parentClassDescriptor.getEnclosingTestClasses());
++			result.add(parentClassDescriptor.getTestClass());
++			return result;
++		}
++		return emptyList();
++	}
++
+ 	/**
+ 	 * Invoke exception handlers for the supplied {@code Throwable} one-by-one
+ 	 * until none are left or the throwable to handle has been swallowed.
+@@ -178,12 +200,57 @@ public abstract class JupiterTestDescriptor extends AbstractTestDescriptor
+ 		throw new JUnitException("Unknown ExecutionMode: " + mode);
+ 	}
+ 
+-	@Override
+-	public Set<ExclusiveResource> getExclusiveResources() {
+-		if (this instanceof ResourceLockAware) {
+-			return ((ResourceLockAware) this).determineExclusiveResources().collect(toSet());
++	Set<ExclusiveResource> getExclusiveResourcesFromAnnotations(AnnotatedElement element,
++			Function<ResourceLocksProvider, Set<ResourceLocksProvider.Lock>> providerToLocks) {
++		// @formatter:off
++		List<ResourceLock> ownAnnotations = findRepeatableAnnotations(element, ResourceLock.class);
++		List<ResourceLock> enclosingClassesAnnotations = getEnclosingTestClasses().stream()
++				.map(clazz -> findRepeatableAnnotations(clazz, ResourceLock.class))
++				.flatMap(Collection::stream)
++				.collect(toList());
++
++		return Stream.of(
++				getExclusiveResourcesFromValues(ownAnnotations),
++				getExclusiveResourcesFromProviders(ownAnnotations, providerToLocks),
++				getExclusiveResourcesFromProviders(enclosingClassesAnnotations, providerToLocks)
++		).flatMap(s -> s)
++		.collect(toSet());
++		// @formatter:on
++	}
++
++	private Stream<ExclusiveResource> getExclusiveResourcesFromValues(List<ResourceLock> annotations) {
++		// @formatter:off
++		return annotations.stream()
++				.flatMap(annotation -> {
++					if (StringUtils.isBlank(annotation.value())) {
++						return Stream.empty();
++					}
++					return Stream.of(new ExclusiveResource(annotation.value(), toLockMode(annotation.mode())));
++				});
++		// @formatter:on
++	}
++
++	private Stream<ExclusiveResource> getExclusiveResourcesFromProviders(List<ResourceLock> annotations,
++			Function<ResourceLocksProvider, Set<ResourceLocksProvider.Lock>> providerToLocks) {
++		// @formatter:off
++		return annotations.stream()
++				.flatMap(annotation -> Stream.of(annotation.providers())
++						.map(ReflectionUtils::newInstance)
++						.map(providerToLocks)
++						.flatMap(Collection::stream)
++						.map(lock -> new ExclusiveResource(lock.getKey(), toLockMode(lock.getAccessMode())))
++				);
++		// @formatter:on
++	}
++
++	private static LockMode toLockMode(ResourceAccessMode mode) {
++		switch (mode) {
++			case READ:
++				return LockMode.READ;
++			case READ_WRITE:
++				return LockMode.READ_WRITE;
+ 		}
+-		return emptySet();
++		throw new JUnitException("Unknown ResourceAccessMode: " + mode);
+ 	}
+ 
+ 	@Override
+diff --git a/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/descriptor/MethodBasedTestDescriptor.java b/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/descriptor/MethodBasedTestDescriptor.java
+index 9c8e4bcb1..6a21a3ae6 100644
+--- a/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/descriptor/MethodBasedTestDescriptor.java
++++ b/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/descriptor/MethodBasedTestDescriptor.java
+@@ -24,7 +24,6 @@ import java.util.function.Consumer;
+ import org.apiguardian.api.API;
+ import org.junit.jupiter.api.extension.ExtensionContext;
+ import org.junit.jupiter.api.extension.TestWatcher;
+-import org.junit.jupiter.api.parallel.ResourceLocksProvider;
+ import org.junit.jupiter.engine.config.JupiterConfiguration;
+ import org.junit.jupiter.engine.execution.JupiterEngineExecutionContext;
+ import org.junit.platform.commons.logging.Logger;
+@@ -37,6 +36,7 @@ import org.junit.platform.engine.TestDescriptor;
+ import org.junit.platform.engine.TestTag;
+ import org.junit.platform.engine.UniqueId;
+ import org.junit.platform.engine.support.descriptor.MethodSource;
++import org.junit.platform.engine.support.hierarchical.ExclusiveResource;
+ 
+ /**
+  * Base class for {@link TestDescriptor TestDescriptors} based on Java methods.
+@@ -44,7 +44,7 @@ import org.junit.platform.engine.support.descriptor.MethodSource;
+  * @since 5.0
+  */
+ @API(status = INTERNAL, since = "5.0")
+-public abstract class MethodBasedTestDescriptor extends JupiterTestDescriptor implements ResourceLockAware {
++public abstract class MethodBasedTestDescriptor extends JupiterTestDescriptor {
+ 
+ 	private static final Logger logger = LoggerFactory.getLogger(MethodBasedTestDescriptor.class);
+ 
+@@ -80,14 +80,13 @@ public abstract class MethodBasedTestDescriptor extends JupiterTestDescriptor im
+ 	}
+ 
+ 	@Override
+-	public ExclusiveResourceCollector getExclusiveResourceCollector() {
+-		// There's no need to cache this as this method should only be called once
+-		return ExclusiveResourceCollector.from(getTestMethod());
+-	}
+-
+-	@Override
+-	public Set<ResourceLocksProvider.Lock> evaluateResourceLocksProvider(ResourceLocksProvider provider) {
+-		return provider.provideForMethod(getTestClass(), getTestMethod());
++	public Set<ExclusiveResource> getExclusiveResources() {
++		// @formatter:off
++		return getExclusiveResourcesFromAnnotations(
++				getTestMethod(),
++				provider -> provider.provideForMethod(getTestClass(), getTestMethod())
++		);
++		// @formatter:on
+ 	}
+ 
+ 	@Override
+diff --git a/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/descriptor/NestedClassTestDescriptor.java b/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/descriptor/NestedClassTestDescriptor.java
+index 0c1f697b2..7732a8585 100644
+--- a/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/descriptor/NestedClassTestDescriptor.java
++++ b/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/descriptor/NestedClassTestDescriptor.java
+@@ -10,20 +10,16 @@
+ 
+ package org.junit.jupiter.engine.descriptor;
+ 
+-import static java.util.Collections.emptyList;
+ import static org.apiguardian.api.API.Status.INTERNAL;
+ import static org.junit.jupiter.engine.descriptor.DisplayNameUtils.createDisplayNameSupplierForNestedClass;
+ 
+-import java.util.ArrayList;
+ import java.util.LinkedHashSet;
+-import java.util.List;
+ import java.util.Optional;
+ import java.util.Set;
+ 
+ import org.apiguardian.api.API;
+ import org.junit.jupiter.api.extension.ExtensionContext;
+ import org.junit.jupiter.api.extension.TestInstances;
+-import org.junit.jupiter.api.parallel.ResourceLocksProvider;
+ import org.junit.jupiter.engine.config.JupiterConfiguration;
+ import org.junit.jupiter.engine.execution.JupiterEngineExecutionContext;
+ import org.junit.jupiter.engine.extension.ExtensionRegistrar;
+@@ -31,6 +27,7 @@ import org.junit.jupiter.engine.extension.ExtensionRegistry;
+ import org.junit.platform.engine.TestDescriptor;
+ import org.junit.platform.engine.TestTag;
+ import org.junit.platform.engine.UniqueId;
++import org.junit.platform.engine.support.hierarchical.ExclusiveResource;
+ import org.junit.platform.engine.support.hierarchical.ThrowableCollector;
+ 
+ /**
+@@ -62,18 +59,6 @@ public class NestedClassTestDescriptor extends ClassBasedTestDescriptor {
+ 		return allTags;
+ 	}
+ 
+-	@Override
+-	public List<Class<?>> getEnclosingTestClasses() {
+-		TestDescriptor parent = getParent().orElse(null);
+-		if (parent instanceof ClassBasedTestDescriptor) {
+-			ClassBasedTestDescriptor parentClassDescriptor = (ClassBasedTestDescriptor) parent;
+-			List<Class<?>> result = new ArrayList<>(parentClassDescriptor.getEnclosingTestClasses());
+-			result.add(parentClassDescriptor.getTestClass());
+-			return result;
+-		}
+-		return emptyList();
+-	}
+-
+ 	// --- Node ----------------------------------------------------------------
+ 
+ 	@Override
+@@ -89,8 +74,13 @@ public class NestedClassTestDescriptor extends ClassBasedTestDescriptor {
+ 	}
+ 
+ 	@Override
+-	public Set<ResourceLocksProvider.Lock> evaluateResourceLocksProvider(ResourceLocksProvider provider) {
+-		return provider.provideForNestedClass(getTestClass());
++	public Set<ExclusiveResource> getExclusiveResources() {
++		// @formatter:off
++		return getExclusiveResourcesFromAnnotations(
++				getTestClass(),
++				provider -> provider.provideForNestedClass(getTestClass())
++		);
++		// @formatter:on
+ 	}
+ 
+ }
+diff --git a/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/descriptor/ResourceLockAware.java b/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/descriptor/ResourceLockAware.java
+deleted file mode 100644
+index 858644d48..000000000
+--- a/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/descriptor/ResourceLockAware.java
++++ /dev/null
+@@ -1,55 +0,0 @@
+-/*
+- * Copyright 2015-2024 the original author or authors.
+- *
+- * All rights reserved. This program and the accompanying materials are
+- * made available under the terms of the Eclipse Public License v2.0 which
+- * accompanies this distribution and is available at
+- *
+- * https://www.eclipse.org/legal/epl-v20.html
+- */
+-
+-package org.junit.jupiter.engine.descriptor;
+-
+-import java.util.ArrayDeque;
+-import java.util.Deque;
+-import java.util.Set;
+-import java.util.stream.Stream;
+-
+-import org.junit.jupiter.api.parallel.ResourceLocksProvider;
+-import org.junit.platform.engine.TestDescriptor;
+-import org.junit.platform.engine.support.hierarchical.ExclusiveResource;
+-
+-/**
+- * @since 5.12
+- */
+-interface ResourceLockAware extends TestDescriptor {
+-
+-	default Stream<ExclusiveResource> determineExclusiveResources() {
+-
+-		Deque<ResourceLockAware> ancestors = new ArrayDeque<>();
+-		TestDescriptor parent = this.getParent().orElse(null);
+-		while (parent instanceof ResourceLockAware) {
+-			ancestors.addFirst((ResourceLockAware) parent);
+-			parent = parent.getParent().orElse(null);
+-		}
+-
+-		if (ancestors.isEmpty()) {
+-			return determineOwnExclusiveResources();
+-		}
+-
+-		Stream<ExclusiveResource> ancestorDynamicResources = ancestors.stream() //
+-				.map(ResourceLockAware::getExclusiveResourceCollector) //
+-				.flatMap(collector -> collector.getDynamicResources(this::evaluateResourceLocksProvider));
+-
+-		return Stream.concat(ancestorDynamicResources, determineOwnExclusiveResources());
+-	}
+-
+-	default Stream<ExclusiveResource> determineOwnExclusiveResources() {
+-		return this.getExclusiveResourceCollector().getAllExclusiveResources(this::evaluateResourceLocksProvider);
+-	}
+-
+-	ExclusiveResourceCollector getExclusiveResourceCollector();
+-
+-	Set<ResourceLocksProvider.Lock> evaluateResourceLocksProvider(ResourceLocksProvider provider);
+-
+-}
+diff --git a/platform-tests/src/test/java/org/junit/platform/engine/support/descriptor/ResourceLocksProviderTests.java b/platform-tests/src/test/java/org/junit/platform/engine/support/descriptor/ResourceLocksProviderTests.java
+index 3b60bc755..f9b350ccb 100644
+--- a/platform-tests/src/test/java/org/junit/platform/engine/support/descriptor/ResourceLocksProviderTests.java
++++ b/platform-tests/src/test/java/org/junit/platform/engine/support/descriptor/ResourceLocksProviderTests.java
+@@ -77,7 +77,6 @@ class ResourceLocksProviderTests {
+ 
+ 	// -------------------------------------------------------------------------
+ 
+-	@SuppressWarnings("JUnitMalformedDeclaration")
+ 	@ResourceLock(providers = ClassLevelProviderTestCase.Provider.class)
+ 	static class ClassLevelProviderTestCase {
+ 
+@@ -151,7 +150,6 @@ class ResourceLocksProviderTests {
+ 		}
+ 	}
+ 
+-	@SuppressWarnings("JUnitMalformedDeclaration")
+ 	static class NestedClassLevelProviderTestCase {
+ 
+ 		@Test
+@@ -204,7 +202,6 @@ class ResourceLocksProviderTests {
+ 		}
+ 	}
+ 
+-	@SuppressWarnings("JUnitMalformedDeclaration")
+ 	static class MethodLevelProviderTestCase {
+ 
+ 		@Test
+@@ -252,7 +249,6 @@ class ResourceLocksProviderTests {
+ 		}
+ 	}
+ 
+-	@SuppressWarnings("JUnitMalformedDeclaration")
+ 	static class MethodLevelProviderInNestedClassTestCase {
+ 
+ 		@Test

@@ -1,0 +1,339 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 9fc4597d..ac5e7316 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,7 +7,6 @@
+  - First-party converters now support deferring serialization to happen when the request body is written (i.e., during HTTP execution) rather than when the HTTP request is created. In some cases this moves conversion from a calling thread to a background thread, such as in the case when using `Call.enqueue` directly.
+ 
+    The following converters support this feature through a new `withStreaming()` factory method:
+-   - Gson
+    - Moshi
+    - Wire
+ 
+diff --git a/retrofit-converters/gson/build.gradle b/retrofit-converters/gson/build.gradle
+index 6a60acb2..eed0d200 100644
+--- a/retrofit-converters/gson/build.gradle
++++ b/retrofit-converters/gson/build.gradle
+@@ -9,7 +9,6 @@ dependencies {
+   testImplementation libs.junit
+   testImplementation libs.truth
+   testImplementation libs.okhttp.mockwebserver
+-  testImplementation libs.testParameterInjector
+ }
+ 
+ jar {
+diff --git a/retrofit-converters/gson/src/main/java/retrofit2/converter/gson/GsonConverterFactory.java b/retrofit-converters/gson/src/main/java/retrofit2/converter/gson/GsonConverterFactory.java
+index 63f619ed..ad0b9e3d 100644
+--- a/retrofit-converters/gson/src/main/java/retrofit2/converter/gson/GsonConverterFactory.java
++++ b/retrofit-converters/gson/src/main/java/retrofit2/converter/gson/GsonConverterFactory.java
+@@ -22,7 +22,6 @@ import java.lang.annotation.Annotation;
+ import java.lang.reflect.Type;
+ import okhttp3.RequestBody;
+ import okhttp3.ResponseBody;
+-import retrofit2.Call;
+ import retrofit2.Converter;
+ import retrofit2.Retrofit;
+ 
+@@ -50,25 +49,13 @@ public final class GsonConverterFactory extends Converter.Factory {
+   @SuppressWarnings("ConstantConditions") // Guarding public API nullability.
+   public static GsonConverterFactory create(Gson gson) {
+     if (gson == null) throw new NullPointerException("gson == null");
+-    return new GsonConverterFactory(gson, false);
++    return new GsonConverterFactory(gson);
+   }
+ 
+   private final Gson gson;
+-  private final boolean streaming;
+ 
+-  private GsonConverterFactory(Gson gson, boolean streaming) {
++  private GsonConverterFactory(Gson gson) {
+     this.gson = gson;
+-    this.streaming = streaming;
+-  }
+-
+-  /**
+-   * Return a new factory which streams serialization of request messages to bytes on the HTTP thread
+-   * This is either the calling thread for {@link Call#execute()}, or one of OkHttp's background
+-   * threads for {@link Call#enqueue}. Response bytes are always converted to message instances on
+-   * one of OkHttp's background threads.
+-   */
+-  public GsonConverterFactory withStreaming() {
+-    return new GsonConverterFactory(gson, true);
+   }
+ 
+   @Override
+@@ -85,6 +72,6 @@ public final class GsonConverterFactory extends Converter.Factory {
+       Annotation[] methodAnnotations,
+       Retrofit retrofit) {
+     TypeAdapter<?> adapter = gson.getAdapter(TypeToken.get(type));
+-    return new GsonRequestBodyConverter<>(gson, adapter, streaming);
++    return new GsonRequestBodyConverter<>(gson, adapter);
+   }
+ }
+diff --git a/retrofit-converters/gson/src/main/java/retrofit2/converter/gson/GsonRequestBodyConverter.java b/retrofit-converters/gson/src/main/java/retrofit2/converter/gson/GsonRequestBodyConverter.java
+index 8a0045ed..2261df7e 100644
+--- a/retrofit-converters/gson/src/main/java/retrofit2/converter/gson/GsonRequestBodyConverter.java
++++ b/retrofit-converters/gson/src/main/java/retrofit2/converter/gson/GsonRequestBodyConverter.java
+@@ -26,38 +26,26 @@ import java.io.Writer;
+ import okhttp3.MediaType;
+ import okhttp3.RequestBody;
+ import okio.Buffer;
+-import okio.BufferedSink;
+ import retrofit2.Converter;
+ 
+ final class GsonRequestBodyConverter<T> implements Converter<T, RequestBody> {
+-  static final MediaType MEDIA_TYPE = MediaType.get("application/json; charset=UTF-8");
++  private static final MediaType MEDIA_TYPE = MediaType.get("application/json; charset=UTF-8");
+ 
+   private final Gson gson;
+   private final TypeAdapter<T> adapter;
+-  private final boolean streaming;
+ 
+-  GsonRequestBodyConverter(Gson gson, TypeAdapter<T> adapter, boolean streaming) {
++  GsonRequestBodyConverter(Gson gson, TypeAdapter<T> adapter) {
+     this.gson = gson;
+     this.adapter = adapter;
+-    this.streaming = streaming;
+   }
+ 
+   @Override
+   public RequestBody convert(T value) throws IOException {
+-    if (streaming) {
+-      return new GsonStreamingRequestBody<>(gson, adapter, value);
+-    }
+-
+     Buffer buffer = new Buffer();
+-    writeJson(buffer, gson, adapter, value);
+-    return RequestBody.create(MEDIA_TYPE, buffer.readByteString());
+-  }
+-
+-  static <T> void writeJson(BufferedSink sink, Gson gson, TypeAdapter<T> adapter, T value)
+-      throws IOException {
+-    Writer writer = new OutputStreamWriter(sink.outputStream(), UTF_8);
++    Writer writer = new OutputStreamWriter(buffer.outputStream(), UTF_8);
+     JsonWriter jsonWriter = gson.newJsonWriter(writer);
+     adapter.write(jsonWriter, value);
+     jsonWriter.close();
++    return RequestBody.create(MEDIA_TYPE, buffer.readByteString());
+   }
+ }
+diff --git a/retrofit-converters/gson/src/main/java/retrofit2/converter/gson/GsonStreamingRequestBody.java b/retrofit-converters/gson/src/main/java/retrofit2/converter/gson/GsonStreamingRequestBody.java
+deleted file mode 100644
+index 590d6d14..00000000
+--- a/retrofit-converters/gson/src/main/java/retrofit2/converter/gson/GsonStreamingRequestBody.java
++++ /dev/null
+@@ -1,48 +0,0 @@
+-/*
+- * Copyright (C) 2025 Square, Inc.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-package retrofit2.converter.gson;
+-
+-import static retrofit2.converter.gson.GsonRequestBodyConverter.MEDIA_TYPE;
+-import static retrofit2.converter.gson.GsonRequestBodyConverter.writeJson;
+-
+-import com.google.gson.Gson;
+-import com.google.gson.TypeAdapter;
+-import java.io.IOException;
+-import okhttp3.MediaType;
+-import okhttp3.RequestBody;
+-import okio.BufferedSink;
+-
+-final class GsonStreamingRequestBody<T> extends RequestBody {
+-  private final Gson gson;
+-  private final TypeAdapter<T> adapter;
+-  private final T value;
+-
+-  public GsonStreamingRequestBody(Gson gson, TypeAdapter<T> adapter, T value) {
+-    this.gson = gson;
+-    this.adapter = adapter;
+-    this.value = value;
+-  }
+-
+-  @Override
+-  public MediaType contentType() {
+-    return MEDIA_TYPE;
+-  }
+-
+-  @Override
+-  public void writeTo(BufferedSink sink) throws IOException {
+-    writeJson(sink, gson, adapter, value);
+-  }
+-}
+diff --git a/retrofit-converters/gson/src/test/java/retrofit2/converter/gson/GsonConverterFactoryTest.java b/retrofit-converters/gson/src/test/java/retrofit2/converter/gson/GsonConverterFactoryTest.java
+index fc9d232a..f09ba6d2 100644
+--- a/retrofit-converters/gson/src/test/java/retrofit2/converter/gson/GsonConverterFactoryTest.java
++++ b/retrofit-converters/gson/src/test/java/retrofit2/converter/gson/GsonConverterFactoryTest.java
+@@ -17,7 +17,6 @@ package retrofit2.converter.gson;
+ 
+ import static com.google.common.truth.Truth.assertThat;
+ import static org.junit.Assert.fail;
+-import static org.junit.Assume.assumeTrue;
+ 
+ import com.google.gson.Gson;
+ import com.google.gson.GsonBuilder;
+@@ -26,27 +25,20 @@ import com.google.gson.TypeAdapter;
+ import com.google.gson.stream.JsonReader;
+ import com.google.gson.stream.JsonToken;
+ import com.google.gson.stream.JsonWriter;
+-import com.google.testing.junit.testparameterinjector.TestParameter;
+-import com.google.testing.junit.testparameterinjector.TestParameterInjector;
+-import java.io.EOFException;
+ import java.io.IOException;
+-import java.util.concurrent.CountDownLatch;
+-import java.util.concurrent.atomic.AtomicReference;
+ import okhttp3.mockwebserver.MockResponse;
+ import okhttp3.mockwebserver.MockWebServer;
+ import okhttp3.mockwebserver.RecordedRequest;
++import org.junit.Before;
+ import org.junit.Rule;
+ import org.junit.Test;
+-import org.junit.runner.RunWith;
+ import retrofit2.Call;
+-import retrofit2.Callback;
+ import retrofit2.Response;
+ import retrofit2.Retrofit;
+ import retrofit2.http.Body;
+ import retrofit2.http.GET;
+ import retrofit2.http.POST;
+ 
+-@RunWith(TestParameterInjector.class)
+ public final class GsonConverterFactoryTest {
+   interface AnInterface {
+     String getName();
+@@ -65,27 +57,27 @@ public final class GsonConverterFactoryTest {
+     }
+   }
+ 
+-  static final class ErroringValue {
+-    static final TypeAdapter<ErroringValue> BROKEN_ADAPTER =
+-        new TypeAdapter<ErroringValue>() {
++  static final class Value {
++    static final TypeAdapter<Value> BROKEN_ADAPTER =
++        new TypeAdapter<Value>() {
+           @Override
+-          public void write(JsonWriter out, ErroringValue value) throws IOException {
+-            throw new EOFException("oops!");
++          public void write(JsonWriter out, Value value) {
++            throw new AssertionError();
+           }
+ 
+           @Override
+           @SuppressWarnings("CheckReturnValue")
+-          public ErroringValue read(JsonReader reader) throws IOException {
++          public Value read(JsonReader reader) throws IOException {
+             reader.beginObject();
+             reader.nextName();
+             String theName = reader.nextString();
+-            return new ErroringValue(theName);
++            return new Value(theName);
+           }
+         };
+ 
+     final String theName;
+ 
+-    ErroringValue(String theName) {
++    Value(String theName) {
+       this.theName = theName;
+     }
+   }
+@@ -124,36 +116,25 @@ public final class GsonConverterFactoryTest {
+     Call<AnInterface> anInterface(@Body AnInterface impl);
+ 
+     @GET("/")
+-    Call<ErroringValue> readErroringValue();
+-
+-    @POST("/")
+-    Call<Void> writeErroringValue(@Body ErroringValue value);
++    Call<Value> value();
+   }
+ 
+   @Rule public final MockWebServer server = new MockWebServer();
+ 
+-  private final boolean streaming;
+-  private final Service service;
+-
+-  public GsonConverterFactoryTest(@TestParameter boolean streaming) {
+-    this.streaming = streaming;
++  private Service service;
+ 
++  @Before
++  public void setUp() {
+     Gson gson =
+         new GsonBuilder()
+             .registerTypeAdapter(AnInterface.class, new AnInterfaceAdapter())
+-            .registerTypeAdapter(ErroringValue.class, ErroringValue.BROKEN_ADAPTER)
++            .registerTypeAdapter(Value.class, Value.BROKEN_ADAPTER)
+             .setLenient()
+             .create();
+-
+-    GsonConverterFactory factory = GsonConverterFactory.create(gson);
+-    if (streaming) {
+-      factory = factory.withStreaming();
+-    }
+-
+     Retrofit retrofit =
+-        new Retrofit.Builder() //
+-            .baseUrl(server.url("/")) //
+-            .addConverterFactory(factory) //
++        new Retrofit.Builder()
++            .baseUrl(server.url("/"))
++            .addConverterFactory(GsonConverterFactory.create(gson))
+             .build();
+     service = retrofit.create(Service.class);
+   }
+@@ -210,7 +191,7 @@ public final class GsonConverterFactoryTest {
+   public void requireFullResponseDocumentConsumption() throws Exception {
+     server.enqueue(new MockResponse().setBody("{\"theName\":\"value\"}"));
+ 
+-    Call<ErroringValue> call = service.readErroringValue();
++    Call<Value> call = service.value();
+     try {
+       call.execute();
+       fail();
+@@ -218,34 +199,4 @@ public final class GsonConverterFactoryTest {
+       assertThat(e).hasMessageThat().isEqualTo("JSON document was not fully consumed.");
+     }
+   }
+-
+-  @Test
+-  public void serializeIsStreamed() throws InterruptedException {
+-    assumeTrue(streaming);
+-
+-    Call<Void> call = service.writeErroringValue(new ErroringValue("hi"));
+-
+-    final AtomicReference<Throwable> throwableRef = new AtomicReference<>();
+-    final CountDownLatch latch = new CountDownLatch(1);
+-
+-    // If streaming were broken, the call to enqueue would throw the exception synchronously.
+-    call.enqueue(
+-        new Callback<Void>() {
+-          @Override
+-          public void onResponse(Call<Void> call, Response<Void> response) {
+-            latch.countDown();
+-          }
+-
+-          @Override
+-          public void onFailure(Call<Void> call, Throwable t) {
+-            throwableRef.set(t);
+-            latch.countDown();
+-          }
+-        });
+-    latch.await();
+-
+-    Throwable throwable = throwableRef.get();
+-    assertThat(throwable).isInstanceOf(EOFException.class);
+-    assertThat(throwable).hasMessageThat().isEqualTo("oops!");
+-  }
+ }

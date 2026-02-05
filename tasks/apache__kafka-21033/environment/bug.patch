@@ -1,0 +1,2380 @@
+diff --git a/clients/src/main/java/org/apache/kafka/clients/consumer/internals/ShareConsumeRequestManager.java b/clients/src/main/java/org/apache/kafka/clients/consumer/internals/ShareConsumeRequestManager.java
+index e57265716f..183f15833a 100644
+--- a/clients/src/main/java/org/apache/kafka/clients/consumer/internals/ShareConsumeRequestManager.java
++++ b/clients/src/main/java/org/apache/kafka/clients/consumer/internals/ShareConsumeRequestManager.java
+@@ -253,20 +253,24 @@ public class ShareConsumeRequestManager implements RequestManager, MemberStateLi
+             Node target = entry.getKey();
+             ShareSessionHandler handler = entry.getValue();
+ 
++            log.trace("Building ShareFetch request to send to node {}", target.id());
++            ShareFetchRequest.Builder requestBuilder = handler.newShareFetchBuilder(groupId, shareFetchConfig);
++
+             // For record_limit mode, we only send a full ShareFetch to a single node at a time.
+             // We prepare to build ShareFetch requests for all nodes with session handlers to permit
+             // piggy-backing of acknowledgements, and also to adjust the topic-partitions
+-            // in the share session, but if the request would contain neither of those, it can be skipped.
+-            boolean canSkipIfRequestEmpty = isShareAcquireModeRecordLimit() && target.id() != fetchRecordsNodeId.get();
+-
+-            ShareFetchRequest.Builder requestBuilder = handler.newShareFetchBuilder(groupId, shareFetchConfig, canSkipIfRequestEmpty);
+-            if (requestBuilder == null) {
+-                log.trace("Skipping ShareFetch request to send to node {}", target.id());
+-                return null;
++            // in the share session.
++            if (isShareAcquireModeRecordLimit() && target.id() != fetchRecordsNodeId.get()) {
++                ShareFetchRequestData data = requestBuilder.data();
++                // If there's nothing to send, just skip building the record.
++                if (data.topics().isEmpty() && data.forgottenTopicsData().isEmpty()) {
++                    return null;
++                } else {
++                    // There is something to send, but we don't want to fetch any records.
++                    requestBuilder.data().setMaxRecords(0);
++                }
+             }
+ 
+-            log.trace("Building ShareFetch request to send to node {}", target.id());
+-
+             nodesWithPendingRequests.add(target.id());
+ 
+             BiConsumer<ClientResponse, Throwable> responseHandler = (clientResponse, error) -> {
+diff --git a/clients/src/main/java/org/apache/kafka/clients/consumer/internals/ShareSessionHandler.java b/clients/src/main/java/org/apache/kafka/clients/consumer/internals/ShareSessionHandler.java
+index 0b6cdf0a6d..348855a341 100644
+--- a/clients/src/main/java/org/apache/kafka/clients/consumer/internals/ShareSessionHandler.java
++++ b/clients/src/main/java/org/apache/kafka/clients/consumer/internals/ShareSessionHandler.java
+@@ -54,7 +54,6 @@ import java.util.stream.Collectors;
+  * <p>ShareSessionHandler tracks the partitions which are in the session. It also determines
+  * which partitions need to be included in each ShareFetch/ShareAcknowledge request.
+  */
+-@SuppressWarnings({"NPathComplexity", "CyclomaticComplexity"})
+ public class ShareSessionHandler {
+     private final Logger log;
+     private final int node;
+@@ -113,7 +112,7 @@ public class ShareSessionHandler {
+         return nextMetadata.isNewSession();
+     }
+ 
+-    public ShareFetchRequest.Builder newShareFetchBuilder(String groupId, ShareFetchConfig shareFetchConfig, boolean canSkipIfRequestEmpty) {
++    public ShareFetchRequest.Builder newShareFetchBuilder(String groupId, ShareFetchConfig shareFetchConfig) {
+         List<TopicIdPartition> added = new ArrayList<>();
+         List<TopicIdPartition> removed = new ArrayList<>();
+         List<TopicIdPartition> replaced = new ArrayList<>();
+@@ -159,6 +158,15 @@ public class ShareSessionHandler {
+             }
+         }
+ 
++        if (log.isDebugEnabled()) {
++            log.debug("Build ShareFetch {} for node {}. Added {}, removed {}, replaced {} out of {}",
++                    nextMetadata, node,
++                    topicIdPartitionsToLogString(added),
++                    topicIdPartitionsToLogString(removed),
++                    topicIdPartitionsToLogString(replaced),
++                    topicIdPartitionsToLogString(sessionPartitions.values()));
++        }
++
+         // The replaced topic-partitions need to be removed, and their replacements are already added
+         removed.addAll(replaced);
+ 
+@@ -179,19 +187,6 @@ public class ShareSessionHandler {
+         nextPartitions = new LinkedHashMap<>();
+         nextAcknowledgements = new LinkedHashMap<>();
+ 
+-        if (canSkipIfRequestEmpty && added.isEmpty() && removed.isEmpty() && acknowledgementBatches.isEmpty()) {
+-            return null;
+-        }
+-
+-        if (log.isDebugEnabled()) {
+-            log.debug("Build ShareFetch {} for node {}. Added {}, removed {}, replaced {} out of {}",
+-                nextMetadata, node,
+-                topicIdPartitionsToLogString(added),
+-                topicIdPartitionsToLogString(removed),
+-                topicIdPartitionsToLogString(replaced),
+-                topicIdPartitionsToLogString(sessionPartitions.values()));
+-        }
+-
+         if (hasRenewAcknowledgements) {
+             // If the request has renew acknowledgements, the ShareFetch is only used to send the acknowledgements
+             // and potentially update the share session. The parameters for wait time, number of bytes and number of
+@@ -201,14 +196,6 @@ public class ShareSessionHandler {
+                 0, 0, 0,
+                 0, shareFetchConfig.shareAcquireMode.id, true,
+                 added, removed, acknowledgementBatches);
+-        } else if (canSkipIfRequestEmpty) {
+-            // The request contains changes to the share session or acknowledgements only. The parameters for wait time,
+-            // number of bytes and number of records are all zero.
+-            return ShareFetchRequest.Builder.forConsumer(
+-                groupId, nextMetadata, 0,
+-                0, 0, 0,
+-                0, shareFetchConfig.shareAcquireMode.id, false,
+-                added, removed, acknowledgementBatches);
+         } else {
+             return ShareFetchRequest.Builder.forConsumer(
+                 groupId, nextMetadata, shareFetchConfig.maxWaitMs,
+diff --git a/clients/src/main/java/org/apache/kafka/common/security/oauthbearer/DefaultJwtValidator.java b/clients/src/main/java/org/apache/kafka/common/security/oauthbearer/DefaultJwtValidator.java
+index 478a0fdc91..3d5710fb64 100644
+--- a/clients/src/main/java/org/apache/kafka/common/security/oauthbearer/DefaultJwtValidator.java
++++ b/clients/src/main/java/org/apache/kafka/common/security/oauthbearer/DefaultJwtValidator.java
+@@ -17,7 +17,9 @@
+ 
+ package org.apache.kafka.common.security.oauthbearer;
+ 
++import org.apache.kafka.common.config.SaslConfigs;
+ import org.apache.kafka.common.security.oauthbearer.internals.secured.CloseableVerificationKeyResolver;
++import org.apache.kafka.common.security.oauthbearer.internals.secured.ConfigurationUtils;
+ import org.apache.kafka.common.utils.Utils;
+ 
+ import org.jose4j.keys.resolvers.VerificationKeyResolver;
+@@ -54,7 +56,13 @@ public class DefaultJwtValidator implements JwtValidator {
+         if (verificationKeyResolver.isPresent()) {
+             delegate = new BrokerJwtValidator(verificationKeyResolver.get());
+         } else {
+-            delegate = new ClientJwtValidator();
++            ConfigurationUtils cu = new ConfigurationUtils(configs, saslMechanism);
++
++            if (cu.containsKey(SaslConfigs.SASL_OAUTHBEARER_JWKS_ENDPOINT_URL)) {
++                delegate = new BrokerJwtValidator();
++            } else {
++                delegate = new ClientJwtValidator();
++            }
+         }
+ 
+         delegate.configure(configs, saslMechanism, jaasConfigEntries);
+diff --git a/clients/src/test/java/org/apache/kafka/clients/consumer/internals/ShareSessionHandlerTest.java b/clients/src/test/java/org/apache/kafka/clients/consumer/internals/ShareSessionHandlerTest.java
+index 826978aab5..72d5d7c4e2 100644
+--- a/clients/src/test/java/org/apache/kafka/clients/consumer/internals/ShareSessionHandlerTest.java
++++ b/clients/src/test/java/org/apache/kafka/clients/consumer/internals/ShareSessionHandlerTest.java
+@@ -26,11 +26,9 @@ import org.apache.kafka.common.message.ShareFetchRequestData;
+ import org.apache.kafka.common.message.ShareFetchResponseData;
+ import org.apache.kafka.common.protocol.ApiKeys;
+ import org.apache.kafka.common.protocol.Errors;
+-import org.apache.kafka.common.requests.ShareFetchRequest;
+ import org.apache.kafka.common.requests.ShareFetchResponse;
+ import org.apache.kafka.common.utils.LogContext;
+ 
+-import org.junit.jupiter.api.Test;
+ import org.junit.jupiter.api.Timeout;
+ import org.junit.jupiter.params.ParameterizedTest;
+ import org.junit.jupiter.params.provider.EnumSource;
+@@ -47,7 +45,6 @@ import java.util.stream.Stream;
+ 
+ import static org.apache.kafka.common.requests.ShareRequestMetadata.INITIAL_EPOCH;
+ import static org.junit.jupiter.api.Assertions.assertEquals;
+-import static org.junit.jupiter.api.Assertions.assertNotNull;
+ import static org.junit.jupiter.api.Assertions.assertNull;
+ import static org.junit.jupiter.api.Assertions.assertTrue;
+ import static org.junit.jupiter.api.Assertions.fail;
+@@ -183,7 +180,7 @@ public class ShareSessionHandlerTest {
+         TopicIdPartition foo1 = new TopicIdPartition(fooId, 1, "foo");
+         handler.addPartitionToFetch(foo0, null);
+         handler.addPartitionToFetch(foo1, null);
+-        ShareFetchRequestData requestData1 = handler.newShareFetchBuilder(groupId, DEFAULT_SHARE_FETCH_CONFIG, false).build().data();
++        ShareFetchRequestData requestData1 = handler.newShareFetchBuilder(groupId, DEFAULT_SHARE_FETCH_CONFIG).build().data();
+         ArrayList<TopicIdPartition> expectedToSend1 = new ArrayList<>();
+         expectedToSend1.add(new TopicIdPartition(fooId, 0, "foo"));
+         expectedToSend1.add(new TopicIdPartition(fooId, 1, "foo"));
+@@ -195,7 +192,7 @@ public class ShareSessionHandlerTest {
+             buildResponseData(new RespEntry("foo", 0, fooId), new RespEntry("foo", 1, fooId)),
+             List.of(),
+             0);
+-        handler.handleResponse(resp, ApiKeys.SHARE_FETCH.latestVersion());
++        handler.handleResponse(resp, ApiKeys.SHARE_FETCH.latestVersion(true));
+ 
+         // Test a fetch request which adds one partition
+         Uuid barId = addTopicId(topicNames, "bar");
+@@ -203,7 +200,7 @@ public class ShareSessionHandlerTest {
+         handler.addPartitionToFetch(foo0, null);
+         handler.addPartitionToFetch(foo1, null);
+         handler.addPartitionToFetch(bar0, null);
+-        ShareFetchRequestData requestData2 = handler.newShareFetchBuilder(groupId, DEFAULT_SHARE_FETCH_CONFIG, false).build().data();
++        ShareFetchRequestData requestData2 = handler.newShareFetchBuilder(groupId, DEFAULT_SHARE_FETCH_CONFIG).build().data();
+         assertMapsEqual(reqMap(new TopicIdPartition(fooId, 0, "foo"),
+                         new TopicIdPartition(fooId, 1, "foo"),
+                         new TopicIdPartition(barId, 0, "bar")),
+@@ -217,13 +214,13 @@ public class ShareSessionHandlerTest {
+             buildResponseData(new RespEntry("foo", 1, fooId)),
+             List.of(),
+             0);
+-        handler.handleResponse(resp2, ApiKeys.SHARE_FETCH.latestVersion());
++        handler.handleResponse(resp2, ApiKeys.SHARE_FETCH.latestVersion(true));
+ 
+         // A top-level error code will reset the session epoch
+         ShareFetchResponse resp3 = ShareFetchResponse.of(error, 0, new LinkedHashMap<>(), List.of(), 0);
+-        handler.handleResponse(resp3, ApiKeys.SHARE_FETCH.latestVersion());
++        handler.handleResponse(resp3, ApiKeys.SHARE_FETCH.latestVersion(true));
+ 
+-        ShareFetchRequestData requestData4 = handler.newShareFetchBuilder(groupId, DEFAULT_SHARE_FETCH_CONFIG, false).build().data();
++        ShareFetchRequestData requestData4 = handler.newShareFetchBuilder(groupId, DEFAULT_SHARE_FETCH_CONFIG).build().data();
+         assertEquals(requestData2.memberId(), requestData4.memberId());
+         assertEquals(INITIAL_EPOCH, requestData4.shareSessionEpoch());
+         assertMapsEqual(reqMap(new TopicIdPartition(fooId, 0, "foo"),
+@@ -253,7 +250,7 @@ public class ShareSessionHandlerTest {
+         handler.addPartitionToFetch(foo0, null);
+         handler.addPartitionToFetch(foo1, null);
+         handler.addPartitionToFetch(bar0, null);
+-        ShareFetchRequestData requestData1 = handler.newShareFetchBuilder(groupId, shareFetchConfig, false).build().data();
++        ShareFetchRequestData requestData1 = handler.newShareFetchBuilder(groupId, shareFetchConfig).build().data();
+         assertMapsEqual(reqMap(
+                         new TopicIdPartition(fooId, 0, "foo"),
+                         new TopicIdPartition(fooId, 1, "foo"),
+@@ -274,11 +271,11 @@ public class ShareSessionHandlerTest {
+                 new RespEntry("bar", 0, barId)),
+             List.of(),
+             0);
+-        handler.handleResponse(resp, ApiKeys.SHARE_FETCH.latestVersion());
++        handler.handleResponse(resp, ApiKeys.SHARE_FETCH.latestVersion(true));
+ 
+         // Test a fetch request which removes two partitions
+         handler.addPartitionToFetch(foo1, null);
+-        ShareFetchRequestData requestData2 = handler.newShareFetchBuilder(groupId, shareFetchConfig, false).build().data();
++        ShareFetchRequestData requestData2 = handler.newShareFetchBuilder(groupId, shareFetchConfig).build().data();
+         assertEquals(memberId.toString(), requestData2.memberId());
+         assertEquals(1, requestData2.shareSessionEpoch());
+         assertMapsEqual(reqMap(new TopicIdPartition(fooId, 1, "foo")),
+@@ -291,10 +288,10 @@ public class ShareSessionHandlerTest {
+ 
+         // A top-level error code will reset the session epoch
+         ShareFetchResponse resp2 = ShareFetchResponse.of(Errors.INVALID_SHARE_SESSION_EPOCH, 0, new LinkedHashMap<>(), List.of(), 0);
+-        handler.handleResponse(resp2, ApiKeys.SHARE_FETCH.latestVersion());
++        handler.handleResponse(resp2, ApiKeys.SHARE_FETCH.latestVersion(true));
+ 
+         handler.addPartitionToFetch(foo1, null);
+-        ShareFetchRequestData requestData3 = handler.newShareFetchBuilder(groupId, shareFetchConfig, false).build().data();
++        ShareFetchRequestData requestData3 = handler.newShareFetchBuilder(groupId, shareFetchConfig).build().data();
+         assertEquals(memberId.toString(), requestData3.memberId());
+         assertEquals(INITIAL_EPOCH, requestData3.shareSessionEpoch());
+         assertMapsEqual(reqMap(new TopicIdPartition(fooId, 1, "foo")),
+@@ -315,7 +312,7 @@ public class ShareSessionHandlerTest {
+         Uuid topicId1 = addTopicId(topicNames, "foo");
+         TopicIdPartition tp = new TopicIdPartition(topicId1, 0, "foo");
+         handler.addPartitionToFetch(tp, null);
+-        ShareFetchRequestData requestData1 = handler.newShareFetchBuilder(groupId, shareFetchConfig, false).build().data();
++        ShareFetchRequestData requestData1 = handler.newShareFetchBuilder(groupId, shareFetchConfig).build().data();
+         assertMapsEqual(reqMap(new TopicIdPartition(topicId1, 0, "foo")),
+                 handler.sessionPartitionMap());
+         ArrayList<TopicIdPartition> expectedToSend1 = new ArrayList<>();
+@@ -327,14 +324,14 @@ public class ShareSessionHandlerTest {
+             buildResponseData(new RespEntry("foo", 0, topicId1)),
+             List.of(),
+             0);
+-        handler.handleResponse(resp, ApiKeys.SHARE_FETCH.latestVersion());
++        handler.handleResponse(resp, ApiKeys.SHARE_FETCH.latestVersion(true));
+ 
+         // Try to add a new topic ID
+         Uuid topicId2 = addTopicId(topicNames, "foo");
+         TopicIdPartition tp2 = new TopicIdPartition(topicId2, 0, "foo");
+         // Use the same data besides the topic ID
+         handler.addPartitionToFetch(tp2, null);
+-        ShareFetchRequestData requestData2 = handler.newShareFetchBuilder(groupId, shareFetchConfig, false).build().data();
++        ShareFetchRequestData requestData2 = handler.newShareFetchBuilder(groupId, shareFetchConfig).build().data();
+ 
+         // If we started with an ID, only a new ID will count towards replaced.
+         // The old topic ID partition should be forgotten, and the new one should be fetched.
+@@ -360,7 +357,7 @@ public class ShareSessionHandlerTest {
+         Uuid topicId = addTopicId(topicNames, "foo");
+         TopicIdPartition foo0 = new TopicIdPartition(topicId, 0, "foo");
+         handler.addPartitionToFetch(foo0, null);
+-        ShareFetchRequestData requestData1 = handler.newShareFetchBuilder(groupId, shareFetchConfig, false).build().data();
++        ShareFetchRequestData requestData1 = handler.newShareFetchBuilder(groupId, shareFetchConfig).build().data();
+         assertMapsEqual(reqMap(foo0), handler.sessionPartitionMap());
+         ArrayList<TopicIdPartition> expectedToSend1 = new ArrayList<>();
+         expectedToSend1.add(new TopicIdPartition(topicId, 0, "foo"));
+@@ -371,10 +368,10 @@ public class ShareSessionHandlerTest {
+             buildResponseData(new RespEntry("foo", 0, topicId)),
+             List.of(),
+             0);
+-        handler.handleResponse(resp, ApiKeys.SHARE_FETCH.latestVersion());
++        handler.handleResponse(resp, ApiKeys.SHARE_FETCH.latestVersion(true));
+ 
+         // Remove the topic from the session by setting acknowledgements only - this is not asking to fetch records
+-        ShareFetchRequestData requestData2 = handler.newShareFetchBuilder(groupId, shareFetchConfig, false).build().data();
++        ShareFetchRequestData requestData2 = handler.newShareFetchBuilder(groupId, shareFetchConfig).build().data();
+         handler.addPartitionToAcknowledgeOnly(foo0, Acknowledgements.empty());
+         assertEquals(Collections.singletonList(foo0), reqForgetList(requestData2, topicNames));
+ 
+@@ -395,7 +392,7 @@ public class ShareSessionHandlerTest {
+         Uuid topicId = addTopicId(topicNames, "foo");
+         TopicIdPartition foo0 = new TopicIdPartition(topicId, 0, "foo");
+         handler.addPartitionToFetch(foo0, null);
+-        ShareFetchRequestData requestData1 = handler.newShareFetchBuilder(groupId, shareFetchConfig, false).build().data();
++        ShareFetchRequestData requestData1 = handler.newShareFetchBuilder(groupId, shareFetchConfig).build().data();
+         assertMapsEqual(reqMap(foo0), handler.sessionPartitionMap());
+         ArrayList<TopicIdPartition> expectedToSend1 = new ArrayList<>();
+         expectedToSend1.add(new TopicIdPartition(topicId, 0, "foo"));
+@@ -406,10 +403,10 @@ public class ShareSessionHandlerTest {
+             buildResponseData(new RespEntry("foo", 0, topicId)),
+             List.of(),
+             0);
+-        handler.handleResponse(resp, ApiKeys.SHARE_FETCH.latestVersion());
++        handler.handleResponse(resp, ApiKeys.SHARE_FETCH.latestVersion(true));
+ 
+         // Remove the topic from the session
+-        ShareFetchRequestData requestData2 = handler.newShareFetchBuilder(groupId, shareFetchConfig, false).build().data();
++        ShareFetchRequestData requestData2 = handler.newShareFetchBuilder(groupId, shareFetchConfig).build().data();
+         assertEquals(Collections.singletonList(foo0), reqForgetList(requestData2, topicNames));
+ 
+         // Should have the same session ID, next epoch, and same ID usage
+@@ -427,7 +424,7 @@ public class ShareSessionHandlerTest {
+         Map<Uuid, String> topicNames = new HashMap<>();
+         Uuid topicId = addTopicId(topicNames, "foo");
+         handler.addPartitionToFetch(new TopicIdPartition(topicId, 0, "foo"), null);
+-        ShareFetchRequestData requestData1 = handler.newShareFetchBuilder(groupId, shareFetchConfig, false).build().data();
++        ShareFetchRequestData requestData1 = handler.newShareFetchBuilder(groupId, shareFetchConfig).build().data();
+         assertMapsEqual(reqMap(new TopicIdPartition(topicId, 0, "foo")),
+                 handler.sessionPartitionMap());
+         ArrayList<TopicIdPartition> expectedToSend1 = new ArrayList<>();
+@@ -439,19 +436,19 @@ public class ShareSessionHandlerTest {
+             buildResponseData(new RespEntry("foo", 0, topicId)),
+             List.of(),
+             0);
+-        handler.handleResponse(resp, ApiKeys.SHARE_FETCH.latestVersion());
++        handler.handleResponse(resp, ApiKeys.SHARE_FETCH.latestVersion(true));
+ 
+         // Remove the partition from the session
+-        ShareFetchRequestData requestData2 = handler.newShareFetchBuilder(groupId, shareFetchConfig, false).build().data();
++        ShareFetchRequestData requestData2 = handler.newShareFetchBuilder(groupId, shareFetchConfig).build().data();
+         assertTrue(handler.sessionPartitionMap().isEmpty());
+         assertTrue(requestData2.topics().isEmpty());
+         ShareFetchResponse resp2 = ShareFetchResponse.of(Errors.NONE, 0, new LinkedHashMap<>(), List.of(), 0);
+-        handler.handleResponse(resp2, ApiKeys.SHARE_FETCH.latestVersion());
++        handler.handleResponse(resp2, ApiKeys.SHARE_FETCH.latestVersion(true));
+ 
+         // After the topic is removed, add a recreated topic with a new ID
+         Uuid topicId2 = addTopicId(topicNames, "foo");
+         handler.addPartitionToFetch(new TopicIdPartition(topicId2, 0, "foo"), null);
+-        ShareFetchRequestData requestData3 = handler.newShareFetchBuilder(groupId, shareFetchConfig, false).build().data();
++        ShareFetchRequestData requestData3 = handler.newShareFetchBuilder(groupId, shareFetchConfig).build().data();
+ 
+         // Should have the same session ID and epoch 2.
+         assertEquals(memberId.toString(), requestData3.memberId(), "Did not use same session");
+@@ -480,7 +477,7 @@ public class ShareSessionHandlerTest {
+         // Attempt a new ShareFetch
+         TopicIdPartition foo1 = new TopicIdPartition(fooId, 1, "foo");
+         handler.addPartitionToFetch(foo1, null);
+-        ShareFetchRequestData requestData = handler.newShareFetchBuilder(groupId, shareFetchConfig, false).build().data();
++        ShareFetchRequestData requestData = handler.newShareFetchBuilder(groupId, shareFetchConfig).build().data();
+ 
+         // We should have cleared the unsent acknowledgements before this ShareFetch.
+         assertEquals(0, requestData.topics().stream().findFirst().get().partitions().stream().findFirst().get().acknowledgementBatches().size());
+@@ -491,54 +488,6 @@ public class ShareSessionHandlerTest {
+         assertEquals(memberId.toString(), requestData.memberId());
+     }
+ 
+-    @Test
+-    public void testCanSkipIfRequestEmpty() {
+-        ShareFetchConfig shareFetchConfig = SHARE_FETCH_CONFIG_RECORD_LIMIT;
+-
+-        String groupId = "G1";
+-        Uuid memberId = Uuid.randomUuid();
+-        ShareSessionHandler handler = new ShareSessionHandler(LOG_CONTEXT, 1, memberId);
+-
+-        Map<Uuid, String> topicNames = new HashMap<>();
+-        Uuid fooId = addTopicId(topicNames, "foo");
+-        TopicIdPartition foo0 = new TopicIdPartition(fooId, 0, "foo");
+-
+-        Acknowledgements acknowledgements = Acknowledgements.empty();
+-        acknowledgements.add(0L, AcknowledgeType.ACCEPT);
+-
+-        // The request cannot be skipped when a topic-partition is added to the share session.
+-        handler.addPartitionToFetch(foo0, null);
+-        ShareFetchRequest.Builder builder = handler.newShareFetchBuilder(groupId, shareFetchConfig, true);
+-        assertNotNull(builder);
+-
+-        ShareFetchResponse resp = ShareFetchResponse.of(Errors.NONE,
+-            0,
+-            buildResponseData(new RespEntry("foo", 0, fooId)),
+-            List.of(),
+-            0);
+-        handler.handleResponse(resp, ApiKeys.SHARE_FETCH.latestVersion());
+-
+-        // The request can be skipped when the same topic-partition is already in the share session.
+-        handler.addPartitionToFetch(foo0, null);
+-        builder = handler.newShareFetchBuilder(groupId, shareFetchConfig, true);
+-        assertNull(builder);
+-
+-        // The request cannot be skipped when there are acknowledgements.
+-        handler.addPartitionToFetch(foo0, acknowledgements);
+-        builder = handler.newShareFetchBuilder(groupId, shareFetchConfig, true);
+-        assertNotNull(builder);
+-        handler.handleResponse(resp, ApiKeys.SHARE_FETCH.latestVersion());
+-
+-        // The request cannot be skipped when the topic-partition is removed from the share session.
+-        builder = handler.newShareFetchBuilder(groupId, shareFetchConfig, true);
+-        assertNotNull(builder);
+-        handler.handleResponse(ShareFetchResponse.of(Errors.NONE, 0, new LinkedHashMap<>(), List.of(), 0), ApiKeys.SHARE_FETCH.latestVersion());
+-
+-        // The request can be skipped when the share session is empty.
+-        builder = handler.newShareFetchBuilder(groupId, shareFetchConfig, true);
+-        assertNull(builder);
+-    }
+-
+     private Uuid addTopicId(Map<Uuid, String> topicNames, String name) {
+         Uuid id = Uuid.randomUuid();
+         topicNames.put(id, name);
+diff --git a/clients/src/test/java/org/apache/kafka/common/security/oauthbearer/DefaultJwtValidatorTest.java b/clients/src/test/java/org/apache/kafka/common/security/oauthbearer/DefaultJwtValidatorTest.java
+index 14c33a012c..cf3754a77a 100644
+--- a/clients/src/test/java/org/apache/kafka/common/security/oauthbearer/DefaultJwtValidatorTest.java
++++ b/clients/src/test/java/org/apache/kafka/common/security/oauthbearer/DefaultJwtValidatorTest.java
+@@ -17,21 +17,34 @@
+ 
+ package org.apache.kafka.common.security.oauthbearer;
+ 
++import org.apache.kafka.common.config.SaslConfigs;
++import org.apache.kafka.common.config.internals.BrokerSecurityConfigs;
+ import org.apache.kafka.common.security.oauthbearer.internals.secured.AccessTokenBuilder;
+ import org.apache.kafka.common.security.oauthbearer.internals.secured.CloseableVerificationKeyResolver;
+ import org.apache.kafka.common.security.oauthbearer.internals.secured.OAuthBearerTest;
+ 
++import org.jose4j.jwk.JsonWebKey;
++import org.jose4j.jwk.JsonWebKeySet;
++import org.jose4j.jwk.PublicJsonWebKey;
+ import org.jose4j.jws.AlgorithmIdentifiers;
++import org.junit.jupiter.api.AfterEach;
+ import org.junit.jupiter.api.Test;
+ 
+ import java.util.Map;
+ 
++import static org.apache.kafka.common.config.internals.BrokerSecurityConfigs.ALLOWED_SASL_OAUTHBEARER_URLS_CONFIG;
+ import static org.apache.kafka.common.security.oauthbearer.OAuthBearerLoginModule.OAUTHBEARER_MECHANISM;
++import static org.apache.kafka.test.TestUtils.tempFile;
+ import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
+ import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+ 
+ public class DefaultJwtValidatorTest extends OAuthBearerTest {
+ 
++    @AfterEach
++    public void tearDown() {
++        System.clearProperty(BrokerSecurityConfigs.ALLOWED_SASL_OAUTHBEARER_URLS_CONFIG);
++    }
++
+     @Test
+     public void testConfigureWithVerificationKeyResolver() {
+         AccessTokenBuilder builder = new AccessTokenBuilder()
+@@ -51,6 +64,26 @@ public class DefaultJwtValidatorTest extends OAuthBearerTest {
+         assertInstanceOf(ClientJwtValidator.class, jwtValidator.delegate());
+     }
+ 
++    @Test
++    public void testConfigureWithJwksUrl() throws Exception {
++        PublicJsonWebKey jwk = createRsaJwk();
++        AccessTokenBuilder builder = new AccessTokenBuilder()
++            .jwk(jwk)
++            .alg(AlgorithmIdentifiers.RSA_USING_SHA256);
++        String accessToken = builder.build();
++
++        JsonWebKeySet jwks = new JsonWebKeySet(jwk);
++        String jwksJson = jwks.toJson(JsonWebKey.OutputControlLevel.PUBLIC_ONLY);
++        String fileUrl = tempFile(jwksJson).toURI().toString();
++        System.setProperty(ALLOWED_SASL_OAUTHBEARER_URLS_CONFIG, fileUrl);
++        Map<String, ?> configs = getSaslConfigs(SaslConfigs.SASL_OAUTHBEARER_JWKS_ENDPOINT_URL, fileUrl);
++
++        DefaultJwtValidator jwtValidator = new DefaultJwtValidator();
++        assertDoesNotThrow(() -> jwtValidator.configure(configs, OAUTHBEARER_MECHANISM, getJaasConfigEntries()));
++        assertInstanceOf(BrokerJwtValidator.class, jwtValidator.delegate());
++        assertDoesNotThrow(() -> jwtValidator.validate(accessToken));
++    }
++
+     private CloseableVerificationKeyResolver createVerificationKeyResolver(AccessTokenBuilder builder) {
+         return (jws, nestingContext) -> builder.jwk().getPublicKey();
+     }
+diff --git a/core/src/main/java/kafka/server/share/SharePartition.java b/core/src/main/java/kafka/server/share/SharePartition.java
+index e03ebca09e..f5ad66d476 100644
+--- a/core/src/main/java/kafka/server/share/SharePartition.java
++++ b/core/src/main/java/kafka/server/share/SharePartition.java
+@@ -774,7 +774,7 @@ public class SharePartition {
+                 // check for the floor entry and adjust the base offset accordingly.
+                 if (baseOffset < startOffset) {
+                     log.info("Adjusting base offset for the fetch as it's prior to start offset: {}-{}"
+-                            + " from {} to {}", groupId, topicIdPartition, baseOffset, startOffset);
++                            + "from {} to {}", groupId, topicIdPartition, baseOffset, startOffset);
+                     baseOffset = startOffset;
+                 }
+             } else if (floorEntry.getValue().lastOffset() >= baseOffset) {
+diff --git a/core/src/test/scala/integration/kafka/api/ClientOAuthIntegrationTest.scala b/core/src/test/scala/integration/kafka/api/ClientOAuthIntegrationTest.scala
+index 22ab6f2673..8745e7ce96 100644
+--- a/core/src/test/scala/integration/kafka/api/ClientOAuthIntegrationTest.scala
++++ b/core/src/test/scala/integration/kafka/api/ClientOAuthIntegrationTest.scala
+@@ -26,10 +26,11 @@ import org.junit.jupiter.api.{AfterEach, BeforeEach, Disabled, TestInfo}
+ import java.util.{Base64, Collections, Properties}
+ import no.nav.security.mock.oauth2.{MockOAuth2Server, OAuth2Config}
+ import no.nav.security.mock.oauth2.token.{KeyProvider, OAuth2TokenProvider}
+-import org.apache.kafka.common.KafkaException
++import org.apache.kafka.common.{KafkaException, TopicPartition}
+ import org.apache.kafka.common.config.internals.BrokerSecurityConfigs
++import org.apache.kafka.common.errors.SaslAuthenticationException
+ import org.apache.kafka.common.security.auth.SecurityProtocol
+-import org.apache.kafka.common.security.oauthbearer.{OAuthBearerLoginCallbackHandler, OAuthBearerLoginModule, OAuthBearerValidatorCallbackHandler}
++import org.apache.kafka.common.security.oauthbearer.{JwtRetriever, OAuthBearerLoginCallbackHandler, OAuthBearerLoginModule, OAuthBearerValidatorCallbackHandler}
+ import org.apache.kafka.common.utils.Utils
+ import org.apache.kafka.test.TestUtils
+ import org.junit.jupiter.api.Assertions.{assertDoesNotThrow, assertThrows}
+@@ -244,6 +245,27 @@ class ClientOAuthIntegrationTest extends IntegrationTestHarness with SaslSetup {
+     assertThrows(classOf[ConfigException], () => createAdminClient(configOverrides = configs))
+   }
+ 
++  @ParameterizedTest(name = TestInfoUtils.TestWithParameterizedGroupProtocolNames)
++  @MethodSource(Array("getTestGroupProtocolParametersAll"))
++  def testAuthenticationErrorOnTamperedJwt(groupProtocol: String): Unit = {
++    val className = classOf[TamperedJwtRetriever].getName
++
++    val configs = defaultOAuthConfigs()
++    configs.put(SaslConfigs.SASL_OAUTHBEARER_JWT_RETRIEVER_CLASS, className)
++
++    val tp = new TopicPartition("test-topic", 0)
++
++    val admin = createAdminClient(configOverrides = configs)
++    TestUtils.assertFutureThrows(classOf[SaslAuthenticationException], admin.describeCluster().clusterId())
++
++    val producer = createProducer(configOverrides = configs)
++    assertThrows(classOf[SaslAuthenticationException], () => producer.partitionsFor(tp.topic()))
++
++    val consumer = createConsumer(configOverrides = configs)
++    consumer.assign(Collections.singleton(tp))
++    assertThrows(classOf[SaslAuthenticationException], () => consumer.position(tp))
++  }
++
+   def generatePrivateKeyFile(): File = {
+     val file = File.createTempFile("private-", ".key")
+     val bytes = Base64.getEncoder.encode(privateKey.getEncoded)
+@@ -258,4 +280,11 @@ class ClientOAuthIntegrationTest extends IntegrationTestHarness with SaslSetup {
+ 
+     file
+   }
+-}
+\ No newline at end of file
++}
++
++class TamperedJwtRetriever extends JwtRetriever {
++
++  override def retrieve(): String = {
++    "eyJhbGciOiAiSFMyNTYiLCAidHlwIjogIkpXVCJ9.eyJzdWIiOiAiMTIzNDU2Nzg5MCIsICJuYW1lIjogIkpvaG4gRG9lIiwgInJvbGUiOiAiYWRtaW4iLCAiaWF0IjogMTUxNjIzOTAyMiwgImV4cCI6IDE5MTYyMzkwMjJ9.vVT5ylQCGvb0B-wv1YXHjmlMd-DZKCThUt5-enry_sA"
++  }
++}
+diff --git a/docs/streams/developer-guide/config-streams.html b/docs/streams/developer-guide/config-streams.html
+index 54ea3570e5..b5dc419e8d 100644
+--- a/docs/streams/developer-guide/config-streams.html
++++ b/docs/streams/developer-guide/config-streams.html
+@@ -1036,7 +1036,10 @@ rack.aware.assignment.tags: zone,cluster   | rack.aware.assignment.tags: zone,cl
+             <div><p>The processing exception handler allows you to manage exceptions triggered during the processing of a record. The implemented exception
+               handler needs to return a <code>FAIL</code> or <code>CONTINUE</code> depending on the record and the exception thrown. Returning
+               <code>FAIL</code> will signal that Streams should shut down and <code>CONTINUE</code> will signal that Streams should ignore the issue
+-              and continue processing. The following library built-in exception handlers are available:</p>
++              and continue processing.</p>
++              <p><strong>Note:</strong> This handler applies only to regular stream processing tasks. It does not apply to global state store updates
++              (global threads). Exceptions occurring in global threads will bubble up to the configured uncaught exception handler.</p>
++              <p>The following library built-in exception handlers are available:</p>
+               <ul class="simple">
+                 <li><a class="reference external" href="/{{version}}/javadoc/org/apache/kafka/streams/errors/LogAndContinueProcessingExceptionHandler.html">LogAndContinueProcessingExceptionHandler</a>:
+                   This handler logs the processing exception and then signals the processing pipeline to continue processing more records.
+diff --git a/streams/src/main/java/org/apache/kafka/streams/StreamsConfig.java b/streams/src/main/java/org/apache/kafka/streams/StreamsConfig.java
+index 1e04c1fd41..402f6f37d2 100644
+--- a/streams/src/main/java/org/apache/kafka/streams/StreamsConfig.java
++++ b/streams/src/main/java/org/apache/kafka/streams/StreamsConfig.java
+@@ -574,7 +574,8 @@ public class StreamsConfig extends AbstractConfig {
+     public static final String ERRORS_DEAD_LETTER_QUEUE_TOPIC_NAME_CONFIG = "errors.dead.letter.queue.topic.name";
+ 
+     private static final String ERRORS_DEAD_LETTER_QUEUE_TOPIC_NAME_DOC = "If not null, the default exception handler will build and send a Dead Letter Queue record to the topic with the provided name if an error occurs.\n" +
+-            "If a custom deserialization/production or processing exception handler is set, this parameter is ignored for this handler.";
++            "If a custom deserialization/production or processing exception handler is set, this parameter is ignored for this handler.\n" +
++            "Note: This configuration applies only to regular stream processing tasks. It does not apply to global state store updates (global threads).";
+ 
+     /** {@code log.summary.interval.ms} */
+     public static final String LOG_SUMMARY_INTERVAL_MS_CONFIG = "log.summary.interval.ms";
+@@ -652,7 +653,9 @@ public class StreamsConfig extends AbstractConfig {
+     @SuppressWarnings("WeakerAccess")
+     public static final String PROCESSING_EXCEPTION_HANDLER_CLASS_CONFIG = "processing.exception.handler";
+     @Deprecated
+-    public static final String PROCESSING_EXCEPTION_HANDLER_CLASS_DOC = "Exception handling class that implements the <code>org.apache.kafka.streams.errors.ProcessingExceptionHandler</code> interface.";
++    public static final String PROCESSING_EXCEPTION_HANDLER_CLASS_DOC = "Exception handling class that implements the <code>org.apache.kafka.streams.errors.ProcessingExceptionHandler</code> interface. " +
++            "Note: This handler applies only to regular stream processing tasks. It does not apply to global state store updates (global threads). " +
++            "Exceptions occurring in global threads will bubble up to the configured uncaught exception handler.";
+ 
+     /** {@code processing.guarantee} */
+     @SuppressWarnings("WeakerAccess")
+diff --git a/streams/src/main/java/org/apache/kafka/streams/processor/internals/ProcessorNode.java b/streams/src/main/java/org/apache/kafka/streams/processor/internals/ProcessorNode.java
+index bbf82ff903..f121c1626e 100644
+--- a/streams/src/main/java/org/apache/kafka/streams/processor/internals/ProcessorNode.java
++++ b/streams/src/main/java/org/apache/kafka/streams/processor/internals/ProcessorNode.java
+@@ -208,6 +208,15 @@ public class ProcessorNode<KIn, VIn, KOut, VOut> {
+             // while Java distinguishes checked vs unchecked exceptions, other languages
+             // like Scala or Kotlin do not, and thus we need to catch `Exception`
+             // (instead of `RuntimeException`) to work well with those languages
++
++            // If the processing exception handler is not set (e.g., for global threads),
++            // rethrow the exception to let it bubble up to the uncaught exception handler.
++            // The processing exception handler is only set for regular stream tasks, not for
++            // global state update tasks which use a different error handling mechanism.
++            if (processingExceptionHandler == null) {
++                throw processingException;
++            }
++
+             final ErrorHandlerContext errorHandlerContext = new DefaultErrorHandlerContext(
+                 null, // only required to pass for DeserializationExceptionHandler
+                 internalProcessorContext.recordContext().topic(),
+diff --git a/streams/src/test/java/org/apache/kafka/streams/processor/internals/ProcessorNodeTest.java b/streams/src/test/java/org/apache/kafka/streams/processor/internals/ProcessorNodeTest.java
+index 565d6dcf8f..21e670ef2c 100644
+--- a/streams/src/test/java/org/apache/kafka/streams/processor/internals/ProcessorNodeTest.java
++++ b/streams/src/test/java/org/apache/kafka/streams/processor/internals/ProcessorNodeTest.java
+@@ -133,6 +133,24 @@ public class ProcessorNodeTest {
+         assertDoesNotThrow(() -> node.process(new Record<>(KEY, VALUE, TIMESTAMP)));
+     }
+ 
++    @Test
++    public void shouldRethrowExceptionWhenProcessingExceptionHandlerIsNull() {
++        // This simulates the global thread case where no ProcessingExceptionHandler is set
++        final ProcessorNode<Object, Object, Object, Object> node =
++            new ProcessorNode<>(NAME, new IgnoredInternalExceptionsProcessor(), Collections.emptySet());
++
++        final InternalProcessorContext<Object, Object> internalProcessorContext = mockInternalProcessorContext();
++        // Initialize without a ProcessingExceptionHandler (simulates global thread initialization)
++        node.init(internalProcessorContext);
++
++        // The exception should be rethrown since there's no handler to process it
++        final RuntimeException exception = assertThrows(RuntimeException.class,
++            () -> node.process(new Record<>(KEY, VALUE, TIMESTAMP)));
++
++        assertEquals("Processing exception should be caught and handled by the processing exception handler.",
++            exception.getMessage());
++    }
++
+     @ParameterizedTest
+     @CsvSource({
+         "FailedProcessingException,java.lang.RuntimeException,Fail processing",
+diff --git a/streams/src/test/java/org/apache/kafka/streams/processor/internals/TaskManagerTest.java b/streams/src/test/java/org/apache/kafka/streams/processor/internals/TaskManagerTest.java
+index 7cfa428d33..63638d12c9 100644
+--- a/streams/src/test/java/org/apache/kafka/streams/processor/internals/TaskManagerTest.java
++++ b/streams/src/test/java/org/apache/kafka/streams/processor/internals/TaskManagerTest.java
+@@ -23,7 +23,6 @@ import org.apache.kafka.clients.admin.RecordsToDelete;
+ import org.apache.kafka.clients.consumer.CommitFailedException;
+ import org.apache.kafka.clients.consumer.Consumer;
+ import org.apache.kafka.clients.consumer.ConsumerGroupMetadata;
+-import org.apache.kafka.clients.consumer.ConsumerRecord;
+ import org.apache.kafka.clients.consumer.OffsetAndMetadata;
+ import org.apache.kafka.common.KafkaException;
+ import org.apache.kafka.common.KafkaFuture;
+@@ -38,14 +37,12 @@ import org.apache.kafka.common.utils.LogCaptureAppender;
+ import org.apache.kafka.common.utils.LogContext;
+ import org.apache.kafka.common.utils.MockTime;
+ import org.apache.kafka.common.utils.Time;
+-import org.apache.kafka.streams.TopologyConfig;
+ import org.apache.kafka.streams.errors.LockException;
+ import org.apache.kafka.streams.errors.StreamsException;
+ import org.apache.kafka.streams.errors.TaskCorruptedException;
+ import org.apache.kafka.streams.errors.TaskMigratedException;
+ import org.apache.kafka.streams.internals.StreamsConfigUtils;
+ import org.apache.kafka.streams.internals.StreamsConfigUtils.ProcessingMode;
+-import org.apache.kafka.streams.processor.StateStore;
+ import org.apache.kafka.streams.processor.TaskId;
+ import org.apache.kafka.streams.processor.assignment.ProcessId;
+ import org.apache.kafka.streams.processor.internals.StateDirectory.TaskDirectory;
+@@ -76,13 +73,10 @@ import java.time.Duration;
+ import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.Collections;
+-import java.util.Deque;
+ import java.util.HashMap;
+ import java.util.HashSet;
+-import java.util.LinkedList;
+ import java.util.List;
+ import java.util.Map;
+-import java.util.Optional;
+ import java.util.Set;
+ import java.util.concurrent.CompletableFuture;
+ import java.util.stream.Collectors;
+@@ -123,7 +117,6 @@ import static org.mockito.Mockito.inOrder;
+ import static org.mockito.Mockito.lenient;
+ import static org.mockito.Mockito.mock;
+ import static org.mockito.Mockito.never;
+-import static org.mockito.Mockito.spy;
+ import static org.mockito.Mockito.times;
+ import static org.mockito.Mockito.verify;
+ import static org.mockito.Mockito.verifyNoInteractions;
+@@ -212,16 +205,16 @@ public class TaskManagerTest {
+ 
+     @BeforeEach
+     public void setUp() {
+-        taskManager = setUpTaskManagerWithoutStateUpdater(StreamsConfigUtils.ProcessingMode.AT_LEAST_ONCE, null, false);
++        taskManager = setUpTaskManager(StreamsConfigUtils.ProcessingMode.AT_LEAST_ONCE, null, false);
+     }
+ 
+-    private TaskManager setUpTaskManagerWithStateUpdater(final ProcessingMode processingMode, final TasksRegistry tasks) {
+-        return setUpTaskManagerWithStateUpdater(processingMode, tasks, false);
++    private TaskManager setUpTaskManager(final ProcessingMode processingMode, final TasksRegistry tasks) {
++        return setUpTaskManager(processingMode, tasks, false);
+     }
+ 
+-    private TaskManager setUpTaskManagerWithStateUpdater(final ProcessingMode processingMode,
+-                                                         final TasksRegistry tasks,
+-                                                         final boolean processingThreadsEnabled) {
++    private TaskManager setUpTaskManager(final ProcessingMode processingMode,
++                                         final TasksRegistry tasks,
++                                         final boolean processingThreadsEnabled) {
+         topologyMetadata = new TopologyMetadata(topologyBuilder, new DummyStreamsConfig(processingMode));
+         final TaskManager taskManager = new TaskManager(
+             time,
+@@ -241,35 +234,13 @@ public class TaskManagerTest {
+         return taskManager;
+     }
+ 
+-    private TaskManager setUpTaskManagerWithoutStateUpdater(final ProcessingMode processingMode,
+-                                                            final TasksRegistry tasks,
+-                                                            final boolean processingThreadsEnabled) {
+-        topologyMetadata = new TopologyMetadata(topologyBuilder, new DummyStreamsConfig(processingMode));
+-        final TaskManager taskManager = new TaskManager(
+-            time,
+-            changeLogReader,
+-            ProcessId.randomProcessId(),
+-            "taskManagerTest",
+-            activeTaskCreator,
+-            standbyTaskCreator,
+-            tasks != null ? tasks : new Tasks(new LogContext()),
+-            topologyMetadata,
+-            adminClient,
+-            stateDirectory,
+-            null,
+-            processingThreadsEnabled ? schedulingTaskManager : null
+-        );
+-        taskManager.setMainConsumer(consumer);
+-        return taskManager;
+-    }
+-
+     @Test
+     public void shouldLockAllTasksOnCorruptionWithProcessingThreads() {
+         final StreamTask activeTask1 = statefulTask(taskId00, taskId00ChangelogPartitions)
+             .inState(State.RUNNING)
+             .withInputPartitions(taskId00Partitions).build();
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks, true);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks, true);
+         when(tasks.activeTaskIds()).thenReturn(Set.of(taskId00, taskId01));
+         when(tasks.task(taskId00)).thenReturn(activeTask1);
+         final KafkaFuture<Void> mockFuture = KafkaFuture.completedFuture(null);
+@@ -291,7 +262,7 @@ public class TaskManagerTest {
+             .inState(State.RUNNING)
+             .withInputPartitions(taskId01Partitions).build();
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks, true);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks, true);
+         final KafkaFuture<Void> mockFuture = KafkaFuture.completedFuture(null);
+         when(schedulingTaskManager.lockTasks(any())).thenReturn(mockFuture);
+ 
+@@ -304,7 +275,7 @@ public class TaskManagerTest {
+     @Test
+     public void shouldLockActiveOnHandleAssignmentWithProcessingThreads() {
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks, true);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks, true);
+         when(tasks.allTaskIds()).thenReturn(Set.of(taskId00, taskId01));
+         final KafkaFuture<Void> mockFuture = KafkaFuture.completedFuture(null);
+         when(schedulingTaskManager.lockTasks(any())).thenReturn(mockFuture);
+@@ -327,7 +298,7 @@ public class TaskManagerTest {
+             .inState(State.RUNNING)
+             .withInputPartitions(taskId01Partitions).build();
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks, true);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks, true);
+         when(tasks.allTasks()).thenReturn(Set.of(activeTask1, activeTask2));
+         final KafkaFuture<Void> mockFuture = KafkaFuture.completedFuture(null);
+         when(schedulingTaskManager.lockTasks(any())).thenReturn(mockFuture);
+@@ -347,7 +318,7 @@ public class TaskManagerTest {
+             .inState(State.RUNNING)
+             .withInputPartitions(taskId01Partitions).build();
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks, true);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks, true);
+         when(tasks.allTasks()).thenReturn(Set.of(activeTask1, activeTask2));
+         final KafkaFuture<Void> mockFuture = KafkaFuture.completedFuture(null);
+         when(schedulingTaskManager.lockTasks(any())).thenReturn(mockFuture);
+@@ -367,7 +338,7 @@ public class TaskManagerTest {
+             .inState(State.RUNNING)
+             .withInputPartitions(taskId01Partitions).build();
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+         when(tasks.activeTasks()).thenReturn(Set.of(activeTask1, activeTask2));
+ 
+         taskManager.resumePollingForPartitionsWithAvailableSpace();
+@@ -385,7 +356,7 @@ public class TaskManagerTest {
+             .inState(State.RUNNING)
+             .withInputPartitions(taskId01Partitions).build();
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+         when(tasks.activeTasks()).thenReturn(Set.of(activeTask1, activeTask2));
+ 
+         taskManager.updateLags();
+@@ -400,7 +371,7 @@ public class TaskManagerTest {
+             .inState(State.RESTORING)
+             .withInputPartitions(taskId03Partitions).build();
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+         when(stateUpdater.tasks()).thenReturn(Set.of(activeTaskToClose));
+         final CompletableFuture<StateUpdater.RemovedTaskResult> future = new CompletableFuture<>();
+         when(stateUpdater.remove(activeTaskToClose.id())).thenReturn(future);
+@@ -420,7 +391,7 @@ public class TaskManagerTest {
+             .inState(State.RESTORING)
+             .withInputPartitions(taskId03Partitions).build();
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+         when(stateUpdater.tasks()).thenReturn(Set.of(activeTaskToClose));
+         final CompletableFuture<StateUpdater.RemovedTaskResult> future = new CompletableFuture<>();
+         when(stateUpdater.remove(activeTaskToClose.id())).thenReturn(future);
+@@ -441,7 +412,7 @@ public class TaskManagerTest {
+             .inState(State.RUNNING)
+             .withInputPartitions(taskId02Partitions).build();
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+         when(stateUpdater.tasks()).thenReturn(Set.of(standbyTaskToClose));
+         final CompletableFuture<StateUpdater.RemovedTaskResult> future = new CompletableFuture<>();
+         when(stateUpdater.remove(standbyTaskToClose.id())).thenReturn(future);
+@@ -461,7 +432,7 @@ public class TaskManagerTest {
+             .inState(State.RUNNING)
+             .withInputPartitions(taskId02Partitions).build();
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+         when(stateUpdater.tasks()).thenReturn(Set.of(standbyTaskToClose));
+         final CompletableFuture<StateUpdater.RemovedTaskResult> future = new CompletableFuture<>();
+         when(stateUpdater.remove(standbyTaskToClose.id())).thenReturn(future);
+@@ -482,7 +453,7 @@ public class TaskManagerTest {
+             .inState(State.RUNNING)
+             .withInputPartitions(taskId02Partitions).build();
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+         when(stateUpdater.tasks()).thenReturn(Set.of(failedStandbyTask));
+         final CompletableFuture<StateUpdater.RemovedTaskResult> future = new CompletableFuture<>();
+         when(stateUpdater.remove(failedStandbyTask.id())).thenReturn(future);
+@@ -509,7 +480,7 @@ public class TaskManagerTest {
+             .withInputPartitions(taskId03Partitions).build();
+         final Set<TopicPartition> newInputPartitions = taskId02Partitions;
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+         when(stateUpdater.tasks()).thenReturn(Set.of(activeTaskToUpdateInputPartitions));
+         final CompletableFuture<StateUpdater.RemovedTaskResult> future = new CompletableFuture<>();
+         when(stateUpdater.remove(activeTaskToUpdateInputPartitions.id())).thenReturn(future);
+@@ -537,7 +508,7 @@ public class TaskManagerTest {
+             .inState(State.CREATED)
+             .withInputPartitions(taskId03Partitions).build();
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+         when(stateUpdater.tasks()).thenReturn(Set.of(activeTaskToRecycle));
+         when(standbyTaskCreator.createStandbyTaskFromActive(activeTaskToRecycle, taskId03Partitions))
+             .thenReturn(recycledStandbyTask);
+@@ -561,7 +532,7 @@ public class TaskManagerTest {
+             .inState(State.RESTORING)
+             .withInputPartitions(taskId00Partitions).build();
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+         when(stateUpdater.tasks()).thenReturn(Set.of(activeTaskToRecycle));
+         when(standbyTaskCreator.createStandbyTaskFromActive(activeTaskToRecycle, activeTaskToRecycle.inputPartitions()))
+             .thenThrow(new RuntimeException());
+@@ -591,7 +562,7 @@ public class TaskManagerTest {
+             .inState(State.CREATED)
+             .withInputPartitions(taskId03Partitions).build();
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+         when(stateUpdater.tasks()).thenReturn(Set.of(standbyTaskToRecycle));
+         when(activeTaskCreator.createActiveTaskFromStandby(standbyTaskToRecycle, taskId03Partitions, consumer))
+             .thenReturn(recycledActiveTask);
+@@ -615,7 +586,7 @@ public class TaskManagerTest {
+             .inState(State.RUNNING)
+             .withInputPartitions(taskId03Partitions).build();
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+         when(stateUpdater.tasks()).thenReturn(Set.of(standbyTaskToRecycle));
+         when(activeTaskCreator.createActiveTaskFromStandby(
+             standbyTaskToRecycle,
+@@ -645,7 +616,7 @@ public class TaskManagerTest {
+             .inState(State.RESTORING)
+             .withInputPartitions(taskId03Partitions).build();
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+         when(stateUpdater.tasks()).thenReturn(Set.of(reassignedActiveTask));
+ 
+         taskManager.handleAssignment(
+@@ -664,7 +635,7 @@ public class TaskManagerTest {
+             .inState(State.SUSPENDED)
+             .withInputPartitions(taskId03Partitions).build();
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+         when(tasks.allNonFailedTasks()).thenReturn(Set.of(reassignedActiveTask));
+ 
+         taskManager.handleAssignment(
+@@ -684,7 +655,7 @@ public class TaskManagerTest {
+             .inState(State.RESTORING)
+             .withInputPartitions(taskId03Partitions).build();
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+         when(stateUpdater.tasks()).thenReturn(Set.of(failedActiveTaskToRecycle));
+         final RuntimeException taskException = new RuntimeException("Nobody expects the Spanish inquisition!");
+         when(stateUpdater.remove(failedActiveTaskToRecycle.id()))
+@@ -714,7 +685,7 @@ public class TaskManagerTest {
+             .inState(State.RUNNING)
+             .withInputPartitions(taskId03Partitions).build();
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+         when(stateUpdater.tasks()).thenReturn(Set.of(failedStandbyTaskToRecycle));
+         final RuntimeException taskException = new RuntimeException("Nobody expects the Spanish inquisition!");
+         when(stateUpdater.remove(failedStandbyTaskToRecycle.id()))
+@@ -744,7 +715,7 @@ public class TaskManagerTest {
+             .inState(State.RESTORING)
+             .withInputPartitions(taskId03Partitions).build();
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+         when(stateUpdater.tasks()).thenReturn(Set.of(failedActiveTaskToReassign));
+         final RuntimeException taskException = new RuntimeException("Nobody expects the Spanish inquisition!");
+         when(stateUpdater.remove(failedActiveTaskToReassign.id()))
+@@ -777,7 +748,7 @@ public class TaskManagerTest {
+             .inState(State.RESTORING)
+             .withInputPartitions(taskId02Partitions).build();
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+         when(tasks.allNonFailedTasks()).thenReturn(Set.of(reassignedActiveTask1));
+         when(stateUpdater.tasks()).thenReturn(Set.of(reassignedActiveTask2));
+         when(stateUpdater.remove(reassignedActiveTask2.id()))
+@@ -803,7 +774,7 @@ public class TaskManagerTest {
+             .inState(State.RUNNING)
+             .withInputPartitions(taskId02Partitions).build();
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+         when(stateUpdater.tasks()).thenReturn(Set.of(standbyTaskToUpdateInputPartitions));
+ 
+         taskManager.handleAssignment(
+@@ -821,7 +792,7 @@ public class TaskManagerTest {
+             .inState(State.RUNNING)
+             .withInputPartitions(taskId02Partitions).build();
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+         when(stateUpdater.tasks()).thenReturn(Set.of(reassignedStandbyTask));
+ 
+         taskManager.handleAssignment(
+@@ -845,7 +816,7 @@ public class TaskManagerTest {
+             .inState(State.CREATED)
+             .withInputPartitions(taskId02Partitions).build();
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+         when(stateUpdater.tasks()).thenReturn(Set.of(activeTaskToClose, standbyTaskToRecycle));
+         final CompletableFuture<StateUpdater.RemovedTaskResult> futureForActiveTaskToClose = new CompletableFuture<>();
+         when(stateUpdater.remove(activeTaskToClose.id())).thenReturn(futureForActiveTaskToClose);
+@@ -880,7 +851,7 @@ public class TaskManagerTest {
+             .inState(State.RUNNING)
+             .withInputPartitions(taskId02Partitions).build();
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+ 
+         when(stateUpdater.tasks()).thenReturn(Set.of(standbyTaskInStateUpdater));
+         when(tasks.allTasksPerId()).thenReturn(mkMap(mkEntry(taskId03, runningActiveTask)));
+@@ -904,7 +875,7 @@ public class TaskManagerTest {
+             .inState(State.RUNNING)
+             .withInputPartitions(taskId02Partitions).build();
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+ 
+         when(tasks.allTasksPerId()).thenReturn(mkMap(mkEntry(taskId03, activeTask)));
+         assertEquals(taskManager.allOwnedTasks(), mkMap(mkEntry(taskId03, activeTask)));
+@@ -916,7 +887,7 @@ public class TaskManagerTest {
+             .inState(State.CREATED)
+             .withInputPartitions(taskId03Partitions).build();
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+         final Set<Task> createdTasks = Set.of(activeTaskToBeCreated);
+         final Map<TaskId, Set<TopicPartition>> tasksToBeCreated = mkMap(
+             mkEntry(activeTaskToBeCreated.id(), activeTaskToBeCreated.inputPartitions()));
+@@ -934,7 +905,7 @@ public class TaskManagerTest {
+             .inState(State.CREATED)
+             .withInputPartitions(taskId02Partitions).build();
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+         final Set<Task> createdTasks = Set.of(standbyTaskToBeCreated);
+         when(standbyTaskCreator.createTasks(mkMap(
+             mkEntry(standbyTaskToBeCreated.id(), standbyTaskToBeCreated.inputPartitions())))
+@@ -950,7 +921,7 @@ public class TaskManagerTest {
+     }
+ 
+     @Test
+-    public void shouldAddRecycledStandbyTasksFromActiveToPendingTasksToInitWithStateUpdaterEnabled() {
++    public void shouldAddRecycledStandbyTasksFromActiveToPendingTasksToInit() {
+         final StreamTask activeTaskToRecycle = statefulTask(taskId01, taskId01ChangelogPartitions)
+             .withInputPartitions(taskId01Partitions)
+             .inState(State.RUNNING).build();
+@@ -961,7 +932,7 @@ public class TaskManagerTest {
+         when(tasks.allNonFailedTasks()).thenReturn(Set.of(activeTaskToRecycle));
+         when(standbyTaskCreator.createStandbyTaskFromActive(activeTaskToRecycle, taskId01Partitions))
+             .thenReturn(standbyTask);
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+ 
+         taskManager.handleAssignment(emptyMap(), mkMap(mkEntry(taskId01, taskId01Partitions)));
+ 
+@@ -973,13 +944,13 @@ public class TaskManagerTest {
+     }
+ 
+     @Test
+-    public void shouldThrowDuringAssignmentIfStandbyTaskToRecycleIsFoundInTasksRegistryWithStateUpdaterEnabled() {
++    public void shouldThrowDuringAssignmentIfStandbyTaskToRecycleIsFoundInTasksRegistry() {
+         final StandbyTask standbyTaskToRecycle = standbyTask(taskId03, taskId03ChangelogPartitions)
+             .inState(State.RUNNING)
+             .withInputPartitions(taskId03Partitions).build();
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+         when(tasks.allNonFailedTasks()).thenReturn(Set.of(standbyTaskToRecycle));
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+ 
+         final IllegalStateException illegalStateException = assertThrows(
+             IllegalStateException.class,
+@@ -995,12 +966,12 @@ public class TaskManagerTest {
+     }
+ 
+     @Test
+-    public void shouldAssignActiveTaskInTasksRegistryToBeClosedCleanlyWithStateUpdaterEnabled() {
++    public void shouldAssignActiveTaskInTasksRegistryToBeClosedCleanly() {
+         final StreamTask activeTaskToClose = statefulTask(taskId03, taskId03ChangelogPartitions)
+             .inState(State.RUNNING)
+             .withInputPartitions(taskId03Partitions).build();
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+         when(tasks.allNonFailedTasks()).thenReturn(Set.of(activeTaskToClose));
+ 
+         taskManager.handleAssignment(Collections.emptyMap(), Collections.emptyMap());
+@@ -1013,12 +984,12 @@ public class TaskManagerTest {
+     }
+ 
+     @Test
+-    public void shouldThrowDuringAssignmentIfStandbyTaskToCloseIsFoundInTasksRegistryWithStateUpdaterEnabled() {
++    public void shouldThrowDuringAssignmentIfStandbyTaskToCloseIsFoundInTasksRegistry() {
+         final StandbyTask standbyTaskToClose = standbyTask(taskId03, taskId03ChangelogPartitions)
+             .inState(State.RUNNING)
+             .withInputPartitions(taskId03Partitions).build();
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+         when(tasks.allNonFailedTasks()).thenReturn(Set.of(standbyTaskToClose));
+ 
+         final IllegalStateException illegalStateException = assertThrows(
+@@ -1032,13 +1003,13 @@ public class TaskManagerTest {
+     }
+ 
+     @Test
+-    public void shouldAssignActiveTaskInTasksRegistryToUpdateInputPartitionsWithStateUpdaterEnabled() {
++    public void shouldAssignActiveTaskInTasksRegistryToUpdateInputPartitions() {
+         final StreamTask activeTaskToUpdateInputPartitions = statefulTask(taskId03, taskId03ChangelogPartitions)
+             .inState(State.RUNNING)
+             .withInputPartitions(taskId03Partitions).build();
+         final Set<TopicPartition> newInputPartitions = taskId02Partitions;
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+         when(tasks.allNonFailedTasks()).thenReturn(Set.of(activeTaskToUpdateInputPartitions));
+         when(tasks.updateActiveTaskInputPartitions(activeTaskToUpdateInputPartitions, newInputPartitions)).thenReturn(true);
+ 
+@@ -1053,12 +1024,12 @@ public class TaskManagerTest {
+     }
+ 
+     @Test
+-    public void shouldResumeActiveRunningTaskInTasksRegistryWithStateUpdaterEnabled() {
++    public void shouldResumeActiveRunningTaskInTasksRegistry() {
+         final StreamTask activeTaskToResume = statefulTask(taskId03, taskId03ChangelogPartitions)
+             .inState(State.RUNNING)
+             .withInputPartitions(taskId03Partitions).build();
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+         when(tasks.allNonFailedTasks()).thenReturn(Set.of(activeTaskToResume));
+ 
+         taskManager.handleAssignment(
+@@ -1076,7 +1047,7 @@ public class TaskManagerTest {
+             .inState(State.SUSPENDED)
+             .withInputPartitions(taskId03Partitions).build();
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+         when(tasks.allNonFailedTasks()).thenReturn(Set.of(activeTaskToResume));
+ 
+         taskManager.handleAssignment(
+@@ -1092,13 +1063,13 @@ public class TaskManagerTest {
+     }
+ 
+     @Test
+-    public void shouldThrowDuringAssignmentIfStandbyTaskToUpdateInputPartitionsIsFoundInTasksRegistryWithStateUpdaterEnabled() {
++    public void shouldThrowDuringAssignmentIfStandbyTaskToUpdateInputPartitionsIsFoundInTasksRegistry() {
+         final StandbyTask standbyTaskToUpdateInputPartitions = standbyTask(taskId02, taskId02ChangelogPartitions)
+             .inState(State.RUNNING)
+             .withInputPartitions(taskId02Partitions).build();
+         final Set<TopicPartition> newInputPartitions = taskId03Partitions;
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+         when(tasks.allNonFailedTasks()).thenReturn(Set.of(standbyTaskToUpdateInputPartitions));
+ 
+         final IllegalStateException illegalStateException = assertThrows(
+@@ -1115,7 +1086,7 @@ public class TaskManagerTest {
+     }
+ 
+     @Test
+-    public void shouldAssignMultipleTasksInTasksRegistryWithStateUpdaterEnabled() {
++    public void shouldAssignMultipleTasksInTasksRegistry() {
+         final StreamTask activeTaskToClose = statefulTask(taskId03, taskId03ChangelogPartitions)
+             .inState(State.RUNNING)
+             .withInputPartitions(taskId03Partitions).build();
+@@ -1123,7 +1094,7 @@ public class TaskManagerTest {
+             .inState(State.CREATED)
+             .withInputPartitions(taskId02Partitions).build();
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+         when(tasks.allNonFailedTasks()).thenReturn(Set.of(activeTaskToClose));
+ 
+         taskManager.handleAssignment(
+@@ -1149,7 +1120,7 @@ public class TaskManagerTest {
+             .inState(State.RUNNING).build();
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+         when(tasks.drainPendingTasksToInit()).thenReturn(Set.of(task00, task01));
+-        taskManager = setUpTaskManagerWithStateUpdater(StreamsConfigUtils.ProcessingMode.AT_LEAST_ONCE, tasks, false);
++        taskManager = setUpTaskManager(StreamsConfigUtils.ProcessingMode.AT_LEAST_ONCE, tasks, false);
+ 
+         taskManager.checkStateUpdater(time.milliseconds(), noOpResetter);
+ 
+@@ -1171,7 +1142,7 @@ public class TaskManagerTest {
+         when(tasks.drainPendingTasksToInit()).thenReturn(Set.of(task00, task01));
+         final LockException lockException = new LockException("Where are my keys??");
+         doThrow(lockException).when(task00).initializeIfNeeded();
+-        taskManager = setUpTaskManagerWithStateUpdater(StreamsConfigUtils.ProcessingMode.AT_LEAST_ONCE, tasks, false);
++        taskManager = setUpTaskManager(StreamsConfigUtils.ProcessingMode.AT_LEAST_ONCE, tasks, false);
+ 
+         taskManager.checkStateUpdater(time.milliseconds(), noOpResetter);
+ 
+@@ -1198,7 +1169,7 @@ public class TaskManagerTest {
+         when(tasks.drainPendingTasksToInit()).thenReturn(Set.of(task00, task01));
+         final TimeoutException timeoutException = new TimeoutException("Timed out!");
+         doThrow(timeoutException).when(task00).initializeIfNeeded();
+-        taskManager = setUpTaskManagerWithStateUpdater(StreamsConfigUtils.ProcessingMode.AT_LEAST_ONCE, tasks, false);
++        taskManager = setUpTaskManager(StreamsConfigUtils.ProcessingMode.AT_LEAST_ONCE, tasks, false);
+ 
+         taskManager.checkStateUpdater(time.milliseconds(), noOpResetter);
+ 
+@@ -1225,7 +1196,7 @@ public class TaskManagerTest {
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+         when(tasks.drainPendingTasksToInit()).thenReturn(Set.of(task00, task01));
+         doThrow(new LockException("Lock Exception!")).when(task00).initializeIfNeeded();
+-        taskManager = setUpTaskManagerWithStateUpdater(StreamsConfigUtils.ProcessingMode.AT_LEAST_ONCE, tasks, false);
++        taskManager = setUpTaskManager(StreamsConfigUtils.ProcessingMode.AT_LEAST_ONCE, tasks, false);
+ 
+         taskManager.checkStateUpdater(time.milliseconds(), noOpResetter);
+ 
+@@ -1263,7 +1234,7 @@ public class TaskManagerTest {
+     }
+ 
+     @Test
+-    public void shouldRethrowRuntimeExceptionInInitTaskWithStateUpdater() {
++    public void shouldRethrowRuntimeExceptionInInitTask() {
+         final StreamTask task00 = statefulTask(taskId00, taskId00ChangelogPartitions)
+             .withInputPartitions(taskId00Partitions)
+             .inState(State.CREATED).build();
+@@ -1271,7 +1242,7 @@ public class TaskManagerTest {
+         when(tasks.drainPendingTasksToInit()).thenReturn(Set.of(task00));
+         final RuntimeException runtimeException = new RuntimeException("KABOOM!");
+         doThrow(runtimeException).when(task00).initializeIfNeeded();
+-        taskManager = setUpTaskManagerWithStateUpdater(StreamsConfigUtils.ProcessingMode.AT_LEAST_ONCE, tasks, false);
++        taskManager = setUpTaskManager(StreamsConfigUtils.ProcessingMode.AT_LEAST_ONCE, tasks, false);
+ 
+         final StreamsException streamsException = assertThrows(
+             StreamsException.class,
+@@ -1297,7 +1268,7 @@ public class TaskManagerTest {
+             .inState(State.CREATED)
+             .withInputPartitions(taskId02Partitions).build();
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.EXACTLY_ONCE_V2, tasks, false);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.EXACTLY_ONCE_V2, tasks, false);
+         when(tasks.drainPendingTasksToInit()).thenReturn(Set.of(statefulTask0, statefulTask1, statefulTask2));
+         doThrow(new TaskCorruptedException(Collections.singleton(statefulTask0.id))).when(statefulTask0).initializeIfNeeded();
+         doThrow(new TaskCorruptedException(Collections.singleton(statefulTask1.id))).when(statefulTask1).initializeIfNeeded();
+@@ -1318,7 +1289,7 @@ public class TaskManagerTest {
+     public void shouldReturnFalseFromCheckStateUpdaterIfActiveTasksAreRestoring() {
+         when(stateUpdater.restoresActiveTasks()).thenReturn(true);
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+ 
+         assertFalse(taskManager.checkStateUpdater(time.milliseconds(), noOpResetter));
+     }
+@@ -1327,7 +1298,7 @@ public class TaskManagerTest {
+     public void shouldReturnFalseFromCheckStateUpdaterIfActiveTasksAreNotRestoringAndNoPendingTaskToRecycleButPendingTasksToInit() {
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+         when(tasks.hasPendingTasksToInit()).thenReturn(true);
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+ 
+         assertFalse(taskManager.checkStateUpdater(time.milliseconds(), noOpResetter));
+     }
+@@ -1335,7 +1306,7 @@ public class TaskManagerTest {
+     @Test
+     public void shouldReturnTrueFromCheckStateUpdaterIfActiveTasksAreNotRestoringAndNoPendingInit() {
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+ 
+         assertTrue(taskManager.checkStateUpdater(time.milliseconds(), noOpResetter));
+     }
+@@ -1555,7 +1526,7 @@ public class TaskManagerTest {
+ 
+     private TaskManager setupForRevocationAndLost(final Set<Task> tasksInStateUpdater,
+                                                   final TasksRegistry tasks) {
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+         when(stateUpdater.tasks()).thenReturn(tasksInStateUpdater);
+ 
+         return taskManager;
+@@ -1624,12 +1595,12 @@ public class TaskManagerTest {
+         when(stateUpdater.restoresActiveTasks()).thenReturn(true);
+         when(stateUpdater.drainRestoredActiveTasks(any(Duration.class))).thenReturn(statefulTasks);
+ 
+-        return setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        return setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+     }
+ 
+     @Test
+-    public void shouldReturnCorrectBooleanWhenTryingToCompleteRestorationWithStateUpdater() {
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, null, false);
++    public void shouldReturnCorrectBooleanWhenTryingToCompleteRestoration() {
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, null, false);
+         when(stateUpdater.restoresActiveTasks()).thenReturn(false);
+         assertTrue(taskManager.checkStateUpdater(time.milliseconds(), noOpResetter));
+         when(stateUpdater.restoresActiveTasks()).thenReturn(true);
+@@ -1647,7 +1618,7 @@ public class TaskManagerTest {
+         when(stateUpdater.drainExceptionsAndFailedTasks()).thenReturn(Collections.singletonList(exceptionAndTasks));
+ 
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+ 
+         final StreamsException thrown = assertThrows(
+             StreamsException.class,
+@@ -1674,7 +1645,7 @@ public class TaskManagerTest {
+         when(stateUpdater.drainExceptionsAndFailedTasks()).thenReturn(Arrays.asList(exceptionAndTasks0, exceptionAndTasks1));
+ 
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+ 
+         final TaskCorruptedException thrown = assertThrows(
+             TaskCorruptedException.class,
+@@ -1746,7 +1717,7 @@ public class TaskManagerTest {
+     public void shouldPauseAllTopicsOnRebalanceComplete() {
+         final Set<TopicPartition> assigned = Set.of(t1p0, t1p1);
+         when(consumer.assignment()).thenReturn(assigned);
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, null);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, null);
+         taskManager.handleRebalanceComplete();
+ 
+         verify(consumer).pause(assigned);
+@@ -1758,7 +1729,7 @@ public class TaskManagerTest {
+             .inState(State.RUNNING)
+             .withInputPartitions(taskId00Partitions).build();
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+         when(tasks.allNonFailedTasks()).thenReturn(Set.of(statefulTask0));
+         final Set<TopicPartition> assigned = Set.of(t1p0, t1p1);
+         when(consumer.assignment()).thenReturn(assigned);
+@@ -1780,7 +1751,7 @@ public class TaskManagerTest {
+             .inState(State.RUNNING)
+             .withInputPartitions(taskId02Partitions).build();
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+         when(tasks.allTasksPerId()).thenReturn(mkMap(mkEntry(taskId00, runningStatefulTask)));
+         when(stateUpdater.tasks()).thenReturn(Set.of(standbyTask, restoringStatefulTask));
+         when(tasks.allNonFailedTasks()).thenReturn(Set.of(runningStatefulTask));
+@@ -1814,7 +1785,7 @@ public class TaskManagerTest {
+         );
+         when(runningStatefulTask.changelogOffsets()).thenReturn(changelogOffsets);
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+         when(tasks.allTasksPerId()).thenReturn(mkMap(mkEntry(taskId00, runningStatefulTask)));
+ 
+         assertThat(
+@@ -1837,7 +1808,7 @@ public class TaskManagerTest {
+         when(restoringStatefulTask.changelogOffsets())
+             .thenReturn(changelogOffsets);
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+         when(stateUpdater.tasks()).thenReturn(Set.of(restoringStatefulTask));
+ 
+         assertThat(taskManager.taskOffsetSums(), is(expectedOffsetSums));
+@@ -1857,7 +1828,7 @@ public class TaskManagerTest {
+         final Map<TopicPartition, Long> changelogOffsetInCheckpoint = mkMap(mkEntry(t1p0changelog, 24L));
+         writeCheckpointFile(taskId00, changelogOffsetInCheckpoint);
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+         when(stateUpdater.tasks()).thenReturn(Set.of(restoringStatefulTask));
+         taskManager.handleRebalanceStart(singleton("topic"));
+ 
+@@ -1875,7 +1846,7 @@ public class TaskManagerTest {
+         final Map<TopicPartition, Long> changelogOffsetInCheckpoint = mkMap(mkEntry(t1p0changelog, 24L));
+         writeCheckpointFile(taskId00, changelogOffsetInCheckpoint);
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+         when(stateUpdater.tasks()).thenReturn(Set.of(restoringStandbyTask));
+         taskManager.handleRebalanceStart(singleton("topic"));
+ 
+@@ -1900,7 +1871,7 @@ public class TaskManagerTest {
+         when(restoringStandbyTask.changelogOffsets())
+             .thenReturn(mkMap(mkEntry(t1p2changelog, changelogOffsetOfRestoringStandbyTask)));
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+         when(tasks.allTasksPerId()).thenReturn(mkMap(mkEntry(taskId00, runningStatefulTask)));
+         when(stateUpdater.tasks()).thenReturn(Set.of(restoringStandbyTask, restoringStatefulTask));
+ 
+@@ -1925,7 +1896,7 @@ public class TaskManagerTest {
+                 mkEntry(t1p1changelog2, OffsetCheckpoint.OFFSET_UNKNOWN)
+             ));
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks, false);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks, false);
+         when(tasks.allTasksPerId()).thenReturn(mkMap(mkEntry(taskId01, restoringStatefulTask)));
+         when(stateUpdater.tasks()).thenReturn(Set.of(restoringStatefulTask));
+ 
+@@ -1952,7 +1923,7 @@ public class TaskManagerTest {
+         when(standbyTask.changelogOffsets()).thenReturn(changelogOffsets);
+ 
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+-        taskManager = setUpTaskManagerWithStateUpdater(StreamsConfigUtils.ProcessingMode.AT_LEAST_ONCE, tasks, false);
++        taskManager = setUpTaskManager(StreamsConfigUtils.ProcessingMode.AT_LEAST_ONCE, tasks, false);
+ 
+         when(stateUpdater.tasks()).thenReturn(Set.of(standbyTask));
+ 
+@@ -2000,7 +1971,7 @@ public class TaskManagerTest {
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+         when(tasks.allTasksPerId()).thenReturn(mkMap(mkEntry(taskId00, task)));
+ 
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+ 
+         expectLockObtainedFor(taskId00);
+         makeTaskFolders(taskId00.toString());
+@@ -2060,7 +2031,7 @@ public class TaskManagerTest {
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+         when(tasks.allNonFailedTasks()).thenReturn(Set.of(task00));
+ 
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+ 
+         taskManager.handleAssignment(emptyMap(), emptyMap());
+ 
+@@ -2081,7 +2052,7 @@ public class TaskManagerTest {
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+         when(tasks.allNonFailedTasks()).thenReturn(Set.of(task00));
+ 
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+ 
+         final RuntimeException thrown = assertThrows(
+             RuntimeException.class,
+@@ -2124,7 +2095,7 @@ public class TaskManagerTest {
+         expectLockObtainedFor(taskId00, taskId01);
+         expectDirectoryNotEmpty(taskId00, taskId01);
+ 
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+ 
+         taskManager.handleRebalanceStart(emptySet());
+         assertThat(taskManager.lockedTaskDirectories(), is(Set.of(taskId00, taskId01)));
+@@ -2155,7 +2126,7 @@ public class TaskManagerTest {
+ 
+     @Test
+     public void shouldReInitializeStreamsProducerOnHandleLostAllIfEosV2Enabled() {
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.EXACTLY_ONCE_V2, null, false);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.EXACTLY_ONCE_V2, null, false);
+ 
+         taskManager.handleLostAll();
+ 
+@@ -2171,7 +2142,7 @@ public class TaskManagerTest {
+             .inState(State.RUNNING)
+             .withInputPartitions(taskId02Partitions).build();
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+         when(tasks.task(taskId03)).thenReturn(corruptedActiveTask);
+         when(tasks.task(taskId02)).thenReturn(corruptedStandbyTask);
+ 
+@@ -2208,7 +2179,7 @@ public class TaskManagerTest {
+ 
+         when(consumer.assignment()).thenReturn(taskId00Partitions);
+ 
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+ 
+         taskManager.handleCorruption(singleton(taskId00));
+ 
+@@ -2239,7 +2210,7 @@ public class TaskManagerTest {
+         when(task00.changelogPartitions()).thenReturn(taskId00ChangelogPartitions);
+         doThrow(new RuntimeException("oops")).when(task00).suspend();
+ 
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+ 
+         taskManager.handleCorruption(singleton(taskId00));
+ 
+@@ -2280,7 +2251,7 @@ public class TaskManagerTest {
+ 
+         when(consumer.assignment()).thenReturn(taskId00Partitions);
+ 
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+ 
+         taskManager.handleCorruption(Set.of(taskId00));
+ 
+@@ -2308,7 +2279,7 @@ public class TaskManagerTest {
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+         when(tasks.allTasksPerId()).thenReturn(mkMap(mkEntry(taskId02, corruptedTask)));
+         when(tasks.task(taskId02)).thenReturn(corruptedTask);
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+         when(consumer.assignment()).thenReturn(intersection(HashSet::new, taskId00Partitions, taskId01Partitions, taskId02Partitions));
+ 
+         taskManager.handleCorruption(Set.of(taskId02));
+@@ -2347,7 +2318,7 @@ public class TaskManagerTest {
+         doNothing().when(corruptedStandby).suspend();
+         doNothing().when(corruptedStandby).postCommit(anyBoolean());
+ 
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+ 
+         assertThrows(TaskMigratedException.class, () -> taskManager.handleCorruption(singleton(taskId00)));
+ 
+@@ -2392,7 +2363,7 @@ public class TaskManagerTest {
+ 
+         when(consumer.assignment()).thenReturn(taskId00Partitions);
+ 
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+ 
+         taskManager.handleRebalanceStart(singleton(topic1));
+         assertThat(taskManager.rebalanceInProgress(), is(true));
+@@ -2459,7 +2430,7 @@ public class TaskManagerTest {
+ 
+         doThrow(new TimeoutException()).when(producer).commitTransaction(offsets, groupMetadata);
+ 
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.EXACTLY_ONCE_V2, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.EXACTLY_ONCE_V2, tasks);
+ 
+         taskManager.handleCorruption(singleton(taskId00));
+ 
+@@ -2532,7 +2503,7 @@ public class TaskManagerTest {
+         doThrow(new TimeoutException()).when(consumer).commitSync(offsets);
+         when(consumer.assignment()).thenReturn(union(HashSet::new, taskId00Partitions, taskId01Partitions));
+ 
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+ 
+         taskManager.handleCorruption(singleton(taskId00));
+ 
+@@ -2614,7 +2585,7 @@ public class TaskManagerTest {
+         expectedCommittedOffsets.putAll(unrevokedTaskOffsets);
+         doThrow(new TimeoutException()).when(consumer).commitSync(expectedCommittedOffsets);
+ 
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+ 
+         taskManager.handleRevocation(taskId00Partitions);
+ 
+@@ -2707,7 +2678,7 @@ public class TaskManagerTest {
+         expectedCommittedOffsets.putAll(unrevokedTaskOffsets);
+         doThrow(new TimeoutException()).when(producer).commitTransaction(expectedCommittedOffsets, groupMetadata);
+ 
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.EXACTLY_ONCE_V2, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.EXACTLY_ONCE_V2, tasks);
+ 
+         taskManager.handleRevocation(taskId00Partitions);
+ 
+@@ -2751,7 +2722,7 @@ public class TaskManagerTest {
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+         when(tasks.drainPendingTasksToInit()).thenReturn(emptySet());
+ 
+-        taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+ 
+         when(stateUpdater.tasks()).thenReturn(Set.of(task00));
+ 
+@@ -2788,7 +2759,7 @@ public class TaskManagerTest {
+         when(tasks.drainPendingTasksToInit()).thenReturn(emptySet());
+         when(tasks.hasPendingTasksToInit()).thenReturn(false);
+ 
+-        taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+ 
+         when(stateUpdater.tasks()).thenReturn(Set.of(task01));
+         when(stateUpdater.restoresActiveTasks()).thenReturn(false);
+@@ -2824,7 +2795,7 @@ public class TaskManagerTest {
+         when(tasks.hasPendingTasksToInit()).thenReturn(false);
+         when(tasks.updateActiveTaskInputPartitions(task00, newPartitionsSet)).thenReturn(true);
+ 
+-        taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+ 
+         when(stateUpdater.tasks()).thenReturn(emptySet());
+         when(stateUpdater.restoresActiveTasks()).thenReturn(false);
+@@ -2850,7 +2821,7 @@ public class TaskManagerTest {
+ 
+         final Map<TaskId, Set<TopicPartition>> assignment = taskId00Assignment;
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+ 
+         // first, we need to handle assignment -- creates tasks and adds to pending initialization
+         when(activeTaskCreator.createTasks(any(), eq(assignment))).thenReturn(singletonList(task00));
+@@ -2888,7 +2859,7 @@ public class TaskManagerTest {
+             .build();
+ 
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+         final Map<TaskId, Set<TopicPartition>> assignment = mkMap(
+             mkEntry(taskId00, taskId00Partitions),
+             mkEntry(taskId01, taskId01Partitions)
+@@ -2931,7 +2902,7 @@ public class TaskManagerTest {
+             .build();
+ 
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+ 
+         when(stateUpdater.restoresActiveTasks()).thenReturn(true);
+         when(stateUpdater.drainRestoredActiveTasks(any(Duration.class))).thenReturn(Set.of(task00));
+@@ -2962,7 +2933,7 @@ public class TaskManagerTest {
+         when(task00.commitNeeded()).thenReturn(true);
+         when(task00.prepareCommit(true)).thenReturn(offsets);
+ 
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+ 
+         taskManager.handleRevocation(taskId00Partitions);
+ 
+@@ -3028,7 +2999,7 @@ public class TaskManagerTest {
+         expectedCommittedOffsets.putAll(offsets00);
+         expectedCommittedOffsets.putAll(offsets01);
+ 
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.EXACTLY_ONCE_V2, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.EXACTLY_ONCE_V2, tasks);
+ 
+         taskManager.handleRevocation(taskId00Partitions);
+ 
+@@ -3093,7 +3064,7 @@ public class TaskManagerTest {
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+         when(tasks.allTasks()).thenReturn(Set.of(task00, task01, task02, task03));
+ 
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+ 
+         taskManager.handleRevocation(taskId00Partitions);
+ 
+@@ -3148,7 +3119,7 @@ public class TaskManagerTest {
+         when(task01.commitNeeded()).thenReturn(true); // only task01 needs commit
+         when(task02.commitNeeded()).thenReturn(false);
+ 
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(processingMode, tasks);
++        final TaskManager taskManager = setUpTaskManager(processingMode, tasks);
+ 
+         taskManager.handleRevocation(taskId00Partitions);
+ 
+@@ -3171,7 +3142,7 @@ public class TaskManagerTest {
+             .withInputPartitions(taskId01Partitions).build();
+ 
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+ 
+         when(tasks.allNonFailedTasks()).thenReturn(Set.of(task00));
+         when(stateUpdater.tasks()).thenReturn(Set.of(task01));
+@@ -3205,7 +3176,7 @@ public class TaskManagerTest {
+             .withInputPartitions(taskId01Partitions).build();
+ 
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+ 
+         when(tasks.allNonFailedTasks()).thenReturn(Set.of(task00));
+         when(stateUpdater.tasks()).thenReturn(Set.of(task01));
+@@ -3238,7 +3209,7 @@ public class TaskManagerTest {
+             .build();
+ 
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+ 
+         when(activeTaskCreator.createTasks(consumer, taskId00Assignment))
+             .thenReturn(singletonList(task00));
+@@ -3277,7 +3248,7 @@ public class TaskManagerTest {
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+         when(tasks.allTasks()).thenReturn(Set.of(task00));
+ 
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+ 
+         assertThrows(RuntimeException.class, () -> taskManager.handleRevocation(taskId00Partitions));
+ 
+@@ -3308,7 +3279,7 @@ public class TaskManagerTest {
+             .withInputPartitions(taskId02Partitions).build();
+ 
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(processingMode, tasks);
++        final TaskManager taskManager = setUpTaskManager(processingMode, tasks);
+ 
+         doThrow(new TaskMigratedException("migrated", new RuntimeException("cause")))
+             .when(task01).suspend();
+@@ -3348,7 +3319,7 @@ public class TaskManagerTest {
+             .build();
+ 
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+ 
+         doThrow(new RuntimeException("whatever")).when(activeTaskCreator).close();
+ 
+@@ -3373,14 +3344,14 @@ public class TaskManagerTest {
+     @SuppressWarnings("unchecked")
+     @Test
+     public void shouldCloseTasksIfStateUpdaterTimesOutOnRemove() throws Exception {
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, null, false);
+-        final Map<TaskId, Set<TopicPartition>> assignment = mkMap(
+-                mkEntry(taskId00, taskId00Partitions)
+-        );
+-        final Task task00 = spy(new StateMachineTask(taskId00, taskId00Partitions, true, stateManager));
++        final StreamTask task00 = statefulTask(taskId00, taskId00ChangelogPartitions)
++            .inState(State.RUNNING)
++            .withInputPartitions(taskId00Partitions)
++            .build();
+ 
+-        when(activeTaskCreator.createTasks(any(), eq(assignment))).thenReturn(singletonList(task00));
+-        taskManager.handleAssignment(assignment, emptyMap());
++        final TasksRegistry tasks = mock(TasksRegistry.class);
++
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks, false);
+ 
+         when(stateUpdater.tasks()).thenReturn(singleton(task00));
+         final CompletableFuture<StateUpdater.RemovedTaskResult> future = mock(CompletableFuture.class);
+@@ -3406,7 +3377,7 @@ public class TaskManagerTest {
+         doThrow(new RuntimeException("task 0_1 suspend boom!")).when(task01).suspend();
+ 
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.EXACTLY_ONCE_V2, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.EXACTLY_ONCE_V2, tasks);
+ 
+         when(stateUpdater.tasks()).thenReturn(Set.of(task00, task01));
+ 
+@@ -3450,7 +3421,7 @@ public class TaskManagerTest {
+             .withInputPartitions(taskId02Partitions).build();
+ 
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+ 
+         when(tasks.allTasks()).thenReturn(Set.of(task00, task01, task02));
+ 
+@@ -3481,7 +3452,7 @@ public class TaskManagerTest {
+             .build();
+ 
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+ 
+         doThrow(new TaskMigratedException("migrated", new RuntimeException("cause")))
+             .when(task01).suspend();
+@@ -3527,7 +3498,7 @@ public class TaskManagerTest {
+         final CompletableFuture<StateUpdater.RemovedTaskResult> futureForStandbyTask = new CompletableFuture<>();
+         when(stateUpdater.remove(taskId00)).thenReturn(futureForStandbyTask);
+ 
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+ 
+         futureForStandbyTask.complete(new StateUpdater.RemovedTaskResult(standbyTask00)); // simulate successful removal
+ 
+@@ -3560,7 +3531,7 @@ public class TaskManagerTest {
+                 new ExceptionAndTask(new RuntimeException(), failedStandbyTask))
+             )
+             .thenReturn(Collections.emptyList());
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+ 
+         taskManager.shutdown(true);
+ 
+@@ -3574,7 +3545,7 @@ public class TaskManagerTest {
+     @Test
+     public void shouldShutdownSchedulingTaskManager() {
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks, true);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks, true);
+ 
+         taskManager.shutdown(true);
+ 
+@@ -3624,7 +3595,7 @@ public class TaskManagerTest {
+                     new ExceptionAndTask(new StreamsException("KABOOM!"), removedFailedStatefulTaskDuringRemoval),
+                     new ExceptionAndTask(new StreamsException("KABOOM!"), removedFailedStandbyTaskDuringRemoval))
+                 ).thenReturn(Collections.emptyList());
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+         futureForRemovedStatefulTask.complete(new StateUpdater.RemovedTaskResult(removedStatefulTask));
+         futureForRemovedStandbyTask.complete(new StateUpdater.RemovedTaskResult(removedStandbyTask));
+         futureForRemovedFailedStatefulTask
+@@ -3664,7 +3635,7 @@ public class TaskManagerTest {
+ 
+         final Map<TaskId, Set<TopicPartition>> assignment = taskId01Assignment;
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+ 
+         when(standbyTaskCreator.createTasks(assignment)).thenReturn(singletonList(task01));
+ 
+@@ -3714,7 +3685,7 @@ public class TaskManagerTest {
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+         when(tasks.allTasks()).thenReturn(Set.of(task00, task01));
+ 
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+ 
+         assertThat(taskManager.commitAll(), equalTo(2));
+ 
+@@ -3774,7 +3745,7 @@ public class TaskManagerTest {
+ 
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+ 
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+ 
+         assertThat(taskManager.commit(Set.of(task00, task02, task03, task05)), equalTo(2));
+ 
+@@ -3810,7 +3781,7 @@ public class TaskManagerTest {
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+         when(tasks.allTasks()).thenReturn(Set.of(task00));
+ 
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+ 
+         assertThat(taskManager.commitAll(), equalTo(1));
+ 
+@@ -3838,7 +3809,7 @@ public class TaskManagerTest {
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+         when(tasks.allTasks()).thenReturn(Set.of(task00, task01));
+ 
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+ 
+         taskManager.handleRebalanceStart(emptySet());
+ 
+@@ -3867,7 +3838,7 @@ public class TaskManagerTest {
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+         when(tasks.allTasks()).thenReturn(Set.of(task01));
+ 
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+ 
+         assertThat(taskManager.commitAll(), equalTo(1));
+ 
+@@ -3912,7 +3883,7 @@ public class TaskManagerTest {
+         final ConsumerGroupMetadata groupMetadata = mock(ConsumerGroupMetadata.class);
+         when(consumer.groupMetadata()).thenReturn(groupMetadata);
+ 
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.EXACTLY_ONCE_V2, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.EXACTLY_ONCE_V2, tasks);
+ 
+         taskManager.commitAll();
+ 
+@@ -3939,7 +3910,7 @@ public class TaskManagerTest {
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+         when(tasks.allTasks()).thenReturn(Set.of(task00));
+ 
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+ 
+         final RuntimeException thrown =
+             assertThrows(RuntimeException.class, taskManager::commitAll);
+@@ -3962,7 +3933,7 @@ public class TaskManagerTest {
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+         when(tasks.allTasks()).thenReturn(Set.of(task01));
+ 
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+ 
+         final RuntimeException thrown =
+             assertThrows(RuntimeException.class, () -> taskManager.commitAll());
+@@ -3994,7 +3965,7 @@ public class TaskManagerTest {
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+         when(tasks.allTasks()).thenReturn(Set.of(task00));
+ 
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+ 
+         taskManager.maybePurgeCommittedRecords(); // no-op
+         taskManager.maybePurgeCommittedRecords(); // sends purge for offset 5L
+@@ -4024,7 +3995,7 @@ public class TaskManagerTest {
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+         when(tasks.allTasks()).thenReturn(Set.of(task00));
+ 
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+ 
+         taskManager.maybePurgeCommittedRecords();
+         taskManager.maybePurgeCommittedRecords();
+@@ -4052,7 +4023,7 @@ public class TaskManagerTest {
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+         when(tasks.allTasks()).thenReturn(Set.of(task00));
+ 
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+ 
+         taskManager.maybePurgeCommittedRecords();
+         taskManager.maybePurgeCommittedRecords();
+@@ -4109,7 +4080,7 @@ public class TaskManagerTest {
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+         when(tasks.allTasks()).thenReturn(Set.of(task00, task01, task02, task03));
+ 
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+ 
+         // maybeCommitActiveTasksPerUserRequested checks if any task has both commitRequested AND commitNeeded
+         // If found, commits all active running tasks that have commitNeeded
+@@ -4169,7 +4140,7 @@ public class TaskManagerTest {
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+         when(tasks.activeTasks()).thenReturn(Set.of(task00, task01));
+ 
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+ 
+         // check that we should be processing at most max num records
+         assertThat(taskManager.process(3, time), is(6));
+@@ -4214,7 +4185,7 @@ public class TaskManagerTest {
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+         when(tasks.activeTasks()).thenReturn(Set.of(task00, task01, task02));
+ 
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+ 
+         // should only process 2 records, because task01 throws TimeoutException
+         assertThat(taskManager.process(1, time), is(2));
+@@ -4241,7 +4212,7 @@ public class TaskManagerTest {
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+         when(tasks.activeTasks()).thenReturn(Set.of(task00));
+ 
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+ 
+         assertThrows(TaskMigratedException.class, () -> taskManager.process(1, time));
+     }
+@@ -4258,7 +4229,7 @@ public class TaskManagerTest {
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+         when(tasks.activeTasks()).thenReturn(Set.of(task00));
+ 
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+ 
+         final StreamsException exception = assertThrows(StreamsException.class, () -> taskManager.process(1, time));
+         assertThat(exception.taskId().isPresent(), is(true));
+@@ -4279,7 +4250,7 @@ public class TaskManagerTest {
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+         when(tasks.activeTasks()).thenReturn(Set.of(task00));
+ 
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+ 
+         assertThrows(TaskMigratedException.class, taskManager::punctuate);
+     }
+@@ -4296,7 +4267,7 @@ public class TaskManagerTest {
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+         when(tasks.activeTasks()).thenReturn(Set.of(task00));
+ 
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+ 
+         assertThrows(KafkaException.class, taskManager::punctuate);
+     }
+@@ -4314,7 +4285,7 @@ public class TaskManagerTest {
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+         when(tasks.activeTasks()).thenReturn(Set.of(task00));
+ 
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+ 
+         // one for stream and one for system time
+         assertThat(taskManager.punctuate(), equalTo(2));
+@@ -4326,7 +4297,7 @@ public class TaskManagerTest {
+     @Test
+     public void shouldReturnFalseWhenThereAreStillNonRunningTasks() {
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+ 
+         // mock that the state updater is still restoring active tasks
+         when(stateUpdater.restoresActiveTasks()).thenReturn(true);
+@@ -4347,7 +4318,7 @@ public class TaskManagerTest {
+         when(task00.prepareCommit(false)).thenReturn(offsets);
+ 
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+         when(tasks.allTasks()).thenReturn(Set.of(task00));
+ 
+         try (final LogCaptureAppender appender = LogCaptureAppender.createAndRegister(TaskManager.class)) {
+@@ -4385,7 +4356,7 @@ public class TaskManagerTest {
+             .when(migratedTask02).suspend();
+ 
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+ 
+         when(stateUpdater.tasks()).thenReturn(Set.of(migratedTask01, migratedTask02));
+ 
+@@ -4431,7 +4402,7 @@ public class TaskManagerTest {
+             .when(migratedTask02).suspend();
+ 
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+ 
+         when(stateUpdater.tasks()).thenReturn(Set.of(migratedTask01, migratedTask02));
+ 
+@@ -4476,7 +4447,7 @@ public class TaskManagerTest {
+             .when(migratedTask02).suspend();
+ 
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+ 
+         when(stateUpdater.tasks()).thenReturn(Set.of(migratedTask01, migratedTask02));
+ 
+@@ -4522,53 +4493,6 @@ public class TaskManagerTest {
+         assertThat(taskManager.producerMetrics(), is(dummyProducerMetrics));
+     }
+ 
+-    private Map<TaskId, StateMachineTask> handleAssignment(final Map<TaskId, Set<TopicPartition>> runningActiveAssignment,
+-                                                           final Map<TaskId, Set<TopicPartition>> standbyAssignment,
+-                                                           final Map<TaskId, Set<TopicPartition>> restoringActiveAssignment) {
+-        final Set<Task> runningTasks = runningActiveAssignment.entrySet().stream()
+-                                           .map(t -> new StateMachineTask(t.getKey(), t.getValue(), true, stateManager))
+-                                           .collect(Collectors.toSet());
+-        final Set<Task> standbyTasks = standbyAssignment.entrySet().stream()
+-                                           .map(t -> new StateMachineTask(t.getKey(), t.getValue(), false, stateManager))
+-                                           .collect(Collectors.toSet());
+-        final Set<Task> restoringTasks = restoringActiveAssignment.entrySet().stream()
+-                                           .map(t -> new StateMachineTask(t.getKey(), t.getValue(), true, stateManager))
+-                                           .collect(Collectors.toSet());
+-        // give the restoring tasks some uncompleted changelog partitions so they'll stay in restoring
+-        restoringTasks.forEach(t -> ((StateMachineTask) t).setChangelogOffsets(singletonMap(new TopicPartition("changelog", 0), 0L)));
+-
+-        // Initially assign only the active tasks we want to complete restoration
+-        final Map<TaskId, Set<TopicPartition>> allActiveTasksAssignment = new HashMap<>(runningActiveAssignment);
+-        allActiveTasksAssignment.putAll(restoringActiveAssignment);
+-        final Set<Task> allActiveTasks = new HashSet<>(runningTasks);
+-        allActiveTasks.addAll(restoringTasks);
+-
+-        when(standbyTaskCreator.createTasks(standbyAssignment)).thenReturn(standbyTasks);
+-        when(activeTaskCreator.createTasks(any(), eq(allActiveTasksAssignment))).thenReturn(allActiveTasks);
+-
+-        lenient().when(consumer.assignment()).thenReturn(assignment);
+-
+-        taskManager.handleAssignment(allActiveTasksAssignment, standbyAssignment);
+-        taskManager.tryToCompleteRestoration(time.milliseconds(), null);
+-
+-        final Map<TaskId, StateMachineTask> allTasks = new HashMap<>();
+-
+-        // Just make sure all tasks ended up in the expected state
+-        for (final Task task : runningTasks) {
+-            assertThat(task.state(), is(Task.State.RUNNING));
+-            allTasks.put(task.id(), (StateMachineTask) task);
+-        }
+-        for (final Task task : restoringTasks) {
+-            assertThat(task.state(), is(Task.State.RESTORING));
+-            allTasks.put(task.id(), (StateMachineTask) task);
+-        }
+-        for (final Task task : standbyTasks) {
+-            assertThat(task.state(), is(Task.State.RUNNING));
+-            allTasks.put(task.id(), (StateMachineTask) task);
+-        }
+-        return allTasks;
+-    }
+-
+     private void expectLockObtainedFor(final TaskId... tasks) {
+         for (final TaskId task : tasks) {
+             when(stateDirectory.lock(task)).thenReturn(true);
+@@ -4602,7 +4526,7 @@ public class TaskManagerTest {
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+         when(tasks.allTasks()).thenReturn(Set.of(task01));
+ 
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+ 
+         doThrow(new CommitFailedException()).when(consumer).commitSync(offsets);
+ 
+@@ -4640,7 +4564,7 @@ public class TaskManagerTest {
+         when(task01.commitNeeded()).thenReturn(false);
+ 
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+ 
+         doThrow(new TimeoutException("KABOOM!")).doNothing().when(consumer).commitSync(any(Map.class));
+ 
+@@ -4688,7 +4612,7 @@ public class TaskManagerTest {
+ 
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+ 
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.EXACTLY_ONCE_V2, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.EXACTLY_ONCE_V2, tasks);
+ 
+         final TaskCorruptedException exception = assertThrows(
+             TaskCorruptedException.class,
+@@ -4717,7 +4641,7 @@ public class TaskManagerTest {
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+         when(tasks.allTasks()).thenReturn(Set.of(task01));
+ 
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+ 
+         doThrow(new KafkaException()).when(consumer).commitSync(offsets);
+ 
+@@ -4748,7 +4672,7 @@ public class TaskManagerTest {
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+         when(tasks.allTasks()).thenReturn(Set.of(task01));
+ 
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+ 
+         doThrow(new RuntimeException("KABOOM")).when(consumer).commitSync(offsets);
+ 
+@@ -4780,7 +4704,7 @@ public class TaskManagerTest {
+ 
+         when(tasks.allTasks()).thenReturn(Set.of(task00, task01));
+ 
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+ 
+         final RuntimeException thrown = assertThrows(
+             RuntimeException.class,
+@@ -4804,7 +4728,7 @@ public class TaskManagerTest {
+             .inState(State.CREATED)
+             .withInputPartitions(taskId00Partitions).build();
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+ 
+         when(activeTaskCreator.createTasks(consumer, taskId00Assignment)).thenReturn(singletonList(activeTaskToRecycle));
+         when(standbyTaskCreator.createStandbyTaskFromActive(activeTaskToRecycle, taskId00Partitions))
+@@ -4836,7 +4760,7 @@ public class TaskManagerTest {
+             .inState(State.CREATED)
+             .withInputPartitions(taskId00Partitions).build();
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+ 
+         when(standbyTaskCreator.createTasks(taskId00Assignment)).thenReturn(singletonList(standbyTaskToRecycle));
+         when(activeTaskCreator.createActiveTaskFromStandby(standbyTaskToRecycle, taskId00Partitions, consumer))
+@@ -4874,7 +4798,7 @@ public class TaskManagerTest {
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+         when(tasks.allTasks()).thenReturn(Set.of(task00, task01));
+ 
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, tasks);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+ 
+         when(stateUpdater.tasks()).thenReturn(Collections.emptySet());
+ 
+@@ -4890,7 +4814,7 @@ public class TaskManagerTest {
+     @Test
+     public void shouldRecycleStartupTasksFromStateDirectoryAsActive() {
+         final Tasks taskRegistry = new Tasks(new LogContext());
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, taskRegistry);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, taskRegistry);
+         final StandbyTask startupTask = standbyTask(taskId00, taskId00ChangelogPartitions).build();
+ 
+         final StreamTask activeTask = statefulTask(taskId00, taskId00ChangelogPartitions).build();
+@@ -4928,7 +4852,7 @@ public class TaskManagerTest {
+     @Test
+     public void shouldUseStartupTasksFromStateDirectoryAsStandby() {
+         final Tasks taskRegistry = new Tasks(new LogContext());
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, taskRegistry);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, taskRegistry);
+         final StandbyTask startupTask = standbyTask(taskId00, taskId00ChangelogPartitions).build();
+ 
+         when(stateDirectory.hasStartupTasks()).thenReturn(true, true, false);
+@@ -4960,7 +4884,7 @@ public class TaskManagerTest {
+ 
+     @Test
+     public void shouldStartStateUpdaterOnInit() {
+-        final TaskManager taskManager = setUpTaskManagerWithStateUpdater(ProcessingMode.AT_LEAST_ONCE, null);
++        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, null);
+         taskManager.init();
+         verify(stateUpdater).start();
+     }
+@@ -4996,249 +4920,4 @@ public class TaskManagerTest {
+     private File getCheckpointFile(final TaskId task) {
+         return new File(new File(testFolder.toAbsolutePath().toString(), task.toString()), StateManagerUtil.CHECKPOINT_FILE_NAME);
+     }
+-
+-    private static ConsumerRecord<byte[], byte[]> getConsumerRecord(final TopicPartition topicPartition, final long offset) {
+-        return new ConsumerRecord<>(topicPartition.topic(), topicPartition.partition(), offset, null, null);
+-    }
+-
+-    private static class StateMachineTask extends AbstractTask implements Task {
+-        private final boolean active;
+-
+-        // TODO: KAFKA-12569 clean up usage of these flags and use the new commitCompleted flag where appropriate
+-        private boolean commitNeeded = false;
+-        private boolean commitRequested = false;
+-        private boolean commitPrepared = false;
+-        private boolean commitCompleted = false;
+-        private Map<TopicPartition, OffsetAndMetadata> committableOffsets = Collections.emptyMap();
+-        private Map<TopicPartition, Long> purgeableOffsets;
+-        private Map<TopicPartition, Long> changelogOffsets = Collections.emptyMap();
+-        private Set<TopicPartition> partitionsForOffsetReset = Collections.emptySet();
+-        private Long timeout = null;
+-
+-        private final Map<TopicPartition, LinkedList<ConsumerRecord<byte[], byte[]>>> queue = new HashMap<>();
+-
+-        StateMachineTask(final TaskId id,
+-                         final Set<TopicPartition> partitions,
+-                         final boolean active,
+-                         final ProcessorStateManager processorStateManager) {
+-            super(id, null, null, processorStateManager, partitions, (new TopologyConfig(new DummyStreamsConfig())).getTaskConfig(), "test-task", StateMachineTask.class);
+-            this.active = active;
+-        }
+-
+-        @Override
+-        public void initializeIfNeeded() {
+-            if (state() == State.CREATED) {
+-                transitionTo(State.RESTORING);
+-                if (!active) {
+-                    transitionTo(State.RUNNING);
+-                }
+-            }
+-        }
+-
+-        @Override
+-        public void addPartitionsForOffsetReset(final Set<TopicPartition> partitionsForOffsetReset) {
+-            this.partitionsForOffsetReset = partitionsForOffsetReset;
+-        }
+-
+-        @Override
+-        public void completeRestoration(final java.util.function.Consumer<Set<TopicPartition>> offsetResetter) {
+-            if (state() == State.RUNNING) {
+-                return;
+-            }
+-            transitionTo(State.RUNNING);
+-        }
+-
+-        public void setCommitNeeded() {
+-            commitNeeded = true;
+-        }
+-
+-        @Override
+-        public boolean commitNeeded() {
+-            return commitNeeded;
+-        }
+-
+-        public void setCommitRequested() {
+-            commitRequested = true;
+-        }
+-
+-        @Override
+-        public boolean commitRequested() {
+-            return commitRequested;
+-        }
+-
+-        @Override
+-        public Map<TopicPartition, OffsetAndMetadata> prepareCommit(final boolean clean) {
+-            commitPrepared = true;
+-
+-            if (commitNeeded) {
+-                if (!clean) {
+-                    return null;
+-                }
+-                return committableOffsets;
+-            } else {
+-                return Collections.emptyMap();
+-            }
+-        }
+-
+-        @Override
+-        public void postCommit(final boolean enforceCheckpoint) {
+-            commitNeeded = false;
+-            commitCompleted = true;
+-        }
+-
+-        @Override
+-        public void suspend() {
+-            if (state() == State.CLOSED) {
+-                throw new IllegalStateException("Illegal state " + state() + " while suspending active task " + id);
+-            } else if (state() == State.SUSPENDED) {
+-                // do nothing
+-            } else {
+-                transitionTo(State.SUSPENDED);
+-            }
+-        }
+-
+-        @Override
+-        public void resume() {
+-            if (state() == State.SUSPENDED) {
+-                transitionTo(State.RUNNING);
+-            }
+-        }
+-
+-        @Override
+-        public void revive() {
+-            //TODO: KAFKA-12569 move clearing of commit-required statuses to closeDirty/Clean/AndRecycle methods
+-            commitNeeded = false;
+-            commitRequested = false;
+-            super.revive();
+-        }
+-
+-        @Override
+-        public void maybeInitTaskTimeoutOrThrow(final long currentWallClockMs,
+-                                                final Exception cause) {
+-            timeout = currentWallClockMs;
+-        }
+-
+-        @Override
+-        public void clearTaskTimeout() {
+-            timeout = null;
+-        }
+-
+-        @Override
+-        public void recordRestoration(final Time time, final long numRecords, final boolean initRemaining) {
+-            // do nothing
+-        }
+-
+-        @Override
+-        public void closeClean() {
+-            transitionTo(State.CLOSED);
+-        }
+-
+-        @Override
+-        public void closeDirty() {
+-            transitionTo(State.CLOSED);
+-        }
+-
+-        @Override
+-        public void prepareRecycle() {
+-            transitionTo(State.CLOSED);
+-        }
+-
+-        @Override
+-        public void resumePollingForPartitionsWithAvailableSpace() {
+-            // noop
+-        }
+-
+-        @Override
+-        public void updateLags() {
+-            // noop
+-        }
+-
+-        @Override
+-        public void updateInputPartitions(final Set<TopicPartition> topicPartitions, final Map<String, List<String>> allTopologyNodesToSourceTopics) {
+-            inputPartitions = topicPartitions;
+-        }
+-
+-        void setCommittableOffsetsAndMetadata(final Map<TopicPartition, OffsetAndMetadata> committableOffsets) {
+-            if (!active) {
+-                throw new IllegalStateException("Cannot set CommittableOffsetsAndMetadate for StandbyTasks");
+-            }
+-            this.committableOffsets = committableOffsets;
+-        }
+-
+-        @Override
+-        public StateStore store(final String name) {
+-            return null;
+-        }
+-
+-        @Override
+-        public Set<TopicPartition> changelogPartitions() {
+-            return changelogOffsets.keySet();
+-        }
+-
+-        public boolean isActive() {
+-            return active;
+-        }
+-
+-        void setPurgeableOffsets(final Map<TopicPartition, Long> purgeableOffsets) {
+-            this.purgeableOffsets = purgeableOffsets;
+-        }
+-
+-        @Override
+-        public Map<TopicPartition, Long> purgeableOffsets() {
+-            return purgeableOffsets;
+-        }
+-
+-        void setChangelogOffsets(final Map<TopicPartition, Long> changelogOffsets) {
+-            this.changelogOffsets = changelogOffsets;
+-        }
+-
+-        @Override
+-        public Map<TopicPartition, Long> changelogOffsets() {
+-            return changelogOffsets;
+-        }
+-
+-        @Override
+-        public Map<TopicPartition, Long> committedOffsets() {
+-            return Collections.emptyMap();
+-        }
+-
+-        @Override
+-        public Map<TopicPartition, Long> highWaterMark() {
+-            return Collections.emptyMap();
+-        }
+-
+-        @Override
+-        public Optional<Long> timeCurrentIdlingStarted() {
+-            return Optional.empty();
+-        }
+-
+-        @Override
+-        public void addRecords(final TopicPartition partition, final Iterable<ConsumerRecord<byte[], byte[]>> records) {
+-            if (isActive()) {
+-                final Deque<ConsumerRecord<byte[], byte[]>> partitionQueue =
+-                    queue.computeIfAbsent(partition, k -> new LinkedList<>());
+-
+-                for (final ConsumerRecord<byte[], byte[]> record : records) {
+-                    partitionQueue.add(record);
+-                }
+-            } else {
+-                throw new IllegalStateException("Can't add records to an inactive task.");
+-            }
+-        }
+-
+-        @Override
+-        public boolean process(final long wallClockTime) {
+-            if (isActive() && state() == State.RUNNING) {
+-                for (final LinkedList<ConsumerRecord<byte[], byte[]>> records : queue.values()) {
+-                    final ConsumerRecord<byte[], byte[]> record = records.poll();
+-                    if (record != null) {
+-                        return true;
+-                    }
+-                }
+-                return false;
+-            } else {
+-                throw new IllegalStateException("Can't process an inactive or non-running task.");
+-            }
+-        }
+-    }
+ }

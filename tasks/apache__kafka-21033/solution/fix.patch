@@ -1,0 +1,213 @@
+diff --git a/clients/src/main/java/org/apache/kafka/clients/consumer/internals/ShareConsumeRequestManager.java b/clients/src/main/java/org/apache/kafka/clients/consumer/internals/ShareConsumeRequestManager.java
+index 183f15833a..e57265716f 100644
+--- a/clients/src/main/java/org/apache/kafka/clients/consumer/internals/ShareConsumeRequestManager.java
++++ b/clients/src/main/java/org/apache/kafka/clients/consumer/internals/ShareConsumeRequestManager.java
+@@ -253,24 +253,20 @@ public class ShareConsumeRequestManager implements RequestManager, MemberStateLi
+             Node target = entry.getKey();
+             ShareSessionHandler handler = entry.getValue();
+ 
+-            log.trace("Building ShareFetch request to send to node {}", target.id());
+-            ShareFetchRequest.Builder requestBuilder = handler.newShareFetchBuilder(groupId, shareFetchConfig);
+-
+             // For record_limit mode, we only send a full ShareFetch to a single node at a time.
+             // We prepare to build ShareFetch requests for all nodes with session handlers to permit
+             // piggy-backing of acknowledgements, and also to adjust the topic-partitions
+-            // in the share session.
+-            if (isShareAcquireModeRecordLimit() && target.id() != fetchRecordsNodeId.get()) {
+-                ShareFetchRequestData data = requestBuilder.data();
+-                // If there's nothing to send, just skip building the record.
+-                if (data.topics().isEmpty() && data.forgottenTopicsData().isEmpty()) {
+-                    return null;
+-                } else {
+-                    // There is something to send, but we don't want to fetch any records.
+-                    requestBuilder.data().setMaxRecords(0);
+-                }
++            // in the share session, but if the request would contain neither of those, it can be skipped.
++            boolean canSkipIfRequestEmpty = isShareAcquireModeRecordLimit() && target.id() != fetchRecordsNodeId.get();
++
++            ShareFetchRequest.Builder requestBuilder = handler.newShareFetchBuilder(groupId, shareFetchConfig, canSkipIfRequestEmpty);
++            if (requestBuilder == null) {
++                log.trace("Skipping ShareFetch request to send to node {}", target.id());
++                return null;
+             }
+ 
++            log.trace("Building ShareFetch request to send to node {}", target.id());
++
+             nodesWithPendingRequests.add(target.id());
+ 
+             BiConsumer<ClientResponse, Throwable> responseHandler = (clientResponse, error) -> {
+diff --git a/clients/src/main/java/org/apache/kafka/clients/consumer/internals/ShareSessionHandler.java b/clients/src/main/java/org/apache/kafka/clients/consumer/internals/ShareSessionHandler.java
+index 348855a341..0b6cdf0a6d 100644
+--- a/clients/src/main/java/org/apache/kafka/clients/consumer/internals/ShareSessionHandler.java
++++ b/clients/src/main/java/org/apache/kafka/clients/consumer/internals/ShareSessionHandler.java
+@@ -54,6 +54,7 @@ import java.util.stream.Collectors;
+  * <p>ShareSessionHandler tracks the partitions which are in the session. It also determines
+  * which partitions need to be included in each ShareFetch/ShareAcknowledge request.
+  */
++@SuppressWarnings({"NPathComplexity", "CyclomaticComplexity"})
+ public class ShareSessionHandler {
+     private final Logger log;
+     private final int node;
+@@ -112,7 +113,7 @@ public class ShareSessionHandler {
+         return nextMetadata.isNewSession();
+     }
+ 
+-    public ShareFetchRequest.Builder newShareFetchBuilder(String groupId, ShareFetchConfig shareFetchConfig) {
++    public ShareFetchRequest.Builder newShareFetchBuilder(String groupId, ShareFetchConfig shareFetchConfig, boolean canSkipIfRequestEmpty) {
+         List<TopicIdPartition> added = new ArrayList<>();
+         List<TopicIdPartition> removed = new ArrayList<>();
+         List<TopicIdPartition> replaced = new ArrayList<>();
+@@ -158,15 +159,6 @@ public class ShareSessionHandler {
+             }
+         }
+ 
+-        if (log.isDebugEnabled()) {
+-            log.debug("Build ShareFetch {} for node {}. Added {}, removed {}, replaced {} out of {}",
+-                    nextMetadata, node,
+-                    topicIdPartitionsToLogString(added),
+-                    topicIdPartitionsToLogString(removed),
+-                    topicIdPartitionsToLogString(replaced),
+-                    topicIdPartitionsToLogString(sessionPartitions.values()));
+-        }
+-
+         // The replaced topic-partitions need to be removed, and their replacements are already added
+         removed.addAll(replaced);
+ 
+@@ -187,6 +179,19 @@ public class ShareSessionHandler {
+         nextPartitions = new LinkedHashMap<>();
+         nextAcknowledgements = new LinkedHashMap<>();
+ 
++        if (canSkipIfRequestEmpty && added.isEmpty() && removed.isEmpty() && acknowledgementBatches.isEmpty()) {
++            return null;
++        }
++
++        if (log.isDebugEnabled()) {
++            log.debug("Build ShareFetch {} for node {}. Added {}, removed {}, replaced {} out of {}",
++                nextMetadata, node,
++                topicIdPartitionsToLogString(added),
++                topicIdPartitionsToLogString(removed),
++                topicIdPartitionsToLogString(replaced),
++                topicIdPartitionsToLogString(sessionPartitions.values()));
++        }
++
+         if (hasRenewAcknowledgements) {
+             // If the request has renew acknowledgements, the ShareFetch is only used to send the acknowledgements
+             // and potentially update the share session. The parameters for wait time, number of bytes and number of
+@@ -196,6 +201,14 @@ public class ShareSessionHandler {
+                 0, 0, 0,
+                 0, shareFetchConfig.shareAcquireMode.id, true,
+                 added, removed, acknowledgementBatches);
++        } else if (canSkipIfRequestEmpty) {
++            // The request contains changes to the share session or acknowledgements only. The parameters for wait time,
++            // number of bytes and number of records are all zero.
++            return ShareFetchRequest.Builder.forConsumer(
++                groupId, nextMetadata, 0,
++                0, 0, 0,
++                0, shareFetchConfig.shareAcquireMode.id, false,
++                added, removed, acknowledgementBatches);
+         } else {
+             return ShareFetchRequest.Builder.forConsumer(
+                 groupId, nextMetadata, shareFetchConfig.maxWaitMs,
+diff --git a/clients/src/main/java/org/apache/kafka/common/security/oauthbearer/DefaultJwtValidator.java b/clients/src/main/java/org/apache/kafka/common/security/oauthbearer/DefaultJwtValidator.java
+index 3d5710fb64..478a0fdc91 100644
+--- a/clients/src/main/java/org/apache/kafka/common/security/oauthbearer/DefaultJwtValidator.java
++++ b/clients/src/main/java/org/apache/kafka/common/security/oauthbearer/DefaultJwtValidator.java
+@@ -17,9 +17,7 @@
+ 
+ package org.apache.kafka.common.security.oauthbearer;
+ 
+-import org.apache.kafka.common.config.SaslConfigs;
+ import org.apache.kafka.common.security.oauthbearer.internals.secured.CloseableVerificationKeyResolver;
+-import org.apache.kafka.common.security.oauthbearer.internals.secured.ConfigurationUtils;
+ import org.apache.kafka.common.utils.Utils;
+ 
+ import org.jose4j.keys.resolvers.VerificationKeyResolver;
+@@ -56,13 +54,7 @@ public class DefaultJwtValidator implements JwtValidator {
+         if (verificationKeyResolver.isPresent()) {
+             delegate = new BrokerJwtValidator(verificationKeyResolver.get());
+         } else {
+-            ConfigurationUtils cu = new ConfigurationUtils(configs, saslMechanism);
+-
+-            if (cu.containsKey(SaslConfigs.SASL_OAUTHBEARER_JWKS_ENDPOINT_URL)) {
+-                delegate = new BrokerJwtValidator();
+-            } else {
+-                delegate = new ClientJwtValidator();
+-            }
++            delegate = new ClientJwtValidator();
+         }
+ 
+         delegate.configure(configs, saslMechanism, jaasConfigEntries);
+diff --git a/core/src/main/java/kafka/server/share/SharePartition.java b/core/src/main/java/kafka/server/share/SharePartition.java
+index f5ad66d476..e03ebca09e 100644
+--- a/core/src/main/java/kafka/server/share/SharePartition.java
++++ b/core/src/main/java/kafka/server/share/SharePartition.java
+@@ -774,7 +774,7 @@ public class SharePartition {
+                 // check for the floor entry and adjust the base offset accordingly.
+                 if (baseOffset < startOffset) {
+                     log.info("Adjusting base offset for the fetch as it's prior to start offset: {}-{}"
+-                            + "from {} to {}", groupId, topicIdPartition, baseOffset, startOffset);
++                            + " from {} to {}", groupId, topicIdPartition, baseOffset, startOffset);
+                     baseOffset = startOffset;
+                 }
+             } else if (floorEntry.getValue().lastOffset() >= baseOffset) {
+diff --git a/docs/streams/developer-guide/config-streams.html b/docs/streams/developer-guide/config-streams.html
+index b5dc419e8d..54ea3570e5 100644
+--- a/docs/streams/developer-guide/config-streams.html
++++ b/docs/streams/developer-guide/config-streams.html
+@@ -1036,10 +1036,7 @@ rack.aware.assignment.tags: zone,cluster   | rack.aware.assignment.tags: zone,cl
+             <div><p>The processing exception handler allows you to manage exceptions triggered during the processing of a record. The implemented exception
+               handler needs to return a <code>FAIL</code> or <code>CONTINUE</code> depending on the record and the exception thrown. Returning
+               <code>FAIL</code> will signal that Streams should shut down and <code>CONTINUE</code> will signal that Streams should ignore the issue
+-              and continue processing.</p>
+-              <p><strong>Note:</strong> This handler applies only to regular stream processing tasks. It does not apply to global state store updates
+-              (global threads). Exceptions occurring in global threads will bubble up to the configured uncaught exception handler.</p>
+-              <p>The following library built-in exception handlers are available:</p>
++              and continue processing. The following library built-in exception handlers are available:</p>
+               <ul class="simple">
+                 <li><a class="reference external" href="/{{version}}/javadoc/org/apache/kafka/streams/errors/LogAndContinueProcessingExceptionHandler.html">LogAndContinueProcessingExceptionHandler</a>:
+                   This handler logs the processing exception and then signals the processing pipeline to continue processing more records.
+diff --git a/streams/src/main/java/org/apache/kafka/streams/StreamsConfig.java b/streams/src/main/java/org/apache/kafka/streams/StreamsConfig.java
+index 402f6f37d2..1e04c1fd41 100644
+--- a/streams/src/main/java/org/apache/kafka/streams/StreamsConfig.java
++++ b/streams/src/main/java/org/apache/kafka/streams/StreamsConfig.java
+@@ -574,8 +574,7 @@ public class StreamsConfig extends AbstractConfig {
+     public static final String ERRORS_DEAD_LETTER_QUEUE_TOPIC_NAME_CONFIG = "errors.dead.letter.queue.topic.name";
+ 
+     private static final String ERRORS_DEAD_LETTER_QUEUE_TOPIC_NAME_DOC = "If not null, the default exception handler will build and send a Dead Letter Queue record to the topic with the provided name if an error occurs.\n" +
+-            "If a custom deserialization/production or processing exception handler is set, this parameter is ignored for this handler.\n" +
+-            "Note: This configuration applies only to regular stream processing tasks. It does not apply to global state store updates (global threads).";
++            "If a custom deserialization/production or processing exception handler is set, this parameter is ignored for this handler.";
+ 
+     /** {@code log.summary.interval.ms} */
+     public static final String LOG_SUMMARY_INTERVAL_MS_CONFIG = "log.summary.interval.ms";
+@@ -653,9 +652,7 @@ public class StreamsConfig extends AbstractConfig {
+     @SuppressWarnings("WeakerAccess")
+     public static final String PROCESSING_EXCEPTION_HANDLER_CLASS_CONFIG = "processing.exception.handler";
+     @Deprecated
+-    public static final String PROCESSING_EXCEPTION_HANDLER_CLASS_DOC = "Exception handling class that implements the <code>org.apache.kafka.streams.errors.ProcessingExceptionHandler</code> interface. " +
+-            "Note: This handler applies only to regular stream processing tasks. It does not apply to global state store updates (global threads). " +
+-            "Exceptions occurring in global threads will bubble up to the configured uncaught exception handler.";
++    public static final String PROCESSING_EXCEPTION_HANDLER_CLASS_DOC = "Exception handling class that implements the <code>org.apache.kafka.streams.errors.ProcessingExceptionHandler</code> interface.";
+ 
+     /** {@code processing.guarantee} */
+     @SuppressWarnings("WeakerAccess")
+diff --git a/streams/src/main/java/org/apache/kafka/streams/processor/internals/ProcessorNode.java b/streams/src/main/java/org/apache/kafka/streams/processor/internals/ProcessorNode.java
+index f121c1626e..bbf82ff903 100644
+--- a/streams/src/main/java/org/apache/kafka/streams/processor/internals/ProcessorNode.java
++++ b/streams/src/main/java/org/apache/kafka/streams/processor/internals/ProcessorNode.java
+@@ -208,15 +208,6 @@ public class ProcessorNode<KIn, VIn, KOut, VOut> {
+             // while Java distinguishes checked vs unchecked exceptions, other languages
+             // like Scala or Kotlin do not, and thus we need to catch `Exception`
+             // (instead of `RuntimeException`) to work well with those languages
+-
+-            // If the processing exception handler is not set (e.g., for global threads),
+-            // rethrow the exception to let it bubble up to the uncaught exception handler.
+-            // The processing exception handler is only set for regular stream tasks, not for
+-            // global state update tasks which use a different error handling mechanism.
+-            if (processingExceptionHandler == null) {
+-                throw processingException;
+-            }
+-
+             final ErrorHandlerContext errorHandlerContext = new DefaultErrorHandlerContext(
+                 null, // only required to pass for DeserializationExceptionHandler
+                 internalProcessorContext.recordContext().topic(),

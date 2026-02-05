@@ -1,0 +1,32 @@
+#!/bin/bash
+
+cd /app/src
+
+export TESTCONTAINERS_RYUK_DISABLED=true
+export CI=true
+
+# Copy HEAD test files from /tests (overwrites BASE state)
+mkdir -p "http-server-netty/src/test/groovy/io/micronaut/http/server/netty"
+cp "/tests/http-server-netty/src/test/groovy/io/micronaut/http/server/netty/CompressionSpec.groovy" "http-server-netty/src/test/groovy/io/micronaut/http/server/netty/CompressionSpec.groovy"
+
+# Remove the buggy-state test file that conflicts with the fixed code
+rm -f http-server-netty/src/test/groovy/io/micronaut/http/server/netty/SmartHttpContentCompressorSpec.groovy
+
+# Update timestamps to force Gradle to detect changes
+touch http-server-netty/src/test/groovy/io/micronaut/http/server/netty/*.groovy 2>/dev/null || true
+
+# Remove compiled test classes to force recompilation with the new test files
+rm -rf http-server-netty/build/classes/ 2>/dev/null || true
+
+# Run the specific tests for this PR
+./gradlew \
+    :http-server-netty:cleanTest :http-server-netty:test --tests "*CompressionSpec*" \
+    --no-daemon --console=plain
+test_status=$?
+
+if [ $test_status -eq 0 ]; then
+  echo 1 > /logs/verifier/reward.txt
+else
+  echo 0 > /logs/verifier/reward.txt
+fi
+exit "$test_status"

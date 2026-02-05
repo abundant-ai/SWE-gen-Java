@@ -1,0 +1,1202 @@
+diff --git a/gradle/libs.versions.toml b/gradle/libs.versions.toml
+index b921a8f2d8..dd54114d69 100644
+--- a/gradle/libs.versions.toml
++++ b/gradle/libs.versions.toml
+@@ -165,6 +165,7 @@ managed-netty-transport-native-epoll = { module = "io.netty:netty-transport-nati
+ managed-netty-transport-native-kqueue = { module = "io.netty:netty-transport-native-kqueue", version.ref = "managed-netty" }
+ managed-netty-transport-native-iouring = { module = "io.netty:netty-transport-native-io_uring", version.ref = "managed-netty" }
+ managed-netty-transport-native-unix-common = { module = "io.netty:netty-transport-native-unix-common", version.ref = "managed-netty" }
++managed-netty-pkitesting = { module = "io.netty:netty-pkitesting", version.ref = "managed-netty" }
+ managed-netty-tcnative-boringssl-static = { module = "io.netty:netty-tcnative-boringssl-static", version.ref = "managed-netty-tcnative" }
+ 
+ managed-reactive-streams = { module = "org.reactivestreams:reactive-streams", version.ref = "managed-reactive-streams" }
+diff --git a/http-client/src/main/java/io/micronaut/http/client/netty/ssl/NettyClientSslBuilder.java b/http-client/src/main/java/io/micronaut/http/client/netty/ssl/NettyClientSslBuilder.java
+index 9500beded6..3fe2ea4284 100644
+--- a/http-client/src/main/java/io/micronaut/http/client/netty/ssl/NettyClientSslBuilder.java
++++ b/http-client/src/main/java/io/micronaut/http/client/netty/ssl/NettyClientSslBuilder.java
+@@ -27,10 +27,10 @@ import io.micronaut.http.ssl.ClientAuthentication;
+ import io.micronaut.http.ssl.SslBuilder;
+ import io.micronaut.http.ssl.SslConfiguration;
+ import io.micronaut.http.ssl.SslConfigurationException;
++import io.netty.handler.codec.http2.Http2SecurityUtil;
+ import io.netty.handler.codec.http3.Http3;
+ import io.netty.handler.codec.quic.QuicSslContext;
+ import io.netty.handler.codec.quic.QuicSslContextBuilder;
+-import io.netty.handler.codec.http2.Http2SecurityUtil;
+ import io.netty.handler.ssl.ApplicationProtocolConfig;
+ import io.netty.handler.ssl.ClientAuth;
+ import io.netty.handler.ssl.SslContext;
+@@ -121,7 +121,7 @@ public class NettyClientSslBuilder extends SslBuilder<SslContext> implements Cli
+             }
+         }
+         if (versionSelection.isAlpn()) {
+-            SslProvider provider = SslProvider.isAlpnSupported(SslProvider.OPENSSL) ? SslProvider.OPENSSL : SslProvider.JDK;
++            SslProvider provider = ssl.isPreferOpenssl() && SslProvider.isAlpnSupported(SslProvider.OPENSSL) ? SslProvider.OPENSSL : SslProvider.JDK;
+             sslBuilder.sslProvider(provider);
+             sslBuilder.applicationProtocolConfig(new ApplicationProtocolConfig(
+                 ApplicationProtocolConfig.Protocol.ALPN,
+diff --git a/http-server-netty/build.gradle.kts b/http-server-netty/build.gradle.kts
+index bc3783333e..eb1a066db3 100644
+--- a/http-server-netty/build.gradle.kts
++++ b/http-server-netty/build.gradle.kts
+@@ -63,6 +63,7 @@ dependencies {
+     testImplementation(libs.spotbugs)
+     testImplementation(projects.micronautHttpNettyHttp3)
+     testImplementation(libs.bcpkix)
++    testImplementation(libs.managed.netty.pkitesting)
+     testImplementation(projects.micronautJacksonDatabind)
+     testImplementation(projects.micronautHttpTck)
+ // Add Micronaut Jackson XML after v4 Migration
+diff --git a/http-server-netty/src/main/java/io/micronaut/http/server/netty/ssl/AbstractServerSslBuilder.java b/http-server-netty/src/main/java/io/micronaut/http/server/netty/ssl/AbstractServerSslBuilder.java
+index adfd58b0f6..4e08ec672c 100644
+--- a/http-server-netty/src/main/java/io/micronaut/http/server/netty/ssl/AbstractServerSslBuilder.java
++++ b/http-server-netty/src/main/java/io/micronaut/http/server/netty/ssl/AbstractServerSslBuilder.java
+@@ -25,10 +25,10 @@ import io.micronaut.http.ssl.ServerSslConfiguration;
+ import io.micronaut.http.ssl.SslBuilder;
+ import io.micronaut.http.ssl.SslConfiguration;
+ import io.micronaut.http.ssl.SslConfigurationException;
++import io.netty.handler.codec.http2.Http2SecurityUtil;
+ import io.netty.handler.codec.http3.Http3;
+ import io.netty.handler.codec.quic.QuicSslContext;
+ import io.netty.handler.codec.quic.QuicSslContextBuilder;
+-import io.netty.handler.codec.http2.Http2SecurityUtil;
+ import io.netty.handler.ssl.ApplicationProtocolConfig;
+ import io.netty.handler.ssl.ApplicationProtocolNames;
+ import io.netty.handler.ssl.ClientAuth;
+@@ -158,7 +158,9 @@ public abstract class AbstractServerSslBuilder extends SslBuilder<SslContext> im
+     @Override
+     protected KeyManagerFactory getKeyManagerFactory(SslConfiguration ssl) {
+         try {
+-            return NettyTlsUtils.storeToFactory(ssl, getKeyStore(ssl).orElse(null));
++            return NettyTlsUtils.storeToFactory(ssl, getKeyStore(ssl).orElseThrow(() -> new SslConfigurationException("No key store configured")));
++        } catch (SslConfigurationException ex) {
++            throw ex;
+         } catch (Exception ex) {
+             throw new SslConfigurationException(ex);
+         }
+diff --git a/http/src/main/java/io/micronaut/http/ssl/PemParser.java b/http/src/main/java/io/micronaut/http/ssl/PemParser.java
+new file mode 100644
+index 0000000000..d16cd4d86f
+--- /dev/null
++++ b/http/src/main/java/io/micronaut/http/ssl/PemParser.java
+@@ -0,0 +1,538 @@
++/*
++ * Copyright 2017-2025 original authors
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * https://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package io.micronaut.http.ssl;
++
++import io.micronaut.core.annotation.Nullable;
++import io.micronaut.core.util.ArrayUtils;
++
++import javax.crypto.Cipher;
++import javax.crypto.EncryptedPrivateKeyInfo;
++import javax.crypto.SecretKey;
++import javax.crypto.SecretKeyFactory;
++import javax.crypto.spec.PBEKeySpec;
++import java.io.ByteArrayInputStream;
++import java.io.IOException;
++import java.security.GeneralSecurityException;
++import java.security.KeyFactory;
++import java.security.cert.CertificateFactory;
++import java.security.spec.PKCS8EncodedKeySpec;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.Base64;
++import java.util.Collection;
++import java.util.List;
++
++/**
++ * Generic PEM file parser with type detection. <b>Note that this class does not defend against DER
++ * parser differential vulnerabilities, so it should not be used to verify untrusted PEMs.</b>
++ *
++ * @param provider The security provider to use for creating cryptographic data structures
++ * @param password The configured password for encrypted private keys
++ */
++record PemParser(
++    @Nullable String provider,
++    @Nullable String password
++) {
++    private static final String DASHES = "-----";
++    private static final String START = DASHES + "BEGIN ";
++    private static final String END = DASHES + "END ";
++
++    private static final String OID_RSA = "1.2.840.113549.1.1.1";
++    private static final String OID_EC = "1.2.840.10045.2.1";
++
++    /**
++     * Load the given PEM file.
++     *
++     * @param pem The PEM
++     * @return A list of {@link java.security.cert.X509Certificate} and
++     * {@link java.security.PrivateKey} instances
++     * @throws GeneralSecurityException On JDK parsing failure
++     * @throws IllegalArgumentException On MN parsing failure
++     * @throws NotPemException On MN parsing failure that points to the input likely not being PEM
++     * at all
++     */
++    List<Object> loadPem(String pem) throws GeneralSecurityException, IllegalArgumentException, NotPemException {
++        // PEM is a sequence of base64 encoded DER objects delimited by -----BEGIN/END lines
++        List<Object> list = new ArrayList<>();
++        int i = 0;
++        while (i < pem.length()) {
++            if (Character.isWhitespace(pem.charAt(i))) {
++                i++;
++                continue;
++            } else if (!pem.startsWith(START, i)) {
++                if (list.isEmpty()) {
++                    throw new NotPemException("Missing start tag");
++                } else {
++                    throw invalidPem(false);
++                }
++            }
++            i += START.length();
++            int labelEnd = pem.indexOf(DASHES, i);
++            if (labelEnd == -1) {
++                throw invalidPem(list.isEmpty());
++            }
++            String label = pem.substring(i, labelEnd);
++            i = labelEnd + DASHES.length();
++            String trailer = END + label + DASHES;
++            int sectionEnd = pem.indexOf(trailer, i);
++            if (sectionEnd == -1) {
++                throw invalidPem(list.isEmpty());
++            }
++            Decoder decoder = getDecoder(label);
++
++            String contentString = pem.substring(i, sectionEnd)
++                .replace("\r", "")
++                .replace("\n", "");
++            i = sectionEnd + trailer.length();
++            byte[] content = Base64.getDecoder().decode(contentString);
++            list.addAll(decoder.decode(content));
++        }
++        if (list.isEmpty()) {
++            throw new IllegalArgumentException("PEM file empty");
++        }
++        return list;
++    }
++
++    private static IllegalArgumentException invalidPem(boolean first) throws NotPemException {
++        if (first) {
++            throw new NotPemException("Invalid PEM");
++        }
++        return new IllegalArgumentException("Invalid PEM");
++    }
++
++    private Decoder getDecoder(String label) {
++        return switch (label) {
++            case "CERTIFICATE", "X509 CERTIFICATE" -> new CertificateDecoder();
++            case "ENCRYPTED PRIVATE KEY" -> new Pkcs8EncryptedPrivateKey();
++            case "PRIVATE KEY" -> new Pkcs8PrivateKey();
++            case "RSA PRIVATE KEY" -> new Pkcs1PrivateKey(false);
++            case "EC PRIVATE KEY" -> new Pkcs1PrivateKey(true);
++            default -> throw new IllegalArgumentException("Unsupported PEM label: " + label);
++        };
++    }
++
++    private sealed interface Decoder {
++        Collection<?> decode(byte[] der) throws GeneralSecurityException;
++    }
++
++    /**
++     * X.509 certificate decoder.
++     */
++    private final class CertificateDecoder implements Decoder {
++        @Override
++        public Collection<?> decode(byte[] der) throws GeneralSecurityException {
++            CertificateFactory factory = provider == null ? CertificateFactory.getInstance("X.509") : CertificateFactory.getInstance("X.509", provider);
++            return factory.generateCertificates(new ByteArrayInputStream(der));
++        }
++    }
++
++    /**
++     * PKCS#8 unencrypted private key decoder with algorithm detection.
++     */
++    private final class Pkcs8PrivateKey implements Decoder {
++        @Override
++        public Collection<?> decode(byte[] der) throws GeneralSecurityException {
++            // we need to figure out which key algorithm is used, so we parse the DER a bit.
++            DerInput outer = new DerInput(der);
++            DerInput privateKeyInfo = outer.readSequence();
++            // Version
++            privateKeyInfo.expect(0x02);
++            privateKeyInfo.expect(0x01);
++            privateKeyInfo.expect(0x00);
++            DerInput privateKeyAlgorithm = privateKeyInfo.readSequence();
++            String algOid = privateKeyAlgorithm.readOid();
++            String alg = switch (algOid) {
++                case OID_RSA -> "RSA";
++                case OID_EC -> "EC";
++                case "1.3.101.112" -> "Ed25519";
++                case "1.3.101.113" -> "Ed448";
++                case "2.16.840.1.101.3.4.3.17", "2.16.840.1.101.3.4.3.18",
++                     "2.16.840.1.101.3.4.3.19" -> "ML-DSA";
++                case "2.16.840.1.101.3.4.4.1", "2.16.840.1.101.3.4.4.2", "2.16.840.1.101.3.4.4.3" ->
++                    "ML-KEM";
++                default ->
++                    throw new IllegalArgumentException("Unrecognized PKCS#8 key algorithm " + algOid);
++            };
++
++            KeyFactory factory = provider == null ? KeyFactory.getInstance(alg) : KeyFactory.getInstance(alg, provider);
++            return List.of(factory.generatePrivate(new PKCS8EncodedKeySpec(der)));
++        }
++    }
++
++    private final class Pkcs8EncryptedPrivateKey implements Decoder {
++        @Override
++        public Collection<?> decode(byte[] der) throws GeneralSecurityException {
++            EncryptedPrivateKeyInfo keyInfo;
++            try {
++                keyInfo = new EncryptedPrivateKeyInfo(der);
++            } catch (IOException e) {
++                throw new GeneralSecurityException("Invalid DER", e);
++            }
++            String cipherAlg = keyInfo.getAlgName();
++            if (cipherAlg.equals("PBES2")) {
++                // Java >= 19 does this automatically
++                cipherAlg = keyInfo.getAlgParameters().toString();
++            }
++            SecretKeyFactory skf = provider == null ? SecretKeyFactory.getInstance(cipherAlg) : SecretKeyFactory.getInstance(cipherAlg, provider);
++            if (password == null) {
++                throw new IllegalArgumentException("Encrypted private key found but no password given");
++            }
++            SecretKey sk = skf.generateSecret(new PBEKeySpec(password.toCharArray()));
++            Cipher cipher = Cipher.getInstance(cipherAlg);
++            cipher.init(Cipher.DECRYPT_MODE, sk, keyInfo.getAlgParameters());
++            PKCS8EncodedKeySpec keySpec = keyInfo.getKeySpec(cipher);
++            String keyAlg = keySpec.getAlgorithm();
++            KeyFactory factory = provider == null ? KeyFactory.getInstance(keyAlg) : KeyFactory.getInstance(keyAlg, provider);
++            return List.of(factory.generatePrivate(keySpec));
++        }
++    }
++
++    private final class Pkcs1PrivateKey implements Decoder {
++        // for ellptic curves, this is specified in SEC.1, not PKCS#1
++        private final boolean ec;
++
++        Pkcs1PrivateKey(boolean ec) {
++            this.ec = ec;
++        }
++
++        @Override
++        public Collection<?> decode(byte[] der) throws GeneralSecurityException {
++            // build PKCS#8 from PKCS#1
++            DerOutput output = new DerOutput();
++            try (DerOutput.Value privateKeyInfo = output.writeValue(0x30)) {
++                try (DerOutput.Value version = output.writeValue(0x2)) {
++                    output.write(0);
++                }
++                try (DerOutput.Value privateKeyAlgorithm = output.writeValue(0x30)) {
++                    if (ec) {
++                        DerInput parameters = extractCurveParams(der);
++                        output.writeOid(OID_EC);
++                        output.write(parameters.data, parameters.i, parameters.limit - parameters.i);
++                    } else {
++                        output.writeOid(OID_RSA);
++                        output.writeValue(0x05).close(); // parameters
++                    }
++                }
++                try (DerOutput.Value privateKey = output.writeValue(0x04)) {
++                    output.write(der, 0, der.length);
++                }
++            }
++            byte[] pkcs8 = output.finish();
++            String algorithm = ec ? "EC" : "RSA";
++            KeyFactory factory = provider == null ? KeyFactory.getInstance(algorithm) : KeyFactory.getInstance(algorithm, provider);
++            return List.of(factory.generatePrivate(new PKCS8EncodedKeySpec(pkcs8)));
++        }
++
++        private DerInput extractCurveParams(byte[] der) {
++            DerInput input = new DerInput(der);
++            DerInput ecPrivateKey = input.readSequence();
++            // version
++            ecPrivateKey.expect(0x02);
++            ecPrivateKey.expect(0x01);
++            ecPrivateKey.expect(0x01);
++            ecPrivateKey.readValue(0x04); // privateKey
++            DerInput parameters = null;
++            while (ecPrivateKey.i < ecPrivateKey.limit) {
++                int tag = ecPrivateKey.peekTag();
++                DerInput value = ecPrivateKey.readValue(tag);
++                if (tag == 0xa0) {
++                    parameters = value;
++                }
++            }
++            if (parameters == null) {
++                throw new IllegalArgumentException("Curve parameters not found for EC private key");
++            }
++            return parameters;
++        }
++    }
++
++    /**
++     * Simple DER parser.
++     */
++    private static final class DerInput {
++        final byte[] data;
++        final int limit;
++        int i;
++
++        DerInput(byte[] data) {
++            this(data, 0, data.length);
++        }
++
++        private DerInput(byte[] data, int start, int limit) {
++            this.data = data;
++            this.i = start;
++            this.limit = limit;
++        }
++
++        /**
++         * Read a single byte.
++         *
++         * @return The byte value
++         */
++        byte read() {
++            if (i >= limit) {
++                throw invalidDer();
++            }
++            return data[i++];
++        }
++
++        /**
++         * Read a single byte, throwing an exception if it does not match the given value.
++         *
++         * @param value The expected byte
++         */
++        void expect(int value) {
++            if ((read() & 0xff) != value) {
++                throw invalidDer();
++            }
++        }
++
++        /**
++         * Read a DER tag length.
++         *
++         * @return The length
++         */
++        private int readLength() {
++            byte b = read();
++            if (b >= 0) {
++                return b;
++            }
++            b &= 0x7f;
++            // this is not as strict as it should be for DER, so don't use this for data where
++            // parsing differentials could be a problem
++            int length = 0;
++            while (b-- > 0) {
++                length <<= 8;
++                length |= read() & 0xff;
++                if (length < 0 || length > limit - i) {
++                    throw invalidDer();
++                }
++            }
++            return length;
++        }
++
++        /**
++         * Get the type of the next tag.
++         *
++         * @return The next tag
++         */
++        int peekTag() {
++            int tag = read() & 0xff;
++            i--;
++            return tag;
++        }
++
++        /**
++         * Read a DER value. This {@link DerInput} will continue after the value, while the
++         * returned {@link DerInput} will read the value contents.
++         *
++         * @param tag The expected tag
++         * @return The reader for the value contents
++         */
++        DerInput readValue(int tag) {
++            expect(tag);
++            int n = readLength();
++            int end = i + n;
++            DerInput sequence = new DerInput(data, i, end);
++            i = end;
++            return sequence;
++        }
++
++        /**
++         * Read a DER sequence.
++         *
++         * @return The reader for the sequence content
++         */
++        DerInput readSequence() {
++            return readValue(0x30);
++        }
++
++        String readOid() {
++            DerInput helper = readValue(0x06);
++            StringBuilder builder = new StringBuilder();
++            while (helper.i < helper.limit) {
++                long value = 0;
++                while (true) {
++                    byte b = helper.read();
++                    value <<= 7;
++                    value |= b & 0x7f;
++                    if (b >= 0) {
++                        break;
++                    }
++                }
++                if (builder.isEmpty()) {
++                    // first value
++                    if (value >= 80) {
++                        builder.append("2.").append(value - 80);
++                    } else {
++                        builder.append(value / 40).append('.').append(value % 40);
++                    }
++                } else {
++                    builder.append('.').append(value);
++                }
++            }
++            return builder.toString();
++        }
++
++        private static RuntimeException invalidDer() {
++            return new IllegalArgumentException("Invalid PKCS#8");
++        }
++    }
++
++    /**
++     * Writer for DER documents.
++     */
++    private static final class DerOutput {
++        private byte[] out = ArrayUtils.EMPTY_BYTE_ARRAY;
++        private int i;
++
++        private void ensureCapacity(int n) {
++            while (i + n > out.length) {
++                out = Arrays.copyOf(out, out.length == 0 ? 16 : out.length * 2);
++            }
++        }
++
++        /**
++         * Write a single byte.
++         *
++         * @param b The byte
++         */
++        void write(int b) {
++            ensureCapacity(1);
++            out[i++] = (byte) b;
++        }
++
++        /**
++         * Write a byte array.
++         *
++         * @param arr The array to write from
++         * @param start The starting offset in the array
++         * @param len The number of bytes to write
++         */
++        void write(byte[] arr, int start, int len) {
++            ensureCapacity(len);
++            System.arraycopy(arr, start, out, i, len);
++            i += len;
++        }
++
++        /**
++         * Finish this DER writer, returning the complete DER document as a byte array.
++         *
++         * @return The finished DER
++         */
++        byte[] finish() {
++            return Arrays.copyOf(out, i);
++        }
++
++        private static int varIntLength(int value) {
++            if (value < (1 << 7)) {
++                return 1;
++            } else if (value < (1 << 14)) {
++                return 2;
++            } else if (value < (1 << 21)) {
++                return 3;
++            } else if (value < (1 << 28)) {
++                return 4;
++            } else {
++                return 5;
++            }
++        }
++
++        private void writeVarInt(int value) {
++            // writes a value in the bit form `1xxxxxxx 1xxxxxxx 0xxxxxxx`
++            int len = varIntLength(value);
++            for (int i = len - 1; i >= 0; i--) {
++                write(((value >> (i * 7)) & 0x7f) | (i == 0 ? 0 : 0x80));
++            }
++        }
++
++        void writeOid(String oid) {
++            try (Value ignored = writeValue(0x06)) {
++                String[] parts = oid.split("\\.");
++                for (int j = 0; j < parts.length; j++) {
++                    int value = Integer.parseInt(parts[j]);
++                    if (j == 0) {
++                        int next = Integer.parseInt(parts[++j]);
++                        writeVarInt(value * 40 + next);
++                    } else {
++                        writeVarInt(value);
++                    }
++                }
++            }
++
++        }
++
++        /**
++         * Write a new DER value. The returned {@link Value} must be {@link Value#close() closed}
++         * when the value is complete, at which point the value length will be written.
++         *
++         * @param tag The value tag
++         * @return The value that must be closed to write the length
++         */
++        Value writeValue(int tag) {
++            write(tag);
++            return new Value();
++        }
++
++        final class Value implements AutoCloseable {
++            private final int lengthOffset;
++
++            private Value() {
++                lengthOffset = i;
++                write(0);
++            }
++
++            @Override
++            public void close() {
++                int length = i - lengthOffset - 1;
++                int lengthLength;
++                if (length < 0x80) {
++                    out[lengthOffset] = (byte) length;
++                    return;
++                } else if (length < (1 << 8)) {
++                    lengthLength = 1;
++                } else if (length < (1 << 16)) {
++                    lengthLength = 2;
++                } else if (length < (1 << 24)) {
++                    lengthLength = 3;
++                } else {
++                    lengthLength = 4;
++                }
++                out[lengthOffset] = (byte) (0x80 | lengthLength);
++                // make sure we have room, and update position
++                for (int i = 0; i < lengthLength; i++) {
++                    write(0);
++                }
++                System.arraycopy(out, lengthOffset + 1, out, lengthOffset + 1 + lengthLength, length);
++                int mark = i;
++                i = lengthOffset + 1;
++                for (int i = lengthLength - 1; i >= 0; i--) {
++                    write((length >> (i * 8)) & 0xff);
++                }
++                i = mark;
++            }
++        }
++    }
++
++    /**
++     * Thrown when the input does not look like PEM.
++     */
++    public static final class NotPemException extends Exception {
++        private NotPemException(String message) {
++            super(message);
++        }
++    }
++}
+diff --git a/http/src/main/java/io/micronaut/http/ssl/SslBuilder.java b/http/src/main/java/io/micronaut/http/ssl/SslBuilder.java
+index fef0804005..c82008524a 100644
+--- a/http/src/main/java/io/micronaut/http/ssl/SslBuilder.java
++++ b/http/src/main/java/io/micronaut/http/ssl/SslBuilder.java
+@@ -15,14 +15,26 @@
+  */
+ package io.micronaut.http.ssl;
+ 
++import io.micronaut.core.annotation.NonNull;
++import io.micronaut.core.annotation.Nullable;
+ import io.micronaut.core.io.ResourceResolver;
+ import io.micronaut.http.HttpVersion;
+ 
+ import javax.net.ssl.KeyManagerFactory;
+ import javax.net.ssl.TrustManagerFactory;
+-import java.net.URL;
++import java.io.IOException;
++import java.io.InputStream;
++import java.nio.charset.StandardCharsets;
++import java.security.GeneralSecurityException;
+ import java.security.KeyStore;
++import java.security.KeyStoreException;
++import java.security.NoSuchProviderException;
++import java.security.PrivateKey;
++import java.security.UnrecoverableKeyException;
++import java.security.cert.X509Certificate;
++import java.util.List;
+ import java.util.Optional;
++import java.util.function.Supplier;
+ 
+ /**
+  * A class to build a key store and a trust store for use in adding SSL support to a server.
+@@ -65,6 +77,8 @@ public abstract class SslBuilder<T> {
+         Optional<KeyStore> store;
+         try {
+             store = getTrustStore(ssl);
++        } catch (SslConfigurationException e) {
++            throw e;
+         } catch (Exception e) {
+             throw new SslConfigurationException(e);
+         }
+@@ -82,6 +96,8 @@ public abstract class SslBuilder<T> {
+                 .getInstance(TrustManagerFactory.getDefaultAlgorithm());
+             trustManagerFactory.init(store);
+             return trustManagerFactory;
++        } catch (SslConfigurationException ex) {
++            throw ex;
+         } catch (Exception ex) {
+             throw new SslConfigurationException(ex);
+         }
+@@ -97,8 +113,12 @@ public abstract class SslBuilder<T> {
+         SslConfiguration.TrustStoreConfiguration trustStore = ssl.getTrustStore();
+         Optional<String> path = trustStore.getPath();
+         if (path.isPresent()) {
+-            return Optional.of(load(trustStore.getType(),
+-                path.get(), trustStore.getPassword()));
++            return Optional.of(loadCompat(new KeyStoreBasedCertificateSpec(
++                trustStore.getType().orElse(null),
++                trustStore.getPassword().orElse(null),
++                trustStore.getProvider().orElse(null),
++                path.get()
++            )));
+         } else {
+             return Optional.empty();
+         }
+@@ -137,33 +157,273 @@ public abstract class SslBuilder<T> {
+         SslConfiguration.KeyStoreConfiguration keyStore = ssl.getKeyStore();
+         Optional<String> path = keyStore.getPath();
+         if (path.isPresent()) {
+-            return Optional.of(load(keyStore.getType(),
+-                path.get(), keyStore.getPassword()));
++            if (keyStore.getKeyPath() != null || keyStore.getCertificatePath() != null) {
++                throw new SslConfigurationException("Cannot specify key store path and key-path or certificate-path at the same time");
++            }
++            return Optional.of(loadCompat(new KeyStoreBasedCertificateSpec(
++                keyStore.getType().orElse(null),
++                keyStore.getPassword().orElse(null),
++                keyStore.getProvider().orElse(null),
++                path.get()
++            )));
++        } else if (keyStore.getKeyPath() != null) {
++            if (keyStore.getCertificatePath() == null) {
++                throw new SslConfigurationException("Must also specify certificate-path");
++            }
++            return Optional.of(loadCompat(new PemBasedCertificateSpec(
++                keyStore.getType().orElse(null),
++                keyStore.getPassword().orElse(null),
++                keyStore.getProvider().orElse(null),
++                keyStore.getKeyPath(),
++                keyStore.getCertificatePath()
++            )));
++        } else if (keyStore.getCertificatePath() != null) {
++            throw new SslConfigurationException("Must also specify key-path");
+         } else {
+             return Optional.empty();
+         }
+     }
+ 
++    private KeyStore loadCompat(CertificateSpec spec) throws Exception {
++        if (spec instanceof KeyStoreBasedCertificateSpec ks && ks.getProvider() == null) {
++            // we need to call the old method to make sure we hit any overrides
++            return load(Optional.ofNullable(ks.getType()), ks.getPath(), Optional.ofNullable(ks.getPassword()));
++        } else {
++            return load(spec);
++        }
++    }
++
+     /**
+      * @param optionalType     The optional type
+      * @param resource         The resource
+      * @param optionalPassword The optional password
+      * @return A {@link KeyStore}
+      * @throws Exception if there is an error
++     * @deprecated Please override {@link #load(CertificateSpec)} instead
+      */
++    @SuppressWarnings("OptionalUsedAsFieldOrParameterType")
++    @Deprecated(forRemoval = true)
+     protected KeyStore load(Optional<String> optionalType,
+                             String resource,
+                             Optional<String> optionalPassword) throws Exception {
+-        String type = optionalType.orElse("JKS");
+-        String password = optionalPassword.orElse(null);
+-        KeyStore store = KeyStore.getInstance(type);
++        return load(new KeyStoreBasedCertificateSpec(optionalType.orElse(null), optionalPassword.orElse(null), null, resource));
++    }
++
++    private static Supplier<SslConfigurationException> resourceNotFound(String resource) {
++        return () -> new SslConfigurationException("The resource " + resource + " could not be found");
++    }
++
++    /**
++     * @param spec The configured certificate spec
++     * @return A {@link KeyStore}
++     * @throws Exception if there is an error
++     */
++    protected KeyStore load(CertificateSpec spec) throws Exception {
++        if (spec instanceof KeyStoreBasedCertificateSpec ks) {
++            KeyStore store = createEmptyKeyStore(spec.provider, spec.type == null ? "JKS" : spec.type);
++
++            InputStream stream = resourceResolver.getResourceAsStream(ks.path)
++                .orElseThrow(resourceNotFound(ks.path));
++            try {
++                store.load(stream, spec.password == null ? null : spec.password.toCharArray());
++            } catch (IOException e) {
++                if (!(e.getCause() instanceof UnrecoverableKeyException)) {
++                    try {
++                        if (spec.type == null) {
++                            // we can't add passwordless keys to a JKS key store
++                            store = createEmptyKeyStore(spec.provider, "PKCS12");
++                        }
++
++                        loadPem(ks.path, spec.password, spec.provider, store);
++                    } catch (PemParser.NotPemException f) {
++                        // probably should have been loaded as KS
++                        e.addSuppressed(new Exception("Also tried and failed to load the input as PEM", f));
++                        throw e;
++                    } catch (Exception f) {
++                        // probably should have been loaded as PEM
++                        f.addSuppressed(new Exception("Also tried and failed to load the input as a key store", e));
++                        throw f;
++                    }
++                } else {
++                    throw e;
++                }
++            }
++            return store;
++        } else if (spec instanceof PemBasedCertificateSpec pem) {
++            List<Object> keyItems;
++            try (InputStream s = resourceResolver.getResourceAsStream(pem.keyPath).orElseThrow(resourceNotFound(pem.keyPath))) {
++                keyItems = new PemParser(pem.provider, pem.password)
++                    .loadPem(new String(s.readAllBytes(), StandardCharsets.UTF_8));
++            }
++            List<Object> certItems;
++            try (InputStream s = resourceResolver.getResourceAsStream(pem.certificatePath).orElseThrow(resourceNotFound(pem.certificatePath))) {
++                certItems = new PemParser(pem.provider, pem.password)
++                    .loadPem(new String(s.readAllBytes(), StandardCharsets.UTF_8));
++            }
+ 
+-        Optional<URL> url = resourceResolver.getResource(resource);
+-        if (url.isPresent()) {
+-            store.load(url.get().openStream(), password == null ? null : password.toCharArray());
++            if (keyItems.size() != 1) {
++                throw new SslConfigurationException("key-path contained more than one PEM object. It should only contain the private key.");
++            }
++            if (!(keyItems.get(0) instanceof PrivateKey pk)) {
++                throw new SslConfigurationException("key-path contained a certificate instead of a private key.");
++            }
++            KeyStore store = createEmptyKeyStore(spec.provider, spec.type == null ? "PKCS12" : spec.type);
++            store.load(null, null);
++            store.setKeyEntry(
++                "key",
++                pk,
++                null,
++                certificates(certItems).toArray(new X509Certificate[0])
++            );
+             return store;
+         } else {
+-            throw new SslConfigurationException("The resource " + resource + " could not be found");
++            throw new AssertionError("Weird CertificateSpec");
++        }
++    }
++
++    private static @NonNull KeyStore createEmptyKeyStore(@Nullable String provider, String type) throws KeyStoreException, NoSuchProviderException {
++        return provider == null ? KeyStore.getInstance(type) : KeyStore.getInstance(type, provider);
++    }
++
++    private void loadPem(@NonNull String resource, @Nullable String password, @Nullable String provider, KeyStore store) throws IOException, GeneralSecurityException, PemParser.NotPemException {
++        List<Object> items;
++        try (InputStream s = resourceResolver.getResourceAsStream(resource).orElseThrow(resourceNotFound(resource))) {
++            items = new PemParser(provider, password)
++                .loadPem(new String(s.readAllBytes(), StandardCharsets.UTF_8));
++        }
++        if (items.get(0) instanceof PrivateKey pk) {
++            X509Certificate[] certs = certificates(items.subList(1, items.size())).toArray(new X509Certificate[0]);
++            store.load(null, null);
++            store.setKeyEntry("key", pk, null, certs);
++        } else if (items.get(0) instanceof X509Certificate) {
++            store.load(null, null);
++            List<X509Certificate> certificates = certificates(items);
++            for (int i = 0; i < certificates.size(); i++) {
++                store.setCertificateEntry("cert" + i, certificates.get(i));
++            }
++        } else {
++            throw new SslConfigurationException("Unrecognized PEM entries");
++        }
++    }
++
++    private static List<X509Certificate> certificates(List<Object> pemObjects) {
++        for (Object pemObject : pemObjects) {
++            if (!(pemObject instanceof X509Certificate)) {
++                throw new SslConfigurationException("PEM must only contain the private key and a certificate chain");
++            }
++        }
++        //noinspection unchecked,rawtypes
++        return (List) pemObjects;
++    }
++
++    /**
++     * Specification for building a {@link KeyStore}, either as a key store or a trust store.
++     *
++     * @since 4.10.0
++     */
++    protected abstract static sealed class CertificateSpec {
++        final String type;
++        final String password;
++        final String provider;
++
++        private CertificateSpec(String type, String password, String provider) {
++            this.type = type;
++            this.password = password;
++            this.provider = provider;
++        }
++
++        /**
++         * {@link KeyStore} type, e.g. JKS or PKCS12.
++         *
++         * @return Key store type
++         */
++        @Nullable
++        public String getType() {
++            return type;
++        }
++
++        /**
++         * Key store password.
++         *
++         * @return The password
++         */
++        @Nullable
++        public String getPassword() {
++            return password;
++        }
++
++        /**
++         * JCA provider for creating the key store and other objects.
++         *
++         * @return The JCA provider
++         */
++        @Nullable
++        public String getProvider() {
++            return provider;
++        }
++    }
++
++    /**
++     * Certificate spec based on {@link SslConfiguration.KeyStoreConfiguration#getPath()} or
++     * {@link SslConfiguration.TrustStoreConfiguration#getPath()}. Note that the path can still
++     * point to a PEM.
++     *
++     * @since 4.10.0
++     */
++    protected static final class KeyStoreBasedCertificateSpec extends CertificateSpec {
++        final String path;
++
++        private KeyStoreBasedCertificateSpec(String type, String password, String provider, String path) {
++            super(type, password, provider);
++            this.path = path;
++        }
++
++        /**
++         * The path to the JKS, PKCS12 or PEM file.
++         *
++         * @return The path
++         */
++        @NonNull
++        public String getPath() {
++            return path;
++        }
++    }
++
++    /**
++     * Certificate spec based on {@link SslConfiguration.KeyStoreConfiguration#getKeyPath()} and
++     * {@link SslConfiguration.KeyStoreConfiguration#getCertificatePath()}, both of which must
++     * contain a PEM.
++     *
++     * @since 4.10.0
++     */
++    protected static final class PemBasedCertificateSpec extends CertificateSpec {
++        final String keyPath;
++        final String certificatePath;
++
++        private PemBasedCertificateSpec(String type, String password, String provider, String keyPath, String certificatePath) {
++            super(type, password, provider);
++            this.keyPath = keyPath;
++            this.certificatePath = certificatePath;
++        }
++
++        /**
++         * The path to the PEM file containing the private key.
++         *
++         * @return The path
++         */
++        @NonNull
++        public String getKeyPath() {
++            return keyPath;
++        }
++
++        /**
++         * The path to the PEM file containing the certificate chain.
++         *
++         * @return The path
++         */
++        @NonNull
++        public String getCertificatePath() {
++            return certificatePath;
+         }
+     }
+ }
+diff --git a/http/src/main/java/io/micronaut/http/ssl/SslConfiguration.java b/http/src/main/java/io/micronaut/http/ssl/SslConfiguration.java
+index 72a7964961..f14aabf6a5 100644
+--- a/http/src/main/java/io/micronaut/http/ssl/SslConfiguration.java
++++ b/http/src/main/java/io/micronaut/http/ssl/SslConfiguration.java
+@@ -17,6 +17,7 @@ package io.micronaut.http.ssl;
+ 
+ import io.micronaut.core.annotation.Experimental;
+ import io.micronaut.core.annotation.NonNull;
++import io.micronaut.core.annotation.Nullable;
+ import io.micronaut.core.util.StringUtils;
+ import io.micronaut.core.util.Toggleable;
+ import org.slf4j.Logger;
+@@ -371,12 +372,18 @@ public class SslConfiguration implements Toggleable {
+     public static class KeyStoreConfiguration {
+         public static final String PREFIX = "key-store";
+         private String path;
++        private String keyPath;
++        private String certificatePath;
+         private String password;
+         private String type;
+         private String provider;
+ 
+         /**
+-         * @return The path to the key store (typically .jks). Can use classpath: and file:.
++         * The path to the key store (typically .jks). Can also point to a PEM file containing
++         * a private key followed by the X.509 trust chain. Can use {@code classpath:},
++         * {@code file:}, {@code string:} or {@code base64:}.
++         *
++         * @return The resource containing the key store
+          */
+         public Optional<String> getPath() {
+             return Optional.ofNullable(path);
+@@ -404,9 +411,11 @@ public class SslConfiguration implements Toggleable {
+         }
+ 
+         /**
+-         * Sets the path.
++         * The path to the key store (typically .jks). Can also point to a PEM file containing
++         * a private key followed by the X.509 trust chain. Can use {@code classpath:},
++         * {@code file:}, {@code string:} or {@code base64:}.
+          *
+-         * @param path The path
++         * @param path The resource containing the key store
+          */
+         public void setPath(String path) {
+             this.path = path;
+@@ -438,6 +447,56 @@ public class SslConfiguration implements Toggleable {
+         public void setProvider(String provider) {
+             this.provider = provider;
+         }
++
++        /**
++         * A path to a PEM file containing the private key of the server. Can use
++         * {@code classpath:}, {@code file:}, {@code string:} or {@code base64:}. Cannot be set at
++         * the same time as the {@code path} property.
++         *
++         * @return The key path
++         * @since 4.10.0
++         */
++        @Nullable
++        public String getKeyPath() {
++            return keyPath;
++        }
++
++        /**
++         * A path to a PEM file containing the private key. Can use
++         * {@code classpath:}, {@code file:}, {@code string:} or {@code base64:}. Cannot be set at
++         * the same time as the {@code path} property.
++         *
++         * @param keyPath The key path
++         * @since 4.10.0
++         */
++        public void setKeyPath(@Nullable String keyPath) {
++            this.keyPath = keyPath;
++        }
++
++        /**
++         * A path to a PEM file containing the certificate chain. Can use
++         * {@code classpath:}, {@code file:}, {@code string:} or {@code base64:}. Cannot be set at
++         * the same time as the {@code path} property.
++         *
++         * @return The certificate chain path
++         * @since 4.10.0
++         */
++        @Nullable
++        public String getCertificatePath() {
++            return certificatePath;
++        }
++
++        /**
++         * A path to a PEM file containing the certificate chain. Can use
++         * {@code classpath:}, {@code file:}, {@code string:} or {@code base64:}. Cannot be set at
++         * the same time as the {@code path} property.
++         *
++         * @param certificatePath The certificate chain path
++         * @since 4.10.0
++         */
++        public void setCertificatePath(@Nullable String certificatePath) {
++            this.certificatePath = certificatePath;
++        }
+     }
+ 
+     /**
+@@ -451,7 +510,11 @@ public class SslConfiguration implements Toggleable {
+         private String provider;
+ 
+         /**
+-         * @return The path to the trust store (typically .jks). Can use classpath: and file:.
++         * The path to the trust store (typically .jks). Can also point to a PEM file containing
++         * one or more X.509 certificates. Can use {@code classpath:}, {@code file:},
++         * {@code string:} or {@code base64:}.
++         *
++         * @return The resource containing the trust store
+          */
+         public Optional<String> getPath() {
+             return Optional.ofNullable(path);
+@@ -479,9 +542,11 @@ public class SslConfiguration implements Toggleable {
+         }
+ 
+         /**
+-         * Sets the path.
++         * The path to the trust store (typically .jks). Can also point to a PEM file containing
++         * one or more X.509 certificates. Can use {@code classpath:}, {@code file:},
++         * {@code string:} or {@code base64:}.
+          *
+-         * @param path The path
++         * @param path The resource containing the trust store
+          */
+         public void setPath(String path) {
+             this.path = path;
+diff --git a/http/src/main/java/io/micronaut/http/util/HttpHeadersUtil.java b/http/src/main/java/io/micronaut/http/util/HttpHeadersUtil.java
+index 2521faa123..55946c77dd 100644
+--- a/http/src/main/java/io/micronaut/http/util/HttpHeadersUtil.java
++++ b/http/src/main/java/io/micronaut/http/util/HttpHeadersUtil.java
+@@ -39,7 +39,7 @@ import java.util.regex.Pattern;
+  * @since 3.8.0
+  */
+ public final class HttpHeadersUtil {
+-    private final static Charset DEFAULT_CHARSET = StandardCharsets.UTF_8;
++    private static final Charset DEFAULT_CHARSET = StandardCharsets.UTF_8;
+     private static final Supplier<Pattern> HEADER_MASK_PATTERNS = SupplierUtil.memoized(() ->
+         Pattern.compile(".*(password|cred|cert|key|secret|token|auth|signat).*", Pattern.CASE_INSENSITIVE)
+     );
+diff --git a/src/main/docs/guide/httpServer/serverConfiguration/https.adoc b/src/main/docs/guide/httpServer/serverConfiguration/https.adoc
+index 04fd50bff3..dc4fe8a362 100644
+--- a/src/main/docs/guide/httpServer/serverConfiguration/https.adoc
++++ b/src/main/docs/guide/httpServer/serverConfiguration/https.adoc
+@@ -28,7 +28,42 @@ image::https-warning.jpg[]
+ 
+ == Using a valid x509 certificate
+ 
+-It is also possible to configure a Micronaut application to use an existing valid x509 certificate, for example one created with https://letsencrypt.org/[Let's Encrypt]. You will need the `server.crt` and `server.key` files and to convert them to a PKCS #12 file.
++It is also possible to configure a Micronaut application to use an existing valid x509 certificate, for example one created with https://letsencrypt.org/[Let's Encrypt]. You will need the `server.crt` and `server.key` files.
++
++.HTTPS Configuration Example
++[configuration]
++----
++micronaut:
++  ssl:
++    enabled: true
++    key-store:
++      key-path: classpath:server.key
++      certificate-path: classpath:server.crt
++----
++
++NOTE: Instead of `classpath:` or `file:`, the PEM can also be specified directly as a string using the `string:` prefix. See the <<resources,Resources>> section.
++
++With this configuration, if we start a Micronaut application and connect to `https://localhost:8443` we still see the warning in the browser, but if we inspect the certificate we can check that it is the one generated by Let's Encrypt.
++
++image::https-certificate.jpg[]
++
++Finally, we can test that the certificate is valid for the browser by adding an alias to the domain in `/etc/hosts` file:
++
++[source,bash]
++----
++$ cat /etc/hosts
++...
++127.0.0.1   my-domain.org
++...
++----
++
++Now we can connect to `https://my-domain.org:8443`:
++
++image::https-valid-certificate.jpg[]
++
++== Using a PKCS#12 key store
++
++The more traditional approach to managing certificates in Java is with a key store, either in PKCS#12 or the older JKS format. You can convert your PEM files to PKCS#12 as follows:
+ 
+ [source,bash]
+ ----
+@@ -44,9 +79,7 @@ $ openssl pkcs12 -export \
+ <3> The `server.p12` file to create
+ <4> The alias for the certificate
+ 
+-During the creation of the `server.p12` file it is necessary to define a password that will be required later when using the certificate in Micronaut.
+-
+-Now modify your configuration:
++The configuration:
+ 
+ .HTTPS Configuration Example
+ [configuration]
+@@ -62,29 +95,9 @@ micronaut:
+ - Specify the `p12` file path. It can also be referenced as `file:/path/to/the/file`
+ - Also provide the `password` defined during the export
+ 
+-With this configuration, if we start a Micronaut application and connect to `https://localhost:8443` we still see the warning in the browser, but if we inspect the certificate we can check that it is the one generated by Let's Encrypt.
+-
+-image::https-certificate.jpg[]
+-
+-Finally, we can test that the certificate is valid for the browser by adding an alias to the domain in `/etc/hosts` file:
+-
+-[source,bash]
+-----
+-$ cat /etc/hosts
+-...
+-127.0.0.1   my-domain.org
+-...
+-----
+-
+-Now we can connect to `https://my-domain.org:8443`:
+-
+-image::https-valid-certificate.jpg[]
+-
+-== Using Java Keystore (JKS)
+-
+-Using this type of certificate is not recommended because the format is proprietary - PKCS12 format is preferred. Regardless, the Micronaut framework also supports it.
++== Using a JKS key store
+ 
+-Convert the `p12` certificate to a JKS one:
++You can optionally convert the `p12` store to a JKS one:
+ 
+ [source,bash]
+ ----

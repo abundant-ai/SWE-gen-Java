@@ -1,0 +1,634 @@
+diff --git a/okhttp-tls/src/main/kotlin/okhttp3/tls/internal/der/Adapters.kt b/okhttp-tls/src/main/kotlin/okhttp3/tls/internal/der/Adapters.kt
+index 0ff46ddde..75065a534 100644
+--- a/okhttp-tls/src/main/kotlin/okhttp3/tls/internal/der/Adapters.kt
++++ b/okhttp-tls/src/main/kotlin/okhttp3/tls/internal/der/Adapters.kt
+@@ -229,25 +229,11 @@ internal object Adapters {
+         tag = 16L
+     ) {
+       override fun encode(writer: DerWriter, value: T) {
+-        writer.pushTypeHint()
+-        try {
+-          encodeWithTypeHints(value, writer)
+-        } finally {
+-          writer.popTypeHint()
+-        }
+-      }
+-
+-      private fun encodeWithTypeHints(value: T, writer: DerWriter) {
+         val list = decompose(value)
+-
+         for (i in list.indices) {
+           val v = list[i]
+           val adapter = members[i] as DerAdapter<Any?>
+ 
+-          if (adapter.typeHint) {
+-            writer.typeHint = v
+-          }
+-
+           if (adapter.omitInSequence(v)) {
+             // Skip.
+           } else {
+@@ -257,38 +243,18 @@ internal object Adapters {
+       }
+ 
+       override fun decode(reader: DerReader, header: DerHeader): T {
+-        reader.pushTypeHint()
+-        try {
+-          return decodeWithTypeHints(reader)
+-        } finally {
+-          reader.popTypeHint()
+-        }
+-      }
+-
+-      private fun decodeWithTypeHints(reader: DerReader): T {
+         val list = mutableListOf<Any?>()
+ 
+         while (list.size < members.size) {
+           val member = members[list.size]
+-
+-          val value = when {
+-            reader.hasNext() &&
+-                member.matches(reader.peekedTagClass, reader.peekedTag) -> {
+-              reader.read(member)
+-            }
+-            member.isOptional -> {
+-              member.defaultValue
+-            }
+-            else -> {
+-              throw IOException("expected ${member.tagClass}/${member.tag} " +
+-                  "but was ${reader.peekedTagClass}/${reader.peekedTag}")
+-            }
+-          }
+-
+-          if (member.typeHint) {
+-            reader.typeHint = value
++          if (reader.hasNext() && member.matches(reader.peekedTagClass, reader.peekedTag)) {
++            list += reader.read(member)
++          } else if (member.isOptional) {
++            list += member.defaultValue
++          } else {
++            throw IOException("expected ${member.tagClass}/${member.tag} " +
++                "but was ${reader.peekedTagClass}/${reader.peekedTag}")
+           }
+-          list += value
+         }
+ 
+         if (reader.hasNext()) {
+@@ -323,43 +289,6 @@ internal object Adapters {
+     }
+   }
+ 
+-  /**
+-   * This decodes an [OCTET_STRING] value into its contents, which are also expected to be ASN.1.
+-   * To determine which type to decode as it uses a preceding member of the same SEQUENCE. For
+-   * example, extensions type IDs specify what types to use for the corresponding values.
+-   *
+-   * If the hint is unknown [chooser] should return null which will cause the value to be decoded as
+-   * an opaque byte string.
+-   */
+-  fun usingTypeHint(chooser: (Any?) -> DerAdapter<*>?): DerAdapter<Any?> {
+-    return object : DerAdapter<Any?>(tagClass = OCTET_STRING.tagClass, tag = OCTET_STRING.tag) {
+-      override fun encode(writer: DerWriter, value: Any?) {
+-        val adapter = chooser(writer.typeHint)
+-
+-        // If we don't understand this hint, encode the body as a byte string. The byte string
+-        // will include a tag and length header as a prefix.
+-        if (adapter == null) {
+-          (OCTET_STRING as DerAdapter<Any?>).encode(writer, value)
+-          return
+-        }
+-
+-        writer.write(adapter as DerAdapter<Any?>, value)
+-      }
+-
+-      override fun decode(reader: DerReader, header: DerHeader): Any? {
+-        val adapter = chooser(reader.typeHint)
+-
+-        // If we don't understand this hint, decode the body as a byte string. The byte string
+-        // will include a tag and length header as a prefix.
+-        if (adapter == null) {
+-          return OCTET_STRING.decode(reader, header)
+-        }
+-
+-        return reader.read(adapter as DerAdapter<Any?>)
+-      }
+-    }
+-  }
+-
+   /**
+    * Object class to adapter type. This approach limits us to one adapter per Kotlin class, which
+    * might be too few for values like UTF_STRING and OBJECT_IDENTIFIER that share a Kotlin class but
+diff --git a/okhttp-tls/src/main/kotlin/okhttp3/tls/internal/der/CertificateAdapters.kt b/okhttp-tls/src/main/kotlin/okhttp3/tls/internal/der/CertificateAdapters.kt
+index 49b1ee85e..9bcaccfb5 100644
+--- a/okhttp-tls/src/main/kotlin/okhttp3/tls/internal/der/CertificateAdapters.kt
++++ b/okhttp-tls/src/main/kotlin/okhttp3/tls/internal/der/CertificateAdapters.kt
+@@ -16,6 +16,7 @@
+ package okhttp3.tls.internal.der
+ 
+ import java.math.BigInteger
++import okio.ByteString
+ 
+ /**
+  * ASN.1 adapters adapted from the specifications in [RFC 5280][rfc_5280].
+@@ -74,66 +75,6 @@ internal object CertificateAdapters {
+       construct = { AlgorithmIdentifier(it[0] as String, it[1]) }
+   )
+ 
+-  /**
+-   * ```
+-   * BasicConstraints ::= SEQUENCE {
+-   *   cA                      BOOLEAN DEFAULT FALSE,
+-   *   pathLenConstraint       INTEGER (0..MAX) OPTIONAL
+-   * }
+-   * ```
+-   */
+-  internal val basicConstraints = Adapters.sequence(
+-      Adapters.BOOLEAN.optional(defaultValue = false),
+-      Adapters.INTEGER_AS_LONG.optional(),
+-      decompose = { listOf(it.ca, it.pathLenConstraint) },
+-      construct = { BasicConstraints(it[0] as Boolean, it[1] as Long?) }
+-  )
+-
+-  /**
+-   * Note that only a subset of available choices are implemented.
+-   *
+-   * ```
+-   * GeneralName ::= CHOICE {
+-   *   otherName                       [0]     OtherName,
+-   *   rfc822Name                      [1]     IA5String,
+-   *   dNSName                         [2]     IA5String,
+-   *   x400Address                     [3]     ORAddress,
+-   *   directoryName                   [4]     Name,
+-   *   ediPartyName                    [5]     EDIPartyName,
+-   *   uniformResourceIdentifier       [6]     IA5String,
+-   *   iPAddress                       [7]     OCTET STRING,
+-   *   registeredID                    [8]     OBJECT IDENTIFIER
+-   * }
+-   * ```
+-   */
+-  internal val generalNameDnsName = Adapters.IA5_STRING.withTag(tag = 2L)
+-  internal val generalNameIpAddress = Adapters.OCTET_STRING.withTag(tag = 7L)
+-  internal val generalName = Adapters.choice(
+-      generalNameDnsName,
+-      generalNameIpAddress
+-  )
+-
+-  /**
+-   * ```
+-   * SubjectAltName ::= GeneralNames
+-   *
+-   * GeneralNames ::= SEQUENCE SIZE (1..MAX) OF GeneralName
+-   * ```
+-   */
+-  internal val subjectAltName = generalName.asSequenceOf()
+-
+-  /**
+-   * This uses the preceding extension ID to select which adapter to use for the extension value
+-   * that follows.
+-   */
+-  internal val extensionValue = Adapters.usingTypeHint { typeHint ->
+-    when (typeHint) {
+-      ObjectIdentifiers.subjectAltName -> subjectAltName
+-      ObjectIdentifiers.basicConstraints -> basicConstraints
+-      else -> null
+-    }
+-  }
+-
+   /**
+    * ```
+    * Extension ::= SEQUENCE  {
+@@ -147,11 +88,11 @@ internal object CertificateAdapters {
+    * ```
+    */
+   internal val extension = Adapters.sequence(
+-      Adapters.OBJECT_IDENTIFIER.asTypeHint(),
++      Adapters.OBJECT_IDENTIFIER,
+       Adapters.BOOLEAN.optional(defaultValue = false),
+-      extensionValue,
++      Adapters.OCTET_STRING,
+       decompose = { listOf(it.extnID, it.critical, it.extnValue) },
+-      construct = { Extension(it[0] as String, it[1] as Boolean, it[2]) }
++      construct = { Extension(it[0] as String, it[1] as Boolean, it[2] as ByteString) }
+   )
+ 
+   /**
+diff --git a/okhttp-tls/src/main/kotlin/okhttp3/tls/internal/der/DerAdapter.kt b/okhttp-tls/src/main/kotlin/okhttp3/tls/internal/der/DerAdapter.kt
+index fbbdb2cde..c15c8f226 100644
+--- a/okhttp-tls/src/main/kotlin/okhttp3/tls/internal/der/DerAdapter.kt
++++ b/okhttp-tls/src/main/kotlin/okhttp3/tls/internal/der/DerAdapter.kt
+@@ -22,7 +22,7 @@ import okio.IOException
+ /**
+  * Reads a DER tag class, tag, length, and value and decodes it as value.
+  */
+-internal abstract class DerAdapter<T> private constructor(
++internal abstract class DerAdapter<T>(
+   /** The tag class this adapter expects, or -1 to match any tag class. */
+   val tagClass: Int,
+ 
+@@ -30,22 +30,11 @@ internal abstract class DerAdapter<T> private constructor(
+   val tag: Long,
+ 
+   /** True if the default value should be used if this value is absent during decoding. */
+-  val isOptional: Boolean,
++  val isOptional: Boolean = false,
+ 
+   /** The value to return if this value is absent. Undefined unless this is optional. */
+-  val defaultValue: T?,
+-
+-  /** True to set the encoded or decoded value as the type hint for the current SEQUENCE. */
+-  val typeHint: Boolean
++  val defaultValue: T? = null
+ ) {
+-  internal constructor(tagClass: Int, tag: Long) : this(
+-      tagClass = tagClass,
+-      tag = tag,
+-      isOptional = false,
+-      defaultValue = null,
+-      typeHint = false
+-  )
+-
+   /**
+    * Returns true if this adapter decodes values with [tagClass] and [tag]. Most adapters match
+    * exactly one tag class and tag, but ANY adapters match anything and CHOICE adapters match
+@@ -87,9 +76,8 @@ internal abstract class DerAdapter<T> private constructor(
+     tagClass: Int = this.tagClass,
+     tag: Long = this.tag,
+     isOptional: Boolean = this.isOptional,
+-    defaultValue: T? = this.defaultValue,
+-    typeHint: Boolean = this.typeHint
+-  ): DerAdapter<T> = object : DerAdapter<T>(tagClass, tag, isOptional, defaultValue, typeHint) {
++    defaultValue: T? = this.defaultValue
++  ): DerAdapter<T> = object : DerAdapter<T>(tagClass, tag, isOptional, defaultValue) {
+     override fun encode(writer: DerWriter, value: T) = this@DerAdapter.encode(writer, value)
+ 
+     override fun decode(reader: DerReader, header: DerHeader): T =
+@@ -132,14 +120,6 @@ internal abstract class DerAdapter<T> private constructor(
+     )
+   }
+ 
+-  /**
+-   * Returns a copy of this adapter that sets the encoded or decoded value as the type hint for the
+-   * other adapters on this SEQUENCE to interrogate.
+-   */
+-  fun asTypeHint(): DerAdapter<T> {
+-    return copy(typeHint = true)
+-  }
+-
+   /**
+    * Returns an adapter that expects this value wrapped by another value. Typically this occurs
+    * when a value has both a context or application tag and a universal tag.
+diff --git a/okhttp-tls/src/main/kotlin/okhttp3/tls/internal/der/DerReader.kt b/okhttp-tls/src/main/kotlin/okhttp3/tls/internal/der/DerReader.kt
+index 50eaa9051..369028375 100644
+--- a/okhttp-tls/src/main/kotlin/okhttp3/tls/internal/der/DerReader.kt
++++ b/okhttp-tls/src/main/kotlin/okhttp3/tls/internal/der/DerReader.kt
+@@ -55,19 +55,6 @@ internal class DerReader(source: Source) {
+   val peekedTag: Long
+     get() = peekedHeader?.tag ?: error("peekedTag only accessible after hasNext")
+ 
+-  /** Type hints scoped to the call stack, manipulated with [pushTypeHint] and [popTypeHint]. */
+-  private val typeHintStack = mutableListOf<Any?>()
+-
+-  /**
+-   * The type hint for the current object. Used to pick adapters based on other fields, such as
+-   * in extensions which have different types depending on their extension ID.
+-   */
+-  var typeHint: Any?
+-    get() = typeHintStack.lastOrNull()
+-    set(value) {
+-      typeHintStack.set(typeHintStack.size - 1, value)
+-    }
+-
+   private var constructed: Boolean = false
+ 
+   private var peekedHeader: DerHeader? = null
+@@ -167,14 +154,6 @@ internal class DerReader(source: Source) {
+     return DerHeader(tagClass, tag, constructed, length)
+   }
+ 
+-  fun pushTypeHint() {
+-    typeHintStack.add(null)
+-  }
+-
+-  fun popTypeHint() {
+-    typeHintStack.removeAt(typeHintStack.size - 1)
+-  }
+-
+   fun readBoolean(): Boolean {
+     if (bytesLeft != 1L) throw ProtocolException("unexpected length: $bytesLeft")
+     return source.readByte().toInt() != 0
+diff --git a/okhttp-tls/src/main/kotlin/okhttp3/tls/internal/der/DerWriter.kt b/okhttp-tls/src/main/kotlin/okhttp3/tls/internal/der/DerWriter.kt
+index 28340e24c..0ed8b6b20 100644
+--- a/okhttp-tls/src/main/kotlin/okhttp3/tls/internal/der/DerWriter.kt
++++ b/okhttp-tls/src/main/kotlin/okhttp3/tls/internal/der/DerWriter.kt
+@@ -24,19 +24,6 @@ internal class DerWriter(sink: BufferedSink) {
+   /** A stack of buffers that will be concatenated once we know the length of each. */
+   private val stack = mutableListOf(sink)
+ 
+-  /** Type hints scoped to the call stack, manipulated with [pushTypeHint] and [popTypeHint]. */
+-  private val typeHintStack = mutableListOf<Any?>()
+-
+-  /**
+-   * The type hint for the current object. Used to pick adapters based on other fields, such as
+-   * in extensions which have different types depending on their extension ID.
+-   */
+-  var typeHint: Any?
+-    get() = typeHintStack.lastOrNull()
+-    set(value) {
+-      typeHintStack[typeHintStack.size - 1] = value
+-    }
+-
+   /** False unless we made a recursive call to [write] at the current stack frame. */
+   private var constructed = false
+ 
+@@ -96,22 +83,6 @@ internal class DerWriter(sink: BufferedSink) {
+     sink.writeAll(content)
+   }
+ 
+-  /**
+-   * Create a new namespace for type hints. Type hints from the enclosing type are no longer usable
+-   * by the current type's members.
+-   */
+-  fun pushTypeHint() {
+-    typeHintStack.add(null)
+-  }
+-
+-  /**
+-   * Remove the current namespace when it is going out of scope. Calls to [pushTypeHint] and
+-   * [popTypeHint] should be balanced.
+-   */
+-  fun popTypeHint() {
+-    typeHintStack.removeAt(typeHintStack.size - 1)
+-  }
+-
+   private fun sink(): BufferedSink = stack[stack.size - 1]
+ 
+   fun writeBoolean(b: Boolean) {
+diff --git a/okhttp-tls/src/main/kotlin/okhttp3/tls/internal/der/ObjectIdentifiers.kt b/okhttp-tls/src/main/kotlin/okhttp3/tls/internal/der/ObjectIdentifiers.kt
+deleted file mode 100644
+index 2998deaad..000000000
+--- a/okhttp-tls/src/main/kotlin/okhttp3/tls/internal/der/ObjectIdentifiers.kt
++++ /dev/null
+@@ -1,22 +0,0 @@
+-/*
+- * Copyright (C) 2020 Square, Inc.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-package okhttp3.tls.internal.der
+-
+-/** ASN.1 object identifiers used internally by this implementation. */
+-internal object ObjectIdentifiers {
+-  val subjectAltName = "2.5.29.17"
+-  val basicConstraints = "2.5.29.19"
+-}
+diff --git a/okhttp-tls/src/main/kotlin/okhttp3/tls/internal/der/certificates.kt b/okhttp-tls/src/main/kotlin/okhttp3/tls/internal/der/certificates.kt
+index 83a6b2b94..b977a248c 100644
+--- a/okhttp-tls/src/main/kotlin/okhttp3/tls/internal/der/certificates.kt
++++ b/okhttp-tls/src/main/kotlin/okhttp3/tls/internal/der/certificates.kt
+@@ -16,6 +16,7 @@
+ package okhttp3.tls.internal.der
+ 
+ import java.math.BigInteger
++import okio.ByteString
+ 
+ internal data class Certificate(
+   val tbsCertificate: TbsCertificate,
+@@ -92,10 +93,5 @@ internal data class SubjectPublicKeyInfo(
+ internal data class Extension(
+   val extnID: String,
+   val critical: Boolean,
+-  val extnValue: Any?
+-)
+-
+-internal data class BasicConstraints(
+-  val ca: Boolean,
+-  val pathLenConstraint: Long?
++  val extnValue: ByteString
+ )
+diff --git a/okhttp-tls/src/test/java/okhttp3/tls/internal/der/DerCertificatesTest.kt b/okhttp-tls/src/test/java/okhttp3/tls/internal/der/DerCertificatesTest.kt
+index 5577802d6..929b5c1d5 100644
+--- a/okhttp-tls/src/test/java/okhttp3/tls/internal/der/DerCertificatesTest.kt
++++ b/okhttp-tls/src/test/java/okhttp3/tls/internal/der/DerCertificatesTest.kt
+@@ -16,7 +16,6 @@
+ package okhttp3.tls.internal.der
+ 
+ import java.math.BigInteger
+-import okhttp3.tls.HeldCertificate
+ import okhttp3.tls.decodeCertificatePem
+ import okio.ByteString.Companion.decodeBase64
+ import okio.ByteString.Companion.decodeHex
+@@ -297,10 +296,7 @@ internal class DerCertificatesTest {
+                     Extension(
+                         extnID = basicConstraints,
+                         critical = true,
+-                        extnValue = BasicConstraints(
+-                            ca = true,
+-                            pathLenConstraint = 1L
+-                        )
++                        extnValue = "30060101ff020101".decodeHex()
+                     ),
+                     Extension(
+                         extnID = authorityInfoAccess,
+@@ -533,10 +529,8 @@ internal class DerCertificatesTest {
+                     Extension(
+                         extnID = subjectAltName,
+                         critical = false,
+-                        extnValue = listOf(
+-                            CertificateAdapters.generalNameDnsName to "cash.app",
+-                            CertificateAdapters.generalNameDnsName to "www.cash.app"
+-                        )
++                        extnValue = "30188208636173682e617070820c7777772e636173682e617070"
++                            .decodeHex()
+                     ),
+                     Extension(
+                         extnID = certificateTransparencySignedCertificateTimestamps,
+@@ -597,10 +591,7 @@ internal class DerCertificatesTest {
+                     Extension(
+                         extnID = basicConstraints,
+                         critical = false,
+-                        extnValue = BasicConstraints(
+-                            ca = false,
+-                            pathLenConstraint = null
+-                        )
++                        extnValue = "3000".decodeHex()
+                     )
+                 )
+             ),
+@@ -615,26 +606,4 @@ internal class DerCertificatesTest {
+         )
+     )
+   }
+-
+-  @Test
+-  fun `basic constraints extension`() {
+-    val certificate = HeldCertificate.Builder()
+-        .certificateAuthority(3)
+-        .build()
+-
+-    val certificateByteString = certificate.certificate.encoded.toByteString()
+-
+-    val okHttpCertificate = CertificateAdapters.certificate
+-        .fromDer(certificateByteString)
+-
+-    val basicConstraints = okHttpCertificate.tbsCertificate.extensions.first {
+-      it.extnID == basicConstraints
+-    }
+-
+-    assertThat(basicConstraints).isEqualTo(Extension(
+-        extnID = ObjectIdentifiers.basicConstraints,
+-        critical = true,
+-        extnValue = BasicConstraints(true, 3)
+-    ))
+-  }
+ }
+diff --git a/okhttp-tls/src/test/java/okhttp3/tls/internal/der/DerTest.kt b/okhttp-tls/src/test/java/okhttp3/tls/internal/der/DerTest.kt
+index bd5fadda2..8d5a23fd0 100644
+--- a/okhttp-tls/src/test/java/okhttp3/tls/internal/der/DerTest.kt
++++ b/okhttp-tls/src/test/java/okhttp3/tls/internal/der/DerTest.kt
+@@ -16,16 +16,12 @@
+ package okhttp3.tls.internal.der
+ 
+ import java.math.BigInteger
+-import java.net.InetAddress
+ import java.text.SimpleDateFormat
+ import java.util.Date
+ import java.util.TimeZone
+-import okhttp3.tls.internal.der.CertificateAdapters.generalNameDnsName
+-import okhttp3.tls.internal.der.CertificateAdapters.generalNameIpAddress
+ import okio.Buffer
+ import okio.ByteString.Companion.decodeHex
+ import okio.ByteString.Companion.encodeUtf8
+-import okio.ByteString.Companion.toByteString
+ import org.assertj.core.api.Assertions.assertThat
+ import org.junit.Test
+ 
+@@ -750,73 +746,26 @@ internal class DerTest {
+     assertThat(byteString).isEqualTo("0404030206A0".decodeHex())
+   }
+ 
+-  @Test fun `decode choice IP address`() {
+-    val localhost = InetAddress.getByName("192.168.2.1").address.toByteString()
+-    val adapterAndValue = CertificateAdapters.generalName.fromDer("8704c0a80201".decodeHex())
+-    assertThat(adapterAndValue).isEqualTo(generalNameIpAddress to localhost)
++  @Test fun `decode choice rfc822`() {
++    val rfc822 = GeneralName.ADAPTER.fromDer("810d61406578616d706c652e636f6d".decodeHex())
++    assertThat(rfc822).isEqualTo(GeneralName.rfc822Name to "a@example.com")
+   }
+ 
+-  @Test fun `encode choice IP address`() {
+-    val localhost = InetAddress.getByName("192.168.2.1").address.toByteString()
+-    val byteString = CertificateAdapters.generalName.toDer(generalNameIpAddress to localhost)
+-    assertThat(byteString).isEqualTo("8704c0a80201".decodeHex())
++  @Test fun `encode choice rfc822`() {
++    val byteString = GeneralName.ADAPTER.toDer(GeneralName.rfc822Name to "a@example.com")
++    assertThat(byteString).isEqualTo("810d61406578616d706c652e636f6d".decodeHex())
+   }
+ 
+   @Test fun `decode choice dns`() {
+-    val dns = CertificateAdapters.generalName.fromDer("820b6578616d706c652e636f6d".decodeHex())
+-    assertThat(dns).isEqualTo(generalNameDnsName to "example.com")
++    val dns = GeneralName.ADAPTER.fromDer("820b6578616d706c652e636f6d".decodeHex())
++    assertThat(dns).isEqualTo(GeneralName.dNSName to "example.com")
+   }
+ 
+   @Test fun `encode choice dns`() {
+-    val byteString = CertificateAdapters.generalName.toDer(generalNameDnsName to "example.com")
++    val byteString = GeneralName.ADAPTER.toDer(GeneralName.dNSName to "example.com")
+     assertThat(byteString).isEqualTo("820b6578616d706c652e636f6d".decodeHex())
+   }
+ 
+-  @Test fun `extension with type hint for basic constraints`() {
+-    val extension = Extension(
+-        ObjectIdentifiers.basicConstraints,
+-        false,
+-        BasicConstraints(true, 4)
+-    )
+-    val bytes = "300f0603551d13240830060101ff020104".decodeHex()
+-
+-    assertThat(CertificateAdapters.extension.toDer(extension))
+-        .isEqualTo(bytes)
+-    assertThat(CertificateAdapters.extension.fromDer(bytes))
+-        .isEqualTo(extension)
+-  }
+-
+-  @Test fun `extension with type hint for subject alternative names`() {
+-    val extension = Extension(
+-        ObjectIdentifiers.subjectAltName,
+-        false,
+-        listOf(
+-            generalNameDnsName to "cash.app",
+-            generalNameDnsName to "www.cash.app"
+-        )
+-    )
+-    val bytes = "30210603551d11241a30188208636173682e617070820c7777772e636173682e617070".decodeHex()
+-
+-    assertThat(CertificateAdapters.extension.toDer(extension))
+-        .isEqualTo(bytes)
+-    assertThat(CertificateAdapters.extension.fromDer(bytes))
+-        .isEqualTo(extension)
+-  }
+-
+-  @Test fun `extension with unknown type hint`() {
+-    val extension = Extension(
+-        "2.5.4.3", // common name is not an extension.
+-        false,
+-        "3006800109810109".decodeHex()
+-    )
+-    val bytes = "300f060355040304083006800109810109".decodeHex()
+-
+-    assertThat(CertificateAdapters.extension.toDer(extension))
+-        .isEqualTo(bytes)
+-    assertThat(CertificateAdapters.extension.fromDer(bytes))
+-        .isEqualTo(extension)
+-  }
+-
+   private fun derAdapter(block: (Int, Long, Boolean, Long) -> Unit): DerAdapter<Unit> {
+     return object : DerAdapter<Unit>(-1, -1L) {
+       override fun encode(writer: DerWriter, value: Unit): Unit = throw error("unsupported")
+@@ -837,6 +786,36 @@ internal class DerTest {
+     }, null)
+   }
+ 
++  /**
++   * ```
++   * GeneralName ::= CHOICE {
++   *   otherName                       [0]     OtherName,
++   *   rfc822Name                      [1]     IA5String,
++   *   dNSName                         [2]     IA5String,
++   *   x400Address                     [3]     ORAddress,
++   *   directoryName                   [4]     Name,
++   *   ediPartyName                    [5]     EDIPartyName,
++   *   uniformResourceIdentifier       [6]     IA5String,
++   *   iPAddress                       [7]     OCTET STRING,
++   *   registeredID                    [8]     OBJECT IDENTIFIER
++   * }
++   * ```
++   */
++  object GeneralName {
++    val rfc822Name = Adapters.IA5_STRING.withTag(tag = 1L)
++    val dNSName = Adapters.IA5_STRING.withTag(tag = 2L)
++    val uniformResourceIdentifier = Adapters.IA5_STRING.withTag(tag = 6L)
++    val iPAddress = Adapters.OCTET_STRING.withTag(tag = 7L)
++    val registeredID = Adapters.OBJECT_IDENTIFIER.withTag(tag = 8L)
++    val ADAPTER = Adapters.choice(
++        rfc822Name,
++        dNSName,
++        uniformResourceIdentifier,
++        iPAddress,
++        registeredID
++    )
++  }
++
+   /**
+    * ```
+    * Point ::= SEQUENCE {

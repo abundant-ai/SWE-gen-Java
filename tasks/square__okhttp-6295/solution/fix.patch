@@ -1,0 +1,960 @@
+diff --git a/README.md b/README.md
+index 3075968da..13c52bab2 100644
+--- a/README.md
++++ b/README.md
+@@ -119,19 +119,6 @@ The latest release is available on [Maven Central](https://search.maven.org/arti
+ testImplementation("com.squareup.okhttp3:mockwebserver:4.9.0")
+ ```
+ 
+-GraalVM Native Image
+---------------------
+-
+-Building your own native images with Graal https://www.graalvm.org/ should work automatically.
+-Please report any bugs or workarounds you find.
+-
+-See okcurl module for an example build.
+-
+-```
+-$ ./gradlew okcurl:nativeImage
+-$ ./okcurl/build/graal/okcurl https://httpbin.org/get
+-```
+-
+ License
+ -------
+ 
+diff --git a/docs/security_providers.md b/docs/security_providers.md
+index 5ee4669cc..f2d3d4e7d 100644
+--- a/docs/security_providers.md
++++ b/docs/security_providers.md
+@@ -8,7 +8,6 @@ Security Providers
+ | :--------------- | :------ | :----------- | :-------------- | :----------------------------------------------------------- |
+ | JVM default      | Java 9+ | Java 11+     | [OpenJDK]       |                                                              |
+ | Android default  | ✅      | Android 10+  | [BoringSSL]     |                                                              |
+-| [GraalVM]        | ✅      |              | [OpenJDK]       | Only actively tested with JDK 11, not with 8 target          |
+ | [Bouncy Castle]  | ✅      |              | [Bouncy Castle] | [Tracking bug.][bug5698]                                     |
+ | [Conscrypt]      | ✅      | ✅           | [BoringSSL]     | Activated if Conscrypt is first registered provider.         |
+ | [OpenJSSE]       |         | ✅           | [OpenJDK]       | OpenJDK backport.                                            |
+@@ -21,7 +20,6 @@ All providers support HTTP/1.1 and TLSv1.2.
+ [Bouncy Castle]: https://www.bouncycastle.org/java.html
+ [Conscrypt]: https://www.conscrypt.org/
+ [Corretto]: https://github.com/corretto/amazon-corretto-crypto-provider
+-[GraalVM]: https://www.graalvm.org/
+ [OpenJDK]: https://openjdk.java.net/groups/security/
+ [OpenJSSE]: https://github.com/openjsse/openjsse
+ [OpenSSL]: https://www.openssl.org/
+diff --git a/mkdocs.yml b/mkdocs.yml
+index c65529aee..2da82aea1 100644
+--- a/mkdocs.yml
++++ b/mkdocs.yml
+@@ -5,7 +5,6 @@ repo_url: https://github.com/square/okhttp
+ site_description: "An HTTP & HTTP/2 client for Android and Java applications"
+ site_author: Square, Inc.
+ remote_branch: gh-pages
+-edit_uri: ""
+ 
+ copyright: 'Copyright &copy; 2019 Square, Inc.'
+ 
+diff --git a/mockwebserver/src/main/kotlin/okhttp3/mockwebserver/MockResponse.kt b/mockwebserver/src/main/kotlin/okhttp3/mockwebserver/MockResponse.kt
+index 1c2b4f58a..e61479bcb 100644
+--- a/mockwebserver/src/main/kotlin/okhttp3/mockwebserver/MockResponse.kt
++++ b/mockwebserver/src/main/kotlin/okhttp3/mockwebserver/MockResponse.kt
+@@ -60,7 +60,8 @@ class MockResponse : Cloneable {
+   /**
+    * Sets the [HTTP/2 error code](https://tools.ietf.org/html/rfc7540#section-7) to be
+    * returned when resetting the stream.
+-   * This is only valid with [SocketPolicy.RESET_STREAM_AT_START].
++   * This is only valid with [SocketPolicy.RESET_STREAM_AT_START] and
++   * [SocketPolicy.DO_NOT_READ_REQUEST_BODY].
+    */
+   @set:JvmName("http2ErrorCode")
+   var http2ErrorCode = -1
+diff --git a/mockwebserver/src/main/kotlin/okhttp3/mockwebserver/MockWebServer.kt b/mockwebserver/src/main/kotlin/okhttp3/mockwebserver/MockWebServer.kt
+index f72a849ef..65622104c 100644
+--- a/mockwebserver/src/main/kotlin/okhttp3/mockwebserver/MockWebServer.kt
++++ b/mockwebserver/src/main/kotlin/okhttp3/mockwebserver/MockWebServer.kt
+@@ -72,6 +72,7 @@ import okhttp3.mockwebserver.SocketPolicy.DISCONNECT_AT_END
+ import okhttp3.mockwebserver.SocketPolicy.DISCONNECT_AT_START
+ import okhttp3.mockwebserver.SocketPolicy.DISCONNECT_DURING_REQUEST_BODY
+ import okhttp3.mockwebserver.SocketPolicy.DISCONNECT_DURING_RESPONSE_BODY
++import okhttp3.mockwebserver.SocketPolicy.DO_NOT_READ_REQUEST_BODY
+ import okhttp3.mockwebserver.SocketPolicy.EXPECT_CONTINUE
+ import okhttp3.mockwebserver.SocketPolicy.FAIL_HANDSHAKE
+ import okhttp3.mockwebserver.SocketPolicy.NO_RESPONSE
+@@ -627,7 +628,7 @@ class MockWebServer : ExternalResource(), Closeable {
+ 
+       // See warnings associated with these socket policies in SocketPolicy.
+       when (response.socketPolicy) {
+-        DISCONNECT_AT_END -> {
++        DISCONNECT_AT_END, DO_NOT_READ_REQUEST_BODY -> {
+           socket.close()
+           return false
+         }
+@@ -719,7 +720,9 @@ class MockWebServer : ExternalResource(), Closeable {
+ 
+       var hasBody = false
+       val policy = dispatcher.peek()
+-      if (contentLength != -1L) {
++      if (policy.socketPolicy == DO_NOT_READ_REQUEST_BODY) {
++        // Ignore the body completely.
++      } else if (contentLength != -1L) {
+         hasBody = contentLength > 0L
+         throttledTransfer(policy, socket, source, requestBody.buffer(), contentLength, true)
+       } else if (chunked) {
+@@ -966,7 +969,8 @@ class MockWebServer : ExternalResource(), Closeable {
+ 
+       val response: MockResponse = dispatcher.dispatch(request)
+ 
+-      if (response.socketPolicy === DISCONNECT_AFTER_REQUEST) {
++      val socketPolicy = response.socketPolicy
++      if (socketPolicy === DISCONNECT_AFTER_REQUEST) {
+         socket.close()
+         return
+       }
+@@ -977,9 +981,15 @@ class MockWebServer : ExternalResource(), Closeable {
+                 "and responded: $response protocol is $protocol")
+       }
+ 
+-      if (response.socketPolicy === DISCONNECT_AT_END) {
+-        val connection = stream.connection
+-        connection.shutdown(ErrorCode.NO_ERROR)
++      when (socketPolicy) {
++        DISCONNECT_AT_END -> {
++          stream.connection.shutdown(ErrorCode.NO_ERROR)
++        }
++        DO_NOT_READ_REQUEST_BODY -> {
++          stream.close(ErrorCode.fromHttp2(response.http2ErrorCode)!!, null)
++        }
++        else -> {
++        }
+       }
+     }
+ 
+@@ -1019,7 +1029,7 @@ class MockWebServer : ExternalResource(), Closeable {
+       val body = Buffer()
+       val requestLine = "$method $path HTTP/1.1"
+       var exception: IOException? = null
+-      if (readBody && !peek.isDuplex) {
++      if (readBody && !peek.isDuplex && peek.socketPolicy !== DO_NOT_READ_REQUEST_BODY) {
+         try {
+           val contentLengthString = headers["content-length"]
+           val byteCount = contentLengthString?.toLong() ?: Long.MAX_VALUE
+diff --git a/mockwebserver/src/main/kotlin/okhttp3/mockwebserver/SocketPolicy.kt b/mockwebserver/src/main/kotlin/okhttp3/mockwebserver/SocketPolicy.kt
+index 60f26e5fd..1a60b6e4d 100644
+--- a/mockwebserver/src/main/kotlin/okhttp3/mockwebserver/SocketPolicy.kt
++++ b/mockwebserver/src/main/kotlin/okhttp3/mockwebserver/SocketPolicy.kt
+@@ -75,6 +75,13 @@ enum class SocketPolicy {
+   /** Close connection after writing half of the response body (if present). */
+   DISCONNECT_DURING_RESPONSE_BODY,
+ 
++  /**
++   * Process the response without even attempting to reading the request body. For HTTP/2 this will
++   * send [MockResponse.getHttp2ErrorCode] after the response body or trailers. For HTTP/1 this will
++   * close the socket after the response body or trailers.
++   */
++  DO_NOT_READ_REQUEST_BODY,
++
+   /** Don't trust the client during the SSL handshake. */
+   FAIL_HANDSHAKE,
+ 
+diff --git a/okcurl/build.gradle b/okcurl/build.gradle
+index bdea9530b..92f8f2bea 100644
+--- a/okcurl/build.gradle
++++ b/okcurl/build.gradle
+@@ -1,9 +1,3 @@
+-plugins {
+-  id "com.palantir.graal" version "0.7.1"
+-}
+-
+-import org.apache.tools.ant.taskdefs.condition.Os
+-
+ apply plugin: 'com.github.johnrengelman.shadow'
+ 
+ jar {
+@@ -33,9 +27,6 @@ dependencies {
+   implementation deps.picocli
+   implementation deps.guava
+ 
+-  implementation 'info.picocli:picocli-codegen:4.5.1'
+-  annotationProcessor 'info.picocli:picocli-codegen:4.5.1'
+-
+   testImplementation project(':okhttp-testing-support')
+   testImplementation deps.junit
+   testImplementation deps.assertj
+@@ -44,21 +35,3 @@ dependencies {
+ shadowJar {
+   mergeServiceFiles()
+ }
+-
+-graal {
+-  mainClass "okhttp3.curl.Main"
+-  outputName "okcurl"
+-  graalVersion "20.2.0"
+-  javaVersion "11"
+-
+-  option "--enable-https"
+-  option "--no-fallback"
+-  option "--allow-incomplete-classpath"
+-
+-  if (Os.isFamily(Os.FAMILY_WINDOWS)) {
+-    // May be possible without, but autodetection is problematic on Windows 10
+-    // see https://github.com/palantir/gradle-graal
+-    // see https://www.graalvm.org/docs/reference-manual/native-image/#prerequisites
+-    windowsVsVarsPath("C:\\Program Files (x86)\\Microsoft Visual Studio\\2019\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat")
+-  }
+-}
+diff --git a/okcurl/src/main/kotlin/okhttp3/curl/Main.kt b/okcurl/src/main/kotlin/okhttp3/curl/Main.kt
+index 7b10d429d..1c6d9d9df 100644
+--- a/okcurl/src/main/kotlin/okhttp3/curl/Main.kt
++++ b/okcurl/src/main/kotlin/okhttp3/curl/Main.kt
+@@ -48,7 +48,6 @@ import picocli.CommandLine.Command
+ import picocli.CommandLine.IVersionProvider
+ import picocli.CommandLine.Option
+ import picocli.CommandLine.Parameters
+-import java.lang.IllegalArgumentException
+ 
+ @Command(name = NAME, description = ["A curl for the next-generation web."],
+     mixinStandardHelpOptions = true, versionProvider = Main.VersionProvider::class)
+@@ -180,9 +179,7 @@ class Main : Runnable {
+ 
+     val requestMethod = method ?: if (data != null) "POST" else "GET"
+ 
+-    val url = url ?: throw IllegalArgumentException("No url provided")
+-
+-    request.url(url)
++    request.url(url!!)
+ 
+     data?.let {
+       request.method(requestMethod, it.toRequestBody(mediaType()))
+diff --git a/okcurl/src/main/resources/META-INF/native-image/okhttp3/okcurl/reflect-config.json b/okcurl/src/main/resources/META-INF/native-image/okhttp3/okcurl/reflect-config.json
+deleted file mode 100644
+index 4907f8d44..000000000
+--- a/okcurl/src/main/resources/META-INF/native-image/okhttp3/okcurl/reflect-config.json
++++ /dev/null
+@@ -1,45 +0,0 @@
+-[
+-  {
+-    "name" : "okhttp3.curl.Main",
+-    "allDeclaredConstructors" : true,
+-    "allPublicConstructors" : true,
+-    "allDeclaredMethods" : true,
+-    "allPublicMethods" : true,
+-    "fields" : [
+-      { "name" : "allowInsecure" },
+-      { "name" : "callTimeout" },
+-      { "name" : "completionScript" },
+-      { "name" : "connectTimeout" },
+-      { "name" : "data" },
+-      { "name" : "followRedirects" },
+-      { "name" : "headers" },
+-      { "name" : "method" },
+-      { "name" : "readTimeout" },
+-      { "name" : "referer" },
+-      { "name" : "showHeaders" },
+-      { "name" : "showHttp2Frames" },
+-      { "name" : "sslDebug" },
+-      { "name" : "url" },
+-      { "name" : "userAgent" },
+-      { "name" : "verbose" }
+-    ]
+-  },
+-  {
+-    "name" : "okhttp3.curl.Main$VersionProvider",
+-    "allDeclaredConstructors" : true,
+-    "allPublicConstructors" : true,
+-    "allDeclaredMethods" : true,
+-    "allPublicMethods" : true
+-  },
+-  {
+-    "name" : "picocli.CommandLine$AutoHelpMixin",
+-    "allDeclaredConstructors" : true,
+-    "allPublicConstructors" : true,
+-    "allDeclaredMethods" : true,
+-    "allPublicMethods" : true,
+-    "fields" : [
+-      { "name" : "helpRequested" },
+-      { "name" : "versionRequested" }
+-    ]
+-  }
+-]
+diff --git a/okcurl/src/main/resources/META-INF/native-image/okhttp3/okcurl/resource-config.json b/okcurl/src/main/resources/META-INF/native-image/okhttp3/okcurl/resource-config.json
+deleted file mode 100644
+index ab5d3a743..000000000
+--- a/okcurl/src/main/resources/META-INF/native-image/okhttp3/okcurl/resource-config.json
++++ /dev/null
+@@ -1,5 +0,0 @@
+-{
+-  "resources": [
+-    {"pattern": "okcurl-version.properties"}
+-  ]
+-}
+diff --git a/okhttp-sse/src/main/kotlin/okhttp3/internal/sse/RealEventSource.kt b/okhttp-sse/src/main/kotlin/okhttp3/internal/sse/RealEventSource.kt
+new file mode 100644
+index 000000000..2e95a2881
+--- /dev/null
++++ b/okhttp-sse/src/main/kotlin/okhttp3/internal/sse/RealEventSource.kt
+@@ -0,0 +1,107 @@
++/*
++ * Copyright (C) 2018 Square, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package okhttp3.internal.sse
++
++import java.io.IOException
++import okhttp3.Call
++import okhttp3.Callback
++import okhttp3.EventListener
++import okhttp3.OkHttpClient
++import okhttp3.Request
++import okhttp3.Response
++import okhttp3.ResponseBody
++import okhttp3.internal.EMPTY_RESPONSE
++import okhttp3.internal.connection.RealCall
++import okhttp3.sse.EventSource
++import okhttp3.sse.EventSourceListener
++
++class RealEventSource(
++  private val request: Request,
++  private val listener: EventSourceListener
++) : EventSource, ServerSentEventReader.Callback, Callback {
++  private lateinit var call: RealCall
++
++  fun connect(client: OkHttpClient) {
++    val client = client.newBuilder()
++        .eventListener(EventListener.NONE)
++        .build()
++    call = client.newCall(request) as RealCall
++    call.enqueue(this)
++  }
++
++  override fun onResponse(call: Call, response: Response) {
++    processResponse(response)
++  }
++
++  fun processResponse(response: Response) {
++    response.use {
++      if (!response.isSuccessful) {
++        listener.onFailure(this, null, response)
++        return
++      }
++
++      val body = response.body!!
++
++      if (!body.isEventStream()) {
++        listener.onFailure(this,
++            IllegalStateException("Invalid content-type: ${body.contentType()}"), response)
++        return
++      }
++
++      // This is a long-lived response. Cancel full-call timeouts.
++      call.timeoutEarlyExit()
++
++      // Replace the body with an empty one so the callbacks can't see real data.
++      val response = response.newBuilder()
++          .body(EMPTY_RESPONSE)
++          .build()
++
++      val reader = ServerSentEventReader(body.source(), this)
++      try {
++        listener.onOpen(this, response)
++        while (reader.processNextEvent()) {
++        }
++      } catch (e: Exception) {
++        listener.onFailure(this, e, response)
++        return
++      }
++      listener.onClosed(this)
++    }
++  }
++
++  private fun ResponseBody.isEventStream(): Boolean {
++    val contentType = contentType() ?: return false
++    return contentType.type == "text" && contentType.subtype == "event-stream"
++  }
++
++  override fun onFailure(call: Call, e: IOException) {
++    listener.onFailure(this, e, null)
++  }
++
++  override fun request(): Request = request
++
++  override fun cancel() {
++    call.cancel()
++  }
++
++  override fun onEvent(id: String?, type: String?, data: String) {
++    listener.onEvent(this, id, type, data)
++  }
++
++  override fun onRetryChange(timeMs: Long) {
++    // Ignored. We do not auto-retry.
++  }
++}
+diff --git a/okhttp-sse/src/main/kotlin/okhttp3/internal/sse/ServerSentEventReader.kt b/okhttp-sse/src/main/kotlin/okhttp3/internal/sse/ServerSentEventReader.kt
+new file mode 100644
+index 000000000..9f6f343bf
+--- /dev/null
++++ b/okhttp-sse/src/main/kotlin/okhttp3/internal/sse/ServerSentEventReader.kt
+@@ -0,0 +1,158 @@
++/*
++ * Copyright (C) 2018 Square, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package okhttp3.internal.sse
++
++import java.io.IOException
++import okhttp3.internal.toLongOrDefault
++import okio.Buffer
++import okio.BufferedSource
++import okio.ByteString.Companion.encodeUtf8
++import okio.Options
++
++class ServerSentEventReader(
++  private val source: BufferedSource,
++  private val callback: Callback
++) {
++  private var lastId: String? = null
++
++  interface Callback {
++    fun onEvent(id: String?, type: String?, data: String)
++    fun onRetryChange(timeMs: Long)
++  }
++
++  /**
++   * Process the next event. This will result in a single call to [Callback.onEvent] *unless* the
++   * data section was empty. Any number of calls to [Callback.onRetryChange] may occur while
++   * processing an event.
++   *
++   * @return false when EOF is reached
++   */
++  @Throws(IOException::class)
++  fun processNextEvent(): Boolean {
++    var id = lastId
++    var type: String? = null
++    val data = Buffer()
++
++    while (true) {
++      when (source.select(options)) {
++        in 0..2 -> {
++          completeEvent(id, type, data)
++          return true
++        }
++
++        in 3..4 -> {
++          source.readData(data)
++        }
++
++        in 5..7 -> {
++          data.writeByte('\n'.toInt()) // 'data' on a line of its own.
++        }
++
++        in 8..9 -> {
++          id = source.readUtf8LineStrict().takeIf { it.isNotEmpty() }
++        }
++
++        in 10..12 -> {
++          id = null // 'id' on a line of its own.
++        }
++
++        in 13..14 -> {
++          type = source.readUtf8LineStrict().takeIf { it.isNotEmpty() }
++        }
++
++        in 15..17 -> {
++          type = null // 'event' on a line of its own
++        }
++
++        in 18..19 -> {
++          val retryMs = source.readRetryMs()
++          if (retryMs != -1L) {
++            callback.onRetryChange(retryMs)
++          }
++        }
++
++        -1 -> {
++          val lineEnd = source.indexOfElement(CRLF)
++          if (lineEnd != -1L) {
++            // Skip the line and newline
++            source.skip(lineEnd)
++            source.select(options)
++          } else {
++            return false // No more newlines.
++          }
++        }
++
++        else -> throw AssertionError()
++      }
++    }
++  }
++
++  @Throws(IOException::class)
++  private fun completeEvent(id: String?, type: String?, data: Buffer) {
++    if (data.size != 0L) {
++      lastId = id
++      data.skip(1L) // Leading newline.
++      callback.onEvent(id, type, data.readUtf8())
++    }
++  }
++
++  companion object {
++    val options = Options.of(
++        /*  0 */ "\r\n".encodeUtf8(),
++        /*  1 */ "\r".encodeUtf8(),
++        /*  2 */ "\n".encodeUtf8(),
++
++        /*  3 */ "data: ".encodeUtf8(),
++        /*  4 */ "data:".encodeUtf8(),
++
++        /*  5 */ "data\r\n".encodeUtf8(),
++        /*  6 */ "data\r".encodeUtf8(),
++        /*  7 */ "data\n".encodeUtf8(),
++
++        /*  8 */ "id: ".encodeUtf8(),
++        /*  9 */ "id:".encodeUtf8(),
++
++        /* 10 */ "id\r\n".encodeUtf8(),
++        /* 11 */ "id\r".encodeUtf8(),
++        /* 12 */ "id\n".encodeUtf8(),
++
++        /* 13 */ "event: ".encodeUtf8(),
++        /* 14 */ "event:".encodeUtf8(),
++
++        /* 15 */ "event\r\n".encodeUtf8(),
++        /* 16 */ "event\r".encodeUtf8(),
++        /* 17 */ "event\n".encodeUtf8(),
++
++        /* 18 */ "retry: ".encodeUtf8(),
++        /* 19 */ "retry:".encodeUtf8()
++    )
++
++    private val CRLF = "\r\n".encodeUtf8()
++
++    @Throws(IOException::class)
++    private fun BufferedSource.readData(data: Buffer) {
++      data.writeByte('\n'.toInt())
++      readFully(data, indexOfElement(CRLF))
++      select(options) // Skip the newline bytes.
++    }
++
++    @Throws(IOException::class)
++    private fun BufferedSource.readRetryMs(): Long {
++      val retryString = readUtf8LineStrict()
++      return retryString.toLongOrDefault(-1L)
++    }
++  }
++}
+diff --git a/okhttp-sse/src/main/kotlin/okhttp3/sse/EventSources.kt b/okhttp-sse/src/main/kotlin/okhttp3/sse/EventSources.kt
+index cb6a3c1e7..fcb6a5550 100644
+--- a/okhttp-sse/src/main/kotlin/okhttp3/sse/EventSources.kt
++++ b/okhttp-sse/src/main/kotlin/okhttp3/sse/EventSources.kt
+@@ -17,7 +17,7 @@ package okhttp3.sse
+ 
+ import okhttp3.OkHttpClient
+ import okhttp3.Response
+-import okhttp3.sse.internal.RealEventSource
++import okhttp3.internal.sse.RealEventSource
+ 
+ object EventSources {
+   @JvmStatic
+diff --git a/okhttp-testing-support/src/main/kotlin/okhttp3/internal/io/InMemoryFileSystem.kt b/okhttp-testing-support/src/main/kotlin/okhttp3/internal/io/InMemoryFileSystem.kt
+index ac120bc47..f6832d2a6 100644
+--- a/okhttp-testing-support/src/main/kotlin/okhttp3/internal/io/InMemoryFileSystem.kt
++++ b/okhttp-testing-support/src/main/kotlin/okhttp3/internal/io/InMemoryFileSystem.kt
+@@ -31,7 +31,7 @@ import org.junit.runners.model.Statement
+ 
+ /** A simple file system where all files are held in memory. Not safe for concurrent use.  */
+ class InMemoryFileSystem : FileSystem, TestRule {
+-  val files = mutableMapOf<File, Buffer>()
++  private val files = mutableMapOf<File, Buffer>()
+   private val openSources = IdentityHashMap<Source, File>()
+   private val openSinks = IdentityHashMap<Sink, File>()
+ 
+diff --git a/okhttp/build.gradle b/okhttp/build.gradle
+index b4416288b..df42f4281 100644
+--- a/okhttp/build.gradle
++++ b/okhttp/build.gradle
+@@ -32,16 +32,6 @@ dependencies {
+   compileOnly deps.jsr305
+   compileOnly deps.animalSniffer
+ 
+-  // graal build support
+-  compileOnly("org.graalvm.nativeimage:svm:20.2.0") {
+-    // Avoid kapt tripping up on a non jar dependency.
+-    // Only annotations are needed here.
+-    // https://youtrack.jetbrains.com/issue/KT-29513
+-    exclude group: 'org.graalvm.nativeimage'
+-    exclude group: 'org.graalvm.truffle'
+-    exclude group: 'org.graalvm.compiler'
+-  }
+-
+   testImplementation project(':okhttp-testing-support')
+   testImplementation project(':okhttp-tls')
+   testImplementation project(':okhttp-urlconnection')
+diff --git a/okhttp/src/main/kotlin/okhttp3/internal/connection/Exchange.kt b/okhttp/src/main/kotlin/okhttp3/internal/connection/Exchange.kt
+index ca93f27c4..8d3696270 100644
+--- a/okhttp/src/main/kotlin/okhttp3/internal/connection/Exchange.kt
++++ b/okhttp/src/main/kotlin/okhttp3/internal/connection/Exchange.kt
+@@ -43,10 +43,14 @@ class Exchange(
+   internal val finder: ExchangeFinder,
+   private val codec: ExchangeCodec
+ ) {
+-  /** Returns true if the request body need not complete before the response body starts. */
++  /** True if the request body need not complete before the response body starts. */
+   internal var isDuplex: Boolean = false
+     private set
+ 
++  /** True if there was an exception on the connection to the peer. */
++  internal var hasFailure: Boolean = false
++    private set
++
+   internal val connection: RealConnection = codec.connection
+ 
+   internal val isCoalescedConnection: Boolean
+@@ -163,6 +167,7 @@ class Exchange(
+   }
+ 
+   private fun trackFailure(e: IOException) {
++    hasFailure = true
+     finder.trackFailure(e)
+     codec.connection.trackFailure(call, e)
+   }
+diff --git a/okhttp/src/main/kotlin/okhttp3/internal/graal/svm.kt b/okhttp/src/main/kotlin/okhttp3/internal/graal/svm.kt
+deleted file mode 100644
+index b609f7daf..000000000
+--- a/okhttp/src/main/kotlin/okhttp3/internal/graal/svm.kt
++++ /dev/null
+@@ -1,66 +0,0 @@
+-/*
+- * Copyright (C) 2020 Square, Inc.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-package okhttp3.internal.graal
+-
+-import com.oracle.svm.core.annotate.Delete
+-import com.oracle.svm.core.annotate.Substitute
+-import com.oracle.svm.core.annotate.TargetClass
+-import okhttp3.internal.platform.Android10Platform
+-import okhttp3.internal.platform.AndroidPlatform
+-import okhttp3.internal.platform.BouncyCastlePlatform
+-import okhttp3.internal.platform.ConscryptPlatform
+-import okhttp3.internal.platform.Jdk8WithJettyBootPlatform
+-import okhttp3.internal.platform.Jdk9Platform
+-import okhttp3.internal.platform.OpenJSSEPlatform
+-import okhttp3.internal.platform.Platform
+-
+-@TargetClass(AndroidPlatform::class)
+-@Delete
+-class TargetAndroidPlatform {
+-}
+-
+-@TargetClass(Android10Platform::class)
+-@Delete
+-class TargetAndroid10Platform {
+-}
+-
+-@TargetClass(BouncyCastlePlatform::class)
+-@Delete
+-class TargetBouncyCastlePlatform {
+-}
+-
+-@TargetClass(ConscryptPlatform::class)
+-@Delete
+-class TargetConscryptPlatform {
+-}
+-
+-@TargetClass(Jdk8WithJettyBootPlatform::class)
+-@Delete
+-class TargetJdk8WithJettyBootPlatform {
+-}
+-
+-@TargetClass(OpenJSSEPlatform::class)
+-@Delete
+-class TargetOpenJSSEPlatform {
+-}
+-
+-@TargetClass(Platform.Companion::class)
+-class TargetPlatform {
+-  @Substitute
+-  fun findPlatform(): Platform {
+-    return Jdk9Platform.buildIfSupported()!!
+-  }
+-}
+\ No newline at end of file
+diff --git a/okhttp/src/main/kotlin/okhttp3/internal/http/CallServerInterceptor.kt b/okhttp/src/main/kotlin/okhttp3/internal/http/CallServerInterceptor.kt
+index 7fdf9feee..6801154b3 100644
+--- a/okhttp/src/main/kotlin/okhttp3/internal/http/CallServerInterceptor.kt
++++ b/okhttp/src/main/kotlin/okhttp3/internal/http/CallServerInterceptor.kt
+@@ -20,6 +20,7 @@ import java.net.ProtocolException
+ import okhttp3.Interceptor
+ import okhttp3.Response
+ import okhttp3.internal.EMPTY_RESPONSE
++import okhttp3.internal.http2.ConnectionShutdownException
+ import okio.buffer
+ 
+ /** This is the last interceptor in the chain. It makes a network call to the server. */
+@@ -33,98 +34,118 @@ class CallServerInterceptor(private val forWebSocket: Boolean) : Interceptor {
+     val requestBody = request.body
+     val sentRequestMillis = System.currentTimeMillis()
+ 
+-    exchange.writeRequestHeaders(request)
+-
+     var invokeStartEvent = true
+     var responseBuilder: Response.Builder? = null
+-    if (HttpMethod.permitsRequestBody(request.method) && requestBody != null) {
+-      // If there's a "Expect: 100-continue" header on the request, wait for a "HTTP/1.1 100
+-      // Continue" response before transmitting the request body. If we don't get that, return
+-      // what we did get (such as a 4xx response) without ever transmitting the request body.
+-      if ("100-continue".equals(request.header("Expect"), ignoreCase = true)) {
+-        exchange.flushRequest()
+-        responseBuilder = exchange.readResponseHeaders(expectContinue = true)
+-        exchange.responseHeadersStart()
+-        invokeStartEvent = false
+-      }
+-      if (responseBuilder == null) {
+-        if (requestBody.isDuplex()) {
+-          // Prepare a duplex body so that the application can send a request body later.
++    var sendRequestException: IOException? = null
++    try {
++      exchange.writeRequestHeaders(request)
++
++      if (HttpMethod.permitsRequestBody(request.method) && requestBody != null) {
++        // If there's a "Expect: 100-continue" header on the request, wait for a "HTTP/1.1 100
++        // Continue" response before transmitting the request body. If we don't get that, return
++        // what we did get (such as a 4xx response) without ever transmitting the request body.
++        if ("100-continue".equals(request.header("Expect"), ignoreCase = true)) {
+           exchange.flushRequest()
+-          val bufferedRequestBody = exchange.createRequestBody(request, true).buffer()
+-          requestBody.writeTo(bufferedRequestBody)
++          responseBuilder = exchange.readResponseHeaders(expectContinue = true)
++          exchange.responseHeadersStart()
++          invokeStartEvent = false
++        }
++        if (responseBuilder == null) {
++          if (requestBody.isDuplex()) {
++            // Prepare a duplex body so that the application can send a request body later.
++            exchange.flushRequest()
++            val bufferedRequestBody = exchange.createRequestBody(request, true).buffer()
++            requestBody.writeTo(bufferedRequestBody)
++          } else {
++            // Write the request body if the "Expect: 100-continue" expectation was met.
++            val bufferedRequestBody = exchange.createRequestBody(request, false).buffer()
++            requestBody.writeTo(bufferedRequestBody)
++            bufferedRequestBody.close()
++          }
+         } else {
+-          // Write the request body if the "Expect: 100-continue" expectation was met.
+-          val bufferedRequestBody = exchange.createRequestBody(request, false).buffer()
+-          requestBody.writeTo(bufferedRequestBody)
+-          bufferedRequestBody.close()
++          exchange.noRequestBody()
++          if (!exchange.connection.isMultiplexed) {
++            // If the "Expect: 100-continue" expectation wasn't met, prevent the HTTP/1 connection
++            // from being reused. Otherwise we're still obligated to transmit the request body to
++            // leave the connection in a consistent state.
++            exchange.noNewExchangesOnConnection()
++          }
+         }
+       } else {
+         exchange.noRequestBody()
+-        if (!exchange.connection.isMultiplexed) {
+-          // If the "Expect: 100-continue" expectation wasn't met, prevent the HTTP/1 connection
+-          // from being reused. Otherwise we're still obligated to transmit the request body to
+-          // leave the connection in a consistent state.
+-          exchange.noNewExchangesOnConnection()
+-        }
+       }
+-    } else {
+-      exchange.noRequestBody()
+-    }
+ 
+-    if (requestBody == null || !requestBody.isDuplex()) {
+-      exchange.finishRequest()
+-    }
+-    if (responseBuilder == null) {
+-      responseBuilder = exchange.readResponseHeaders(expectContinue = false)!!
+-      if (invokeStartEvent) {
+-        exchange.responseHeadersStart()
+-        invokeStartEvent = false
++      if (requestBody == null || !requestBody.isDuplex()) {
++        exchange.finishRequest()
++      }
++    } catch (e: IOException) {
++      if (e is ConnectionShutdownException) {
++        throw e // No request was sent so there's no response to read.
++      }
++      if (!exchange.hasFailure) {
++        throw e // Don't attempt to read the response; we failed to send the request.
+       }
++      sendRequestException = e
+     }
+-    var response = responseBuilder
+-        .request(request)
+-        .handshake(exchange.connection.handshake())
+-        .sentRequestAtMillis(sentRequestMillis)
+-        .receivedResponseAtMillis(System.currentTimeMillis())
+-        .build()
+-    var code = response.code
+-    if (code == 100) {
+-      // Server sent a 100-continue even though we did not request one. Try again to read the actual
+-      // response status.
+-      responseBuilder = exchange.readResponseHeaders(expectContinue = false)!!
+-      if (invokeStartEvent) {
+-        exchange.responseHeadersStart()
++
++    try {
++      if (responseBuilder == null) {
++        responseBuilder = exchange.readResponseHeaders(expectContinue = false)!!
++        if (invokeStartEvent) {
++          exchange.responseHeadersStart()
++          invokeStartEvent = false
++        }
+       }
+-      response = responseBuilder
++      var response = responseBuilder
+           .request(request)
+           .handshake(exchange.connection.handshake())
+           .sentRequestAtMillis(sentRequestMillis)
+           .receivedResponseAtMillis(System.currentTimeMillis())
+           .build()
+-      code = response.code
+-    }
++      var code = response.code
++      if (code == 100) {
++        // Server sent a 100-continue even though we did not request one. Try again to read the
++        // actual response status.
++        responseBuilder = exchange.readResponseHeaders(expectContinue = false)!!
++        if (invokeStartEvent) {
++          exchange.responseHeadersStart()
++        }
++        response = responseBuilder
++            .request(request)
++            .handshake(exchange.connection.handshake())
++            .sentRequestAtMillis(sentRequestMillis)
++            .receivedResponseAtMillis(System.currentTimeMillis())
++            .build()
++        code = response.code
++      }
+ 
+-    exchange.responseHeadersEnd(response)
++      exchange.responseHeadersEnd(response)
+ 
+-    response = if (forWebSocket && code == 101) {
+-      // Connection is upgrading, but we need to ensure interceptors see a non-null response body.
+-      response.newBuilder()
+-          .body(EMPTY_RESPONSE)
+-          .build()
+-    } else {
+-      response.newBuilder()
+-          .body(exchange.openResponseBody(response))
+-          .build()
+-    }
+-    if ("close".equals(response.request.header("Connection"), ignoreCase = true) ||
+-        "close".equals(response.header("Connection"), ignoreCase = true)) {
+-      exchange.noNewExchangesOnConnection()
+-    }
+-    if ((code == 204 || code == 205) && response.body?.contentLength() ?: -1L > 0L) {
+-      throw ProtocolException(
+-          "HTTP $code had non-zero Content-Length: ${response.body?.contentLength()}")
++      response = if (forWebSocket && code == 101) {
++        // Connection is upgrading, but we need to ensure interceptors see a non-null response body.
++        response.newBuilder()
++            .body(EMPTY_RESPONSE)
++            .build()
++      } else {
++        response.newBuilder()
++            .body(exchange.openResponseBody(response))
++            .build()
++      }
++      if ("close".equals(response.request.header("Connection"), ignoreCase = true) ||
++          "close".equals(response.header("Connection"), ignoreCase = true)) {
++        exchange.noNewExchangesOnConnection()
++      }
++      if ((code == 204 || code == 205) && response.body?.contentLength() ?: -1L > 0L) {
++        throw ProtocolException(
++            "HTTP $code had non-zero Content-Length: ${response.body?.contentLength()}")
++      }
++      return response
++    } catch (e: IOException) {
++      if (sendRequestException != null) {
++        sendRequestException.addSuppressed(e)
++        throw sendRequestException
++      }
++      throw e
+     }
+-    return response
+   }
+ }
+diff --git a/okhttp/src/main/kotlin/okhttp3/internal/http1/Http1ExchangeCodec.kt b/okhttp/src/main/kotlin/okhttp3/internal/http1/Http1ExchangeCodec.kt
+index 156085e14..87f516a69 100644
+--- a/okhttp/src/main/kotlin/okhttp3/internal/http1/Http1ExchangeCodec.kt
++++ b/okhttp/src/main/kotlin/okhttp3/internal/http1/Http1ExchangeCodec.kt
+@@ -170,7 +170,9 @@ class Http1ExchangeCodec(
+   }
+ 
+   override fun readResponseHeaders(expectContinue: Boolean): Response.Builder? {
+-    check(state == STATE_OPEN_REQUEST_BODY || state == STATE_READ_RESPONSE_HEADERS) {
++    check(state == STATE_OPEN_REQUEST_BODY ||
++        state == STATE_WRITING_REQUEST_BODY ||
++        state == STATE_READ_RESPONSE_HEADERS) {
+       "state: $state"
+     }
+ 
+diff --git a/okhttp/src/main/kotlin/okhttp3/internal/http2/Http2ExchangeCodec.kt b/okhttp/src/main/kotlin/okhttp3/internal/http2/Http2ExchangeCodec.kt
+index d0b6b20de..eddc78a61 100644
+--- a/okhttp/src/main/kotlin/okhttp3/internal/http2/Http2ExchangeCodec.kt
++++ b/okhttp/src/main/kotlin/okhttp3/internal/http2/Http2ExchangeCodec.kt
+@@ -93,7 +93,8 @@ class Http2ExchangeCodec(
+   }
+ 
+   override fun readResponseHeaders(expectContinue: Boolean): Response.Builder? {
+-    val headers = stream!!.takeHeaders()
++    val stream = stream ?: throw IOException("stream wasn't created")
++    val headers = stream.takeHeaders()
+     val responseBuilder = readHttp2HeadersList(headers, protocol)
+     return if (expectContinue && responseBuilder.code == HTTP_CONTINUE) {
+       null
+diff --git a/okhttp/src/main/kotlin/okhttp3/internal/http2/Http2Stream.kt b/okhttp/src/main/kotlin/okhttp3/internal/http2/Http2Stream.kt
+index 73c261bfd..e8a6d7499 100644
+--- a/okhttp/src/main/kotlin/okhttp3/internal/http2/Http2Stream.kt
++++ b/okhttp/src/main/kotlin/okhttp3/internal/http2/Http2Stream.kt
+@@ -350,7 +350,7 @@ class Http2Stream internal constructor(
+         synchronized(this@Http2Stream) {
+           readTimeout.enter()
+           try {
+-            if (errorCode != null) {
++            if (errorCode != null && !finished) {
+               // Prepare to deliver an error.
+               errorExceptionToDeliver = errorException ?: StreamResetException(errorCode!!)
+             }

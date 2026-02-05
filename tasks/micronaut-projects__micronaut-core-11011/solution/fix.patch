@@ -1,0 +1,264 @@
+diff --git a/gradle/libs.versions.toml b/gradle/libs.versions.toml
+index cd17516c9f..220c435043 100644
+--- a/gradle/libs.versions.toml
++++ b/gradle/libs.versions.toml
+@@ -58,6 +58,7 @@ testcontainers = "1.19.8"
+ tomlj="1.1.1"
+ vertx = "4.5.9"
+ wiremock = "2.33.2"
++mimepull = "1.10.0"
+ 
+ #
+ # Versions which start with managed- are managed by Micronaut in the sense
+@@ -280,6 +281,7 @@ vertx = { module = "io.vertx:vertx-core", version.ref = "vertx" }
+ vertx-webclient = { module = "io.vertx:vertx-web-client", version.ref = "vertx" }
+ httpcomponents-client = { module = "org.apache.httpcomponents:httpclient", version.ref = "httpcomponents-client" }
+ httpcomponents-mime = { module = "org.apache.httpcomponents:httpmime", version.ref = "httpcomponents-client" }
++mimepull = { module = "org.jvnet.mimepull:mimepull", version.ref = "mimepull" }
+ 
+ wiremock = { module = "com.github.tomakehurst:wiremock-jre8", version.ref = "wiremock" }
+ 
+diff --git a/http-netty/src/main/java/io/micronaut/http/netty/body/NettyJsonHandler.java b/http-netty/src/main/java/io/micronaut/http/netty/body/NettyJsonHandler.java
+index 88d37150af..019c94cb9e 100644
+--- a/http-netty/src/main/java/io/micronaut/http/netty/body/NettyJsonHandler.java
++++ b/http-netty/src/main/java/io/micronaut/http/netty/body/NettyJsonHandler.java
+@@ -144,7 +144,7 @@ public final class NettyJsonHandler<T> implements MessageBodyHandler<T>, Chunked
+ 
+     @Override
+     public MessageBodyWriter<T> createSpecific(Argument<T> type) {
+-        return new NettyJsonHandler<>((JsonMessageHandler<T>) jsonMessageHandler.createSpecific(type));
++        return new NettyJsonHandler<>(jsonMessageHandler.createSpecific(type));
+     }
+ 
+     @Override
+diff --git a/http-server-netty/build.gradle b/http-server-netty/build.gradle
+index 860168c16f..e4d2a0d221 100644
+--- a/http-server-netty/build.gradle
++++ b/http-server-netty/build.gradle
+@@ -103,6 +103,8 @@ dependencies {
+     // Adding these for now since micronaut-test isnt resolving correctly ... probably need to upgrade gradle there too
+     testImplementation libs.junit.jupiter.api
+     testImplementation project(":websocket")
++
++    testImplementation(libs.mimepull)
+ }
+ 
+ tasks.withType(Test).configureEach {
+diff --git a/http-server-netty/src/main/java/io/micronaut/http/server/netty/binders/NettyBodyAnnotationBinder.java b/http-server-netty/src/main/java/io/micronaut/http/server/netty/binders/NettyBodyAnnotationBinder.java
+index 9438533c18..28986c5ae8 100644
+--- a/http-server-netty/src/main/java/io/micronaut/http/server/netty/binders/NettyBodyAnnotationBinder.java
++++ b/http-server-netty/src/main/java/io/micronaut/http/server/netty/binders/NettyBodyAnnotationBinder.java
+@@ -15,6 +15,7 @@
+  */
+ package io.micronaut.http.server.netty.binders;
+ 
++import io.micronaut.core.annotation.Internal;
+ import io.micronaut.core.convert.ArgumentConversionContext;
+ import io.micronaut.core.convert.ConversionContext;
+ import io.micronaut.core.convert.ConversionError;
+@@ -24,9 +25,8 @@ import io.micronaut.core.execution.ExecutionFlow;
+ import io.micronaut.core.io.buffer.ByteBuffer;
+ import io.micronaut.core.io.buffer.ReferenceCounted;
+ import io.micronaut.core.propagation.PropagatedContext;
+-import io.micronaut.core.type.Argument;
+-import io.micronaut.core.util.CollectionUtils;
+ import io.micronaut.http.HttpAttributes;
++import io.micronaut.http.HttpHeaders;
+ import io.micronaut.http.HttpRequest;
+ import io.micronaut.http.MediaType;
+ import io.micronaut.http.bind.binders.DefaultBodyAnnotationBinder;
+@@ -50,14 +50,12 @@ import io.netty.buffer.ByteBuf;
+ import io.netty.handler.codec.http.DefaultLastHttpContent;
+ import io.netty.handler.codec.http.multipart.InterfaceHttpData;
+ 
+-import java.io.InputStream;
+ import java.util.ArrayList;
+ import java.util.List;
+ import java.util.Optional;
+-import java.util.Set;
+ 
++@Internal
+ final class NettyBodyAnnotationBinder<T> extends DefaultBodyAnnotationBinder<T> {
+-    private static final Set<Class<?>> RAW_BODY_TYPES = CollectionUtils.setOf(String.class, byte[].class, ByteBuffer.class, InputStream.class);
+     final NettyHttpServerConfiguration httpServerConfiguration;
+     final MessageBodyHandlerRegistry bodyHandlerRegistry;
+ 
+@@ -69,10 +67,6 @@ final class NettyBodyAnnotationBinder<T> extends DefaultBodyAnnotationBinder<T>
+         this.bodyHandlerRegistry = bodyHandlerRegistry;
+     }
+ 
+-    public static boolean isRaw(Argument<?> bodyType) {
+-        return RAW_BODY_TYPES.contains(bodyType.getType());
+-    }
+-
+     @Override
+     protected BindingResult<T> bindBodyPart(ArgumentConversionContext<T> context, HttpRequest<?> source, String bodyComponent) {
+         if (source instanceof NettyHttpRequest<?> nhr && nhr.isFormOrMultipartData()) {
+@@ -149,56 +143,41 @@ final class NettyBodyAnnotationBinder<T> extends DefaultBodyAnnotationBinder<T>
+     }
+ 
+     Optional<T> transform(NettyHttpRequest<?> nhr, ArgumentConversionContext<T> context, AvailableByteBody imm) throws Throwable {
+-        if (!isRaw(context.getArgument())) {
+-            if (nhr.isFormOrMultipartData()) {
+-                FormDataHttpContentProcessor processor = new FormDataHttpContentProcessor(nhr, httpServerConfiguration);
+-                ByteBuf buf = AvailableNettyByteBody.toByteBuf(imm);
+-                List<InterfaceHttpData> result = new ArrayList<>();
+-                if (buf.isReadable()) {
+-                    processor.add(new DefaultLastHttpContent(buf), result);
+-                } else {
+-                    buf.release();
+-                }
+-                processor.complete(result);
+-                Optional<T> converted = new ImmediateMultiObjectBody(result)
+-                    .single(httpServerConfiguration.getDefaultCharset(), nhr.getChannelHandlerContext().alloc())
+-                    .convert(conversionService, context)
+-                    .map(o -> (T) o.claimForExternal());
+-                nhr.setLegacyBody(converted.orElse(null));
+-                return converted;
+-            }
+-            MessageBodyReader<T> reader = null;
+-            final RouteInfo<?> routeInfo = nhr.getAttribute(HttpAttributes.ROUTE_INFO, RouteInfo.class).orElse(null);
+-            if (routeInfo != null) {
+-                reader = (MessageBodyReader<T>) routeInfo.getMessageBodyReader();
+-            }
+-            MediaType mediaType = nhr.getContentType().orElse(null);
+-            if (mediaType != null) {
+-                if (reader == null) {
+-                    reader = bodyHandlerRegistry.findReader(context.getArgument(), List.of(mediaType)).orElse(null);
+-                }
+-                if (reader != null) {
+-                    ByteBuffer<?> byteBuffer = imm.toByteBuffer();
+-                    boolean success = false;
+-                    try {
+-                        T result = reader.read(context.getArgument(), mediaType, nhr.getHeaders(), byteBuffer);
+-                        success = true;
+-                        nhr.setLegacyBody(result);
+-                        return Optional.ofNullable(result);
+-                    } catch (CodecException ce) {
+-                        if (ce.getCause() instanceof Exception e) {
+-                            context.reject(e);
+-                        } else {
+-                            context.reject(ce);
+-                        }
+-                        return Optional.empty();
+-                    } finally {
+-                        if (!success && byteBuffer instanceof ReferenceCounted rc) {
+-                            rc.release();
+-                        }
+-                    }
+-                }
++        MessageBodyReader<T> reader = null;
++        final RouteInfo<?> routeInfo = nhr.getAttribute(HttpAttributes.ROUTE_INFO, RouteInfo.class).orElse(null);
++        if (routeInfo != null) {
++            reader = (MessageBodyReader<T>) routeInfo.getMessageBodyReader();
++        }
++        MediaType mediaType = nhr.getContentType().orElse(null);
++        if (mediaType != null && (reader == null || !reader.isReadable(context.getArgument(), mediaType))) {
++            reader = bodyHandlerRegistry.findReader(context.getArgument(), List.of(mediaType)).orElse(null);
++        }
++        if (reader != null && context.getArgument().getType().equals(Object.class)) {
++            // Prevent random object convertors
++            reader = null;
++        }
++        if (reader == null && nhr.isFormOrMultipartData()) {
++            FormDataHttpContentProcessor processor = new FormDataHttpContentProcessor(nhr, httpServerConfiguration);
++            ByteBuf buf = AvailableNettyByteBody.toByteBuf(imm);
++            List<InterfaceHttpData> data = new ArrayList<>();
++            if (buf.isReadable()) {
++                processor.add(new DefaultLastHttpContent(buf), data);
++            } else {
++                buf.release();
+             }
++            processor.complete(data);
++            Optional<T> converted = new ImmediateMultiObjectBody(data)
++                .single(httpServerConfiguration.getDefaultCharset(), nhr.getChannelHandlerContext().alloc())
++                .convert(conversionService, context)
++                .map(o -> (T) o.claimForExternal());
++            nhr.setLegacyBody(converted.orElse(null));
++            return converted;
++        }
++        ByteBuffer<?> byteBuffer = imm.toByteBuffer();
++        if (reader != null) {
++            T result = read(context, reader, nhr.getHeaders(), mediaType, byteBuffer);
++            nhr.setLegacyBody(result);
++            return Optional.ofNullable(result);
+         }
+         //noinspection unchecked
+         Optional<T> converted = new ImmediateSingleObjectBody(imm.toByteBuffer().asNativeBuffer())
+@@ -207,4 +186,24 @@ final class NettyBodyAnnotationBinder<T> extends DefaultBodyAnnotationBinder<T>
+         nhr.setLegacyBody(converted.orElse(null));
+         return converted;
+     }
++
++    private T read(ArgumentConversionContext<T> context, MessageBodyReader<T> reader, HttpHeaders headers, MediaType mediaType, ByteBuffer<?> byteBuffer) {
++        boolean success = false;
++        try {
++            T result = reader.read(context.getArgument(), mediaType, headers, byteBuffer);
++            success = true;
++            return result;
++        } catch (CodecException ce) {
++            if (ce.getCause() instanceof Exception e) {
++                context.reject(e);
++            } else {
++                context.reject(ce);
++            }
++            return null;
++        } finally {
++            if (!success && byteBuffer instanceof ReferenceCounted rc) {
++                rc.release();
++            }
++        }
++    }
+ }
+diff --git a/http-server/src/main/java/io/micronaut/http/server/RequestLifecycle.java b/http-server/src/main/java/io/micronaut/http/server/RequestLifecycle.java
+index a1df75544b..3bae8aab85 100644
+--- a/http-server/src/main/java/io/micronaut/http/server/RequestLifecycle.java
++++ b/http-server/src/main/java/io/micronaut/http/server/RequestLifecycle.java
+@@ -265,6 +265,7 @@ public class RequestLifecycle {
+ 
+         RouteMatch<?> errorRoute = routeExecutor.findErrorRoute(cause, declaringType, request);
+         if (errorRoute != null) {
++            RouteExecutor.setRouteAttributes(request, errorRoute);
+             if (routeExecutor.serverConfiguration.isLogHandledExceptions()) {
+                 routeExecutor.logException(cause);
+             }
+diff --git a/http-server/src/main/java/io/micronaut/http/server/RouteExecutor.java b/http-server/src/main/java/io/micronaut/http/server/RouteExecutor.java
+index 836d6c155a..2a1ddd188f 100644
+--- a/http-server/src/main/java/io/micronaut/http/server/RouteExecutor.java
++++ b/http-server/src/main/java/io/micronaut/http/server/RouteExecutor.java
+@@ -192,9 +192,13 @@ public final class RouteExecutor {
+     }
+ 
+     static void setRouteAttributes(HttpRequest<?> request, UriRouteMatch<Object, Object> route) {
++        setRouteAttributes(request, (RouteMatch<?>) route);
++        request.setAttribute(HttpAttributes.URI_TEMPLATE, route.getRouteInfo().getUriMatchTemplate().toString());
++    }
++
++    static void setRouteAttributes(HttpRequest<?> request, RouteMatch<?> route) {
+         request.setAttribute(HttpAttributes.ROUTE_MATCH, route);
+         request.setAttribute(HttpAttributes.ROUTE_INFO, route.getRouteInfo());
+-        request.setAttribute(HttpAttributes.URI_TEMPLATE, route.getRouteInfo().getUriMatchTemplate().toString());
+     }
+ 
+     /**
+@@ -347,6 +351,7 @@ public final class RouteExecutor {
+             if (LOG.isDebugEnabled()) {
+                 LOG.debug("Found matching exception handler for exception [{}]: {}", cause.getMessage(), errorRoute);
+             }
++            setRouteAttributes(httpRequest, errorRoute);
+             requestArgumentSatisfier.fulfillArgumentRequirementsBeforeFilters(errorRoute, httpRequest);
+         }
+ 
+diff --git a/json-core/src/main/java/io/micronaut/json/body/JsonMessageHandler.java b/json-core/src/main/java/io/micronaut/json/body/JsonMessageHandler.java
+index 602d79146b..808942ffbd 100644
+--- a/json-core/src/main/java/io/micronaut/json/body/JsonMessageHandler.java
++++ b/json-core/src/main/java/io/micronaut/json/body/JsonMessageHandler.java
+@@ -85,7 +85,7 @@ public final class JsonMessageHandler<T> implements MessageBodyHandler<T> {
+     }
+ 
+     @Override
+-    public MessageBodyWriter<T> createSpecific(Argument<T> type) {
++    public JsonMessageHandler<T> createSpecific(Argument<T> type) {
+         return new JsonMessageHandler<>(jsonMapper.createSpecific(type));
+     }
+ 

@@ -1,0 +1,150 @@
+diff --git a/docs/src/main/asciidoc/http-reference.adoc b/docs/src/main/asciidoc/http-reference.adoc
+index 5c612f97542..50d694c3754 100644
+--- a/docs/src/main/asciidoc/http-reference.adoc
++++ b/docs/src/main/asciidoc/http-reference.adoc
+@@ -636,3 +636,36 @@ Route order constants defined in `io.quarkus.vertx.http.runtime.RouteConstants`
+ | `10000` | `ROUTE_ORDER_DEFAULT` | Default route order (i.e. Static Resources, Servlet).
+ | `20000` | `ROUTE_ORDER_AFTER_DEFAULT` | Route without priority over the default route (add an offset from this value)
+ |===
++
++=== Undertow configuration
++
++The following configuration properties are available when using the Undertow servlet extension.
++
++[cols="3,1,1,5",options="header"]
++|===
++|Configuration property |Type |Default |Description
++
++|`quarkus.undertow.disallowed-methods`
++|list of string
++|`<empty>`
++|A list of HTTP methods that should be rejected with `405 Method Not Allowed`.
++Useful for disabling insecure methods such as `TRACE` or `TRACK`.
++
++Example:
++----
++quarkus.undertow.disallowed-methods=TRACE,TRACK
++----
++
++|`quarkus.undertow.record-request-start-time`
++|boolean
++|false
++|If enabled, Undertow records the request start timestamp.
++Useful for timing, logging and request tracing.
++
++|`quarkus.undertow.max-parameters`
++|int
++|1000
++|Maximum number of allowed HTTP parameters.
++Provides protection against parameter-based DoS attacks.
++
++|===
+\ No newline at end of file
+diff --git a/extensions/undertow/runtime/src/main/java/io/quarkus/undertow/runtime/ServletRuntimeConfig.java b/extensions/undertow/runtime/src/main/java/io/quarkus/undertow/runtime/ServletRuntimeConfig.java
+index 23d62eb3162..5b4481573b8 100644
+--- a/extensions/undertow/runtime/src/main/java/io/quarkus/undertow/runtime/ServletRuntimeConfig.java
++++ b/extensions/undertow/runtime/src/main/java/io/quarkus/undertow/runtime/ServletRuntimeConfig.java
+@@ -1,6 +1,7 @@
+ package io.quarkus.undertow.runtime;
+ 
+ import java.util.Optional;
++import java.util.Set;
+ 
+ import io.quarkus.runtime.annotations.ConfigPhase;
+ import io.quarkus.runtime.annotations.ConfigRoot;
+@@ -34,4 +35,17 @@ public interface ServletRuntimeConfig {
+      */
+     @WithDefault("1000")
+     int maxParameters();
++
++    /**
++     * A list of HTTP methods that are disallowed for servlet requests.
++     * Requests using these methods will be rejected before being processed.
++     */
++    Optional<Set<String>> disallowedMethods();
++
++    /**
++     * Whether to record the request start time for each HTTP request.
++     * Useful for access logs and response time metrics.
++     */
++    @WithDefault("false")
++    boolean recordRequestStartTime();
+ }
+diff --git a/extensions/undertow/runtime/src/main/java/io/quarkus/undertow/runtime/UndertowDeploymentRecorder.java b/extensions/undertow/runtime/src/main/java/io/quarkus/undertow/runtime/UndertowDeploymentRecorder.java
+index eab77cc4a03..278e2219b76 100644
+--- a/extensions/undertow/runtime/src/main/java/io/quarkus/undertow/runtime/UndertowDeploymentRecorder.java
++++ b/extensions/undertow/runtime/src/main/java/io/quarkus/undertow/runtime/UndertowDeploymentRecorder.java
+@@ -9,7 +9,9 @@
+ import java.util.ArrayList;
+ import java.util.Collections;
+ import java.util.EventListener;
++import java.util.HashSet;
+ import java.util.List;
++import java.util.Locale;
+ import java.util.Optional;
+ import java.util.Set;
+ import java.util.concurrent.CopyOnWriteArrayList;
+@@ -394,12 +396,28 @@ public void run() {
+ 
+         UndertowOptionMap.Builder undertowOptions = UndertowOptionMap.builder();
+         undertowOptions.set(UndertowOptions.MAX_PARAMETERS, servletRuntimeConfig.getValue().maxParameters());
++        undertowOptions.set(UndertowOptions.RECORD_REQUEST_START_TIME,
++                servletRuntimeConfig.getValue().recordRequestStartTime());
+         UndertowOptionMap undertowOptionMap = undertowOptions.getMap();
+ 
+         Set<String> compressMediaTypes = httpBuildTimeConfig.enableCompression()
+                 ? Set.copyOf(httpBuildTimeConfig.compressMediaTypes().get())
+                 : Collections.emptySet();
+ 
++        Set<String> disallowedMethods;
++        Optional<Set<String>> configured = servletRuntimeConfig.getValue().disallowedMethods();
++        if (configured.isPresent()) {
++            Set<String> normalized = new HashSet<>();
++            for (String method : configured.get()) {
++                if (method != null && !method.isBlank()) {
++                    normalized.add(method.trim().toUpperCase(Locale.ROOT));
++                }
++            }
++            disallowedMethods = normalized;
++        } else {
++            disallowedMethods = Collections.emptySet();
++        }
++
+         return new Handler<RoutingContext>() {
+             @Override
+             public void handle(RoutingContext event) {
+@@ -407,6 +425,14 @@ public void handle(RoutingContext event) {
+                     event.request().pause();
+                 }
+ 
++                boolean disallowedMethod = !disallowedMethods.isEmpty()
++                        && disallowedMethods.contains(event.request().method().name());
++
++                if (disallowedMethod) {
++                    event.response().setStatusCode(StatusCodes.METHOD_NOT_ALLOWED).end("Method Not Allowed");
++                    event.response().end();
++                    return;
++                }
+                 //we handle auth failure directly
+                 event.remove(QuarkusHttpUser.AUTH_FAILURE_HANDLER);
+ 
+@@ -450,6 +476,7 @@ public void run() {
+                         }
+                     });
+                 }
++
+             }
+         };
+     }
+@@ -822,9 +849,8 @@ public void setLength(final int length) {
+         }
+ 
+         /**
+-         * Encode the bytes into a String with a slightly modified Base64-algorithm
+-         * This code was written by Kevin Kelley <kelley@ruralnet.net>
+-         * and adapted by Thomas Peuss <jboss@peuss.de>
++         * Encode the bytes into a String with a slightly modified Base64-algorithm This code was written by Kevin Kelley
++         * <kelley@ruralnet.net> and adapted by Thomas Peuss <jboss@peuss.de>
+          *
+          * @param data The bytes you want to encode
+          * @return the encoded String

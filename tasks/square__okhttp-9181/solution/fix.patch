@@ -1,0 +1,421 @@
+diff --git a/okhttp-testing-support/src/main/kotlin/okhttp3/EventListenerRelay.kt b/okhttp-testing-support/src/main/kotlin/okhttp3/EventListenerRelay.kt
+new file mode 100644
+index 000000000..a66de098b
+--- /dev/null
++++ b/okhttp-testing-support/src/main/kotlin/okhttp3/EventListenerRelay.kt
+@@ -0,0 +1,49 @@
++/*
++ * Copyright (C) 2025 Square, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package okhttp3
++
++/**
++ * A special [EventListener] for testing the mechanics of event listeners.
++ *
++ * Each instance processes a single event on [call], and then adds a successor [EventListenerRelay]
++ * on the same [call] to process the next event.
++ *
++ * By forcing the list of listeners to change after every event, we can detect if buggy code caches
++ * a stale [EventListener] in a field or local variable.
++ */
++class EventListenerRelay(
++  val call: Call,
++  val eventRecorder: EventRecorder,
++) {
++  private val eventListenerAdapter =
++    EventListenerAdapter()
++      .apply {
++        listeners += ::onEvent
++      }
++
++  val eventListener: EventListener
++    get() = eventListenerAdapter
++
++  var eventCount = 0
++
++  private fun onEvent(callEvent: CallEvent) {
++    if (eventCount++ == 0) {
++      eventRecorder.logEvent(callEvent)
++      val next = EventListenerRelay(call, eventRecorder)
++      call.addEventListener(next.eventListener)
++    }
++  }
++}
+diff --git a/okhttp-testing-support/src/main/kotlin/okhttp3/EventRecorder.kt b/okhttp-testing-support/src/main/kotlin/okhttp3/EventRecorder.kt
+index dd2061cf0..2be9b6f83 100644
+--- a/okhttp-testing-support/src/main/kotlin/okhttp3/EventRecorder.kt
++++ b/okhttp-testing-support/src/main/kotlin/okhttp3/EventRecorder.kt
+@@ -120,7 +120,7 @@ open class EventRecorder(
+     }
+   }
+ 
+-  private fun logEvent(e: CallEvent) {
++  internal fun logEvent(e: CallEvent) {
+     for (lock in forbiddenLocks) {
+       assertThat(Thread.holdsLock(lock), lock.toString()).isFalse()
+     }
+diff --git a/okhttp-testing-support/src/main/kotlin/okhttp3/FailingCall.kt b/okhttp-testing-support/src/main/kotlin/okhttp3/FailingCall.kt
+index a29cd9883..dd88d25ab 100644
+--- a/okhttp-testing-support/src/main/kotlin/okhttp3/FailingCall.kt
++++ b/okhttp-testing-support/src/main/kotlin/okhttp3/FailingCall.kt
+@@ -33,6 +33,8 @@ open class FailingCall : Call {
+ 
+   override fun timeout(): Timeout = error("unexpected")
+ 
++  override fun addEventListener(eventListener: EventListener) = error("unexpected")
++
+   override fun <T : Any> tag(type: KClass<T>): T? = error("unexpected")
+ 
+   override fun <T> tag(type: Class<out T>): T? = error("unexpected")
+diff --git a/okhttp/api/android/okhttp.api b/okhttp/api/android/okhttp.api
+index 75e72ac69..91980d116 100644
+--- a/okhttp/api/android/okhttp.api
++++ b/okhttp/api/android/okhttp.api
+@@ -119,6 +119,7 @@ public final class okhttp3/CacheControl$Companion {
+ }
+ 
+ public abstract interface class okhttp3/Call : java/lang/Cloneable {
++	public abstract fun addEventListener (Lokhttp3/EventListener;)V
+ 	public abstract fun cancel ()V
+ 	public abstract fun clone ()Lokhttp3/Call;
+ 	public abstract fun enqueue (Lokhttp3/Callback;)V
+diff --git a/okhttp/api/jvm/okhttp.api b/okhttp/api/jvm/okhttp.api
+index 3c5e42435..493b859af 100644
+--- a/okhttp/api/jvm/okhttp.api
++++ b/okhttp/api/jvm/okhttp.api
+@@ -119,6 +119,7 @@ public final class okhttp3/CacheControl$Companion {
+ }
+ 
+ public abstract interface class okhttp3/Call : java/lang/Cloneable {
++	public abstract fun addEventListener (Lokhttp3/EventListener;)V
+ 	public abstract fun cancel ()V
+ 	public abstract fun clone ()Lokhttp3/Call;
+ 	public abstract fun enqueue (Lokhttp3/Callback;)V
+diff --git a/okhttp/src/commonJvmAndroid/kotlin/okhttp3/Call.kt b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/Call.kt
+index 75c95fc83..b4990ed92 100644
+--- a/okhttp/src/commonJvmAndroid/kotlin/okhttp3/Call.kt
++++ b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/Call.kt
+@@ -88,6 +88,19 @@ interface Call : Cloneable {
+    */
+   fun timeout(): Timeout
+ 
++  /**
++   * Configure this call to publish all future events to [eventListener], in addition to the
++   * listeners configured by [OkHttpClient.Builder.eventListener] and other calls to this function.
++   *
++   * If this call is later [cloned][clone], [eventListener] will not be notified of its events.
++   *
++   * There is no mechanism to remove an event listener. Implementations should instead ignore events
++   * that they are not interested in.
++   *
++   * @see EventListener for semantics and restrictions on listener implementations.
++   */
++  fun addEventListener(eventListener: EventListener)
++
+   /**
+    * Returns the tag attached with [type] as a key, or null if no tag is attached with that key.
+    *
+@@ -161,6 +174,9 @@ interface Call : Cloneable {
+    *   copy.tag(MyTag.class, () -> myTag);
+    * }
+    * ```
++   *
++   * If any event listeners were installed on this call with [addEventListener], they will not be
++   * installed on this copy.
+    */
+   public override fun clone(): Call
+ 
+diff --git a/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/cache/CacheInterceptor.kt b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/cache/CacheInterceptor.kt
+index 0e266c987..e76c977c2 100644
+--- a/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/cache/CacheInterceptor.kt
++++ b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/cache/CacheInterceptor.kt
+@@ -21,7 +21,6 @@ import java.net.HttpURLConnection.HTTP_GATEWAY_TIMEOUT
+ import java.net.HttpURLConnection.HTTP_NOT_MODIFIED
+ import java.util.concurrent.TimeUnit.MILLISECONDS
+ import okhttp3.Cache
+-import okhttp3.EventListener
+ import okhttp3.Headers
+ import okhttp3.Interceptor
+ import okhttp3.Protocol
+@@ -42,11 +41,11 @@ import okio.buffer
+ 
+ /** Serves requests from the cache and writes responses to the cache. */
+ class CacheInterceptor(
++  internal val call: RealCall,
+   internal val cache: Cache?,
+ ) : Interceptor {
+   @Throws(IOException::class)
+   override fun intercept(chain: Interceptor.Chain): Response {
+-    val call = chain.call()
+     val cacheCandidate = cache?.get(chain.request().requestForCache())
+ 
+     val now = System.currentTimeMillis()
+@@ -56,7 +55,6 @@ class CacheInterceptor(
+     val cacheResponse = strategy.cacheResponse
+ 
+     cache?.trackResponse(strategy)
+-    val listener = (call as? RealCall)?.eventListener ?: EventListener.NONE
+ 
+     if (cacheCandidate != null && cacheResponse == null) {
+       // The cache candidate wasn't applicable. Close it.
+@@ -75,7 +73,7 @@ class CacheInterceptor(
+         .receivedResponseAtMillis(System.currentTimeMillis())
+         .build()
+         .also {
+-          listener.satisfactionFailure(call, it)
++          call.eventListener.satisfactionFailure(call, it)
+         }
+     }
+ 
+@@ -86,14 +84,14 @@ class CacheInterceptor(
+         .cacheResponse(cacheResponse.stripBody())
+         .build()
+         .also {
+-          listener.cacheHit(call, it)
++          call.eventListener.cacheHit(call, it)
+         }
+     }
+ 
+     if (cacheResponse != null) {
+-      listener.cacheConditionalHit(call, cacheResponse)
++      call.eventListener.cacheConditionalHit(call, cacheResponse)
+     } else if (cache != null) {
+-      listener.cacheMiss(call)
++      call.eventListener.cacheMiss(call)
+     }
+ 
+     var networkResponse: Response? = null
+@@ -126,7 +124,7 @@ class CacheInterceptor(
+         cache!!.trackConditionalCacheHit()
+         cache.update(cacheResponse, response)
+         return response.also {
+-          listener.cacheHit(call, it)
++          call.eventListener.cacheHit(call, it)
+         }
+       } else {
+         cacheResponse.body.closeQuietly()
+@@ -149,7 +147,7 @@ class CacheInterceptor(
+         return cacheWritingResponse(cacheRequest, response).also {
+           if (cacheResponse != null) {
+             // This will log a conditional cache miss only.
+-            listener.cacheMiss(call)
++            call.eventListener.cacheMiss(call)
+           }
+         }
+       }
+diff --git a/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/connection/Exchange.kt b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/connection/Exchange.kt
+index 64a902a91..4a9f62004 100644
+--- a/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/connection/Exchange.kt
++++ b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/connection/Exchange.kt
+@@ -38,7 +38,6 @@ import okio.buffer
+  */
+ class Exchange(
+   internal val call: RealCall,
+-  internal val eventListener: EventListener,
+   internal val finder: ExchangeFinder,
+   private val codec: ExchangeCodec,
+ ) {
+@@ -59,11 +58,11 @@ class Exchange(
+   @Throws(IOException::class)
+   fun writeRequestHeaders(request: Request) {
+     try {
+-      eventListener.requestHeadersStart(call)
++      call.eventListener.requestHeadersStart(call)
+       codec.writeRequestHeaders(request)
+-      eventListener.requestHeadersEnd(call, request)
++      call.eventListener.requestHeadersEnd(call, request)
+     } catch (e: IOException) {
+-      eventListener.requestFailed(call, e)
++      call.eventListener.requestFailed(call, e)
+       trackFailure(e)
+       throw e
+     }
+@@ -76,7 +75,7 @@ class Exchange(
+   ): Sink {
+     this.isDuplex = duplex
+     val contentLength = request.body!!.contentLength()
+-    eventListener.requestBodyStart(call)
++    call.eventListener.requestBodyStart(call)
+     val rawRequestBody = codec.createRequestBody(request, contentLength)
+     return RequestBodySink(
+       delegate = rawRequestBody,
+@@ -90,7 +89,7 @@ class Exchange(
+     try {
+       codec.flushRequest()
+     } catch (e: IOException) {
+-      eventListener.requestFailed(call, e)
++      call.eventListener.requestFailed(call, e)
+       trackFailure(e)
+       throw e
+     }
+@@ -101,14 +100,14 @@ class Exchange(
+     try {
+       codec.finishRequest()
+     } catch (e: IOException) {
+-      eventListener.requestFailed(call, e)
++      call.eventListener.requestFailed(call, e)
+       trackFailure(e)
+       throw e
+     }
+   }
+ 
+   fun responseHeadersStart() {
+-    eventListener.responseHeadersStart(call)
++    call.eventListener.responseHeadersStart(call)
+   }
+ 
+   @Throws(IOException::class)
+@@ -118,14 +117,14 @@ class Exchange(
+       result?.initExchange(this)
+       return result
+     } catch (e: IOException) {
+-      eventListener.responseFailed(call, e)
++      call.eventListener.responseFailed(call, e)
+       trackFailure(e)
+       throw e
+     }
+   }
+ 
+   fun responseHeadersEnd(response: Response) {
+-    eventListener.responseHeadersEnd(call, response)
++    call.eventListener.responseHeadersEnd(call, response)
+   }
+ 
+   @Throws(IOException::class)
+@@ -142,7 +141,7 @@ class Exchange(
+         )
+       return RealResponseBody(contentType, contentLength, source.buffer())
+     } catch (e: IOException) {
+-      eventListener.responseFailed(call, e)
++      call.eventListener.responseFailed(call, e)
+       trackFailure(e)
+       throw e
+     }
+@@ -217,16 +216,16 @@ class Exchange(
+     }
+     if (requestDone) {
+       if (e != null) {
+-        eventListener.requestFailed(call, e)
++        call.eventListener.requestFailed(call, e)
+       } else {
+-        eventListener.requestBodyEnd(call, bytesRead)
++        call.eventListener.requestBodyEnd(call, bytesRead)
+       }
+     }
+     if (responseDone) {
+       if (e != null) {
+-        eventListener.responseFailed(call, e)
++        call.eventListener.responseFailed(call, e)
+       } else {
+-        eventListener.responseBodyEnd(call, bytesRead)
++        call.eventListener.responseBodyEnd(call, bytesRead)
+       }
+     }
+     return call.messageDone(
+@@ -273,7 +272,7 @@ class Exchange(
+       try {
+         if (invokeStartEvent) {
+           invokeStartEvent = false
+-          eventListener.requestBodyStart(call)
++          call.eventListener.requestBodyStart(call)
+         }
+         super.write(source, byteCount)
+         this.bytesReceived += byteCount
+@@ -347,7 +346,7 @@ class Exchange(
+ 
+         if (invokeStartEvent) {
+           invokeStartEvent = false
+-          eventListener.responseBodyStart(call)
++          call.eventListener.responseBodyStart(call)
+         }
+ 
+         if (read == -1L) {
+@@ -390,7 +389,7 @@ class Exchange(
+       // If the body is closed without reading any bytes send a responseBodyStart() now.
+       if (e == null && invokeStartEvent) {
+         invokeStartEvent = false
+-        eventListener.responseBodyStart(call)
++        call.eventListener.responseBodyStart(call)
+       }
+       return bodyComplete(
+         bytesRead = bytesReceived,
+diff --git a/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/connection/RealCall.kt b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/connection/RealCall.kt
+index ad13414a1..e2a4f7381 100644
+--- a/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/connection/RealCall.kt
++++ b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/connection/RealCall.kt
+@@ -26,6 +26,7 @@ import java.util.concurrent.TimeUnit.MILLISECONDS
+ import java.util.concurrent.atomic.AtomicBoolean
+ import java.util.concurrent.atomic.AtomicInteger
+ import java.util.concurrent.atomic.AtomicReference
++import java.util.concurrent.atomic.AtomicReferenceFieldUpdater
+ import kotlin.reflect.KClass
+ import okhttp3.Call
+ import okhttp3.Callback
+@@ -70,7 +71,8 @@ class RealCall(
+   Lockable {
+   private val connectionPool: RealConnectionPool = client.connectionPool.delegate
+ 
+-  internal val eventListener: EventListener = client.eventListenerFactory.create(this)
++  @Volatile
++  internal var eventListener: EventListener = client.eventListenerFactory.create(this)
+ 
+   private val timeout =
+     object : AsyncTimeout() {
+@@ -126,6 +128,13 @@ class RealCall(
+ 
+   override fun timeout(): Timeout = timeout
+ 
++  override fun addEventListener(eventListener: EventListener) {
++    // Atomically replace the current eventListener with a composite one.
++    do {
++      val previous = this.eventListener
++    } while (!eventListenerUpdater.compareAndSet(this, previous, previous + eventListener))
++  }
++
+   override fun <T : Any> tag(type: KClass<T>): T? = type.java.cast(tags.get()[type])
+ 
+   override fun <T> tag(type: Class<out T>): T? = tag(type.kotlin)
+@@ -202,7 +211,7 @@ class RealCall(
+     interceptors += client.interceptors
+     interceptors += RetryAndFollowUpInterceptor(client)
+     interceptors += BridgeInterceptor(client.cookieJar)
+-    interceptors += CacheInterceptor(client.cache)
++    interceptors += CacheInterceptor(this, client.cache)
+     interceptors += ConnectInterceptor
+     if (!forWebSocket) {
+       interceptors += client.networkInterceptors
+@@ -297,7 +306,7 @@ class RealCall(
+     val exchangeFinder = this.exchangeFinder!!
+     val connection = exchangeFinder.find()
+     val codec = connection.newCodec(client, chain)
+-    val result = Exchange(this, eventListener, exchangeFinder, codec)
++    val result = Exchange(this, exchangeFinder, codec)
+     this.interceptorScopedExchange = result
+     this.exchange = result
+     withLock {
+@@ -608,4 +617,13 @@ class RealCall(
+      */
+     val callStackTrace: Any?,
+   ) : WeakReference<RealCall>(referent)
++
++  private companion object {
++    val eventListenerUpdater: AtomicReferenceFieldUpdater<RealCall, EventListener> =
++      AtomicReferenceFieldUpdater.newUpdater(
++        RealCall::class.java,
++        EventListener::class.java,
++        "eventListener",
++      )
++  }
+ }

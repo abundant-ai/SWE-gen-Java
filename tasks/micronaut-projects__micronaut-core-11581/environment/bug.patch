@@ -1,0 +1,233 @@
+diff --git a/.github/workflows/gradle.yml b/.github/workflows/gradle.yml
+index 9c4c534141..4bd7b30547 100644
+--- a/.github/workflows/gradle.yml
++++ b/.github/workflows/gradle.yml
+@@ -30,6 +30,8 @@ jobs:
+       PREDICTIVE_TEST_SELECTION: "${{ github.event_name == 'pull_request' && 'true' || 'false' }}"
+       SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
++      OSS_INDEX_USERNAME: ${{ secrets.OSS_INDEX_USERNAME }}
++      OSS_INDEX_PASSWORD: ${{ secrets.OSS_INDEX_PASSWORD }}
+     steps:
+        # https://github.com/actions/virtual-environments/issues/709
+       - name: "🗑 Free disk space"
+@@ -61,7 +63,7 @@ jobs:
+       - name: "🚔 Sonatype Scan"
+         id: sonatypescan
+         run: |
+-          ./gradlew ossIndexAudit --no-parallel
++          ./gradlew ossIndexAudit --info --no-parallel
+ 
+       - name: "🛠 Build with Gradle"
+         id: gradle
+diff --git a/buildSrc/src/main/groovy/io/micronaut/build/internal/io.micronaut.build.internal.convention-core-library.gradle b/buildSrc/src/main/groovy/io/micronaut/build/internal/io.micronaut.build.internal.convention-core-library.gradle
+index 4b3f777468..dad5d95a73 100644
+--- a/buildSrc/src/main/groovy/io/micronaut/build/internal/io.micronaut.build.internal.convention-core-library.gradle
++++ b/buildSrc/src/main/groovy/io/micronaut/build/internal/io.micronaut.build.internal.convention-core-library.gradle
+@@ -9,6 +9,10 @@ if (sonatypePluginConfigured) {
+ ossIndexAudit {
+     username = ossIndexUsername
+     password = ossIndexPassword
++    excludeVulnerabilityIds = ["CVE-2025-24970"] // the vulnerability description says Netty 4.1.118 patches it. However, Netty 4.1.118 is still reported as vulnerable.
++    // https://ossindex.sonatype.org/vulnerability/CVE-2025-24970?component-type=maven&component-name=io.netty/netty-handler
++    // > Version 4.1.118.Final contains a patch
++    // SslHandler doesn't correctly validate packets which can lead to native crash when using native SSLEngine https://netty.io/news/2025/02/10/4-1-118-Final.html
+ }
+ }
+ 
+diff --git a/context/src/main/java/io/micronaut/runtime/converters/time/TimeConverterRegistrar.java b/context/src/main/java/io/micronaut/runtime/converters/time/TimeConverterRegistrar.java
+index bee86b8f2f..34445dcd18 100644
+--- a/context/src/main/java/io/micronaut/runtime/converters/time/TimeConverterRegistrar.java
++++ b/context/src/main/java/io/micronaut/runtime/converters/time/TimeConverterRegistrar.java
+@@ -89,7 +89,7 @@ import static java.time.temporal.ChronoField.YEAR;
+ @Internal
+ public class TimeConverterRegistrar implements TypeConverterRegistrar {
+ 
+-    private static final Pattern PERIOD_MATCHER = Pattern.compile("^(-?\\d+)([unywmMdD])(s?)$");
++    private static final Pattern PERIOD_MATCHER = Pattern.compile("^(-?\\d+)([unywmd])(s?)$");
+     private static final Pattern DURATION_MATCHER = Pattern.compile("^(-?\\d+)([unsmhd])(s?)$");
+     private static final int MILLIS = 3;
+ 
+@@ -141,6 +141,13 @@ public class TimeConverterRegistrar implements TypeConverterRegistrar {
+             (integer, targetType, context) -> durationConverter.apply(integer.toString(), context)
+         );
+ 
++        // CharSequence -> TemporalAmount
++        conversionService.addConverter(
++            CharSequence.class,
++            TemporalAmount.class,
++            (object, targetType, context) -> durationConverter.apply(object, context).map(TemporalAmount.class::cast)
++        );
++
+         final BiFunction<CharSequence, ConversionContext, Optional<Period>> periodConverter = periodConverter();
+ 
+         // CharSequence -> Period
+@@ -161,17 +168,7 @@ public class TimeConverterRegistrar implements TypeConverterRegistrar {
+         conversionService.addConverter(
+             CharSequence.class,
+             TemporalAmount.class,
+-            (object, targetType, context) -> {
+-                var str = object.toString();
+-                if (str.contains("y")
+-                    || str.contains("M")
+-                    || str.contains("w")
+-                    || str.contains("D")
+-                ) {
+-                    return periodConverter.apply(object, context).map(TemporalAmount.class::cast);
+-                }
+-                return durationConverter.apply(object, context).map(TemporalAmount.class::cast);
+-            }
++            (object, targetType, context) -> periodConverter.apply(object, context).map(TemporalAmount.class::cast)
+         );
+ 
+         addTemporalStringConverters(conversionService, Instant.class, DateTimeFormatter.ISO_INSTANT, Instant::from);
+@@ -392,13 +389,13 @@ public class TimeConverterRegistrar implements TypeConverterRegistrar {
+                             case 'y' -> {
+                                 return Optional.of(Period.ofYears(Integer.parseInt(amount)));
+                             }
+-                            case 'm', 'M' -> {
++                            case 'm' -> {
+                                 return Optional.of(Period.ofMonths(Integer.parseInt(amount)));
+                             }
+                             case 'w' -> {
+                                 return Optional.of(Period.ofWeeks(Integer.parseInt(amount)));
+                             }
+-                            case 'd', 'D' -> {
++                            case 'd' -> {
+                                 return Optional.of(Period.ofDays(Integer.parseInt(amount)));
+                             }
+                             default -> {
+diff --git a/core/src/main/java/io/micronaut/core/convert/DefaultMutableConversionService.java b/core/src/main/java/io/micronaut/core/convert/DefaultMutableConversionService.java
+index cf64700dc9..db48937a9c 100644
+--- a/core/src/main/java/io/micronaut/core/convert/DefaultMutableConversionService.java
++++ b/core/src/main/java/io/micronaut/core/convert/DefaultMutableConversionService.java
+@@ -326,11 +326,11 @@ public class DefaultMutableConversionService implements MutableConversionService
+ 
+                     @Override
+                     public Optional<T> convert(String value, Class<T> targetType, ConversionContext context) {
+-                        return typeConverter.convert((S) value.toString(), (Class<T>) CharSequence.class, context);
++                        return typeConverter.convert((S) ((CharSequence) value).toString(), (Class<T>) CharSequence.class, context);
+                     }
+                 };
+             } else {
+-                converter = (value, theTarget, context) -> typeConverter.convert((S) value.toString(), theTarget, context);
++                converter = (value, theTarget, context) -> typeConverter.convert((S) ((CharSequence) value).toString(), theTarget, context);
+             }
+             addConverterToMap(typeConverters, String.class, targetType, converter);
+         } else if (sourceType == String.class) {
+diff --git a/gradle.properties b/gradle.properties
+index a2748e47ce..c07f5b6451 100644
+--- a/gradle.properties
++++ b/gradle.properties
+@@ -1,4 +1,4 @@
+-projectVersion=4.7.14-SNAPSHOT
++projectVersion=4.7.15-SNAPSHOT
+ projectGroupId=io.micronaut
+ projectDesc=Core components supporting the Micronaut Framework
+ title=Micronaut Core
+diff --git a/gradle/libs.versions.toml b/gradle/libs.versions.toml
+index 2ff1bba0e8..1dda164ba3 100644
+--- a/gradle/libs.versions.toml
++++ b/gradle/libs.versions.toml
+@@ -74,17 +74,17 @@ managed-jackson-databind = "2.17.0"
+ managed-kotlin = "1.9.25"
+ managed-kotlin-coroutines = "1.8.1"
+ managed-methvin-directory-watcher = "0.18.0"
+-managed-netty = "4.1.116.Final"
++managed-netty = "4.1.118.Final"
+ managed-netty-iouring = "0.0.25.Final"
+ managed-netty-http3 = "0.0.28.Final"
+-managed-netty-tcnative = "2.0.69.Final"
++managed-netty-tcnative = "2.0.70.Final"
+ managed-reactive-streams = "1.0.4"
+ # This should be kept aligned with https://github.com/micronaut-projects/micronaut-reactor/blob/master/gradle.properties from the BOM
+ managed-reactor = "3.6.10"
+ managed-snakeyaml = "2.2"
+ managed-java-parser-core = "3.26.3"
+ managed-ksp = "1.9.25-1.0.20"
+-sonatype-scan = "2.8.3"
++sonatype-scan = "3.0.0"
+ micronaut-docs = "2.0.0"
+ 
+ [libraries]
+diff --git a/http/src/main/java/io/micronaut/http/cookie/Cookie.java b/http/src/main/java/io/micronaut/http/cookie/Cookie.java
+index 78dda16db8..6a44989fd1 100644
+--- a/http/src/main/java/io/micronaut/http/cookie/Cookie.java
++++ b/http/src/main/java/io/micronaut/http/cookie/Cookie.java
+@@ -15,10 +15,9 @@
+  */
+ package io.micronaut.http.cookie;
+ 
++import io.micronaut.core.util.ArgumentUtils;
+ import io.micronaut.core.annotation.NonNull;
+ import io.micronaut.core.annotation.Nullable;
+-import io.micronaut.core.util.ArgumentUtils;
+-
+ import java.io.Serializable;
+ import java.time.temporal.ChronoUnit;
+ import java.time.temporal.TemporalAmount;
+diff --git a/runtime/src/test/groovy/io/micronaut/runtime/converters/time/TimeConverterRegistrarSpec.groovy b/runtime/src/test/groovy/io/micronaut/runtime/converters/time/TimeConverterRegistrarSpec.groovy
+index 85b0ed5e07..9730049e5a 100644
+--- a/runtime/src/test/groovy/io/micronaut/runtime/converters/time/TimeConverterRegistrarSpec.groovy
++++ b/runtime/src/test/groovy/io/micronaut/runtime/converters/time/TimeConverterRegistrarSpec.groovy
+@@ -16,8 +16,6 @@
+ package io.micronaut.runtime.converters.time
+ 
+ import io.micronaut.core.convert.DefaultMutableConversionService
+-import java.time.temporal.ChronoUnit
+-import java.time.temporal.TemporalAmount
+ import spock.lang.Specification
+ import spock.lang.Unroll
+ 
+@@ -49,12 +47,12 @@ class TimeConverterRegistrarSpec extends Specification {
+ 
+         where:
+         val    | expected
+-        '10ns' | Duration.ofNanos(10)
+         '10ms' | Duration.ofMillis(10)
+         '10s'  | Duration.ofSeconds(10)
+         '10m'  | Duration.ofMinutes(10)
+-        '10h'  | Duration.ofHours(10)
+         '10d'  | Duration.ofDays(10)
++        '10h'  | Duration.ofHours(10)
++        '10ns' | Duration.ofNanos(10)
+     }
+ 
+     @Unroll
+@@ -68,34 +66,10 @@ class TimeConverterRegistrarSpec extends Specification {
+ 
+         where:
+         val   | expected
+-        '10d' | Period.ofDays(10)
+-        '10D' | Period.ofDays(10)
+-        '10w' | Period.ofWeeks(10)
+-        '10m' | Period.ofMonths(10)
+-        '10M' | Period.ofMonths(10)
+         '10y' | Period.ofYears(10)
+-    }
+-
+-    @Unroll
+-    void "test convert to TemporalAmount #val"() {
+-        given:
+-        def conversionService = new DefaultMutableConversionService()
+-        new TimeConverterRegistrar().register(conversionService)
+-
+-        expect:
+-        conversionService.convert(val, TemporalAmount).get() == expected
+-
+-        where:
+-        val   | expected
+-        '10ns' | Duration.ofNanos(10)
+-        '10ms' | Duration.ofMillis(10)
+-        '10s' | Duration.ofSeconds(10)
+-        '10m' | Duration.ofMinutes(10)
+-        '10d' | Duration.ofDays(10)
+-        '10D' | Period.ofDays(10)
+-        '10M' | Period.ofMonths(10)
++        '10m' | Period.ofMonths(10)
+         '10w' | Period.ofWeeks(10)
+-        '10y' | Period.ofYears(10)
++        '10d' | Period.ofDays(10)
+     }
+ 
+     @Unroll

@@ -1,0 +1,174 @@
+diff --git a/gradle/libs.versions.toml b/gradle/libs.versions.toml
+index 7fbf9f8ee..c6c9fd129 100644
+--- a/gradle/libs.versions.toml
++++ b/gradle/libs.versions.toml
+@@ -106,3 +106,4 @@ squareup-okio-fakefilesystem = { module = "com.squareup.okio:okio-fakefilesystem
+ squareup-okio-nodefilesystem = { module = "com.squareup.okio:okio-nodefilesystem", version.ref = "com-squareup-okio" }
+ testcontainers = { module = "org.testcontainers:testcontainers", version.ref = "testcontainers" }
+ testcontainers-junit5 = { module = "org.testcontainers:junit-jupiter", version.ref = "testcontainers" }
++zstd-kmp-okio = { module = "com.squareup.zstd:zstd-kmp-okio", version = "0.3.0" }
+diff --git a/okhttp-zstd/README.md b/okhttp-zstd/README.md
+new file mode 100644
+index 000000000..4dabca5ea
+--- /dev/null
++++ b/okhttp-zstd/README.md
+@@ -0,0 +1,20 @@
++OkHttp Zstandard (zstd) Integration
++===================================
++
++This module enables [Zstandard (zstd)][1] response compression in addition to Gzip, as long as
++the `Accept-Encoding` header is not otherwise set. Web servers must be configured to return zstd
++responses.
++
++Note that zstd is not used for sending requests.
++
++```java
++OkHttpClient client = new OkHttpClient.Builder()
++  .addInterceptor(ZstdInterceptor.INSTANCE)
++  .build();
++```
++
++```kotlin
++implementation("com.squareup.okhttp3:okhttp-zstd:0.0.0")
++```
++
++ [1]: https://github.com/facebook/zstd
+diff --git a/okhttp-zstd/api/okhttp-zstd.api b/okhttp-zstd/api/okhttp-zstd.api
+new file mode 100644
+index 000000000..af53dcaff
+--- /dev/null
++++ b/okhttp-zstd/api/okhttp-zstd.api
+@@ -0,0 +1,5 @@
++public final class okhttp3/zstd/ZstdInterceptor : okhttp3/Interceptor {
++	public static final field INSTANCE Lokhttp3/zstd/ZstdInterceptor;
++	public fun intercept (Lokhttp3/Interceptor$Chain;)Lokhttp3/Response;
++}
++
+diff --git a/okhttp-zstd/build.gradle.kts b/okhttp-zstd/build.gradle.kts
+new file mode 100644
+index 000000000..359eb646a
+--- /dev/null
++++ b/okhttp-zstd/build.gradle.kts
+@@ -0,0 +1,29 @@
++import com.vanniktech.maven.publish.JavadocJar
++import com.vanniktech.maven.publish.KotlinJvm
++
++plugins {
++  kotlin("jvm")
++  id("org.jetbrains.dokka")
++  id("com.vanniktech.maven.publish.base")
++  id("binary-compatibility-validator")
++}
++
++project.applyOsgi(
++  "Export-Package: okhttp3.zstd",
++  "Automatic-Module-Name: okhttp3.zstd",
++  "Bundle-SymbolicName: com.squareup.okhttp3.zstd"
++)
++
++dependencies {
++  api(projects.okhttp)
++  implementation(libs.zstd.kmp.okio)
++
++  testImplementation(projects.okhttpTestingSupport)
++  testImplementation(libs.kotlin.test.common)
++  testImplementation(libs.kotlin.test.junit)
++  testImplementation(libs.assertk)
++}
++
++mavenPublishing {
++  configure(KotlinJvm(javadocJar = JavadocJar.Empty()))
++}
+diff --git a/okhttp-zstd/src/main/kotlin/okhttp3/zstd/ZstdInterceptor.kt b/okhttp-zstd/src/main/kotlin/okhttp3/zstd/ZstdInterceptor.kt
+new file mode 100644
+index 000000000..82d3dd41e
+--- /dev/null
++++ b/okhttp-zstd/src/main/kotlin/okhttp3/zstd/ZstdInterceptor.kt
+@@ -0,0 +1,75 @@
++/*
++ * Copyright (C) 2025 Square, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package okhttp3.zstd
++
++import com.squareup.zstd.okio.zstdDecompress
++import okhttp3.Interceptor
++import okhttp3.Response
++import okhttp3.ResponseBody.Companion.asResponseBody
++import okhttp3.internal.http.promisesBody
++import okio.buffer
++import okio.gzip
++
++/**
++ * Transparent Zstandard response support.
++ *
++ * This must be installed as an application interceptor.
++ *
++ * Adds `Accept-Encoding: zstd,gzip` to request and checks (and strips) for `Content-Encoding: zstd`
++ * in responses.
++ *
++ * This replaces the transparent gzip compression in OkHttp.
++ */
++object ZstdInterceptor : Interceptor {
++  override fun intercept(chain: Interceptor.Chain): Response {
++    val originalRequest = chain.request()
++
++    if (originalRequest.header("Accept-Encoding") != null) {
++      return chain.proceed(originalRequest)
++    }
++
++    val request =
++      originalRequest
++        .newBuilder()
++        .header("Accept-Encoding", "zstd,gzip")
++        .build()
++
++    return decompress(chain.proceed(request))
++  }
++
++  internal fun decompress(response: Response): Response {
++    if (!response.promisesBody()) {
++      return response
++    }
++
++    val body = response.body
++    val encoding = response.header("Content-Encoding") ?: return response
++
++    val decompressedSource =
++      when {
++        encoding.equals("zstd", ignoreCase = true) -> body.source().zstdDecompress()
++        encoding.equals("gzip", ignoreCase = true) -> body.source().gzip()
++        else -> return response
++      }
++
++    return response
++      .newBuilder()
++      .removeHeader("Content-Encoding")
++      .removeHeader("Content-Length")
++      .body(decompressedSource.buffer().asResponseBody(body.contentType(), -1L))
++      .build()
++  }
++}
+diff --git a/settings.gradle.kts b/settings.gradle.kts
+index 41b6eb1b1..c478b9158 100644
+--- a/settings.gradle.kts
++++ b/settings.gradle.kts
+@@ -42,6 +42,7 @@ include(":okhttp-sse")
+ include(":okhttp-testing-support")
+ include(":okhttp-tls")
+ include(":okhttp-urlconnection")
++include(":okhttp-zstd")
+ include(":samples:compare")
+ include(":samples:crawler")
+ include(":samples:guide")

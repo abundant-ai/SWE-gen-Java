@@ -1,0 +1,884 @@
+diff --git a/mockwebserver-deprecated/src/main/kotlin/okhttp3/mockwebserver/DeprecationBridge.kt b/mockwebserver-deprecated/src/main/kotlin/okhttp3/mockwebserver/DeprecationBridge.kt
+index 337fc26fe..d6813ff4b 100644
+--- a/mockwebserver-deprecated/src/main/kotlin/okhttp3/mockwebserver/DeprecationBridge.kt
++++ b/mockwebserver-deprecated/src/main/kotlin/okhttp3/mockwebserver/DeprecationBridge.kt
+@@ -31,7 +31,6 @@ import mockwebserver3.SocketPolicy.ShutdownOutputAtEnd
+ import mockwebserver3.SocketPolicy.ShutdownServerAfterResponse
+ import mockwebserver3.SocketPolicy.StallSocketAtStart
+ import okio.Buffer
+-import okio.ByteString
+ 
+ internal fun Dispatcher.wrap(): mockwebserver3.Dispatcher {
+   if (this is QueueDispatcher) return this.delegate
+@@ -99,7 +98,7 @@ internal fun mockwebserver3.RecordedRequest.unwrap(): RecordedRequest =
+     headers = headers,
+     chunkSizes = chunkSizes,
+     bodySize = bodySize,
+-    body = Buffer().write(body ?: ByteString.EMPTY),
++    body = Buffer().write(body),
+     sequenceNumber = sequenceNumber,
+     failure = failure,
+     method = method,
+diff --git a/mockwebserver/src/main/kotlin/mockwebserver3/MockWebServer.kt b/mockwebserver/src/main/kotlin/mockwebserver3/MockWebServer.kt
+index 4e637e076..c63d01e2f 100644
+--- a/mockwebserver/src/main/kotlin/mockwebserver3/MockWebServer.kt
++++ b/mockwebserver/src/main/kotlin/mockwebserver3/MockWebServer.kt
+@@ -95,7 +95,6 @@ import okhttp3.internal.ws.WebSocketProtocol
+ import okio.Buffer
+ import okio.BufferedSink
+ import okio.BufferedSource
+-import okio.ByteString
+ import okio.Sink
+ import okio.Timeout
+ import okio.buffer
+@@ -660,13 +659,13 @@ public class MockWebServer : Closeable {
+   ) {
+     val request =
+       RecordedRequest(
+-        requestLine = DEFAULT_REQUEST_LINE,
+-        headers = headersOf(),
+-        chunkSizes = emptyList(),
+-        bodySize = 0L,
+-        body = null,
+-        sequenceNumber = sequenceNumber,
+-        socket = socket,
++        DEFAULT_REQUEST_LINE,
++        headersOf(),
++        emptyList(),
++        0L,
++        Buffer(),
++        sequenceNumber,
++        socket,
+       )
+     atomicRequestCount.incrementAndGet()
+     requestQueue.add(request)
+@@ -685,7 +684,6 @@ public class MockWebServer : Closeable {
+     val headers = Headers.Builder()
+     var contentLength = -1L
+     var chunked = false
+-    var hasBody = false
+     val requestBody = TruncatingBuffer(bodyLimit)
+     val chunkSizes = mutableListOf<Int>()
+     var failure: IOException? = null
+@@ -719,6 +717,7 @@ public class MockWebServer : Closeable {
+         writeHttpResponse(socket, sink, response)
+       }
+ 
++      var hasBody = false
+       val policy = dispatcher.peek()
+       val requestBodySink =
+         requestBody
+@@ -731,11 +730,11 @@ public class MockWebServer : Closeable {
+       requestBodySink.use {
+         when {
+           policy.socketPolicy is DoNotReadRequestBody -> {
+-            hasBody = false // Ignore the body completely.
++            // Ignore the body completely.
+           }
+ 
+           contentLength != -1L -> {
+-            hasBody = contentLength > 0L || HttpMethod.permitsRequestBody(request.method)
++            hasBody = contentLength > 0L
+             requestBodySink.write(source, contentLength)
+           }
+ 
+@@ -753,9 +752,7 @@ public class MockWebServer : Closeable {
+             }
+           }
+ 
+-          else -> {
+-            hasBody = false // No request body.
+-          }
++          else -> Unit // No request body.
+         }
+       }
+ 
+@@ -771,11 +768,7 @@ public class MockWebServer : Closeable {
+       headers = headers.build(),
+       chunkSizes = chunkSizes,
+       bodySize = requestBody.receivedByteCount,
+-      body =
+-        when {
+-          hasBody -> requestBody.buffer.readByteString()
+-          else -> null
+-        },
++      body = requestBody.buffer,
+       sequenceNumber = sequenceNumber,
+       socket = socket,
+       failure = failure,
+@@ -1067,6 +1060,7 @@ public class MockWebServer : Closeable {
+         }
+       }
+ 
++      val body = Buffer()
+       val requestLine =
+         RequestLine(
+           method = method,
+@@ -1074,9 +1068,7 @@ public class MockWebServer : Closeable {
+           version = "HTTP/1.1",
+         )
+       var exception: IOException? = null
+-      var bodyByteString: ByteString? = null
+       if (readBody && peek.socketHandler == null && peek.socketPolicy !is DoNotReadRequestBody) {
+-        val body = Buffer()
+         try {
+           val contentLengthString = headers["content-length"]
+           val requestBodySink =
+@@ -1092,8 +1084,6 @@ public class MockWebServer : Closeable {
+           }
+         } catch (e: IOException) {
+           exception = e
+-        } finally {
+-          bodyByteString = body.readByteString()
+         }
+       }
+ 
+@@ -1101,12 +1091,8 @@ public class MockWebServer : Closeable {
+         requestLine = requestLine,
+         headers = headers,
+         chunkSizes = emptyList(),
+-        bodySize = bodyByteString?.size?.toLong() ?: 0,
+-        body =
+-          when {
+-            HttpMethod.permitsRequestBody(method) -> bodyByteString
+-            else -> null
+-          },
++        bodySize = body.size,
++        body = body,
+         sequenceNumber = sequenceNumber.getAndIncrement(),
+         socket = socket,
+         failure = exception,
+@@ -1212,7 +1198,7 @@ public class MockWebServer : Closeable {
+             headers = pushPromise.headers,
+             chunkSizes = chunkSizes,
+             bodySize = 0,
+-            body = null,
++            body = Buffer(),
+             sequenceNumber = sequenceNumber.getAndIncrement(),
+             socket = socket,
+           ),
+diff --git a/mockwebserver/src/main/kotlin/mockwebserver3/RecordedRequest.kt b/mockwebserver/src/main/kotlin/mockwebserver3/RecordedRequest.kt
+index e98b45554..a9ebc77a2 100644
+--- a/mockwebserver/src/main/kotlin/mockwebserver3/RecordedRequest.kt
++++ b/mockwebserver/src/main/kotlin/mockwebserver3/RecordedRequest.kt
+@@ -62,8 +62,8 @@ public class RecordedRequest(
+   public val url: HttpUrl,
+   /** All headers. */
+   public val headers: Headers,
+-  /** The body of this request, or null if it has none. This may be truncated. */
+-  public val body: ByteString?,
++  /** The body of this request, or [ByteString.EMPTY] if it has none. This may be truncated. */
++  public val body: ByteString,
+   /** The total size of the body of this request (before truncation).*/
+   public val bodySize: Long,
+   /**
+diff --git a/mockwebserver/src/main/kotlin/mockwebserver3/internal/RecordedRequestFactory.kt b/mockwebserver/src/main/kotlin/mockwebserver3/internal/RecordedRequestFactory.kt
+index 8869e4267..000de9712 100644
+--- a/mockwebserver/src/main/kotlin/mockwebserver3/internal/RecordedRequestFactory.kt
++++ b/mockwebserver/src/main/kotlin/mockwebserver3/internal/RecordedRequestFactory.kt
+@@ -28,14 +28,14 @@ import okhttp3.HttpUrl
+ import okhttp3.HttpUrl.Companion.toHttpUrl
+ import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+ import okhttp3.internal.platform.Platform
+-import okio.ByteString
++import okio.Buffer
+ 
+ internal fun RecordedRequest(
+   requestLine: RequestLine,
+   headers: Headers,
+   chunkSizes: List<Int>,
+   bodySize: Long,
+-  body: ByteString?,
++  body: Buffer,
+   sequenceNumber: Int,
+   socket: Socket,
+   failure: IOException? = null,
+@@ -71,7 +71,7 @@ internal fun RecordedRequest(
+     version = requestLine.version,
+     url = requestUrl,
+     headers = headers,
+-    body = body,
++    body = body.readByteString(),
+     bodySize = bodySize,
+     chunkSizes = chunkSizes,
+     failure = failure,
+diff --git a/mockwebserver/src/test/java/mockwebserver3/MockWebServerTest.kt b/mockwebserver/src/test/java/mockwebserver3/MockWebServerTest.kt
+index 954bc6583..f968d08c7 100644
+--- a/mockwebserver/src/test/java/mockwebserver3/MockWebServerTest.kt
++++ b/mockwebserver/src/test/java/mockwebserver3/MockWebServerTest.kt
+@@ -50,14 +50,11 @@ import okhttp3.OkHttpClient
+ import okhttp3.Protocol
+ import okhttp3.RecordingHostnameVerifier
+ import okhttp3.Request
+-import okhttp3.RequestBody.Companion.toRequestBody
+ import okhttp3.TestUtil.assumeNotWindows
+ import okhttp3.testing.PlatformRule
+ import okhttp3.tls.HandshakeCertificates
+ import okhttp3.tls.HeldCertificate
+ import okio.Buffer
+-import okio.ByteString
+-import okio.ByteString.Companion.encodeUtf8
+ import org.junit.jupiter.api.AfterEach
+ import org.junit.jupiter.api.Assertions.fail
+ import org.junit.jupiter.api.BeforeEach
+@@ -651,7 +648,7 @@ class MockWebServerTest {
+     val reader = BufferedReader(InputStreamReader(inputStream, UTF_8))
+     assertThat(reader.readLine()).isEqualTo("response")
+     val request = server.takeRequest()
+-    assertThat(request.body?.utf8()).isEqualTo("request")
++    assertThat(request.body.utf8()).isEqualTo("request")
+   }
+ 
+   @Test
+@@ -672,7 +669,7 @@ class MockWebServerTest {
+     val reader = BufferedReader(InputStreamReader(inputStream, UTF_8))
+     assertThat(reader.readLine()).isEqualTo("response")
+     val request = server.takeRequest()
+-    assertThat(request.body?.utf8()).isEqualTo("request")
++    assertThat(request.body.utf8()).isEqualTo("request")
+   }
+ 
+   @Test
+@@ -841,72 +838,4 @@ class MockWebServerTest {
+     }
+     server2.close()
+   }
+-
+-  @Test
+-  fun recordedBodyIsNullForGetRequests() {
+-    server.enqueue(MockResponse())
+-    val client = OkHttpClient()
+-    val request =
+-      Request(
+-        url = server.url("/"),
+-      )
+-    client.newCall(request).execute().use { response ->
+-      assertThat(response.body.string()).isEqualTo("")
+-    }
+-    val recordedRequest = server.takeRequest()
+-    assertThat(recordedRequest.body).isNull()
+-  }
+-
+-  @Test
+-  fun recordedBodyIsNullWithDoNotRead() {
+-    server.enqueue(
+-      MockResponse
+-        .Builder()
+-        .socketPolicy(SocketPolicy.DoNotReadRequestBody())
+-        .build(),
+-    )
+-    val client = OkHttpClient()
+-    val request =
+-      Request(
+-        url = server.url("/"),
+-        body = "hello".toRequestBody(),
+-      )
+-    client.newCall(request).execute().use { response ->
+-      assertThat(response.body.string()).isEqualTo("")
+-    }
+-    val recordedRequest = server.takeRequest()
+-    assertThat(recordedRequest.body).isNull()
+-  }
+-
+-  @Test
+-  fun recordedBodyIsEmptyForEmptyPostRequests() {
+-    server.enqueue(MockResponse())
+-    val client = OkHttpClient()
+-    val request =
+-      Request(
+-        url = server.url("/"),
+-        body = "".toRequestBody(),
+-      )
+-    client.newCall(request).execute().use { response ->
+-      assertThat(response.body.string()).isEqualTo("")
+-    }
+-    val recordedRequest = server.takeRequest()
+-    assertThat(recordedRequest.body).isEqualTo(ByteString.EMPTY)
+-  }
+-
+-  @Test
+-  fun recordedBodyIsNonEmptyForNonEmptyPostRequests() {
+-    server.enqueue(MockResponse())
+-    val client = OkHttpClient()
+-    val request =
+-      Request(
+-        url = server.url("/"),
+-        body = "hello".toRequestBody(),
+-      )
+-    client.newCall(request).execute().use { response ->
+-      assertThat(response.body.string()).isEqualTo("")
+-    }
+-    val recordedRequest = server.takeRequest()
+-    assertThat(recordedRequest.body).isEqualTo("hello".encodeUtf8())
+-  }
+ }
+diff --git a/mockwebserver/src/test/java/mockwebserver3/RecordedRequestTest.kt b/mockwebserver/src/test/java/mockwebserver3/RecordedRequestTest.kt
+index 57d4d5fe3..fb7936269 100644
+--- a/mockwebserver/src/test/java/mockwebserver3/RecordedRequestTest.kt
++++ b/mockwebserver/src/test/java/mockwebserver3/RecordedRequestTest.kt
+@@ -25,7 +25,7 @@ import mockwebserver3.internal.RecordedRequest
+ import mockwebserver3.internal.decodeRequestLine
+ import okhttp3.Headers
+ import okhttp3.Headers.Companion.headersOf
+-import okio.ByteString
++import okio.Buffer
+ import org.junit.jupiter.api.Test
+ import org.junit.jupiter.api.Timeout
+ 
+@@ -39,7 +39,7 @@ class RecordedRequestTest {
+         localAddress = InetAddress.getByAddress("127.0.0.1", byteArrayOf(127, 0, 0, 1)),
+         localPort = 80,
+       )
+-    val request = RecordedRequest(DEFAULT_REQUEST_LINE, headers, emptyList(), 0, ByteString.EMPTY, 0, socket)
++    val request = RecordedRequest(DEFAULT_REQUEST_LINE, headers, emptyList(), 0, Buffer(), 0, socket)
+     assertThat(request.url.toString()).isEqualTo("http://127.0.0.1/")
+   }
+ 
+@@ -50,7 +50,7 @@ class RecordedRequestTest {
+         localPort = 80,
+       )
+     val requestLine = decodeRequestLine("CONNECT example.com:8080 HTTP/1.1")
+-    val request = RecordedRequest(requestLine, headers, emptyList(), 0, ByteString.EMPTY, 0, socket)
++    val request = RecordedRequest(requestLine, headers, emptyList(), 0, Buffer(), 0, socket)
+     assertThat(request.target).isEqualTo("example.com:8080")
+     assertThat(request.url.toString()).isEqualTo("http://example.com:8080/")
+   }
+@@ -62,7 +62,7 @@ class RecordedRequestTest {
+         localPort = 80,
+       )
+     val requestLine = decodeRequestLine("GET http://example.com:8080/index.html HTTP/1.1")
+-    val request = RecordedRequest(requestLine, headers, emptyList(), 0, ByteString.EMPTY, 0, socket)
++    val request = RecordedRequest(requestLine, headers, emptyList(), 0, Buffer(), 0, socket)
+     assertThat(request.target).isEqualTo("http://example.com:8080/index.html")
+     assertThat(request.url.toString()).isEqualTo("http://example.com:8080/index.html")
+   }
+@@ -80,7 +80,7 @@ class RecordedRequestTest {
+         headers,
+         emptyList(),
+         0,
+-        ByteString.EMPTY,
++        Buffer(),
+         0,
+         socket,
+       )
+@@ -98,7 +98,7 @@ class RecordedRequestTest {
+           ),
+         localPort = 80,
+       )
+-    val request = RecordedRequest(DEFAULT_REQUEST_LINE, headers, emptyList(), 0, ByteString.EMPTY, 0, socket)
++    val request = RecordedRequest(DEFAULT_REQUEST_LINE, headers, emptyList(), 0, Buffer(), 0, socket)
+     assertThat(request.url.toString()).isEqualTo("http://[::1]/")
+   }
+ 
+@@ -108,7 +108,7 @@ class RecordedRequestTest {
+         localAddress = InetAddress.getByAddress("127.0.0.1", byteArrayOf(127, 0, 0, 1)),
+         localPort = 80,
+       )
+-    val request = RecordedRequest(DEFAULT_REQUEST_LINE, headers, emptyList(), 0, ByteString.EMPTY, 0, socket)
++    val request = RecordedRequest(DEFAULT_REQUEST_LINE, headers, emptyList(), 0, Buffer(), 0, socket)
+     assertThat(request.url.toString()).isEqualTo("http://127.0.0.1/")
+   }
+ 
+@@ -123,7 +123,7 @@ class RecordedRequestTest {
+           ),
+         localPort = 80,
+       )
+-    val request = RecordedRequest(DEFAULT_REQUEST_LINE, headers, emptyList(), 0, ByteString.EMPTY, 0, socket)
++    val request = RecordedRequest(DEFAULT_REQUEST_LINE, headers, emptyList(), 0, Buffer(), 0, socket)
+     assertThat(request.url.toString()).isEqualTo("http://host-from-header.com/")
+   }
+ 
+diff --git a/okhttp/src/jvmTest/kotlin/okhttp3/CallTest.kt b/okhttp/src/jvmTest/kotlin/okhttp3/CallTest.kt
+index 9091ca3ae..9dc8dbf39 100644
+--- a/okhttp/src/jvmTest/kotlin/okhttp3/CallTest.kt
++++ b/okhttp/src/jvmTest/kotlin/okhttp3/CallTest.kt
+@@ -27,7 +27,6 @@ import assertk.assertions.isCloseTo
+ import assertk.assertions.isEmpty
+ import assertk.assertions.isEqualTo
+ import assertk.assertions.isFalse
+-import assertk.assertions.isIn
+ import assertk.assertions.isLessThan
+ import assertk.assertions.isNotEmpty
+ import assertk.assertions.isNotNull
+@@ -111,7 +110,6 @@ import okhttp3.tls.HandshakeCertificates
+ import okhttp3.tls.HeldCertificate
+ import okio.Buffer
+ import okio.BufferedSink
+-import okio.ByteString
+ import okio.ForwardingSource
+ import okio.GzipSink
+ import okio.Path.Companion.toPath
+@@ -206,7 +204,7 @@ open class CallTest {
+     val recordedRequest = server.takeRequest()
+     assertThat(recordedRequest.method).isEqualTo("GET")
+     assertThat(recordedRequest.headers["User-Agent"]).isEqualTo("SyncApiTest")
+-    assertThat(recordedRequest.body).isNull()
++    assertThat(recordedRequest.body.size).isEqualTo(0)
+     assertThat(recordedRequest.headers["Content-Length"]).isNull()
+   }
+ 
+@@ -310,7 +308,7 @@ open class CallTest {
+     val recordedRequest = server.takeRequest()
+     assertThat(recordedRequest.method).isEqualTo("HEAD")
+     assertThat(recordedRequest.headers["User-Agent"]).isEqualTo("SyncApiTest")
+-    assertThat(recordedRequest.body).isNull()
++    assertThat(recordedRequest.body.size).isEqualTo(0)
+     assertThat(recordedRequest.headers["Content-Length"]).isNull()
+   }
+ 
+@@ -396,7 +394,7 @@ open class CallTest {
+       .assertBody("abc")
+     val recordedRequest = server.takeRequest()
+     assertThat(recordedRequest.method).isEqualTo("POST")
+-    assertThat(recordedRequest.body?.utf8()).isEqualTo("def")
++    assertThat(recordedRequest.body.utf8()).isEqualTo("def")
+     assertThat(recordedRequest.headers["Content-Length"]).isEqualTo("3")
+     assertThat(recordedRequest.headers["Content-Type"]).isEqualTo("text/plain; charset=utf-8")
+   }
+@@ -427,7 +425,7 @@ open class CallTest {
+       .assertBody("abc")
+     val recordedRequest = server.takeRequest()
+     assertThat(recordedRequest.method).isEqualTo("POST")
+-    assertThat(recordedRequest.body?.size).isEqualTo(0)
++    assertThat(recordedRequest.body.size).isEqualTo(0)
+     assertThat(recordedRequest.headers["Content-Length"]).isEqualTo("0")
+     assertThat(recordedRequest.headers["Content-Type"]).isNull()
+   }
+@@ -499,11 +497,11 @@ open class CallTest {
+     response.body.close()
+     val recordedRequest1 = server.takeRequest()
+     assertThat(recordedRequest1.method).isEqualTo("POST")
+-    assertThat(recordedRequest1.body?.utf8()).isEqualTo(body)
++    assertThat(recordedRequest1.body.utf8()).isEqualTo(body)
+     assertThat(recordedRequest1.headers["Authorization"]).isNull()
+     val recordedRequest2 = server.takeRequest()
+     assertThat(recordedRequest2.method).isEqualTo("POST")
+-    assertThat(recordedRequest2.body?.utf8()).isEqualTo(body)
++    assertThat(recordedRequest2.body.utf8()).isEqualTo(body)
+     assertThat(recordedRequest2.headers["Authorization"]).isEqualTo(credential)
+   }
+ 
+@@ -580,7 +578,7 @@ open class CallTest {
+       .assertBody("abc")
+     val recordedRequest = server.takeRequest()
+     assertThat(recordedRequest.method).isEqualTo("DELETE")
+-    assertThat(recordedRequest.body?.size).isEqualTo(0)
++    assertThat(recordedRequest.body.size).isEqualTo(0)
+     assertThat(recordedRequest.headers["Content-Length"]).isEqualTo("0")
+     assertThat(recordedRequest.headers["Content-Type"]).isNull()
+   }
+@@ -611,7 +609,7 @@ open class CallTest {
+       .assertBody("abc")
+     val recordedRequest = server.takeRequest()
+     assertThat(recordedRequest.method).isEqualTo("DELETE")
+-    assertThat(recordedRequest.body?.utf8()).isEqualTo("def")
++    assertThat(recordedRequest.body.utf8()).isEqualTo("def")
+   }
+ 
+   @Test
+@@ -628,7 +626,7 @@ open class CallTest {
+       .assertBody("abc")
+     val recordedRequest = server.takeRequest()
+     assertThat(recordedRequest.method).isEqualTo("PUT")
+-    assertThat(recordedRequest.body?.utf8()).isEqualTo("def")
++    assertThat(recordedRequest.body.utf8()).isEqualTo("def")
+     assertThat(recordedRequest.headers["Content-Length"]).isEqualTo("3")
+     assertThat(recordedRequest.headers["Content-Type"]).isEqualTo(
+       "text/plain; charset=utf-8",
+@@ -661,7 +659,7 @@ open class CallTest {
+       .assertBody("abc")
+     val recordedRequest = server.takeRequest()
+     assertThat(recordedRequest.method).isEqualTo("PATCH")
+-    assertThat(recordedRequest.body?.utf8()).isEqualTo("def")
++    assertThat(recordedRequest.body.utf8()).isEqualTo("def")
+     assertThat(recordedRequest.headers["Content-Length"]).isEqualTo("3")
+     assertThat(recordedRequest.headers["Content-Type"]).isEqualTo("text/plain; charset=utf-8")
+   }
+@@ -692,7 +690,7 @@ open class CallTest {
+       .assertBody("abc")
+     val recordedRequest = server.takeRequest()
+     assertThat(recordedRequest.method).isEqualTo("CUSTOM")
+-    assertThat(recordedRequest.body?.utf8()).isEqualTo("def")
++    assertThat(recordedRequest.body.utf8()).isEqualTo("def")
+     assertThat(recordedRequest.headers["Content-Length"]).isEqualTo("3")
+     assertThat(recordedRequest.headers["Content-Type"])
+       .isEqualTo("text/plain; charset=utf-8")
+@@ -711,7 +709,7 @@ open class CallTest {
+     val recordedRequest = server.takeRequest()
+     assertThat(recordedRequest.headers["Content-Type"]).isNull()
+     assertThat(recordedRequest.headers["Content-Length"]).isEqualTo("3")
+-    assertThat(recordedRequest.body?.utf8()).isEqualTo("abc")
++    assertThat(recordedRequest.body.utf8()).isEqualTo("abc")
+   }
+ 
+   @Test
+@@ -1678,7 +1676,7 @@ open class CallTest {
+       .assertCode(200)
+       .assertBody("abc")
+     val recordedRequest = server.takeRequest()
+-    assertThat(recordedRequest.body?.utf8()).isEqualTo("def")
++    assertThat(recordedRequest.body.utf8()).isEqualTo("def")
+     assertThat(recordedRequest.headers["Content-Length"]).isEqualTo("3")
+     assertThat(recordedRequest.headers["Content-Type"]).isEqualTo("text/plain; charset=utf-8")
+   }
+@@ -1757,7 +1755,7 @@ open class CallTest {
+     assertThat(get.sequenceNumber).isEqualTo(0)
+ 
+     val post1 = server.takeRequest()
+-    assertThat(post1.body?.utf8()).isEqualTo("body!")
++    assertThat(post1.body.utf8()).isEqualTo("body!")
+     assertThat(post1.sequenceNumber).isEqualTo(1)
+ 
+     val get2 = server.takeRequest()
+@@ -1784,10 +1782,10 @@ open class CallTest {
+     val get = server.takeRequest()
+     assertThat(get.sequenceNumber).isEqualTo(0)
+     val post1 = server.takeRequest()
+-    assertThat(post1.body?.utf8()).isEqualTo("body!")
++    assertThat(post1.body.utf8()).isEqualTo("body!")
+     assertThat(post1.sequenceNumber).isEqualTo(1)
+     val post2 = server.takeRequest()
+-    assertThat(post2.body?.utf8()).isEqualTo("body!")
++    assertThat(post2.body.utf8()).isEqualTo("body!")
+     assertThat(post2.sequenceNumber).isEqualTo(0)
+   }
+ 
+@@ -2205,7 +2203,7 @@ open class CallTest {
+     assertThat(response.body.string()).isEqualTo("Page 2")
+     val page1 = server.takeRequest()
+     assertThat(page1.requestLine).isEqualTo("POST /page1 HTTP/1.1")
+-    assertThat(page1.body?.utf8()).isEqualTo("Request Body")
++    assertThat(page1.body.utf8()).isEqualTo("Request Body")
+     val page2 = server.takeRequest()
+     assertThat(page2.requestLine).isEqualTo("GET /page2 HTTP/1.1")
+   }
+@@ -2266,9 +2264,9 @@ open class CallTest {
+     val response = client.newCall(request).execute()
+     assertThat(response.body.string()).isEqualTo("Body")
+     val request1 = server.takeRequest()
+-    assertThat(request1.body?.utf8()).isEqualTo("Hello")
++    assertThat(request1.body.utf8()).isEqualTo("Hello")
+     val request2 = server.takeRequest()
+-    assertThat(request2.body?.utf8()).isEqualTo("Hello")
++    assertThat(request2.body.utf8()).isEqualTo("Hello")
+   }
+ 
+   @Test
+@@ -2405,8 +2403,8 @@ open class CallTest {
+     val response = client.newCall(request).execute()
+     assertThat(response.code).isEqualTo(200)
+     assertThat(response.body.string()).isEqualTo("thank you for retrying")
+-    assertThat(server.takeRequest().body?.utf8()).isEqualTo("attempt 0")
+-    assertThat(server.takeRequest().body?.utf8()).isEqualTo("attempt 1")
++    assertThat(server.takeRequest().body.utf8()).isEqualTo("attempt 0")
++    assertThat(server.takeRequest().body.utf8()).isEqualTo("attempt 1")
+     assertThat(server.requestCount).isEqualTo(2)
+   }
+ 
+@@ -2441,7 +2439,7 @@ open class CallTest {
+     val response = client.newCall(request).execute()
+     assertThat(response.code).isEqualTo(503)
+     assertThat(response.body.string()).isEqualTo("please retry")
+-    assertThat(server.takeRequest().body?.utf8()).isEqualTo("attempt 0")
++    assertThat(server.takeRequest().body.utf8()).isEqualTo("attempt 0")
+     assertThat(server.requestCount).isEqualTo(1)
+   }
+ 
+@@ -2472,10 +2470,10 @@ open class CallTest {
+     assertThat(response.body.string()).isEqualTo("Page 2")
+     val page1 = server.takeRequest()
+     assertThat(page1.requestLine).isEqualTo("PROPFIND /page1 HTTP/1.1")
+-    assertThat(page1.body?.utf8()).isEqualTo("Request Body")
++    assertThat(page1.body.utf8()).isEqualTo("Request Body")
+     val page2 = server.takeRequest()
+     assertThat(page2.requestLine).isEqualTo("PROPFIND /page2 HTTP/1.1")
+-    assertThat(page2.body?.utf8()).isEqualTo("Request Body")
++    assertThat(page2.body.utf8()).isEqualTo("Request Body")
+   }
+ 
+   @Test
+@@ -3249,7 +3247,7 @@ open class CallTest {
+     executeSynchronously(request)
+       .assertCode(200)
+       .assertSuccessful()
+-    assertThat(server.takeRequest().body?.utf8()).isEqualTo("abc")
++    assertThat(server.takeRequest().body.utf8()).isEqualTo("abc")
+   }
+ 
+   @Test
+@@ -3294,7 +3292,7 @@ open class CallTest {
+       call.execute()
+     }
+     val recordedRequest = server.takeRequest()
+-    assertThat(recordedRequest.body).isIn(null, ByteString.EMPTY)
++    assertThat(recordedRequest.body.utf8()).isEqualTo("")
+   }
+ 
+   @Tag("Slowish")
+@@ -3321,7 +3319,7 @@ open class CallTest {
+       .assertCode(200)
+       .assertSuccessful()
+     val recordedRequest = server.takeRequest()
+-    assertThat(recordedRequest.body?.utf8()).isEqualTo("abc")
++    assertThat(recordedRequest.body.utf8()).isEqualTo("abc")
+   }
+ 
+   @Test
+@@ -3351,7 +3349,7 @@ open class CallTest {
+       .assertCode(200)
+       .assertSuccessful()
+     val recordedRequest = server.takeRequest()
+-    assertThat(recordedRequest.body?.utf8()).isEqualTo("abc")
++    assertThat(recordedRequest.body.utf8()).isEqualTo("abc")
+     assertThat(recordedRequest.headers["Link"]).isNull()
+   }
+ 
+@@ -3379,7 +3377,7 @@ open class CallTest {
+       )
+     executeSynchronously(request).assertCode(200).assertSuccessful()
+     val recordedRequest = server.takeRequest()
+-    assertThat(recordedRequest.body?.utf8()).isEqualTo("abc")
++    assertThat(recordedRequest.body.utf8()).isEqualTo("abc")
+   }
+ 
+   @Test
+@@ -3408,7 +3406,7 @@ open class CallTest {
+       .assertCode(200)
+       .assertSuccessful()
+     val recordedRequest = server.takeRequest()
+-    assertThat(recordedRequest.body?.utf8()).isEqualTo("abc")
++    assertThat(recordedRequest.body.utf8()).isEqualTo("abc")
+   }
+ 
+   @Test
+@@ -3435,7 +3433,7 @@ open class CallTest {
+       .assertCode(200)
+       .assertSuccessful()
+     val recordedRequest = server.takeRequest()
+-    assertThat(recordedRequest.body?.utf8()).isEqualTo("abc")
++    assertThat(recordedRequest.body.utf8()).isEqualTo("abc")
+   }
+ 
+   @Test
+@@ -3463,7 +3461,7 @@ open class CallTest {
+       call.execute()
+     }
+     val recordedRequest = server.takeRequest()
+-    assertThat(recordedRequest.body?.utf8()).isEqualTo("abc")
++    assertThat(recordedRequest.body.utf8()).isEqualTo("abc")
+   }
+ 
+   @Tag("Slow")
+@@ -4186,7 +4184,7 @@ open class CallTest {
+         body = "abc".toRequestBody("text/plain".toMediaType()),
+       )
+     executeSynchronously(request)
+-    assertThat(server.takeRequest().body?.utf8()).isEqualTo("abc")
++    assertThat(server.takeRequest().body.utf8()).isEqualTo("abc")
+   }
+ 
+   @Disabled // This may fail in DNS lookup, which we don't have timeouts for.
+diff --git a/okhttp/src/jvmTest/kotlin/okhttp3/InterceptorTest.kt b/okhttp/src/jvmTest/kotlin/okhttp3/InterceptorTest.kt
+index cd10ba593..a00a165dc 100644
+--- a/okhttp/src/jvmTest/kotlin/okhttp3/InterceptorTest.kt
++++ b/okhttp/src/jvmTest/kotlin/okhttp3/InterceptorTest.kt
+@@ -298,7 +298,7 @@ class InterceptorTest {
+     client.newCall(request).execute()
+     val recordedRequest = server.takeRequest()
+     assertThat(recordedRequest.method).isEqualTo("POST")
+-    assertThat(recordedRequest.body?.utf8()).isEqualTo("abc")
++    assertThat(recordedRequest.body.utf8()).isEqualTo("abc")
+   }
+ 
+   @Test
+@@ -332,7 +332,7 @@ class InterceptorTest {
+         .build()
+     client.newCall(request).execute()
+     val recordedRequest = server.takeRequest()
+-    assertThat(recordedRequest.body?.utf8()).isEqualTo("ABC")
++    assertThat(recordedRequest.body.utf8()).isEqualTo("ABC")
+     assertThat(recordedRequest.headers["Original-Header"]).isEqualTo("foo")
+     assertThat(recordedRequest.headers["OkHttp-Intercepted"]).isEqualTo("yep")
+     assertThat(recordedRequest.method).isEqualTo("POST")
+diff --git a/okhttp/src/jvmTest/kotlin/okhttp3/URLConnectionTest.kt b/okhttp/src/jvmTest/kotlin/okhttp3/URLConnectionTest.kt
+index 852feee1f..649bc6c19 100644
+--- a/okhttp/src/jvmTest/kotlin/okhttp3/URLConnectionTest.kt
++++ b/okhttp/src/jvmTest/kotlin/okhttp3/URLConnectionTest.kt
+@@ -309,7 +309,7 @@ class URLConnectionTest {
+       )
+     val response = getResponse(request)
+     assertContent("abc", response)
+-    assertThat(server.takeRequest().body?.utf8()).isEqualTo("body")
++    assertThat(server.takeRequest().body.utf8()).isEqualTo("body")
+   }
+ 
+   // Check that if we don't read to the end of a response, the next request on the
+@@ -1707,7 +1707,7 @@ class URLConnectionTest {
+       )
+     assertThat(response.code).isEqualTo(200)
+     val request = server.takeRequest()
+-    assertThat(request.body?.utf8()).isEqualTo("ABCDEFGHIJKLMNOPQ")
++    assertThat(request.body.utf8()).isEqualTo("ABCDEFGHIJKLMNOPQ")
+     assertThat(request.chunkSizes).isEqualTo(
+       Arrays.asList("ABCDEFGHIJKLMNOPQ".length),
+     )
+@@ -1752,7 +1752,7 @@ class URLConnectionTest {
+     // No authorization header for the request...
+     val recordedRequest = server.takeRequest()
+     assertThat(recordedRequest.headers["Authorization"]).isNull()
+-    assertThat(recordedRequest.body?.utf8()).isEqualTo("ABCD")
++    assertThat(recordedRequest.body.utf8()).isEqualTo("ABCD")
+   }
+ 
+   @Test
+@@ -1802,11 +1802,11 @@ class URLConnectionTest {
+     response.body.byteStream().close()
+     val recordedRequest1 = server.takeRequest()
+     assertThat(recordedRequest1.method).isEqualTo("POST")
+-    assertThat(recordedRequest1.body?.utf8()).isEqualTo(body)
++    assertThat(recordedRequest1.body.utf8()).isEqualTo(body)
+     assertThat(recordedRequest1.headers["Authorization"]).isNull()
+     val recordedRequest2 = server.takeRequest()
+     assertThat(recordedRequest2.method).isEqualTo("POST")
+-    assertThat(recordedRequest2.body?.utf8()).isEqualTo(body)
++    assertThat(recordedRequest2.body.utf8()).isEqualTo(body)
+     assertThat(recordedRequest2.headers["Authorization"]).isEqualTo(credential)
+   }
+ 
+@@ -2084,7 +2084,7 @@ class URLConnectionTest {
+     } else if (streamingMode === TransferKind.CHUNKED) {
+       assertThat(request.chunkSizes).containsExactly(4)
+     }
+-    assertThat(request.body?.utf8()).isEqualTo("ABCD")
++    assertThat(request.body.utf8()).isEqualTo("ABCD")
+   }
+ 
+   @Test
+@@ -2131,7 +2131,7 @@ class URLConnectionTest {
+       assertThat(request.headers["Authorization"]).isEqualTo(
+         "Basic " + RecordingAuthenticator.BASE_64_CREDENTIALS,
+       )
+-      assertThat(request.body?.utf8()).isEqualTo("ABCD")
++      assertThat(request.body.utf8()).isEqualTo("ABCD")
+     }
+   }
+ 
+@@ -2650,7 +2650,7 @@ class URLConnectionTest {
+       .isEqualTo("Page 2")
+     val page1 = server.takeRequest()
+     assertThat(page1.requestLine).isEqualTo("POST /page1 HTTP/1.1")
+-    assertThat(page1.body?.utf8()).isEqualTo("ABCD")
++    assertThat(page1.body.utf8()).isEqualTo("ABCD")
+     val page2 = server.takeRequest()
+     assertThat(page2.requestLine).isEqualTo("GET /page2 HTTP/1.1")
+   }
+@@ -2802,7 +2802,7 @@ class URLConnectionTest {
+     val responseString = readAscii(response.body.byteStream(), Int.MAX_VALUE)
+     val page1 = server.takeRequest()
+     assertThat(page1.requestLine).isEqualTo("POST /page1 HTTP/1.1")
+-    assertThat(page1.body?.utf8()).isEqualTo("ABCD")
++    assertThat(page1.body.utf8()).isEqualTo("ABCD")
+     assertThat(server.requestCount).isEqualTo(1)
+     assertThat(responseString).isEqualTo("This page has moved!")
+   }
+@@ -2830,7 +2830,7 @@ class URLConnectionTest {
+     val responseString = readAscii(response.body.byteStream(), Int.MAX_VALUE)
+     val page1 = server.takeRequest()
+     assertThat(page1.requestLine).isEqualTo("POST /page1 HTTP/1.1")
+-    assertThat(page1.body?.utf8()).isEqualTo("ABCD")
++    assertThat(page1.body.utf8()).isEqualTo("ABCD")
+     assertThat(server.requestCount).isEqualTo(1)
+     assertThat(responseString).isEqualTo("This page has moved!")
+   }
+@@ -2978,9 +2978,9 @@ class URLConnectionTest {
+     assertThat(readAscii(response.body.byteStream(), Int.MAX_VALUE))
+       .isEqualTo("Body")
+     val request1 = server.takeRequest()
+-    assertThat(request1.body?.utf8()).isEqualTo("Hello")
++    assertThat(request1.body.utf8()).isEqualTo("Hello")
+     val request2 = server.takeRequest()
+-    assertThat(request2.body?.utf8()).isEqualTo("Hello")
++    assertThat(request2.body.utf8()).isEqualTo("Hello")
+   }
+ 
+   @Test
+@@ -3093,7 +3093,7 @@ class URLConnectionTest {
+       )
+     assertThat(response.code).isEqualTo(200)
+     val request = server.takeRequest()
+-    assertThat(request.body?.utf8()).isEqualTo("ABC")
++    assertThat(request.body.utf8()).isEqualTo("ABC")
+   }
+ 
+   @Test
+@@ -3516,7 +3516,7 @@ class URLConnectionTest {
+     assertThat(requestA.url.encodedPath).isEqualTo("/a")
+     val requestB = server.takeRequest()
+     assertThat(requestB.url.encodedPath).isEqualTo("/b")
+-    assertThat(requestB.body?.utf8()).isEqualTo(requestBody)
++    assertThat(requestB.body.utf8()).isEqualTo(requestBody)
+   }
+ 
+   @Test
+@@ -3538,10 +3538,10 @@ class URLConnectionTest {
+     val get = server.takeRequest()
+     assertThat(get.sequenceNumber).isEqualTo(0)
+     val post1 = server.takeRequest()
+-    assertThat(post1.body?.utf8()).isEqualTo("body!")
++    assertThat(post1.body.utf8()).isEqualTo("body!")
+     assertThat(post1.sequenceNumber).isEqualTo(1)
+     val post2 = server.takeRequest()
+-    assertThat(post2.body?.utf8()).isEqualTo("body!")
++    assertThat(post2.body.utf8()).isEqualTo("body!")
+     assertThat(post2.sequenceNumber).isEqualTo(0)
+   }
+ 
+@@ -4143,7 +4143,7 @@ class URLConnectionTest {
+     assertThat(response.code).isEqualTo(200)
+     val request = server.takeRequest()
+     assertThat(request.method).isEqualTo("DELETE")
+-    assertThat(request.body?.utf8()).isEqualTo("BODY")
++    assertThat(request.body.utf8()).isEqualTo("BODY")
+   }
+ 
+   @Test
+@@ -4258,7 +4258,7 @@ class URLConnectionTest {
+     val request1 = server.takeRequest()
+     assertThat(request1.sequenceNumber).isEqualTo(0)
+     val request2 = server.takeRequest()
+-    assertThat(request2.body?.utf8()).isEqualTo("123")
++    assertThat(request2.body.utf8()).isEqualTo("123")
+     assertThat(request2.sequenceNumber).isEqualTo(0)
+   }
+ 
+diff --git a/okhttp/src/jvmTest/kotlin/okhttp3/internal/http2/HttpOverHttp2Test.kt b/okhttp/src/jvmTest/kotlin/okhttp3/internal/http2/HttpOverHttp2Test.kt
+index 8ce1776c1..8c453f6e5 100644
+--- a/okhttp/src/jvmTest/kotlin/okhttp3/internal/http2/HttpOverHttp2Test.kt
++++ b/okhttp/src/jvmTest/kotlin/okhttp3/internal/http2/HttpOverHttp2Test.kt
+@@ -296,7 +296,7 @@ class HttpOverHttp2Test {
+     assertThat(response.body.string()).isEqualTo("ABCDE")
+     val request = server.takeRequest()
+     assertThat(request.requestLine).isEqualTo("POST /foo HTTP/1.1")
+-    assertArrayEquals(postBytes, request.body?.toByteArray())
++    assertArrayEquals(postBytes, request.body.toByteArray())
+     assertThat(request.headers["Content-Length"]).isNull()
+   }
+ 
+@@ -329,7 +329,7 @@ class HttpOverHttp2Test {
+     assertThat(response.body.string()).isEqualTo("ABCDE")
+     val request = server.takeRequest()
+     assertThat(request.requestLine).isEqualTo("POST /foo HTTP/1.1")
+-    assertArrayEquals(postBytes, request.body?.toByteArray())
++    assertArrayEquals(postBytes, request.body.toByteArray())
+     assertThat(request.headers["Content-Length"]!!.toInt()).isEqualTo(postBytes.size)
+   }
+ 
+@@ -364,7 +364,7 @@ class HttpOverHttp2Test {
+     assertThat(response.body.string()).isEqualTo("ABCDE")
+     val request = server.takeRequest()
+     assertThat(request.requestLine).isEqualTo("POST /foo HTTP/1.1")
+-    assertArrayEquals(postBytes, request.body?.toByteArray())
++    assertArrayEquals(postBytes, request.body.toByteArray())
+     assertThat(request.headers["Content-Length"]!!.toInt()).isEqualTo(postBytes.size)
+   }
+ 

@@ -1,0 +1,170 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 95cef913..eb2d6154 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -4,7 +4,10 @@
+ 
+ **New**
+ 
+- - Nothing yet!
++ - First-party converters now support deferring serialization to happen when the request body is written (i.e., during HTTP execution) rather than when the HTTP request is created. In some cases this moves conversion from a calling thread to a background thread, such as in the case when using `Call.enqueue` directly.
++
++   The following converters support this feature through a new `createStreaming()` factory:
++   - Wire
+ 
+ **Changed**
+ 
+diff --git a/gradle/libs.versions.toml b/gradle/libs.versions.toml
+index 94841d99..16998a3a 100644
+--- a/gradle/libs.versions.toml
++++ b/gradle/libs.versions.toml
+@@ -83,3 +83,4 @@ robovm = { module = "com.mobidevelop.robovm:robovm-rt", version.ref = "robovm" }
+ googleJavaFormat = "com.google.googlejavaformat:google-java-format:1.25.0"
+ ktlint = "com.pinterest.ktlint:ktlint-cli:1.5.0"
+ compileTesting = "com.google.testing.compile:compile-testing:0.21.0"
++testParameterInjector = "com.google.testparameterinjector:test-parameter-injector:1.18"
+diff --git a/retrofit-converters/wire/build.gradle b/retrofit-converters/wire/build.gradle
+index 6f7c414a..06aef0cc 100644
+--- a/retrofit-converters/wire/build.gradle
++++ b/retrofit-converters/wire/build.gradle
+@@ -12,6 +12,7 @@ dependencies {
+   testImplementation libs.junit
+   testImplementation libs.truth
+   testImplementation libs.okhttp.mockwebserver
++  testImplementation libs.testParameterInjector
+ }
+ 
+ jar {
+diff --git a/retrofit-converters/wire/src/main/java/retrofit2/converter/wire/WireConverterFactory.java b/retrofit-converters/wire/src/main/java/retrofit2/converter/wire/WireConverterFactory.java
+index f3472b57..aaa4c26c 100644
+--- a/retrofit-converters/wire/src/main/java/retrofit2/converter/wire/WireConverterFactory.java
++++ b/retrofit-converters/wire/src/main/java/retrofit2/converter/wire/WireConverterFactory.java
+@@ -22,6 +22,7 @@ import java.lang.reflect.Type;
+ import javax.annotation.Nullable;
+ import okhttp3.RequestBody;
+ import okhttp3.ResponseBody;
++import retrofit2.Call;
+ import retrofit2.Converter;
+ import retrofit2.Retrofit;
+ 
+@@ -31,11 +32,30 @@ import retrofit2.Retrofit;
+  * <p>This converter only applies for types which extend from {@link Message}.
+  */
+ public final class WireConverterFactory extends Converter.Factory {
++  /**
++   * Create an instance which serializes request messages to bytes eagerly on the caller thread
++   * when either {@link Call#execute()} or {@link Call#enqueue} is called. Response bytes are
++   * always converted to message instances on one of OKHttp's background threads.
++   */
+   public static WireConverterFactory create() {
+-    return new WireConverterFactory();
++    return new WireConverterFactory(false);
+   }
+ 
+-  private WireConverterFactory() {}
++  /**
++   * Create an instance which streams serialization of request messages to bytes on the HTTP thread
++   * This is either the calling thread for {@link Call#execute()}, or one of OKHttp's background
++   * threads for {@link Call#enqueue}. Response bytes are always converted to message instances on
++   * one of OKHttp's background threads.
++   */
++  public static WireConverterFactory createStreaming() {
++    return new WireConverterFactory(true);
++  }
++
++  private final boolean streaming;
++
++  private WireConverterFactory(boolean streaming) {
++    this.streaming = streaming;
++  }
+ 
+   @Override
+   public @Nullable Converter<ResponseBody, ?> responseBodyConverter(
+@@ -67,6 +87,6 @@ public final class WireConverterFactory extends Converter.Factory {
+     }
+     //noinspection unchecked
+     ProtoAdapter<? extends Message> adapter = ProtoAdapter.get((Class<? extends Message>) c);
+-    return new WireRequestBodyConverter<>(adapter);
++    return new WireRequestBodyConverter<>(adapter, streaming);
+   }
+ }
+diff --git a/retrofit-converters/wire/src/main/java/retrofit2/converter/wire/WireRequestBodyConverter.java b/retrofit-converters/wire/src/main/java/retrofit2/converter/wire/WireRequestBodyConverter.java
+index 1d6be146..c1d96d3a 100644
+--- a/retrofit-converters/wire/src/main/java/retrofit2/converter/wire/WireRequestBodyConverter.java
++++ b/retrofit-converters/wire/src/main/java/retrofit2/converter/wire/WireRequestBodyConverter.java
+@@ -24,16 +24,22 @@ import okio.Buffer;
+ import retrofit2.Converter;
+ 
+ final class WireRequestBodyConverter<T extends Message<T, ?>> implements Converter<T, RequestBody> {
+-  private static final MediaType MEDIA_TYPE = MediaType.get("application/x-protobuf");
++  static final MediaType MEDIA_TYPE = MediaType.get("application/x-protobuf");
+ 
+   private final ProtoAdapter<T> adapter;
++  private final boolean streaming;
+ 
+-  WireRequestBodyConverter(ProtoAdapter<T> adapter) {
++  WireRequestBodyConverter(ProtoAdapter<T> adapter, boolean streaming) {
+     this.adapter = adapter;
++    this.streaming = streaming;
+   }
+ 
+   @Override
+   public RequestBody convert(T value) throws IOException {
++    if (streaming) {
++      return new WireStreamingRequestBody<>(adapter, value);
++    }
++
+     Buffer buffer = new Buffer();
+     adapter.encode(buffer, value);
+     return RequestBody.create(MEDIA_TYPE, buffer.snapshot());
+diff --git a/retrofit-converters/wire/src/main/java/retrofit2/converter/wire/WireStreamingRequestBody.java b/retrofit-converters/wire/src/main/java/retrofit2/converter/wire/WireStreamingRequestBody.java
+new file mode 100644
+index 00000000..f441ff4a
+--- /dev/null
++++ b/retrofit-converters/wire/src/main/java/retrofit2/converter/wire/WireStreamingRequestBody.java
+@@ -0,0 +1,45 @@
++/*
++ * Copyright (C) 2015 Square, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package retrofit2.converter.wire;
++
++import static retrofit2.converter.wire.WireRequestBodyConverter.MEDIA_TYPE;
++
++import com.squareup.wire.Message;
++import com.squareup.wire.ProtoAdapter;
++import java.io.IOException;
++import okhttp3.MediaType;
++import okhttp3.RequestBody;
++import okio.BufferedSink;
++
++final class WireStreamingRequestBody<T extends Message<T, ?>> extends RequestBody {
++  private final ProtoAdapter<T> adapter;
++  private final T value;
++
++  WireStreamingRequestBody(ProtoAdapter<T> adapter, T value) {
++    this.adapter = adapter;
++    this.value = value;
++  }
++
++  @Override
++  public MediaType contentType() {
++    return MEDIA_TYPE;
++  }
++
++  @Override
++  public void writeTo(BufferedSink sink) throws IOException {
++    adapter.encode(sink, value);
++  }
++}

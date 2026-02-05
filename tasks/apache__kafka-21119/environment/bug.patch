@@ -1,0 +1,1266 @@
+diff --git a/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupMetadataManager.java b/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupMetadataManager.java
+index 6516ef181d..5b20c4ba4b 100644
+--- a/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupMetadataManager.java
++++ b/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupMetadataManager.java
+@@ -817,10 +817,10 @@ public class GroupMetadataManager {
+         }
+ 
+         if (group == null) {
+-            return new ConsumerGroup(logContext, snapshotRegistry, groupId, metrics);
++            return new ConsumerGroup(snapshotRegistry, groupId, metrics);
+         } else if (createIfNotExists && maybeDeleteEmptyClassicGroup(group, records)) {
+             log.info("[GroupId {}] Converted the empty classic group to a consumer group.", groupId);
+-            return new ConsumerGroup(logContext, snapshotRegistry, groupId, metrics);
++            return new ConsumerGroup(snapshotRegistry, groupId, metrics);
+         } else {
+             if (group.type() == CONSUMER) {
+                 return (ConsumerGroup) group;
+@@ -975,7 +975,7 @@ public class GroupMetadataManager {
+         }
+ 
+         if (group == null) {
+-            ConsumerGroup consumerGroup = new ConsumerGroup(logContext, snapshotRegistry, groupId, metrics);
++            ConsumerGroup consumerGroup = new ConsumerGroup(snapshotRegistry, groupId, metrics);
+             groups.put(groupId, consumerGroup);
+             return consumerGroup;
+         } else if (group.type() == CONSUMER) {
+@@ -985,7 +985,7 @@ public class GroupMetadataManager {
+             // offsets if no group existed. Simple classic groups are not backed by any records
+             // in the __consumer_offsets topic hence we can safely replace it here. Without this,
+             // replaying consumer group records after offset commit records would not work.
+-            ConsumerGroup consumerGroup = new ConsumerGroup(logContext, snapshotRegistry, groupId, metrics);
++            ConsumerGroup consumerGroup = new ConsumerGroup(snapshotRegistry, groupId, metrics);
+             groups.put(groupId, consumerGroup);
+             return consumerGroup;
+         } else {
+@@ -1364,7 +1364,6 @@ public class GroupMetadataManager {
+         ConsumerGroup consumerGroup;
+         try {
+             consumerGroup = ConsumerGroup.fromClassicGroup(
+-                logContext,
+                 snapshotRegistry,
+                 metrics,
+                 classicGroup,
+diff --git a/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/modern/consumer/ConsumerGroup.java b/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/modern/consumer/ConsumerGroup.java
+index 0477610895..880cd49769 100644
+--- a/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/modern/consumer/ConsumerGroup.java
++++ b/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/modern/consumer/ConsumerGroup.java
+@@ -29,7 +29,6 @@ import org.apache.kafka.common.message.ConsumerProtocolSubscription;
+ import org.apache.kafka.common.protocol.Errors;
+ import org.apache.kafka.common.protocol.types.SchemaException;
+ import org.apache.kafka.common.requests.JoinGroupRequest;
+-import org.apache.kafka.common.utils.LogContext;
+ import org.apache.kafka.coordinator.common.runtime.CoordinatorRecord;
+ import org.apache.kafka.coordinator.group.GroupCoordinatorRecordHelpers;
+ import org.apache.kafka.coordinator.group.OffsetExpirationCondition;
+@@ -51,8 +50,6 @@ import org.apache.kafka.timeline.TimelineHashMap;
+ import org.apache.kafka.timeline.TimelineInteger;
+ import org.apache.kafka.timeline.TimelineObject;
+ 
+-import org.slf4j.Logger;
+-
+ import java.nio.ByteBuffer;
+ import java.util.Arrays;
+ import java.util.Collections;
+@@ -108,11 +105,6 @@ public class ConsumerGroup extends ModernGroup<ConsumerGroupMember> {
+         }
+     }
+ 
+-    /**
+-     * The logger.
+-     */
+-    private final Logger log;
+-
+     /**
+      * The group state.
+      */
+@@ -163,13 +155,11 @@ public class ConsumerGroup extends ModernGroup<ConsumerGroupMember> {
+     private final TimelineObject<Boolean> hasSubscriptionMetadataRecord;
+ 
+     public ConsumerGroup(
+-        LogContext logContext,
+         SnapshotRegistry snapshotRegistry,
+         String groupId,
+         GroupCoordinatorMetricsShard metrics
+     ) {
+         super(snapshotRegistry, groupId);
+-        this.log = logContext.logger(ConsumerGroup.class);
+         this.state = new TimelineObject<>(snapshotRegistry, EMPTY);
+         this.staticMembers = new TimelineHashMap<>(snapshotRegistry, 0);
+         this.serverAssignors = new TimelineHashMap<>(snapshotRegistry, 0);
+@@ -1053,6 +1043,7 @@ public class ConsumerGroup extends ModernGroup<ConsumerGroupMember> {
+      *
+      * @param assignment    The assignment.
+      * @param expectedEpoch The expected epoch.
++     * @throws IllegalStateException if the epoch does not match the expected one.
+      * package-private for testing.
+      */
+     void removePartitionEpochs(
+@@ -1063,12 +1054,11 @@ public class ConsumerGroup extends ModernGroup<ConsumerGroupMember> {
+             currentPartitionEpoch.compute(topicId, (__, partitionsOrNull) -> {
+                 if (partitionsOrNull != null) {
+                     assignedPartitions.forEach(partitionId -> {
+-                        Integer prevValue = partitionsOrNull.get(partitionId);
+-                        if (prevValue != null && prevValue == expectedEpoch) {
+-                            partitionsOrNull.remove(partitionId);
+-                        } else {
+-                            log.debug("[GroupId {}] Cannot remove the epoch {} from {}-{} because the partition is " +
+-                                    "still owned at a different epoch {}", groupId, expectedEpoch, topicId, partitionId, prevValue);
++                        Integer prevValue = partitionsOrNull.remove(partitionId);
++                        if (prevValue != expectedEpoch) {
++                            throw new IllegalStateException(
++                                String.format("Cannot remove the epoch %d from %s-%s because the partition is " +
++                                    "still owned at a different epoch %d", expectedEpoch, topicId, partitionId, prevValue));
+                         }
+                     });
+                     if (partitionsOrNull.isEmpty()) {
+@@ -1077,9 +1067,9 @@ public class ConsumerGroup extends ModernGroup<ConsumerGroupMember> {
+                         return partitionsOrNull;
+                     }
+                 } else {
+-                    log.debug("[GroupId {}] Cannot remove the epoch {} from {} because it does not have any epoch",
+-                            groupId, expectedEpoch, topicId);
+-                    return partitionsOrNull;
++                    throw new IllegalStateException(
++                        String.format("Cannot remove the epoch %d from %s because it does not have any epoch",
++                            expectedEpoch, topicId));
+                 }
+             });
+         });
+@@ -1090,7 +1080,7 @@ public class ConsumerGroup extends ModernGroup<ConsumerGroupMember> {
+      *
+      * @param assignment    The assignment.
+      * @param epoch         The new epoch.
+-     * @throws IllegalStateException if updating a partition with a smaller or equal epoch.
++     * @throws IllegalStateException if the partition already has an epoch assigned.
+      * package-private for testing.
+      */
+     void addPartitionEpochs(
+@@ -1103,10 +1093,8 @@ public class ConsumerGroup extends ModernGroup<ConsumerGroupMember> {
+                     partitionsOrNull = new TimelineHashMap<>(snapshotRegistry, assignedPartitions.size());
+                 }
+                 for (Integer partitionId : assignedPartitions) {
+-                    Integer prevValue = partitionsOrNull.get(partitionId);
+-                    if (prevValue == null || prevValue < epoch) {
+-                        partitionsOrNull.put(partitionId, epoch);
+-                    } else {
++                    Integer prevValue = partitionsOrNull.put(partitionId, epoch);
++                    if (prevValue != null) {
+                         throw new IllegalStateException(
+                             String.format("Cannot set the epoch of %s-%s to %d because the partition is " +
+                                 "still owned at epoch %d", topicId, partitionId, epoch, prevValue));
+@@ -1142,7 +1130,6 @@ public class ConsumerGroup extends ModernGroup<ConsumerGroupMember> {
+     /**
+      * Create a new consumer group according to the given classic group.
+      *
+-     * @param logContext        The log context.
+      * @param snapshotRegistry  The SnapshotRegistry.
+      * @param metrics           The GroupCoordinatorMetricsShard.
+      * @param classicGroup      The converted classic group.
+@@ -1154,7 +1141,6 @@ public class ConsumerGroup extends ModernGroup<ConsumerGroupMember> {
+      * @throws UnsupportedVersionException if userData from a custom assignor would be lost.
+      */
+     public static ConsumerGroup fromClassicGroup(
+-        LogContext logContext,
+         SnapshotRegistry snapshotRegistry,
+         GroupCoordinatorMetricsShard metrics,
+         ClassicGroup classicGroup,
+@@ -1162,7 +1148,7 @@ public class ConsumerGroup extends ModernGroup<ConsumerGroupMember> {
+         MetadataImage metadataImage
+     ) {
+         String groupId = classicGroup.groupId();
+-        ConsumerGroup consumerGroup = new ConsumerGroup(logContext, snapshotRegistry, groupId, metrics);
++        ConsumerGroup consumerGroup = new ConsumerGroup(snapshotRegistry, groupId, metrics);
+         consumerGroup.setGroupEpoch(classicGroup.generationId());
+         consumerGroup.setTargetAssignmentEpoch(classicGroup.generationId());
+ 
+diff --git a/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/streams/StreamsGroup.java b/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/streams/StreamsGroup.java
+index ee49c7643d..afc252a7fe 100644
+--- a/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/streams/StreamsGroup.java
++++ b/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/streams/StreamsGroup.java
+@@ -915,7 +915,7 @@ public class StreamsGroup implements Group {
+      *
+      * @param assignment    The assignment.
+      * @param expectedProcessId The expected process ID.
+-     * package-private for testing.
++     * @throws IllegalStateException if the process ID does not match the expected one. package-private for testing.
+      */
+     private void removeTaskProcessIds(
+         Map<String, Set<Integer>> assignment,
+@@ -926,12 +926,11 @@ public class StreamsGroup implements Group {
+             currentTasksProcessId.compute(subtopologyId, (__, partitionsOrNull) -> {
+                 if (partitionsOrNull != null) {
+                     assignedPartitions.forEach(partitionId -> {
+-                        String prevValue = partitionsOrNull.get(partitionId);
+-                        if (Objects.equals(prevValue, expectedProcessId)) {
+-                            partitionsOrNull.remove(partitionId);
+-                        } else {
+-                            log.debug("[GroupId {}] Cannot remove the process ID {} from task {}_{} because the partition is " +
+-                                    "still owned at a different process ID {}", groupId, expectedProcessId, subtopologyId, partitionId, prevValue);
++                        String prevValue = partitionsOrNull.remove(partitionId);
++                        if (!Objects.equals(prevValue, expectedProcessId)) {
++                            throw new IllegalStateException(
++                                String.format("Cannot remove the process ID %s from task %s_%s because the partition is " +
++                                    "still owned at a different process ID %s", expectedProcessId, subtopologyId, partitionId, prevValue));
+                         }
+                     });
+                     if (partitionsOrNull.isEmpty()) {
+@@ -940,9 +939,9 @@ public class StreamsGroup implements Group {
+                         return partitionsOrNull;
+                     }
+                 } else {
+-                    log.debug("[GroupId {}] Cannot remove the process ID {} from {} because it does not have any processId",
+-                            groupId, expectedProcessId, subtopologyId);
+-                    return partitionsOrNull;
++                    throw new IllegalStateException(
++                        String.format("Cannot remove the process ID %s from %s because it does not have any processId",
++                            expectedProcessId, subtopologyId));
+                 }
+             });
+         });
+@@ -953,7 +952,7 @@ public class StreamsGroup implements Group {
+      *
+      * @param assignment    The assignment.
+      * @param processIdToRemove The expected process ID.
+-     * package-private for testing.
++     * @throws IllegalStateException if the process ID does not match the expected one. package-private for testing.
+      */
+     private void removeTaskProcessIdsFromSet(
+         Map<String, Set<Integer>> assignment,
+@@ -964,9 +963,10 @@ public class StreamsGroup implements Group {
+             currentTasksProcessId.compute(subtopologyId, (__, partitionsOrNull) -> {
+                 if (partitionsOrNull != null) {
+                     assignedPartitions.forEach(partitionId -> {
+-                        if (!partitionsOrNull.containsKey(partitionId) || !partitionsOrNull.get(partitionId).remove(processIdToRemove)) {
+-                            log.debug("[GroupId {}] Cannot remove the process ID {} from task {}_{} because the task is " +
+-                                    "not owned by this process ID", groupId, processIdToRemove, subtopologyId, partitionId);
++                        if (!partitionsOrNull.get(partitionId).remove(processIdToRemove)) {
++                            throw new IllegalStateException(
++                                String.format("Cannot remove the process ID %s from task %s_%s because the task is " +
++                                    "not owned by this process ID", processIdToRemove, subtopologyId, partitionId));
+                         }
+                     });
+                     if (partitionsOrNull.isEmpty()) {
+@@ -975,9 +975,9 @@ public class StreamsGroup implements Group {
+                         return partitionsOrNull;
+                     }
+                 } else {
+-                    log.debug("[GroupId {}] Cannot remove the process ID {} from {} because it does not have any process ID",
+-                            groupId, processIdToRemove, subtopologyId);
+-                    return partitionsOrNull;
++                    throw new IllegalStateException(
++                        String.format("Cannot remove the process ID %s from %s because it does not have any process ID",
++                            processIdToRemove, subtopologyId));
+                 }
+             });
+         });
+@@ -988,7 +988,7 @@ public class StreamsGroup implements Group {
+      *
+      * @param tasks     The assigned tasks.
+      * @param processId The process ID.
+-     * package-private for testing.
++     * @throws IllegalStateException if the partition already has an epoch assigned. package-private for testing.
+      */
+     void addTaskProcessId(
+         TasksTuple tasks,
+@@ -1014,8 +1014,9 @@ public class StreamsGroup implements Group {
+                 for (Integer partitionId : assignedTaskPartitions) {
+                     String prevValue = partitionsOrNull.put(partitionId, processId);
+                     if (prevValue != null) {
+-                        log.debug("[GroupId {}] Setting the process ID of {}-{} to {} even though the partition is " +
+-                            "still owned by process ID {}", groupId, subtopologyId, partitionId, processId, prevValue);
++                        throw new IllegalStateException(
++                            String.format("Cannot set the process ID of %s-%s to %s because the partition is " +
++                                "still owned by process ID %s", subtopologyId, partitionId, processId, prevValue));
+                     }
+                 }
+                 return partitionsOrNull;
+diff --git a/group-coordinator/src/test/java/org/apache/kafka/coordinator/group/GroupCoordinatorShardTest.java b/group-coordinator/src/test/java/org/apache/kafka/coordinator/group/GroupCoordinatorShardTest.java
+index 605fef803b..d58c6b6b1a 100644
+--- a/group-coordinator/src/test/java/org/apache/kafka/coordinator/group/GroupCoordinatorShardTest.java
++++ b/group-coordinator/src/test/java/org/apache/kafka/coordinator/group/GroupCoordinatorShardTest.java
+@@ -1386,8 +1386,8 @@ public class GroupCoordinatorShardTest {
+         SnapshotRegistry snapshotRegistry = new SnapshotRegistry(new LogContext());
+         GroupCoordinatorMetricsShard metricsShard = mock(GroupCoordinatorMetricsShard.class);
+ 
+-        ConsumerGroup group1 = new ConsumerGroup(new LogContext(), snapshotRegistry, "group-id", metricsShard);
+-        ConsumerGroup group2 = new ConsumerGroup(new LogContext(), snapshotRegistry, "other-group-id", metricsShard);
++        ConsumerGroup group1 = new ConsumerGroup(snapshotRegistry, "group-id", metricsShard);
++        ConsumerGroup group2 = new ConsumerGroup(snapshotRegistry, "other-group-id", metricsShard);
+ 
+         when(groupMetadataManager.groupIds()).thenReturn(Set.of("group-id", "other-group-id"));
+         when(groupMetadataManager.group("group-id")).thenReturn(group1);
+diff --git a/group-coordinator/src/test/java/org/apache/kafka/coordinator/group/GroupMetadataManagerTest.java b/group-coordinator/src/test/java/org/apache/kafka/coordinator/group/GroupMetadataManagerTest.java
+index e9069f12f8..3c87628451 100644
+--- a/group-coordinator/src/test/java/org/apache/kafka/coordinator/group/GroupMetadataManagerTest.java
++++ b/group-coordinator/src/test/java/org/apache/kafka/coordinator/group/GroupMetadataManagerTest.java
+@@ -23465,238 +23465,6 @@ public class GroupMetadataManagerTest {
+         return members;
+     }
+ 
+-    @Test
+-    public void testReplayConsumerGroupCurrentMemberAssignmentWithCompaction() {
+-        String groupId = "fooup";
+-        String memberIdA = "memberIdA";
+-        String memberIdB = "memberIdB";
+-        Uuid topicId = Uuid.randomUuid();
+-
+-        GroupMetadataManagerTestContext context = new GroupMetadataManagerTestContext.Builder().build();
+-
+-        // This test enacts the following scenario:
+-        // 1. Member A is assigned partition 0.
+-        // 2. Member A is unassigned partition 0 [record removed by compaction].
+-        // 3. Member B is assigned partition 0. 
+-        // 4. Member A is assigned partition 1. 
+-        // If record 2 is processed, there are no issues, however with compaction it is possible that 
+-        // unassignment records are removed. We would like to not fail in these cases.
+-        // Therefore we will allow assignments to owned partitions as long as the epoch is larger. 
+-
+-        context.replay(GroupCoordinatorRecordHelpers.newConsumerGroupCurrentAssignmentRecord(groupId, new ConsumerGroupMember.Builder(memberIdA)
+-            .setState(MemberState.STABLE)
+-            .setMemberEpoch(11)
+-            .setPreviousMemberEpoch(10)
+-            .setAssignedPartitions(mkAssignment(mkTopicAssignment(topicId, 0)))
+-            .build()));
+-
+-        // Partition 0's owner is replaced by member B at epoch 12.
+-        context.replay(GroupCoordinatorRecordHelpers.newConsumerGroupCurrentAssignmentRecord(groupId, new ConsumerGroupMember.Builder(memberIdB)
+-            .setState(MemberState.STABLE)
+-            .setMemberEpoch(12)
+-            .setPreviousMemberEpoch(11)
+-            .setAssignedPartitions(mkAssignment(mkTopicAssignment(topicId, 0)))
+-            .build()));
+-
+-        // Partition 0 must remain with member B at epoch 12 even though member A has just been unassigned partition 0.
+-        context.replay(GroupCoordinatorRecordHelpers.newConsumerGroupCurrentAssignmentRecord(groupId, new ConsumerGroupMember.Builder(memberIdA)
+-            .setState(MemberState.STABLE)
+-            .setMemberEpoch(13)
+-            .setPreviousMemberEpoch(12)
+-            .setAssignedPartitions(mkAssignment(mkTopicAssignment(topicId, 1)))
+-            .build()));
+-
+-        // Verify partition epochs.
+-        ConsumerGroup group = context.groupMetadataManager.consumerGroup(groupId);
+-        assertEquals(12, group.currentPartitionEpoch(topicId, 0));
+-        assertEquals(13, group.currentPartitionEpoch(topicId, 1));
+-    }
+-
+-    @Test
+-    public void testReplayConsumerGroupCurrentMemberAssignmentUnownedTopicWithCompaction() {
+-        String groupId = "fooup";
+-        String memberIdA = "memberIdA";
+-        String memberIdB = "memberIdB";
+-        Uuid fooTopicId = Uuid.randomUuid();
+-        Uuid barTopicId = Uuid.randomUuid();
+-
+-        GroupMetadataManagerTestContext context = new GroupMetadataManagerTestContext.Builder().build();
+-
+-        // This test enacts the following scenario:
+-        // 1. Member A is assigned partition foo-0.
+-        // 2. Member A is unassigned partition foo-0 [record removed by compaction].
+-        // 3. Member B is assigned partition foo-0.
+-        // 4. Member B is unassigned partition foo-0. 
+-        // 5. Member A is assigned partition bar-0. 
+-        // This is a legitimate set of assignments but with compaction the unassignment record can be skipped.
+-        // This can lead to conflicts from updating an owned partition in step 3 and attempting 
+-        // to remove nonexistent ownership in step 5. We want to ensure removing ownership from a 
+-        // completely unowned partition in step 5 is allowed.  
+-
+-        context.replay(GroupCoordinatorRecordHelpers.newConsumerGroupCurrentAssignmentRecord(groupId, new ConsumerGroupMember.Builder(memberIdA)
+-            .setState(MemberState.STABLE)
+-            .setMemberEpoch(11)
+-            .setPreviousMemberEpoch(10)
+-            .setAssignedPartitions(mkAssignment(mkTopicAssignment(fooTopicId, 0)))
+-            .build()));
+-
+-        // foo-0's owner is replaced by member B at epoch 12.
+-        context.replay(GroupCoordinatorRecordHelpers.newConsumerGroupCurrentAssignmentRecord(groupId, new ConsumerGroupMember.Builder(memberIdB)
+-            .setState(MemberState.STABLE)
+-            .setMemberEpoch(12)
+-            .setPreviousMemberEpoch(11)
+-            .setAssignedPartitions(mkAssignment(mkTopicAssignment(fooTopicId, 0)))
+-            .build()));
+-
+-        // foo becomes unowned.
+-        context.replay(GroupCoordinatorRecordHelpers.newConsumerGroupCurrentAssignmentRecord(groupId, new ConsumerGroupMember.Builder(memberIdB)
+-            .setState(MemberState.STABLE)
+-            .setMemberEpoch(13)
+-            .setPreviousMemberEpoch(12)
+-            .build()));
+-
+-        // Member A is unassigned foo-0.
+-        context.replay(GroupCoordinatorRecordHelpers.newConsumerGroupCurrentAssignmentRecord(groupId, new ConsumerGroupMember.Builder(memberIdA)
+-            .setState(MemberState.STABLE)
+-            .setMemberEpoch(14)
+-            .setPreviousMemberEpoch(13)
+-            .setAssignedPartitions(mkAssignment(mkTopicAssignment(barTopicId, 0)))
+-            .build()));
+-
+-        // Verify foo-0 is unowned and bar-0 is owned by member A at epoch 14.
+-        ConsumerGroup group = context.groupMetadataManager.consumerGroup(groupId);
+-        assertEquals(-1, group.currentPartitionEpoch(fooTopicId, 0));
+-        assertEquals(14, group.currentPartitionEpoch(barTopicId, 0));
+-    }
+-
+-    @Test
+-    public void testReplayStreamsGroupCurrentMemberAssignmentWithCompaction() {
+-        String groupId = "fooup";
+-        String memberIdA = "memberIdA";
+-        String memberIdB = "memberIdB";
+-        String processIdA = "processIdA";
+-        String processIdB = "processIdB";
+-        String subtopologyId = "subtopology";
+-
+-        GroupMetadataManagerTestContext context = new GroupMetadataManagerTestContext.Builder().build();
+-        // Initialize members with process Ids.
+-        context.replay(StreamsCoordinatorRecordHelpers.newStreamsGroupMemberRecord(groupId, 
+-            streamsGroupMemberBuilderWithDefaults(memberIdA)
+-                .setProcessId(processIdA)
+-                .build()));
+-        context.replay(StreamsCoordinatorRecordHelpers.newStreamsGroupMemberRecord(groupId, 
+-            streamsGroupMemberBuilderWithDefaults(memberIdB)
+-                .setProcessId(processIdB)
+-                .build()));
+-
+-        // This test enacts the following scenario:
+-        // 1. Member A is assigned task 0.
+-        // 2. Member A is unassigned task 0 [record removed by compaction].
+-        // 3. Member B is assigned task 0. 
+-        // 4. Member A is assigned task 1. 
+-        // If record 2 is processed, there are no issues, however with compaction it is possible that 
+-        // unassignment records are removed. We would like to not fail in these cases.
+-        // Therefore we will allow assignments to owned tasks as long as the epoch is larger.
+-
+-        // Assign task 0 to member A.
+-        context.replay(StreamsCoordinatorRecordHelpers.newStreamsGroupCurrentAssignmentRecord(groupId, streamsGroupMemberBuilderWithDefaults(memberIdA)
+-            .setState(org.apache.kafka.coordinator.group.streams.MemberState.STABLE)
+-            .setMemberEpoch(11)
+-            .setPreviousMemberEpoch(10)
+-            .setAssignedTasks(TaskAssignmentTestUtil.mkTasksTuple(TaskRole.ACTIVE, 
+-                    TaskAssignmentTestUtil.mkTasks(subtopologyId, 0)))
+-            .build()));
+-
+-        // Task 0's owner is replaced by member B at epoch 12.
+-        context.replay(StreamsCoordinatorRecordHelpers.newStreamsGroupCurrentAssignmentRecord(groupId, streamsGroupMemberBuilderWithDefaults(memberIdB)
+-            .setMemberEpoch(12)
+-            .setPreviousMemberEpoch(11)
+-            .setAssignedTasks(TaskAssignmentTestUtil.mkTasksTuple(TaskRole.ACTIVE, 
+-                    TaskAssignmentTestUtil.mkTasks(subtopologyId, 0)))
+-            .build()));
+-
+-        // Task 0 must remain with member B at epoch 12 even though member A has just been unassigned task 0.
+-        context.replay(StreamsCoordinatorRecordHelpers.newStreamsGroupCurrentAssignmentRecord(groupId, streamsGroupMemberBuilderWithDefaults(memberIdA)
+-            .setMemberEpoch(13)
+-            .setPreviousMemberEpoch(12)
+-            .setAssignedTasks(TaskAssignmentTestUtil.mkTasksTuple(TaskRole.ACTIVE, 
+-                    TaskAssignmentTestUtil.mkTasks(subtopologyId, 1)))
+-            .build()));
+-
+-        // Verify task 1 is assigned to member A and task 0 to member B.
+-        StreamsGroup group = context.groupMetadataManager.streamsGroup(groupId);
+-        assertEquals(processIdA, group.currentActiveTaskProcessId(subtopologyId, 1));
+-        assertEquals(processIdB, group.currentActiveTaskProcessId(subtopologyId, 0));
+-    }
+-
+-    @Test
+-    public void testReplayStreamsGroupCurrentMemberAssignmentUnownedTopologyWithCompaction() {
+-        String groupId = "fooup";
+-        String memberIdA = "memberIdA";
+-        String memberIdB = "memberIdB";
+-        String processIdA = "processIdA";
+-        String processIdB = "processIdB";
+-        String subtopologyFoo = "subtopologyFoo";
+-        String subtopologyBar = "subtopologyBar";
+-
+-        GroupMetadataManagerTestContext context = new GroupMetadataManagerTestContext.Builder().build();
+-        // Initialize members with process Ids.
+-        context.replay(StreamsCoordinatorRecordHelpers.newStreamsGroupMemberRecord(groupId, 
+-            streamsGroupMemberBuilderWithDefaults(memberIdA)
+-                .setProcessId(processIdA)
+-                .build()));
+-        context.replay(StreamsCoordinatorRecordHelpers.newStreamsGroupMemberRecord(groupId, 
+-            streamsGroupMemberBuilderWithDefaults(memberIdB)
+-                .setProcessId(processIdB)
+-                .build()));
+-
+-        // This test enacts the following scenario:
+-        // 1. Member A is assigned task foo-0.
+-        // 2. Member A is unassigned task foo-0 [record removed by compaction].
+-        // 3. Member B is assigned task foo-0.
+-        // 4. Member B is unassigned task foo-0. 
+-        // 5. Member A is assigned task bar-0. 
+-        // This is a legitimate set of assignments but with compaction the unassignment record can be skipped.
+-        // This can lead to conflicts from updating an owned subtopology in step 3 and attempting to remove
+-        // nonexistent ownership in step 5. We want to ensure removing ownership from a 
+-        // completely unowned subtopology in step 5 is allowed.  
+-
+-        context.replay(StreamsCoordinatorRecordHelpers.newStreamsGroupCurrentAssignmentRecord(groupId, streamsGroupMemberBuilderWithDefaults(memberIdA)
+-            .setState(org.apache.kafka.coordinator.group.streams.MemberState.STABLE)
+-            .setMemberEpoch(11)
+-            .setPreviousMemberEpoch(10)
+-            .setAssignedTasks(TaskAssignmentTestUtil.mkTasksTuple(TaskRole.ACTIVE, 
+-                TaskAssignmentTestUtil.mkTasks(subtopologyFoo, 0)))
+-            .build()));
+-
+-        // foo-0's owner is replaced by member B at epoch 12.
+-        context.replay(StreamsCoordinatorRecordHelpers.newStreamsGroupCurrentAssignmentRecord(groupId, streamsGroupMemberBuilderWithDefaults(memberIdB)
+-            .setMemberEpoch(12)
+-            .setPreviousMemberEpoch(11)
+-            .setAssignedTasks(TaskAssignmentTestUtil.mkTasksTuple(TaskRole.ACTIVE, 
+-                TaskAssignmentTestUtil.mkTasks(subtopologyFoo, 0)))
+-            .build()));
+-
+-        // foo becomes unowned
+-        context.replay(StreamsCoordinatorRecordHelpers.newStreamsGroupCurrentAssignmentRecord(groupId, streamsGroupMemberBuilderWithDefaults(memberIdB)
+-            .setMemberEpoch(13)
+-            .setPreviousMemberEpoch(12)
+-            .build()));
+-
+-        // Member A is unassigned foo-0.
+-        context.replay(StreamsCoordinatorRecordHelpers.newStreamsGroupCurrentAssignmentRecord(groupId, streamsGroupMemberBuilderWithDefaults(memberIdA)
+-            .setMemberEpoch(14)
+-            .setPreviousMemberEpoch(13)
+-            .setAssignedTasks(TaskAssignmentTestUtil.mkTasksTuple(TaskRole.ACTIVE, 
+-                TaskAssignmentTestUtil.mkTasks(subtopologyBar, 0)))
+-            .build()));
+-
+-        // Verify foo-0 is unassigned and bar-0 is assigned to member A.
+-        StreamsGroup group = context.groupMetadataManager.streamsGroup(groupId);
+-        assertEquals(null, group.currentActiveTaskProcessId(subtopologyFoo, 0));
+-        assertEquals(processIdA, group.currentActiveTaskProcessId(subtopologyBar, 0));
+-    }
+-
+     private static List<String> verifyClassicGroupJoinResponses(
+         List<GroupMetadataManagerTestContext.JoinResult> joinResults,
+         int expectedSuccessCount,
+diff --git a/group-coordinator/src/test/java/org/apache/kafka/coordinator/group/classic/ClassicGroupTest.java b/group-coordinator/src/test/java/org/apache/kafka/coordinator/group/classic/ClassicGroupTest.java
+index 2464324733..dfcb415fd3 100644
+--- a/group-coordinator/src/test/java/org/apache/kafka/coordinator/group/classic/ClassicGroupTest.java
++++ b/group-coordinator/src/test/java/org/apache/kafka/coordinator/group/classic/ClassicGroupTest.java
+@@ -1381,7 +1381,6 @@ public class ClassicGroupTest {
+             .build();
+ 
+         ConsumerGroup consumerGroup = new ConsumerGroup(
+-            logContext,
+             new SnapshotRegistry(logContext),
+             groupId,
+             mock(GroupCoordinatorMetricsShard.class)
+@@ -1535,7 +1534,6 @@ public class ClassicGroupTest {
+             .build();
+ 
+         ConsumerGroup consumerGroup = new ConsumerGroup(
+-            logContext,
+             new SnapshotRegistry(logContext),
+             groupId,
+             mock(GroupCoordinatorMetricsShard.class)
+diff --git a/group-coordinator/src/test/java/org/apache/kafka/coordinator/group/modern/consumer/ConsumerGroupTest.java b/group-coordinator/src/test/java/org/apache/kafka/coordinator/group/modern/consumer/ConsumerGroupTest.java
+index f8bf2fe15f..f6afa3ee08 100644
+--- a/group-coordinator/src/test/java/org/apache/kafka/coordinator/group/modern/consumer/ConsumerGroupTest.java
++++ b/group-coordinator/src/test/java/org/apache/kafka/coordinator/group/modern/consumer/ConsumerGroupTest.java
+@@ -89,7 +89,6 @@ public class ConsumerGroupTest {
+     private ConsumerGroup createConsumerGroup(String groupId) {
+         SnapshotRegistry snapshotRegistry = new SnapshotRegistry(new LogContext());
+         return new ConsumerGroup(
+-            new LogContext(),
+             snapshotRegistry,
+             groupId,
+             mock(GroupCoordinatorMetricsShard.class)
+@@ -285,26 +284,14 @@ public class ConsumerGroupTest {
+         consumerGroup.updateMember(m1);
+ 
+         ConsumerGroupMember m2 = new ConsumerGroupMember.Builder("m2")
+-            .setMemberEpoch(11)
+-            .setAssignedPartitions(mkAssignment(
+-                mkTopicAssignment(fooTopicId, 1)))
+-            .build();
+-
+-        // m2 can acquire foo-1 because the epoch is larger than m1's epoch.
+-        // This should not throw IllegalStateException.
+-        consumerGroup.updateMember(m2);
+-
+-        ConsumerGroupMember m3 = new ConsumerGroupMember.Builder("m3")
+             .setMemberEpoch(10)
+             .setAssignedPartitions(mkAssignment(
+                 mkTopicAssignment(fooTopicId, 1)))
+             .build();
+ 
+-        // m3 should not be able to acquire foo-1 because the epoch is smaller 
+-        // than the current partition epoch (11).
+-        assertThrows(IllegalStateException.class, () -> {
+-            consumerGroup.updateMember(m3);
+-        });
++        // m2 should not be able to acquire foo-1 because the partition is
++        // still owned by another member.
++        assertThrows(IllegalStateException.class, () -> consumerGroup.updateMember(m2));
+     }
+ 
+     @Test
+@@ -312,13 +299,13 @@ public class ConsumerGroupTest {
+         Uuid fooTopicId = Uuid.randomUuid();
+         ConsumerGroup consumerGroup = createConsumerGroup("foo");
+ 
+-        // Removing should be a no-op when there is no epoch set.
+-        consumerGroup.removePartitionEpochs(
++        // Removing should fail because there is no epoch set.
++        assertThrows(IllegalStateException.class, () -> consumerGroup.removePartitionEpochs(
+             mkAssignment(
+                 mkTopicAssignment(fooTopicId, 1)
+             ),
+             10
+-        );
++        ));
+ 
+         ConsumerGroupMember m1 = new ConsumerGroupMember.Builder("m1")
+             .setMemberEpoch(10)
+@@ -328,15 +315,13 @@ public class ConsumerGroupTest {
+ 
+         consumerGroup.updateMember(m1);
+ 
+-        // Removing with incorrect epoch should do nothing. 
+-        // A debug message is logged, no exception is thrown.
+-        consumerGroup.removePartitionEpochs(
++        // Removing should fail because the expected epoch is incorrect.
++        assertThrows(IllegalStateException.class, () -> consumerGroup.removePartitionEpochs(
+             mkAssignment(
+                 mkTopicAssignment(fooTopicId, 1)
+             ),
+             11
+-        );
+-        assertEquals(10, consumerGroup.currentPartitionEpoch(fooTopicId, 1));
++        ));
+     }
+ 
+     @Test
+@@ -351,24 +336,14 @@ public class ConsumerGroupTest {
+             10
+         );
+ 
+-        // Updating to a larger epoch should succeed.
+-        consumerGroup.addPartitionEpochs(
++        // Changing the epoch should fail because the owner of the partition
++        // should remove it first.
++        assertThrows(IllegalStateException.class, () -> consumerGroup.addPartitionEpochs(
+             mkAssignment(
+                 mkTopicAssignment(fooTopicId, 1)
+             ),
+             11
+-        );
+-        assertEquals(11, consumerGroup.currentPartitionEpoch(fooTopicId, 1));
+-
+-        // Updating to a smaller epoch should fail.
+-        assertThrows(IllegalStateException.class, () -> {
+-            consumerGroup.addPartitionEpochs(
+-                mkAssignment(
+-                    mkTopicAssignment(fooTopicId, 1)
+-                ),
+-                10
+-            );
+-        });
++        ));
+     }
+ 
+     @Test
+@@ -725,7 +700,7 @@ public class ConsumerGroupTest {
+     public void testUpdateInvertedAssignment() {
+         SnapshotRegistry snapshotRegistry = new SnapshotRegistry(new LogContext());
+         GroupCoordinatorMetricsShard metricsShard = mock(GroupCoordinatorMetricsShard.class);
+-        ConsumerGroup consumerGroup = new ConsumerGroup(new LogContext(), snapshotRegistry, "test-group", metricsShard);
++        ConsumerGroup consumerGroup = new ConsumerGroup(snapshotRegistry, "test-group", metricsShard);
+         Uuid topicId = Uuid.randomUuid();
+         String memberId1 = "member1";
+         String memberId2 = "member2";
+@@ -945,7 +920,7 @@ public class ConsumerGroupTest {
+             Map.of(),
+             new TopicPartition(Topic.GROUP_METADATA_TOPIC_NAME, 0)
+         );
+-        ConsumerGroup group = new ConsumerGroup(new LogContext(), snapshotRegistry, "group-foo", metricsShard);
++        ConsumerGroup group = new ConsumerGroup(snapshotRegistry, "group-foo", metricsShard);
+         snapshotRegistry.idempotentCreateSnapshot(0);
+         assertEquals(ConsumerGroup.ConsumerGroupState.EMPTY.toString(), group.stateAsString(0));
+         group.updateMember(new ConsumerGroupMember.Builder("member1")
+@@ -960,7 +935,6 @@ public class ConsumerGroupTest {
+     public void testValidateOffsetFetch() {
+         SnapshotRegistry snapshotRegistry = new SnapshotRegistry(new LogContext());
+         ConsumerGroup group = new ConsumerGroup(
+-            new LogContext(), 
+             snapshotRegistry,
+             "group-foo",
+             mock(GroupCoordinatorMetricsShard.class)
+@@ -1022,7 +996,7 @@ public class ConsumerGroupTest {
+         long commitTimestamp = 20000L;
+         long offsetsRetentionMs = 10000L;
+         OffsetAndMetadata offsetAndMetadata = new OffsetAndMetadata(15000L, OptionalInt.empty(), "", commitTimestamp, OptionalLong.empty(), Uuid.ZERO_UUID);
+-        ConsumerGroup group = new ConsumerGroup(new LogContext(), new SnapshotRegistry(new LogContext()), "group-id", mock(GroupCoordinatorMetricsShard.class));
++        ConsumerGroup group = new ConsumerGroup(new SnapshotRegistry(new LogContext()), "group-id", mock(GroupCoordinatorMetricsShard.class));
+ 
+         Optional<OffsetExpirationCondition> offsetExpirationCondition = group.offsetExpirationCondition();
+         assertTrue(offsetExpirationCondition.isPresent());
+@@ -1059,7 +1033,7 @@ public class ConsumerGroupTest {
+     @Test
+     public void testAsDescribedGroup() {
+         SnapshotRegistry snapshotRegistry = new SnapshotRegistry(new LogContext());
+-        ConsumerGroup group = new ConsumerGroup(new LogContext(), snapshotRegistry, "group-id-1", mock(GroupCoordinatorMetricsShard.class));
++        ConsumerGroup group = new ConsumerGroup(snapshotRegistry, "group-id-1", mock(GroupCoordinatorMetricsShard.class));
+         snapshotRegistry.idempotentCreateSnapshot(0);
+         assertEquals(ConsumerGroup.ConsumerGroupState.EMPTY.toString(), group.stateAsString(0));
+ 
+@@ -1101,7 +1075,7 @@ public class ConsumerGroupTest {
+             Map.of(),
+             new TopicPartition(Topic.GROUP_METADATA_TOPIC_NAME, 0)
+         );
+-        ConsumerGroup group = new ConsumerGroup(new LogContext(), snapshotRegistry, "group-foo", metricsShard);
++        ConsumerGroup group = new ConsumerGroup(snapshotRegistry, "group-foo", metricsShard);
+         snapshotRegistry.idempotentCreateSnapshot(0);
+         assertTrue(group.isInStates(Set.of("empty"), 0));
+         assertFalse(group.isInStates(Set.of("Empty"), 0));
+@@ -1331,7 +1305,6 @@ public class ConsumerGroupTest {
+         classicGroup.add(member);
+ 
+         ConsumerGroup consumerGroup = ConsumerGroup.fromClassicGroup(
+-            logContext,
+             new SnapshotRegistry(logContext),
+             mock(GroupCoordinatorMetricsShard.class),
+             classicGroup,
+@@ -1340,7 +1313,6 @@ public class ConsumerGroupTest {
+         );
+ 
+         ConsumerGroup expectedConsumerGroup = new ConsumerGroup(
+-            new LogContext(), 
+             new SnapshotRegistry(logContext),
+             groupId,
+             mock(GroupCoordinatorMetricsShard.class)
+diff --git a/group-coordinator/src/test/java/org/apache/kafka/coordinator/group/streams/StreamsGroupTest.java b/group-coordinator/src/test/java/org/apache/kafka/coordinator/group/streams/StreamsGroupTest.java
+index 22d42a3d97..8966c93635 100644
+--- a/group-coordinator/src/test/java/org/apache/kafka/coordinator/group/streams/StreamsGroupTest.java
++++ b/group-coordinator/src/test/java/org/apache/kafka/coordinator/group/streams/StreamsGroupTest.java
+@@ -348,7 +348,7 @@ public class StreamsGroupTest {
+         StreamsGroup streamsGroup = createStreamsGroup("foo");
+ 
+         StreamsGroupMember m1 = new StreamsGroupMember.Builder("m1")
+-            .setProcessId("process1")
++            .setProcessId("process")
+             .setAssignedTasks(
+                 new TasksTuple(
+                     mkTasksPerSubtopology(mkTasks(fooSubtopologyId, 1)),
+@@ -361,7 +361,7 @@ public class StreamsGroupTest {
+         streamsGroup.updateMember(m1);
+ 
+         StreamsGroupMember m2 = new StreamsGroupMember.Builder("m2")
+-            .setProcessId("process2")
++            .setProcessId("process")
+             .setAssignedTasks(
+                 new TasksTuple(
+                     mkTasksPerSubtopology(mkTasks(fooSubtopologyId, 1)),
+@@ -371,10 +371,9 @@ public class StreamsGroupTest {
+             )
+             .build();
+ 
+-        // We allow m2 to acquire foo-1 despite the fact that m1 has ownership because the processId is different.
+-        streamsGroup.updateMember(m2);
+-
+-        assertEquals("process2", streamsGroup.currentActiveTaskProcessId(fooSubtopologyId, 1));
++        // m2 should not be able to acquire foo-1 because the partition is
++        // still owned by another member.
++        assertThrows(IllegalStateException.class, () -> streamsGroup.updateMember(m2));
+     }
+ 
+ 
+@@ -384,11 +383,11 @@ public class StreamsGroupTest {
+         String fooSubtopologyId = "foo-sub";
+         StreamsGroup streamsGroup = createStreamsGroup("foo");
+ 
+-        // Removing should be a no-op when there is no process id set.
+-        streamsGroup.removeTaskProcessIds(
++        // Removing should fail because there is no epoch set.
++        assertThrows(IllegalStateException.class, () -> streamsGroup.removeTaskProcessIds(
+             mkTasksTuple(taskRole, mkTasks(fooSubtopologyId, 1)),
+             "process"
+-        );
++        ));
+ 
+         StreamsGroupMember m1 = new StreamsGroupMember.Builder("m1")
+             .setProcessId("process")
+@@ -397,15 +396,11 @@ public class StreamsGroupTest {
+ 
+         streamsGroup.updateMember(m1);
+ 
+-        // Removing with incorrect process id should do nothing. 
+-        // A debug message is logged, no exception is thrown.
+-        streamsGroup.removeTaskProcessIds(
+-            TaskAssignmentTestUtil.mkTasksTuple(taskRole, mkTasks(fooSubtopologyId, 1)),
++        // Removing should fail because the expected epoch is incorrect.
++        assertThrows(IllegalStateException.class, () -> streamsGroup.removeTaskProcessIds(
++            mkTasksTuple(taskRole, mkTasks(fooSubtopologyId, 1)),
+             "process1"
+-        );
+-        if (taskRole == TaskRole.ACTIVE) {
+-            assertEquals("process", streamsGroup.currentActiveTaskProcessId(fooSubtopologyId, 1));
+-        }
++        ));
+     }
+ 
+     @Test
+@@ -422,17 +417,16 @@ public class StreamsGroupTest {
+             "process"
+         );
+ 
+-        // We allow replacing with a different process id.
+-        streamsGroup.addTaskProcessId(
++        // Changing the epoch should fail because the owner of the partition
++        // should remove it first.
++        assertThrows(IllegalStateException.class, () -> streamsGroup.addTaskProcessId(
+             new TasksTuple(
+                 mkTasksPerSubtopology(mkTasks(fooSubtopologyId, 1)),
+                 mkTasksPerSubtopology(mkTasks(fooSubtopologyId, 2)),
+                 mkTasksPerSubtopology(mkTasks(fooSubtopologyId, 3))
+             ),
+-            "process2"
+-        );
+-
+-        assertEquals("process2", streamsGroup.currentActiveTaskProcessId(fooSubtopologyId, 1));
++            "process"
++        ));
+     }
+ 
+     @Test
+diff --git a/streams/src/main/java/org/apache/kafka/streams/internals/metrics/OpenIterators.java b/streams/src/main/java/org/apache/kafka/streams/internals/metrics/OpenIterators.java
+deleted file mode 100644
+index bdeed2f897..0000000000
+--- a/streams/src/main/java/org/apache/kafka/streams/internals/metrics/OpenIterators.java
++++ /dev/null
+@@ -1,86 +0,0 @@
+-/*
+- * Licensed to the Apache Software Foundation (ASF) under one or more
+- * contributor license agreements. See the NOTICE file distributed with
+- * this work for additional information regarding copyright ownership.
+- * The ASF licenses this file to You under the Apache License, Version 2.0
+- * (the "License"); you may not use this file except in compliance with
+- * the License. You may obtain a copy of the License at
+- *
+- *    http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-package org.apache.kafka.streams.internals.metrics;
+-
+-import org.apache.kafka.common.MetricName;
+-import org.apache.kafka.streams.processor.TaskId;
+-import org.apache.kafka.streams.processor.internals.metrics.StreamsMetricsImpl;
+-import org.apache.kafka.streams.state.internals.MeteredIterator;
+-import org.apache.kafka.streams.state.internals.metrics.StateStoreMetrics;
+-
+-import java.util.Comparator;
+-import java.util.Iterator;
+-import java.util.NavigableSet;
+-import java.util.concurrent.ConcurrentSkipListSet;
+-import java.util.concurrent.atomic.AtomicLong;
+-import java.util.concurrent.atomic.LongAdder;
+-
+-public class OpenIterators {
+-    private final TaskId taskId;
+-    private final String metricsScope;
+-    private final String name;
+-    private final StreamsMetricsImpl streamsMetrics;
+-
+-    private final LongAdder numOpenIterators = new LongAdder();
+-    private final NavigableSet<MeteredIterator> openIterators = new ConcurrentSkipListSet<>(Comparator.comparingLong(MeteredIterator::startTimestamp));
+-    private final AtomicLong oldestStartTimestamp = new AtomicLong();
+-
+-    private MetricName metricName;
+-
+-    public OpenIterators(final TaskId taskId,
+-                         final String metricsScope,
+-                         final String name,
+-                         final StreamsMetricsImpl streamsMetrics) {
+-        this.taskId = taskId;
+-        this.metricsScope = metricsScope;
+-        this.name = name;
+-        this.streamsMetrics = streamsMetrics;
+-    }
+-
+-    public void add(final MeteredIterator iterator) {
+-        openIterators.add(iterator);
+-        numOpenIterators.increment();
+-        updateOldestStartTimestamp();
+-
+-        if (numOpenIterators.intValue() == 1) {
+-            metricName = StateStoreMetrics.addOldestOpenIteratorGauge(taskId.toString(), metricsScope, name, streamsMetrics,
+-                (config, now) -> oldestStartTimestamp.get()
+-            );
+-        }
+-    }
+-
+-    public void remove(final MeteredIterator iterator) {
+-        if (numOpenIterators.intValue() == 1) {
+-            streamsMetrics.removeMetric(metricName);
+-            streamsMetrics.removeStoreLevelMetric(metricName);
+-        }
+-        numOpenIterators.decrement();
+-        openIterators.remove(iterator);
+-        updateOldestStartTimestamp();
+-    }
+-
+-    public long sum() {
+-        return numOpenIterators.sum();
+-    }
+-
+-    private void updateOldestStartTimestamp() {
+-        final Iterator<MeteredIterator> openIteratorsIterator = openIterators.iterator();
+-        if (openIteratorsIterator.hasNext()) {
+-            oldestStartTimestamp.set(openIteratorsIterator.next().startTimestamp());
+-        }
+-    }
+-}
+diff --git a/streams/src/main/java/org/apache/kafka/streams/state/internals/MeteredKeyValueStore.java b/streams/src/main/java/org/apache/kafka/streams/state/internals/MeteredKeyValueStore.java
+index 32d1ee9143..c2268f3269 100644
+--- a/streams/src/main/java/org/apache/kafka/streams/state/internals/MeteredKeyValueStore.java
++++ b/streams/src/main/java/org/apache/kafka/streams/state/internals/MeteredKeyValueStore.java
+@@ -23,7 +23,6 @@ import org.apache.kafka.common.utils.Bytes;
+ import org.apache.kafka.common.utils.Time;
+ import org.apache.kafka.streams.KeyValue;
+ import org.apache.kafka.streams.errors.ProcessorStateException;
+-import org.apache.kafka.streams.internals.metrics.OpenIterators;
+ import org.apache.kafka.streams.kstream.internals.Change;
+ import org.apache.kafka.streams.kstream.internals.WrappingNullableUtils;
+ import org.apache.kafka.streams.processor.StateStore;
+@@ -49,9 +48,15 @@ import org.apache.kafka.streams.state.internals.StoreQueryUtils.QueryHandler;
+ import org.apache.kafka.streams.state.internals.metrics.StateStoreMetrics;
+ 
+ import java.util.ArrayList;
++import java.util.Comparator;
++import java.util.Iterator;
+ import java.util.List;
+ import java.util.Map;
++import java.util.NavigableSet;
++import java.util.NoSuchElementException;
+ import java.util.Objects;
++import java.util.concurrent.ConcurrentSkipListSet;
++import java.util.concurrent.atomic.LongAdder;
+ import java.util.function.Function;
+ 
+ import static org.apache.kafka.common.utils.Utils.mkEntry;
+@@ -92,7 +97,9 @@ public class MeteredKeyValueStore<K, V>
+     private StreamsMetricsImpl streamsMetrics;
+     private TaskId taskId;
+ 
+-    protected OpenIterators openIterators;
++    protected LongAdder numOpenIterators = new LongAdder();
++    protected NavigableSet<MeteredIterator> openIterators = new ConcurrentSkipListSet<>(Comparator.comparingLong(MeteredIterator::startTimestamp));
++
+ 
+     @SuppressWarnings("rawtypes")
+     private final Map<Class, QueryHandler> queryHandlers =
+@@ -148,8 +155,16 @@ public class MeteredKeyValueStore<K, V>
+         e2eLatencySensor = StateStoreMetrics.e2ELatencySensor(taskId.toString(), metricsScope, name(), streamsMetrics);
+         iteratorDurationSensor = StateStoreMetrics.iteratorDurationSensor(taskId.toString(), metricsScope, name(), streamsMetrics);
+         StateStoreMetrics.addNumOpenIteratorsGauge(taskId.toString(), metricsScope, name(), streamsMetrics,
+-                (config, now) -> openIterators.sum());
+-        openIterators = new OpenIterators(taskId, metricsScope, name(), streamsMetrics);
++                (config, now) -> numOpenIterators.sum());
++        StateStoreMetrics.addOldestOpenIteratorGauge(taskId.toString(), metricsScope, name(), streamsMetrics,
++            (config, now) -> {
++                try {
++                    final Iterator<MeteredIterator> iter = openIterators.iterator();
++                    return iter.hasNext() ? iter.next().startTimestamp() : 0L;
++                } catch (final NoSuchElementException e) {
++                    return 0L;
++                }
++            });
+     }
+ 
+     protected Serde<V> prepareValueSerdeForStore(final Serde<V> valueSerde, final SerdeGetter getter) {
+@@ -435,6 +450,7 @@ public class MeteredKeyValueStore<K, V>
+             this.sensor = sensor;
+             this.startTimestamp = time.milliseconds();
+             this.startNs = time.nanoseconds();
++            numOpenIterators.increment();
+             openIterators.add(this);
+         }
+ 
+@@ -464,6 +480,7 @@ public class MeteredKeyValueStore<K, V>
+                 final long duration = time.nanoseconds() - startNs;
+                 sensor.record(duration);
+                 iteratorDurationSensor.record(duration);
++                numOpenIterators.decrement();
+                 openIterators.remove(this);
+             }
+         }
+@@ -492,6 +509,7 @@ public class MeteredKeyValueStore<K, V>
+             this.valueDeserializer = valueDeserializer;
+             this.startTimestamp = time.milliseconds();
+             this.startNs = time.nanoseconds();
++            numOpenIterators.increment();
+             openIterators.add(this);
+         }
+ 
+@@ -521,6 +539,7 @@ public class MeteredKeyValueStore<K, V>
+                 final long duration = time.nanoseconds() - startNs;
+                 sensor.record(duration);
+                 iteratorDurationSensor.record(duration);
++                numOpenIterators.decrement();
+                 openIterators.remove(this);
+             }
+         }
+diff --git a/streams/src/main/java/org/apache/kafka/streams/state/internals/MeteredMultiVersionedKeyQueryIterator.java b/streams/src/main/java/org/apache/kafka/streams/state/internals/MeteredMultiVersionedKeyQueryIterator.java
+index b27e6a78d8..b6787a311e 100644
+--- a/streams/src/main/java/org/apache/kafka/streams/state/internals/MeteredMultiVersionedKeyQueryIterator.java
++++ b/streams/src/main/java/org/apache/kafka/streams/state/internals/MeteredMultiVersionedKeyQueryIterator.java
+@@ -18,10 +18,11 @@ package org.apache.kafka.streams.state.internals;
+ 
+ import org.apache.kafka.common.metrics.Sensor;
+ import org.apache.kafka.common.utils.Time;
+-import org.apache.kafka.streams.internals.metrics.OpenIterators;
+ import org.apache.kafka.streams.state.VersionedRecord;
+ import org.apache.kafka.streams.state.VersionedRecordIterator;
+ 
++import java.util.Set;
++import java.util.concurrent.atomic.LongAdder;
+ import java.util.function.Function;
+ 
+ class MeteredMultiVersionedKeyQueryIterator<V> implements VersionedRecordIterator<V>, MeteredIterator {
+@@ -32,20 +33,24 @@ class MeteredMultiVersionedKeyQueryIterator<V> implements VersionedRecordIterato
+     private final Time time;
+     private final long startNs;
+     private final long startTimestampMs;
+-    private final OpenIterators openIterators;
++    private final Set<MeteredIterator> openIterators;
++    private final LongAdder numOpenIterators;
+ 
+     public MeteredMultiVersionedKeyQueryIterator(final VersionedRecordIterator<byte[]> iterator,
+                                                  final Sensor sensor,
+                                                  final Time time,
+                                                  final Function<VersionedRecord<byte[]>, VersionedRecord<V>> deserializeValue,
+-                                                 final OpenIterators openIterators) {
++                                                 final LongAdder numOpenIterators,
++                                                 final Set<MeteredIterator> openIterators) {
+         this.iterator = iterator;
+         this.deserializeValue = deserializeValue;
++        this.numOpenIterators = numOpenIterators;
+         this.openIterators = openIterators;
+         this.sensor = sensor;
+         this.time = time;
+         this.startNs = time.nanoseconds();
+         this.startTimestampMs = time.milliseconds();
++        numOpenIterators.increment();
+         openIterators.add(this);
+     }
+ 
+@@ -60,6 +65,7 @@ class MeteredMultiVersionedKeyQueryIterator<V> implements VersionedRecordIterato
+             iterator.close();
+         } finally {
+             sensor.record(time.nanoseconds() - startNs);
++            numOpenIterators.decrement();
+             openIterators.remove(this);
+         }
+     }
+diff --git a/streams/src/main/java/org/apache/kafka/streams/state/internals/MeteredVersionedKeyValueStore.java b/streams/src/main/java/org/apache/kafka/streams/state/internals/MeteredVersionedKeyValueStore.java
+index 6afb4d1531..66eb3206de 100644
+--- a/streams/src/main/java/org/apache/kafka/streams/state/internals/MeteredVersionedKeyValueStore.java
++++ b/streams/src/main/java/org/apache/kafka/streams/state/internals/MeteredVersionedKeyValueStore.java
+@@ -269,6 +269,7 @@ public class MeteredVersionedKeyValueStore<K, V>
+                             iteratorDurationSensor,
+                             time,
+                             StoreQueryUtils.deserializeValue(plainValueSerdes),
++                            numOpenIterators,
+                             openIterators
+                         );
+                 final QueryResult<MeteredMultiVersionedKeyQueryIterator<V>> typedQueryResult =
+diff --git a/streams/src/main/java/org/apache/kafka/streams/state/internals/metrics/StateStoreMetrics.java b/streams/src/main/java/org/apache/kafka/streams/state/internals/metrics/StateStoreMetrics.java
+index bb60c30468..cfaece063e 100644
+--- a/streams/src/main/java/org/apache/kafka/streams/state/internals/metrics/StateStoreMetrics.java
++++ b/streams/src/main/java/org/apache/kafka/streams/state/internals/metrics/StateStoreMetrics.java
+@@ -467,7 +467,7 @@ public class StateStoreMetrics {
+                 storeName,
+                 OLDEST_ITERATOR_OPEN_SINCE_MS,
+                 OLDEST_ITERATOR_OPEN_SINCE_MS_DESCRIPTION,
+-                RecordingLevel.INFO,
++                RecordingLevel.DEBUG,
+                 oldestOpenIteratorGauge
+         );
+     }
+diff --git a/streams/src/test/java/org/apache/kafka/streams/internals/metrics/OpenIteratorsTest.java b/streams/src/test/java/org/apache/kafka/streams/internals/metrics/OpenIteratorsTest.java
+deleted file mode 100644
+index daaacb7bec..0000000000
+--- a/streams/src/test/java/org/apache/kafka/streams/internals/metrics/OpenIteratorsTest.java
++++ /dev/null
+@@ -1,73 +0,0 @@
+-/*
+- * Licensed to the Apache Software Foundation (ASF) under one or more
+- * contributor license agreements. See the NOTICE file distributed with
+- * this work for additional information regarding copyright ownership.
+- * The ASF licenses this file to You under the Apache License, Version 2.0
+- * (the "License"); you may not use this file except in compliance with
+- * the License. You may obtain a copy of the License at
+- *
+- *    http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-package org.apache.kafka.streams.internals.metrics;
+-
+-import org.apache.kafka.common.metrics.Gauge;
+-import org.apache.kafka.streams.processor.TaskId;
+-import org.apache.kafka.streams.processor.internals.metrics.StreamsMetricsImpl;
+-import org.apache.kafka.streams.state.internals.MeteredIterator;
+-
+-import org.junit.jupiter.api.Test;
+-import org.mockito.ArgumentCaptor;
+-
+-import static org.hamcrest.CoreMatchers.is;
+-import static org.hamcrest.CoreMatchers.not;
+-import static org.hamcrest.MatcherAssert.assertThat;
+-import static org.mockito.ArgumentMatchers.any;
+-import static org.mockito.Mockito.mock;
+-import static org.mockito.Mockito.never;
+-import static org.mockito.Mockito.reset;
+-import static org.mockito.Mockito.verify;
+-
+-public class OpenIteratorsTest {
+-
+-    private final StreamsMetricsImpl streamsMetrics = mock(StreamsMetricsImpl.class);
+-
+-    @SuppressWarnings("unchecked")
+-    @Test
+-    public void shouldCalculateOldestStartTimestampCorrectly() {
+-        final OpenIterators openIterators = new OpenIterators(new TaskId(0, 0), "scope", "name", streamsMetrics);
+-
+-        final MeteredIterator meteredIterator1 = () -> 5;
+-        final MeteredIterator meteredIterator2 = () -> 2;
+-        final MeteredIterator meteredIterator3 = () -> 6;
+-
+-        openIterators.add(meteredIterator1);
+-        final ArgumentCaptor<Gauge<Long>> gaugeCaptor = ArgumentCaptor.forClass(Gauge.class);
+-        verify(streamsMetrics).addStoreLevelMutableMetric(any(), any(), any(), any(), any(), any(), gaugeCaptor.capture());
+-        final Gauge<Long> gauge = gaugeCaptor.getValue();
+-        assertThat(gauge.value(null, 0), is(5L));
+-        reset(streamsMetrics);
+-
+-        openIterators.add(meteredIterator2);
+-        verify(streamsMetrics, never()).addStoreLevelMutableMetric(any(), any(), any(), any(), any(), any(), gaugeCaptor.capture());
+-        assertThat(gauge.value(null, 0), is(2L));
+-
+-        openIterators.remove(meteredIterator2);
+-        verify(streamsMetrics, never()).removeStoreLevelMetric(any());
+-        assertThat(gauge.value(null, 0), is(5L));
+-
+-        openIterators.remove(meteredIterator1);
+-        verify(streamsMetrics).removeStoreLevelMetric(any());
+-        assertThat(gauge.value(null, 0), is(5L));
+-
+-        openIterators.add(meteredIterator3);
+-        verify(streamsMetrics).addStoreLevelMutableMetric(any(), any(), any(), any(), any(), any(), gaugeCaptor.capture());
+-        assertThat(gaugeCaptor.getValue(), not(gauge));
+-        assertThat(gaugeCaptor.getValue().value(null, 0), is(6L));
+-    }
+-}
+diff --git a/streams/src/test/java/org/apache/kafka/streams/state/internals/MeteredKeyValueStoreTest.java b/streams/src/test/java/org/apache/kafka/streams/state/internals/MeteredKeyValueStoreTest.java
+index 1a85901ccc..1a6560f5f4 100644
+--- a/streams/src/test/java/org/apache/kafka/streams/state/internals/MeteredKeyValueStoreTest.java
++++ b/streams/src/test/java/org/apache/kafka/streams/state/internals/MeteredKeyValueStoreTest.java
+@@ -525,16 +525,13 @@ public class MeteredKeyValueStoreTest {
+         when(inner.all()).thenReturn(KeyValueIterators.emptyIterator());
+         init();
+ 
+-        KafkaMetric oldestIteratorTimestampMetric = metric("oldest-iterator-open-since-ms");
+-        assertThat(oldestIteratorTimestampMetric, nullValue());
++        final KafkaMetric oldestIteratorTimestampMetric = metric("oldest-iterator-open-since-ms");
++        assertThat(oldestIteratorTimestampMetric, not(nullValue()));
+ 
+         KeyValueIterator<String, String> second = null;
+         final long secondTimestamp;
+         try {
+             try (final KeyValueIterator<String, String> unused = metered.all()) {
+-                oldestIteratorTimestampMetric = metric("oldest-iterator-open-since-ms");
+-                assertThat(oldestIteratorTimestampMetric, not(nullValue()));
+-
+                 final long oldestTimestamp = mockTime.milliseconds();
+                 assertThat((Long) oldestIteratorTimestampMetric.metricValue(), equalTo(oldestTimestamp));
+                 mockTime.sleep(100);
+@@ -553,9 +550,8 @@ public class MeteredKeyValueStoreTest {
+                 second.close();
+             }
+         }
+-
+-        oldestIteratorTimestampMetric = metric("oldest-iterator-open-since-ms");
+-        assertThat(oldestIteratorTimestampMetric, nullValue());
++        // no open iterators left, timestamp should be reset to 0
++        assertThat((Long) oldestIteratorTimestampMetric.metricValue(), equalTo(0L));
+     }
+ 
+     private KafkaMetric metric(final MetricName metricName) {
+diff --git a/streams/src/test/java/org/apache/kafka/streams/state/internals/MeteredTimestampedKeyValueStoreTest.java b/streams/src/test/java/org/apache/kafka/streams/state/internals/MeteredTimestampedKeyValueStoreTest.java
+index 9b5d33db96..0f3f303c8a 100644
+--- a/streams/src/test/java/org/apache/kafka/streams/state/internals/MeteredTimestampedKeyValueStoreTest.java
++++ b/streams/src/test/java/org/apache/kafka/streams/state/internals/MeteredTimestampedKeyValueStoreTest.java
+@@ -503,15 +503,13 @@ public class MeteredTimestampedKeyValueStoreTest {
+         when(inner.all()).thenReturn(KeyValueIterators.emptyIterator());
+         init();
+ 
+-        KafkaMetric oldestIteratorTimestampMetric = metric("oldest-iterator-open-since-ms");
+-        assertThat(oldestIteratorTimestampMetric, nullValue());
++        final KafkaMetric oldestIteratorTimestampMetric = metric("oldest-iterator-open-since-ms");
++        assertThat(oldestIteratorTimestampMetric, not(nullValue()));
+ 
+         KeyValueIterator<String, ValueAndTimestamp<String>> second = null;
+         final long secondTimestamp;
+         try {
+             try (final KeyValueIterator<String, ValueAndTimestamp<String>> unused = metered.all()) {
+-                oldestIteratorTimestampMetric = metric("oldest-iterator-open-since-ms");
+-                assertThat(oldestIteratorTimestampMetric, not(nullValue()));
+ 
+                 final long oldestTimestamp = mockTime.milliseconds();
+                 assertThat((Long) oldestIteratorTimestampMetric.metricValue(), equalTo(oldestTimestamp));
+@@ -531,8 +529,7 @@ public class MeteredTimestampedKeyValueStoreTest {
+                 second.close();
+             }
+         }
+-
+-        oldestIteratorTimestampMetric = metric("oldest-iterator-open-since-ms");
+-        assertThat(oldestIteratorTimestampMetric, nullValue());
++        // now that all iterators are closed, the metric should be zero
++        assertThat((Long) oldestIteratorTimestampMetric.metricValue(), equalTo(0L));
+     }
+ }
+diff --git a/streams/src/test/java/org/apache/kafka/streams/state/internals/MeteredVersionedKeyValueStoreTest.java b/streams/src/test/java/org/apache/kafka/streams/state/internals/MeteredVersionedKeyValueStoreTest.java
+index d40f694748..f3676377c4 100644
+--- a/streams/src/test/java/org/apache/kafka/streams/state/internals/MeteredVersionedKeyValueStoreTest.java
++++ b/streams/src/test/java/org/apache/kafka/streams/state/internals/MeteredVersionedKeyValueStoreTest.java
+@@ -426,16 +426,14 @@ public class MeteredVersionedKeyValueStoreTest {
+         when(inner.query(any(), any(), any())).thenReturn(
+                 QueryResult.forResult(new LogicalSegmentIterator(Collections.emptyListIterator(), RAW_KEY, 0L, 0L, ResultOrder.ANY)));
+ 
+-        KafkaMetric oldestIteratorTimestampMetric = getMetric("oldest-iterator-open-since-ms");
+-        assertThat(oldestIteratorTimestampMetric, nullValue());
++        final KafkaMetric oldestIteratorTimestampMetric = getMetric("oldest-iterator-open-since-ms");
++        assertThat(oldestIteratorTimestampMetric, not(nullValue()));
+ 
+         final QueryResult<VersionedRecordIterator<String>> first = store.query(query, bound, config);
+         VersionedRecordIterator<String> secondIterator = null;
+         final long secondTime;
+         try {
+             try (final VersionedRecordIterator<String> unused = first.getResult()) {
+-                oldestIteratorTimestampMetric = getMetric("oldest-iterator-open-since-ms");
+-                assertThat(oldestIteratorTimestampMetric, not(nullValue()));
+ 
+                 final long oldestTimestamp = mockTime.milliseconds();
+                 assertThat((Long) oldestIteratorTimestampMetric.metricValue(), equalTo(oldestTimestamp));
+@@ -457,9 +455,8 @@ public class MeteredVersionedKeyValueStoreTest {
+                 secondIterator.close();
+             }
+         }
+-
+-        oldestIteratorTimestampMetric = getMetric("oldest-iterator-open-since-ms");
+-        assertThat(oldestIteratorTimestampMetric, nullValue());
++        // no open iterators left, timestamp should be reset to 0
++        assertThat((Long) oldestIteratorTimestampMetric.metricValue(), equalTo(0L));
+     }
+ 
+     private KafkaMetric getMetric(final String name) {

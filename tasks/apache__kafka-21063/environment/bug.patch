@@ -1,0 +1,417 @@
+diff --git a/clients/src/main/java/org/apache/kafka/common/requests/OffsetFetchRequest.java b/clients/src/main/java/org/apache/kafka/common/requests/OffsetFetchRequest.java
+index 57de0ee16a..7ece0700bf 100644
+--- a/clients/src/main/java/org/apache/kafka/common/requests/OffsetFetchRequest.java
++++ b/clients/src/main/java/org/apache/kafka/common/requests/OffsetFetchRequest.java
+@@ -41,8 +41,6 @@ import java.util.stream.Collectors;
+ 
+ public class OffsetFetchRequest extends AbstractRequest {
+ 
+-    public static final short TOP_LEVEL_ERROR_AND_NULL_TOPICS_MIN_VERSION = 2;
+-
+     private static final Logger log = LoggerFactory.getLogger(OffsetFetchRequest.class);
+ 
+     private static final List<OffsetFetchRequestTopic> ALL_TOPIC_PARTITIONS = null;
+diff --git a/clients/src/main/java/org/apache/kafka/common/requests/OffsetFetchResponse.java b/clients/src/main/java/org/apache/kafka/common/requests/OffsetFetchResponse.java
+index e07d3550b8..82b6cdb097 100644
+--- a/clients/src/main/java/org/apache/kafka/common/requests/OffsetFetchResponse.java
++++ b/clients/src/main/java/org/apache/kafka/common/requests/OffsetFetchResponse.java
+@@ -18,7 +18,6 @@ package org.apache.kafka.common.requests;
+ 
+ import org.apache.kafka.common.TopicPartition;
+ import org.apache.kafka.common.errors.UnsupportedVersionException;
+-import org.apache.kafka.common.message.OffsetFetchRequestData;
+ import org.apache.kafka.common.message.OffsetFetchResponseData;
+ import org.apache.kafka.common.message.OffsetFetchResponseData.OffsetFetchResponseGroup;
+ import org.apache.kafka.common.message.OffsetFetchResponseData.OffsetFetchResponsePartition;
+@@ -41,7 +40,6 @@ import java.util.Optional;
+ import java.util.stream.Collectors;
+ 
+ import static org.apache.kafka.common.record.RecordBatch.NO_PARTITION_LEADER_EPOCH;
+-import static org.apache.kafka.common.requests.OffsetFetchRequest.TOP_LEVEL_ERROR_AND_NULL_TOPICS_MIN_VERSION;
+ 
+ /**
+  * Possible error codes:
+@@ -233,14 +231,29 @@ public class OffsetFetchResponse extends AbstractResponse {
+                 OffsetFetchResponseTopic newTopic = new OffsetFetchResponseTopic().setName(topic.name());
+                 data.topics().add(newTopic);
+ 
+-                topic.partitions().forEach(partition ->
+-                    newTopic.partitions().add(new OffsetFetchResponsePartition()
++                topic.partitions().forEach(partition -> {
++                    OffsetFetchResponsePartition newPartition;
++
++                    if (version < 2 && group.errorCode() != Errors.NONE.code()) {
++                        // Versions prior to version 2 do not support a top level error. Therefore,
++                        // we put it at the partition level.
++                        newPartition = new OffsetFetchResponsePartition()
++                            .setPartitionIndex(partition.partitionIndex())
++                            .setErrorCode(group.errorCode())
++                            .setCommittedOffset(INVALID_OFFSET)
++                            .setMetadata(NO_METADATA)
++                            .setCommittedLeaderEpoch(NO_PARTITION_LEADER_EPOCH);
++                    } else {
++                        newPartition = new OffsetFetchResponsePartition()
+                             .setPartitionIndex(partition.partitionIndex())
+                             .setErrorCode(partition.errorCode())
+                             .setCommittedOffset(partition.committedOffset())
+                             .setMetadata(partition.metadata())
+-                            .setCommittedLeaderEpoch(partition.committedLeaderEpoch()))
+-                );
++                            .setCommittedLeaderEpoch(partition.committedLeaderEpoch());
++                    }
++
++                    newTopic.partitions().add(newPartition);
++                });
+             });
+         }
+     }
+@@ -390,31 +403,4 @@ public class OffsetFetchResponse extends AbstractResponse {
+     public boolean shouldClientThrottle(short version) {
+         return version >= 4;
+     }
+-
+-    public static OffsetFetchResponseData.OffsetFetchResponseGroup groupError(
+-        OffsetFetchRequestData.OffsetFetchRequestGroup group,
+-        Errors error,
+-        int version
+-    ) {
+-        if (version >= TOP_LEVEL_ERROR_AND_NULL_TOPICS_MIN_VERSION) {
+-            return new OffsetFetchResponseData.OffsetFetchResponseGroup()
+-                .setGroupId(group.groupId())
+-                .setErrorCode(error.code());
+-        } else {
+-            return new OffsetFetchResponseData.OffsetFetchResponseGroup()
+-                .setGroupId(group.groupId())
+-                .setTopics(group.topics().stream().map(topic ->
+-                    new OffsetFetchResponseData.OffsetFetchResponseTopics()
+-                        .setName(topic.name())
+-                        .setPartitions(topic.partitionIndexes().stream().map(partition ->
+-                            new OffsetFetchResponseData.OffsetFetchResponsePartitions()
+-                                .setPartitionIndex(partition)
+-                                .setErrorCode(error.code())
+-                                .setCommittedOffset(INVALID_OFFSET)
+-                                .setMetadata(NO_METADATA)
+-                                .setCommittedLeaderEpoch(NO_PARTITION_LEADER_EPOCH)
+-                        ).collect(Collectors.toList()))
+-                ).collect(Collectors.toList()));
+-        }
+-    }
+ }
+diff --git a/clients/src/test/java/org/apache/kafka/common/requests/OffsetFetchResponseTest.java b/clients/src/test/java/org/apache/kafka/common/requests/OffsetFetchResponseTest.java
+index 3992c6a58e..c85d26dac5 100644
+--- a/clients/src/test/java/org/apache/kafka/common/requests/OffsetFetchResponseTest.java
++++ b/clients/src/test/java/org/apache/kafka/common/requests/OffsetFetchResponseTest.java
+@@ -17,7 +17,6 @@
+ package org.apache.kafka.common.requests;
+ 
+ import org.apache.kafka.common.TopicPartition;
+-import org.apache.kafka.common.message.OffsetFetchRequestData;
+ import org.apache.kafka.common.message.OffsetFetchResponseData;
+ import org.apache.kafka.common.message.OffsetFetchResponseData.OffsetFetchResponseGroup;
+ import org.apache.kafka.common.message.OffsetFetchResponseData.OffsetFetchResponsePartition;
+@@ -30,21 +29,16 @@ import org.apache.kafka.common.protocol.Errors;
+ import org.apache.kafka.common.record.RecordBatch;
+ import org.apache.kafka.common.requests.OffsetFetchResponse.PartitionData;
+ import org.apache.kafka.common.utils.Utils;
+-import org.apache.kafka.common.utils.annotation.ApiKeyVersionsSource;
+ 
+ import org.junit.jupiter.api.BeforeEach;
+ import org.junit.jupiter.api.Test;
+-import org.junit.jupiter.params.ParameterizedTest;
+ 
+ import java.util.Collections;
+ import java.util.HashMap;
+ import java.util.Map;
+ import java.util.Optional;
+ 
+-import static org.apache.kafka.common.record.RecordBatch.NO_PARTITION_LEADER_EPOCH;
+ import static org.apache.kafka.common.requests.AbstractResponse.DEFAULT_THROTTLE_TIME;
+-import static org.apache.kafka.common.requests.OffsetFetchResponse.INVALID_OFFSET;
+-import static org.apache.kafka.common.requests.OffsetFetchResponse.NO_METADATA;
+ import static org.junit.jupiter.api.Assertions.assertEquals;
+ import static org.junit.jupiter.api.Assertions.assertFalse;
+ import static org.junit.jupiter.api.Assertions.assertTrue;
+@@ -445,43 +439,4 @@ public class OffsetFetchResponseTest {
+                 .setThrottleTimeMs(throttleTimeMs);
+         assertEquals(expectedData, response.data());
+     }
+-
+-    @ParameterizedTest
+-    @ApiKeyVersionsSource(apiKey = ApiKeys.OFFSET_FETCH)
+-    public void testSingleGroupWithError(short version) {
+-        OffsetFetchRequestData.OffsetFetchRequestGroup group = new OffsetFetchRequestData.OffsetFetchRequestGroup()
+-            .setGroupId("group1")
+-            .setTopics(Collections.singletonList(
+-                new OffsetFetchRequestData.OffsetFetchRequestTopics()
+-                    .setName("foo")
+-                    .setPartitionIndexes(Collections.singletonList(0))
+-            ));
+-
+-        if (version < 2) {
+-            assertEquals(
+-                new OffsetFetchResponseData.OffsetFetchResponseGroup()
+-                    .setGroupId("group1")
+-                    .setTopics(Collections.singletonList(
+-                        new OffsetFetchResponseData.OffsetFetchResponseTopics()
+-                            .setName("foo")
+-                            .setPartitions(Collections.singletonList(
+-                                new OffsetFetchResponseData.OffsetFetchResponsePartitions()
+-                                    .setPartitionIndex(0)
+-                                    .setErrorCode(Errors.INVALID_GROUP_ID.code())
+-                                    .setCommittedOffset(INVALID_OFFSET)
+-                                    .setMetadata(NO_METADATA)
+-                                    .setCommittedLeaderEpoch(NO_PARTITION_LEADER_EPOCH)
+-                            ))
+-                    )),
+-                OffsetFetchResponse.groupError(group, Errors.INVALID_GROUP_ID, version)
+-            );
+-        } else {
+-            assertEquals(
+-                new OffsetFetchResponseData.OffsetFetchResponseGroup()
+-                    .setGroupId("group1")
+-                    .setErrorCode(Errors.INVALID_GROUP_ID.code()),
+-                OffsetFetchResponse.groupError(group, Errors.INVALID_GROUP_ID, version)
+-            );
+-        }
+-    }
+ }
+diff --git a/core/src/main/scala/kafka/server/KafkaApis.scala b/core/src/main/scala/kafka/server/KafkaApis.scala
+index 44df00510b..1a813b9094 100644
+--- a/core/src/main/scala/kafka/server/KafkaApis.scala
++++ b/core/src/main/scala/kafka/server/KafkaApis.scala
+@@ -1527,11 +1527,9 @@ class KafkaApis(val requestChannel: RequestChannel,
+     groups.forEach { groupOffsetFetch =>
+       val isAllPartitions = groupOffsetFetch.topics == null
+       if (!authHelper.authorize(request.context, DESCRIBE, GROUP, groupOffsetFetch.groupId)) {
+-        futures += CompletableFuture.completedFuture(OffsetFetchResponse.groupError(
+-          groupOffsetFetch,
+-          Errors.GROUP_AUTHORIZATION_FAILED,
+-          request.header.apiVersion()
+-        ))
++        futures += CompletableFuture.completedFuture(new OffsetFetchResponseData.OffsetFetchResponseGroup()
++          .setGroupId(groupOffsetFetch.groupId)
++          .setErrorCode(Errors.GROUP_AUTHORIZATION_FAILED.code))
+       } else if (isAllPartitions) {
+         futures += fetchAllOffsetsForGroup(
+           request.context,
+@@ -1556,38 +1554,36 @@ class KafkaApis(val requestChannel: RequestChannel,
+ 
+   private def fetchAllOffsetsForGroup(
+     requestContext: RequestContext,
+-    groupFetchRequest: OffsetFetchRequestData.OffsetFetchRequestGroup,
++    offsetFetchRequest: OffsetFetchRequestData.OffsetFetchRequestGroup,
+     requireStable: Boolean
+   ): CompletableFuture[OffsetFetchResponseData.OffsetFetchResponseGroup] = {
+     groupCoordinator.fetchAllOffsets(
+       requestContext,
+-      groupFetchRequest,
++      offsetFetchRequest,
+       requireStable
+-    ).handle[OffsetFetchResponseData.OffsetFetchResponseGroup] { (groupFetchResponse, exception) =>
++    ).handle[OffsetFetchResponseData.OffsetFetchResponseGroup] { (offsetFetchResponse, exception) =>
+       if (exception != null) {
+-        OffsetFetchResponse.groupError(
+-          groupFetchRequest,
+-          Errors.forException(exception),
+-          requestContext.apiVersion()
+-        )
+-      } else if (groupFetchResponse.errorCode() != Errors.NONE.code) {
+-        groupFetchResponse
++        new OffsetFetchResponseData.OffsetFetchResponseGroup()
++          .setGroupId(offsetFetchRequest.groupId)
++          .setErrorCode(Errors.forException(exception).code)
++      } else if (offsetFetchResponse.errorCode() != Errors.NONE.code) {
++        offsetFetchResponse
+       } else {
+         // Clients are not allowed to see offsets for topics that are not authorized for Describe.
+         val (authorizedOffsets, _) = authHelper.partitionSeqByAuthorized(
+           requestContext,
+           DESCRIBE,
+           TOPIC,
+-          groupFetchResponse.topics.asScala
++          offsetFetchResponse.topics.asScala
+         )(_.name)
+-        groupFetchResponse.setTopics(authorizedOffsets.asJava)
++        offsetFetchResponse.setTopics(authorizedOffsets.asJava)
+       }
+     }
+   }
+ 
+   private def fetchOffsetsForGroup(
+     requestContext: RequestContext,
+-    groupFetchRequest: OffsetFetchRequestData.OffsetFetchRequestGroup,
++    offsetFetchRequest: OffsetFetchRequestData.OffsetFetchRequestGroup,
+     requireStable: Boolean
+   ): CompletableFuture[OffsetFetchResponseData.OffsetFetchResponseGroup] = {
+     // Clients are not allowed to see offsets for topics that are not authorized for Describe.
+@@ -1595,31 +1591,29 @@ class KafkaApis(val requestChannel: RequestChannel,
+       requestContext,
+       DESCRIBE,
+       TOPIC,
+-      groupFetchRequest.topics.asScala
++      offsetFetchRequest.topics.asScala
+     )(_.name)
+ 
+     groupCoordinator.fetchOffsets(
+       requestContext,
+       new OffsetFetchRequestData.OffsetFetchRequestGroup()
+-        .setGroupId(groupFetchRequest.groupId)
+-        .setMemberId(groupFetchRequest.memberId)
+-        .setMemberEpoch(groupFetchRequest.memberEpoch)
++        .setGroupId(offsetFetchRequest.groupId)
++        .setMemberId(offsetFetchRequest.memberId)
++        .setMemberEpoch(offsetFetchRequest.memberEpoch)
+         .setTopics(authorizedTopics.asJava),
+       requireStable
+-    ).handle[OffsetFetchResponseData.OffsetFetchResponseGroup] { (groupFetchResponse, exception) =>
++    ).handle[OffsetFetchResponseData.OffsetFetchResponseGroup] { (offsetFetchResponse, exception) =>
+       if (exception != null) {
+-        OffsetFetchResponse.groupError(
+-          groupFetchRequest,
+-          Errors.forException(exception),
+-          requestContext.apiVersion()
+-        )
+-      } else if (groupFetchResponse.errorCode() != Errors.NONE.code) {
+-        groupFetchResponse
++        new OffsetFetchResponseData.OffsetFetchResponseGroup()
++          .setGroupId(offsetFetchRequest.groupId)
++          .setErrorCode(Errors.forException(exception).code)
++      } else if (offsetFetchResponse.errorCode() != Errors.NONE.code) {
++        offsetFetchResponse
+       } else {
+         val topics = new util.ArrayList[OffsetFetchResponseData.OffsetFetchResponseTopics](
+-          groupFetchResponse.topics.size + unauthorizedTopics.size
++          offsetFetchResponse.topics.size + unauthorizedTopics.size
+         )
+-        topics.addAll(groupFetchResponse.topics)
++        topics.addAll(offsetFetchResponse.topics)
+         unauthorizedTopics.foreach { topic =>
+           val topicResponse = new OffsetFetchResponseData.OffsetFetchResponseTopics().setName(topic.name)
+           topic.partitionIndexes.forEach { partitionIndex =>
+@@ -1630,7 +1624,7 @@ class KafkaApis(val requestChannel: RequestChannel,
+           }
+           topics.add(topicResponse)
+         }
+-        groupFetchResponse.setTopics(topics)
++        offsetFetchResponse.setTopics(topics)
+       }
+     }
+   }
+diff --git a/core/src/test/scala/unit/kafka/server/OffsetFetchRequestTest.scala b/core/src/test/scala/unit/kafka/server/OffsetFetchRequestTest.scala
+index fc43dc31c5..67f5cfb549 100644
+--- a/core/src/test/scala/unit/kafka/server/OffsetFetchRequestTest.scala
++++ b/core/src/test/scala/unit/kafka/server/OffsetFetchRequestTest.scala
+@@ -561,43 +561,4 @@ class OffsetFetchRequestTest(cluster: ClusterInstance) extends GroupCoordinatorB
+       )
+     }
+   }
+-
+-  @ClusterTest
+-  def testGroupErrors(): Unit = {
+-    // Start from version 1 because version 0 goes to ZK.
+-    for (version <- 1 to ApiKeys.OFFSET_FETCH.latestVersion(isUnstableApiEnabled)) {
+-      assertEquals(
+-        if (version >= 2) {
+-          new OffsetFetchResponseData.OffsetFetchResponseGroup()
+-            .setGroupId("unknown")
+-            .setErrorCode(Errors.NOT_COORDINATOR.code)
+-        } else {
+-          // Version 1 does not support group level errors. Hence, the error is
+-          // returned at the partition level.
+-          new OffsetFetchResponseData.OffsetFetchResponseGroup()
+-            .setGroupId("unknown")
+-            .setTopics(List(
+-              new OffsetFetchResponseData.OffsetFetchResponseTopics()
+-                .setName("foo")
+-                .setPartitions(List(
+-                  new OffsetFetchResponseData.OffsetFetchResponsePartitions()
+-                    .setPartitionIndex(0)
+-                    .setErrorCode(Errors.NOT_COORDINATOR.code)
+-                    .setCommittedOffset(-1)
+-                    .setCommittedLeaderEpoch(-1)
+-                    .setMetadata("")
+-                ).asJava)
+-            ).asJava)
+-        },
+-        fetchOffsets(
+-          groupId = "unknown",
+-          memberId = null,
+-          memberEpoch = -1,
+-          partitions = List(new TopicPartition("foo", 0)),
+-          requireStable = false,
+-          version = version.toShort
+-        )
+-      )
+-    }
+-  }
+ }
+diff --git a/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupCoordinatorService.java b/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupCoordinatorService.java
+index 20ffb390f7..a7f7375f08 100644
+--- a/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupCoordinatorService.java
++++ b/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupCoordinatorService.java
+@@ -53,7 +53,6 @@ import org.apache.kafka.common.requests.ConsumerGroupDescribeRequest;
+ import org.apache.kafka.common.requests.DeleteGroupsRequest;
+ import org.apache.kafka.common.requests.DescribeGroupsRequest;
+ import org.apache.kafka.common.requests.OffsetCommitRequest;
+-import org.apache.kafka.common.requests.OffsetFetchResponse;
+ import org.apache.kafka.common.requests.RequestContext;
+ import org.apache.kafka.common.requests.TransactionResult;
+ import org.apache.kafka.common.requests.TxnOffsetCommitRequest;
+@@ -754,20 +753,18 @@ public class GroupCoordinatorService implements GroupCoordinator {
+         boolean requireStable
+     ) {
+         if (!isActive.get()) {
+-            return CompletableFuture.completedFuture(OffsetFetchResponse.groupError(
+-                request,
+-                Errors.COORDINATOR_NOT_AVAILABLE,
+-                context.requestVersion()
+-            ));
++            return CompletableFuture.completedFuture(new OffsetFetchResponseData.OffsetFetchResponseGroup()
++                .setGroupId(request.groupId())
++                .setErrorCode(Errors.COORDINATOR_NOT_AVAILABLE.code())
++            );
+         }
+ 
+         // For backwards compatibility, we support fetch commits for the empty group id.
+         if (request.groupId() == null) {
+-            return CompletableFuture.completedFuture(OffsetFetchResponse.groupError(
+-                request,
+-                Errors.INVALID_GROUP_ID,
+-                context.requestVersion()
+-            ));
++            return CompletableFuture.completedFuture(new OffsetFetchResponseData.OffsetFetchResponseGroup()
++                .setGroupId(request.groupId())
++                .setErrorCode(Errors.INVALID_GROUP_ID.code())
++            );
+         }
+ 
+         // The require stable flag when set tells the broker to hold on returning unstable
+@@ -807,20 +804,18 @@ public class GroupCoordinatorService implements GroupCoordinator {
+         boolean requireStable
+     ) {
+         if (!isActive.get()) {
+-            return CompletableFuture.completedFuture(OffsetFetchResponse.groupError(
+-                request,
+-                Errors.COORDINATOR_NOT_AVAILABLE,
+-                context.requestVersion()
+-            ));
++            return CompletableFuture.completedFuture(new OffsetFetchResponseData.OffsetFetchResponseGroup()
++                .setGroupId(request.groupId())
++                .setErrorCode(Errors.COORDINATOR_NOT_AVAILABLE.code())
++            );
+         }
+ 
+         // For backwards compatibility, we support fetch commits for the empty group id.
+         if (request.groupId() == null) {
+-            return CompletableFuture.completedFuture(OffsetFetchResponse.groupError(
+-                request,
+-                Errors.INVALID_GROUP_ID,
+-                context.requestVersion()
+-            ));
++            return CompletableFuture.completedFuture(new OffsetFetchResponseData.OffsetFetchResponseGroup()
++                .setGroupId(request.groupId())
++                .setErrorCode(Errors.INVALID_GROUP_ID.code())
++            );
+         }
+ 
+         // The require stable flag when set tells the broker to hold on returning unstable

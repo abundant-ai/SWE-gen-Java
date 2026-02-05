@@ -1,0 +1,296 @@
+diff --git a/clients/src/main/java/org/apache/kafka/clients/admin/KafkaAdminClient.java b/clients/src/main/java/org/apache/kafka/clients/admin/KafkaAdminClient.java
+index fa9440dfb9..a80c860de5 100644
+--- a/clients/src/main/java/org/apache/kafka/clients/admin/KafkaAdminClient.java
++++ b/clients/src/main/java/org/apache/kafka/clients/admin/KafkaAdminClient.java
+@@ -63,6 +63,7 @@ import org.apache.kafka.clients.admin.internals.ListConsumerGroupOffsetsHandler;
+ import org.apache.kafka.clients.admin.internals.ListOffsetsHandler;
+ import org.apache.kafka.clients.admin.internals.ListShareGroupOffsetsHandler;
+ import org.apache.kafka.clients.admin.internals.ListTransactionsHandler;
++import org.apache.kafka.clients.admin.internals.PartitionLeaderCache;
+ import org.apache.kafka.clients.admin.internals.PartitionLeaderStrategy;
+ import org.apache.kafka.clients.admin.internals.RemoveMembersFromConsumerGroupHandler;
+ import org.apache.kafka.clients.consumer.OffsetAndMetadata;
+@@ -407,7 +408,7 @@ public class KafkaAdminClient extends AdminClient {
+     private final long retryBackoffMaxMs;
+     private final ExponentialBackoff retryBackoff;
+     private final MetadataRecoveryStrategy metadataRecoveryStrategy;
+-    private final Map<TopicPartition, Integer> partitionLeaderCache;
++    private final PartitionLeaderCache partitionLeaderCache;
+     private final AdminFetchMetricsManager adminFetchMetricsManager;
+     private final Optional<ClientTelemetryReporter> clientTelemetryReporter;
+ 
+@@ -631,7 +632,7 @@ public class KafkaAdminClient extends AdminClient {
+             CommonClientConfigs.RETRY_BACKOFF_JITTER);
+         this.clientTelemetryReporter = clientTelemetryReporter;
+         this.metadataRecoveryStrategy = MetadataRecoveryStrategy.forName(config.getString(AdminClientConfig.METADATA_RECOVERY_STRATEGY_CONFIG));
+-        this.partitionLeaderCache = new HashMap<>();
++        this.partitionLeaderCache = new PartitionLeaderCache();
+         this.adminFetchMetricsManager = new AdminFetchMetricsManager(metrics);
+         config.logUnused();
+         AppInfoParser.registerAppInfo(JMX_PREFIX, clientId, metrics, time.milliseconds());
+diff --git a/clients/src/main/java/org/apache/kafka/clients/admin/internals/AbortTransactionHandler.java b/clients/src/main/java/org/apache/kafka/clients/admin/internals/AbortTransactionHandler.java
+index f0b6d28be6..80ad8da3e3 100644
+--- a/clients/src/main/java/org/apache/kafka/clients/admin/internals/AbortTransactionHandler.java
++++ b/clients/src/main/java/org/apache/kafka/clients/admin/internals/AbortTransactionHandler.java
+@@ -34,7 +34,6 @@ import org.apache.kafka.common.utils.LogContext;
+ import org.slf4j.Logger;
+ 
+ import java.util.List;
+-import java.util.Map;
+ import java.util.Set;
+ 
+ import static java.util.Collections.singleton;
+@@ -56,7 +55,7 @@ public class AbortTransactionHandler extends AdminApiHandler.Batched<TopicPartit
+ 
+     public static PartitionLeaderStrategy.PartitionLeaderFuture<Void> newFuture(
+         Set<TopicPartition> topicPartitions,
+-        Map<TopicPartition, Integer> partitionLeaderCache
++        PartitionLeaderCache partitionLeaderCache
+     ) {
+         return new PartitionLeaderStrategy.PartitionLeaderFuture<>(topicPartitions, partitionLeaderCache);
+     }
+diff --git a/clients/src/main/java/org/apache/kafka/clients/admin/internals/AdminApiDriver.java b/clients/src/main/java/org/apache/kafka/clients/admin/internals/AdminApiDriver.java
+index 6286f59ed7..2db63c7ed5 100644
+--- a/clients/src/main/java/org/apache/kafka/clients/admin/internals/AdminApiDriver.java
++++ b/clients/src/main/java/org/apache/kafka/clients/admin/internals/AdminApiDriver.java
+@@ -115,8 +115,13 @@ public class AdminApiDriver<K, V> {
+         // metadata. For all cached keys, they can proceed straight to the fulfillment map.
+         // Note that the cache is only used on the initial calls, and any errors that result
+         // in additional lookups use the full set of lookup keys.
+-        retryLookup(future.uncachedLookupKeys());
+-        future.cachedKeyBrokerIdMapping().forEach((key, brokerId) -> fulfillmentMap.put(new FulfillmentScope(brokerId), key));
++        future.cachedKeyBrokerIdMapping().forEach((key, brokerId) -> {
++            if (AdminApiFuture.UNKNOWN_BROKER_ID.equals(brokerId)) {
++                unmap(key);
++            } else {
++                fulfillmentMap.put(new FulfillmentScope(brokerId), key);
++            }
++        });
+     }
+ 
+     /**
+diff --git a/clients/src/main/java/org/apache/kafka/clients/admin/internals/AdminApiFuture.java b/clients/src/main/java/org/apache/kafka/clients/admin/internals/AdminApiFuture.java
+index 322d116a3d..ed0b60b430 100644
+--- a/clients/src/main/java/org/apache/kafka/clients/admin/internals/AdminApiFuture.java
++++ b/clients/src/main/java/org/apache/kafka/clients/admin/internals/AdminApiFuture.java
+@@ -19,7 +19,7 @@ package org.apache.kafka.clients.admin.internals;
+ import org.apache.kafka.common.KafkaFuture;
+ import org.apache.kafka.common.internals.KafkaFutureImpl;
+ 
+-import java.util.Collections;
++import java.util.HashMap;
+ import java.util.Map;
+ import java.util.Set;
+ import java.util.function.Function;
+@@ -27,6 +27,8 @@ import java.util.stream.Collectors;
+ 
+ public interface AdminApiFuture<K, V> {
+ 
++    Integer UNKNOWN_BROKER_ID = -1;
++
+     /**
+      * The initial set of lookup keys. Although this will usually match the fulfillment
+      * keys, it does not necessarily have to. For example, in the case of
+@@ -39,22 +41,17 @@ public interface AdminApiFuture<K, V> {
+     Set<K> lookupKeys();
+ 
+     /**
+-     * The set of request keys that do not have cached key-broker id mappings. If there
+-     * is no cached key mapping, this will be the same as the lookup keys.
+-     * Can be empty, but only if the cached key mapping is not empty.
+-     */
+-    default Set<K> uncachedLookupKeys() {
+-        return lookupKeys();
+-    }
+-
+-    /**
+-     * The cached key-broker id mapping. For lookup strategies that do not make use of a
+-     * cache of metadata, this will be empty.
++     * The cached key-broker id mapping. For non-cached values(or lookup strategies that do not make use of a
++     * cache of metadata) the broker id will be {@link #UNKNOWN_BROKER_ID}
+      *
+      * @return mapping of keys to broker ids
+      */
+     default Map<K, Integer> cachedKeyBrokerIdMapping() {
+-        return Collections.emptyMap();
++        Map<K, Integer> result = new HashMap<>();
++        for (K key : lookupKeys()) {
++            result.put(key, UNKNOWN_BROKER_ID);
++        }
++        return result;
+     }
+ 
+     /**
+diff --git a/clients/src/main/java/org/apache/kafka/clients/admin/internals/DeleteRecordsHandler.java b/clients/src/main/java/org/apache/kafka/clients/admin/internals/DeleteRecordsHandler.java
+index 4afef617cb..7a8aca79b3 100644
+--- a/clients/src/main/java/org/apache/kafka/clients/admin/internals/DeleteRecordsHandler.java
++++ b/clients/src/main/java/org/apache/kafka/clients/admin/internals/DeleteRecordsHandler.java
+@@ -73,7 +73,7 @@ public final class DeleteRecordsHandler extends Batched<TopicPartition, DeletedR
+ 
+     public static PartitionLeaderStrategy.PartitionLeaderFuture<DeletedRecords> newFuture(
+             Collection<TopicPartition> topicPartitions,
+-            Map<TopicPartition, Integer> partitionLeaderCache
++            PartitionLeaderCache partitionLeaderCache
+     ) {
+         return new PartitionLeaderStrategy.PartitionLeaderFuture<>(new HashSet<>(topicPartitions), partitionLeaderCache);
+     }
+diff --git a/clients/src/main/java/org/apache/kafka/clients/admin/internals/DescribeProducersHandler.java b/clients/src/main/java/org/apache/kafka/clients/admin/internals/DescribeProducersHandler.java
+index 84338feb9e..3ae5638423 100644
+--- a/clients/src/main/java/org/apache/kafka/clients/admin/internals/DescribeProducersHandler.java
++++ b/clients/src/main/java/org/apache/kafka/clients/admin/internals/DescribeProducersHandler.java
+@@ -68,7 +68,7 @@ public class DescribeProducersHandler extends AdminApiHandler.Batched<TopicParti
+ 
+     public static PartitionLeaderStrategy.PartitionLeaderFuture<PartitionProducerState> newFuture(
+         Collection<TopicPartition> topicPartitions,
+-        Map<TopicPartition, Integer> partitionLeaderCache
++        PartitionLeaderCache partitionLeaderCache
+     ) {
+         return new PartitionLeaderStrategy.PartitionLeaderFuture<>(new HashSet<>(topicPartitions), partitionLeaderCache);
+     }
+diff --git a/clients/src/main/java/org/apache/kafka/clients/admin/internals/ListOffsetsHandler.java b/clients/src/main/java/org/apache/kafka/clients/admin/internals/ListOffsetsHandler.java
+index 330a9efaf9..c03a6c5bee 100644
+--- a/clients/src/main/java/org/apache/kafka/clients/admin/internals/ListOffsetsHandler.java
++++ b/clients/src/main/java/org/apache/kafka/clients/admin/internals/ListOffsetsHandler.java
+@@ -223,7 +223,7 @@ public final class ListOffsetsHandler extends Batched<TopicPartition, ListOffset
+ 
+     public static PartitionLeaderStrategy.PartitionLeaderFuture<ListOffsetsResultInfo> newFuture(
+         Collection<TopicPartition> topicPartitions,
+-        Map<TopicPartition, Integer> partitionLeaderCache
++        PartitionLeaderCache partitionLeaderCache
+     ) {
+         return new PartitionLeaderStrategy.PartitionLeaderFuture<>(new HashSet<>(topicPartitions), partitionLeaderCache);
+     }
+diff --git a/clients/src/main/java/org/apache/kafka/clients/admin/internals/PartitionLeaderCache.java b/clients/src/main/java/org/apache/kafka/clients/admin/internals/PartitionLeaderCache.java
+new file mode 100644
+index 0000000000..089126dce4
+--- /dev/null
++++ b/clients/src/main/java/org/apache/kafka/clients/admin/internals/PartitionLeaderCache.java
+@@ -0,0 +1,54 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements. See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License. You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.kafka.clients.admin.internals;
++
++import org.apache.kafka.common.TopicPartition;
++
++import java.util.Collection;
++import java.util.HashMap;
++import java.util.Map;
++
++public class PartitionLeaderCache {
++
++    private final Map<TopicPartition, Integer> cache = new HashMap<>();
++
++    public Map<TopicPartition, Integer> get(Collection<TopicPartition> keys) {
++        Map<TopicPartition, Integer> result = new HashMap<>();
++        synchronized (cache) {
++            for (TopicPartition key : keys) {
++                if (cache.containsKey(key)) {
++                    result.put(key, cache.get(key));
++                }
++            }
++        }
++        return result;
++    }
++
++    public void put(Map<TopicPartition, Integer> values) {
++        synchronized (cache) {
++            cache.putAll(values);
++        }
++    }
++
++    public void remove(Collection<TopicPartition> keys) {
++        synchronized (cache) {
++            for (TopicPartition key : keys) {
++                cache.remove(key);
++            }
++        }
++    }
++}
+diff --git a/clients/src/main/java/org/apache/kafka/clients/admin/internals/PartitionLeaderStrategy.java b/clients/src/main/java/org/apache/kafka/clients/admin/internals/PartitionLeaderStrategy.java
+index ff7dff2db8..e43e7914a7 100644
+--- a/clients/src/main/java/org/apache/kafka/clients/admin/internals/PartitionLeaderStrategy.java
++++ b/clients/src/main/java/org/apache/kafka/clients/admin/internals/PartitionLeaderStrategy.java
+@@ -33,7 +33,6 @@ import org.slf4j.Logger;
+ 
+ import java.util.Collections;
+ import java.util.HashMap;
+-import java.util.HashSet;
+ import java.util.Map;
+ import java.util.Set;
+ import java.util.function.Function;
+@@ -208,10 +207,10 @@ public class PartitionLeaderStrategy implements AdminApiLookupStrategy<TopicPart
+      */
+     public static class PartitionLeaderFuture<V> implements AdminApiFuture<TopicPartition, V> {
+         private final Set<TopicPartition> requestKeys;
+-        private final Map<TopicPartition, Integer> partitionLeaderCache;
++        private final PartitionLeaderCache partitionLeaderCache;
+         private final Map<TopicPartition, KafkaFuture<V>> futures;
+ 
+-        public PartitionLeaderFuture(Set<TopicPartition> requestKeys, Map<TopicPartition, Integer> partitionLeaderCache) {
++        public PartitionLeaderFuture(Set<TopicPartition> requestKeys, PartitionLeaderCache partitionLeaderCache) {
+             this.requestKeys = requestKeys;
+             this.partitionLeaderCache = partitionLeaderCache;
+             this.futures = requestKeys.stream().collect(Collectors.toUnmodifiableMap(
+@@ -225,26 +224,12 @@ public class PartitionLeaderStrategy implements AdminApiLookupStrategy<TopicPart
+             return futures.keySet();
+         }
+ 
+-        @Override
+-        public Set<TopicPartition> uncachedLookupKeys() {
+-            Set<TopicPartition> keys = new HashSet<>();
+-            requestKeys.forEach(tp -> {
+-                if (!partitionLeaderCache.containsKey(tp)) {
+-                    keys.add(tp);
+-                }
+-            });
+-            return keys;
+-        }
+-
+         @Override
+         public Map<TopicPartition, Integer> cachedKeyBrokerIdMapping() {
++            Map<TopicPartition, Integer> cache = partitionLeaderCache.get(requestKeys);
++
+             Map<TopicPartition, Integer> mapping = new HashMap<>();
+-            requestKeys.forEach(tp -> {
+-                Integer brokerId = partitionLeaderCache.get(tp);
+-                if (brokerId != null) {
+-                    mapping.put(tp, brokerId);
+-                }
+-            });
++            requestKeys.forEach(tp -> mapping.put(tp, cache.getOrDefault(tp, UNKNOWN_BROKER_ID)));
+             return mapping;
+         }
+ 
+@@ -263,16 +248,16 @@ public class PartitionLeaderStrategy implements AdminApiLookupStrategy<TopicPart
+ 
+         @Override
+         public void completeLookup(Map<TopicPartition, Integer> brokerIdMapping) {
+-            partitionLeaderCache.putAll(brokerIdMapping);
++            partitionLeaderCache.put(brokerIdMapping);
+         }
+ 
+         @Override
+         public void completeExceptionally(Map<TopicPartition, Throwable> errors) {
++            partitionLeaderCache.remove(errors.keySet());
+             errors.forEach(this::completeExceptionally);
+         }
+ 
+         private void completeExceptionally(TopicPartition key, Throwable t) {
+-            partitionLeaderCache.remove(key);
+             futureOrThrow(key).completeExceptionally(t);
+         }
+ 

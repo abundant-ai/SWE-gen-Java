@@ -1,0 +1,229 @@
+diff --git a/inject-java/src/main/java/io/micronaut/annotation/processing/BeanDefinitionInjectProcessor.java b/inject-java/src/main/java/io/micronaut/annotation/processing/BeanDefinitionInjectProcessor.java
+index 3f5f4ec871..54d464c87e 100644
+--- a/inject-java/src/main/java/io/micronaut/annotation/processing/BeanDefinitionInjectProcessor.java
++++ b/inject-java/src/main/java/io/micronaut/annotation/processing/BeanDefinitionInjectProcessor.java
+@@ -30,7 +30,6 @@ import io.micronaut.inject.processing.BeanDefinitionCreatorFactory;
+ import io.micronaut.inject.processing.JavaModelUtils;
+ import io.micronaut.inject.processing.ProcessingException;
+ import io.micronaut.inject.visitor.BeanElementVisitor;
+-import io.micronaut.inject.visitor.ElementPostponedToNextRoundException;
+ import io.micronaut.inject.writer.AbstractBeanDefinitionBuilder;
+ import io.micronaut.inject.writer.BeanDefinitionVisitor;
+ import io.micronaut.inject.writer.BeanDefinitionWriter;
+@@ -92,7 +91,7 @@ public class BeanDefinitionInjectProcessor extends AbstractInjectAnnotationProce
+ 
+     private Set<String> beanDefinitions;
+     private final Set<String> processed = new HashSet<>();
+-    private final Map<String, Element> postponed = new HashMap<>();
++    private final Map<String, PostponeToNextRoundException> postponed = new HashMap<>();
+ 
+     @Override
+     public final synchronized void init(ProcessingEnvironment processingEnv) {
+@@ -198,10 +197,7 @@ public class BeanDefinitionInjectProcessor extends AbstractInjectAnnotationProce
+                             error(((JavaNativeElement) ex.getOriginatingElement()).element(), ex.getMessage());
+                         } catch (PostponeToNextRoundException e) {
+                             processed.remove(className);
+-                            postponed.put(className, (Element) e.getErrorElement());
+-                        } catch (ElementPostponedToNextRoundException e) {
+-                            processed.remove(className);
+-                            postponed.put(className, ((JavaNativeElement) e.getOriginatingElement().getNativeType()).element());
++                            postponed.put(className, e);
+                         }
+                     }
+                 }
+@@ -213,9 +209,9 @@ public class BeanDefinitionInjectProcessor extends AbstractInjectAnnotationProce
+         processing round.
+         */
+         if (processingOver) {
+-            for (Map.Entry<String, Element> e : postponed.entrySet()) {
+-                javaVisitorContext.warn("Bean definition generation [" + e.getKey() + "] skipped from processing because of prior error." +
+-                    " This error is normally due to missing classes on the classpath. Verify the compilation classpath is correct to resolve the problem.", e.getValue());
++            for (Map.Entry<String, PostponeToNextRoundException> e : postponed.entrySet()) {
++                javaVisitorContext.warn("Bean definition generation [" + e.getKey() + "] skipped from processing because of prior error: [" + e.getValue().getPath() + "]." +
++                    " This error is normally due to missing classes on the classpath. Verify the compilation classpath is correct to resolve the problem.", (Element) e.getValue().getErrorElement());
+             }
+ 
+             try {
+diff --git a/inject-java/src/main/java/io/micronaut/annotation/processing/visitor/JavaClassElement.java b/inject-java/src/main/java/io/micronaut/annotation/processing/visitor/JavaClassElement.java
+index 0aa188d703..ba6ec0721e 100644
+--- a/inject-java/src/main/java/io/micronaut/annotation/processing/visitor/JavaClassElement.java
++++ b/inject-java/src/main/java/io/micronaut/annotation/processing/visitor/JavaClassElement.java
+@@ -42,7 +42,6 @@ import io.micronaut.inject.ast.annotation.MutableAnnotationMetadataDelegate;
+ import io.micronaut.inject.ast.utils.AstBeanPropertiesUtils;
+ import io.micronaut.inject.ast.utils.EnclosedElementsQuery;
+ import io.micronaut.inject.processing.JavaModelUtils;
+-import io.micronaut.inject.visitor.ElementPostponedToNextRoundException;
+ 
+ import javax.lang.model.element.Element;
+ import javax.lang.model.element.ElementKind;
+@@ -272,17 +271,15 @@ public class JavaClassElement extends AbstractJavaElement implements ArrayableCl
+     @Override
+     public Collection<ClassElement> getInterfaces() {
+         if (resolvedInterfaces == null) {
+-            resolvedInterfaces = classElement.getInterfaces().stream()
+-                .map(mirror -> {
+-                    if (mirror.getKind() == TypeKind.ERROR) {
+-                        throw new ElementPostponedToNextRoundException(this);
+-                    }
+-                    return newClassElement(mirror, getTypeArguments());
+-                }).toList();
++            resolvedInterfaces = classElement.getInterfaces().stream().filter(this::onlyAvailable).map(mirror -> newClassElement(mirror, getTypeArguments())).toList();
+         }
+         return resolvedInterfaces;
+     }
+ 
++    private boolean onlyAvailable(TypeMirror mirror) {
++        return !(mirror instanceof DeclaredType declaredType) || declaredType.getKind() != TypeKind.ERROR;
++    }
++
+     @Override
+     public Optional<ClassElement> getSuperType() {
+         if (resolvedSuperType == null) {
+@@ -290,9 +287,6 @@ public class JavaClassElement extends AbstractJavaElement implements ArrayableCl
+             if (superclass == null) {
+                 return Optional.empty();
+             }
+-            if (superclass.getKind() == TypeKind.ERROR) {
+-                throw new ElementPostponedToNextRoundException(this);
+-            }
+             final Element element = visitorContext.getTypes().asElement(superclass);
+             if (element instanceof TypeElement superElement) {
+                 if (Object.class.getName().equals(superElement.getQualifiedName().toString())) {
+diff --git a/inject-java/src/test/groovy/io/micronaut/visitors/IntroductionTest.java b/inject-java/src/test/groovy/io/micronaut/visitors/IntroductionTest.java
+deleted file mode 100644
+index 798fc61d7e..0000000000
+--- a/inject-java/src/test/groovy/io/micronaut/visitors/IntroductionTest.java
++++ /dev/null
+@@ -1,11 +0,0 @@
+-package io.micronaut.visitors;
+-
+-import io.micronaut.aop.Introduction;
+-
+-import java.lang.annotation.Retention;
+-import java.lang.annotation.RetentionPolicy;
+-
+-@Introduction
+-@Retention(RetentionPolicy.RUNTIME)
+-public @interface IntroductionTest {
+-}
+diff --git a/inject-java/src/test/groovy/io/micronaut/visitors/IntroductionTestGen.java b/inject-java/src/test/groovy/io/micronaut/visitors/IntroductionTestGen.java
+deleted file mode 100644
+index 767a759c4d..0000000000
+--- a/inject-java/src/test/groovy/io/micronaut/visitors/IntroductionTestGen.java
++++ /dev/null
+@@ -1,10 +0,0 @@
+-package io.micronaut.visitors;
+-
+-import io.micronaut.aop.Introduction;
+-
+-import java.lang.annotation.Retention;
+-import java.lang.annotation.RetentionPolicy;
+-
+-@Retention(RetentionPolicy.RUNTIME)
+-public @interface IntroductionTestGen {
+-}
+diff --git a/inject-java/src/test/groovy/io/micronaut/visitors/IntroductionTestVisitor.java b/inject-java/src/test/groovy/io/micronaut/visitors/IntroductionTestVisitor.java
+deleted file mode 100644
+index 1049ac7cfc..0000000000
+--- a/inject-java/src/test/groovy/io/micronaut/visitors/IntroductionTestVisitor.java
++++ /dev/null
+@@ -1,31 +0,0 @@
+-package io.micronaut.visitors;
+-
+-import io.micronaut.inject.ast.ClassElement;
+-import io.micronaut.inject.processing.ProcessingException;
+-import io.micronaut.inject.visitor.TypeElementVisitor;
+-import io.micronaut.inject.visitor.VisitorContext;
+-
+-public class IntroductionTestVisitor implements TypeElementVisitor<IntroductionTestGen, Object> {
+-
+-    @Override
+-    public void visitClass(ClassElement element, VisitorContext context) {
+-            context.visitGeneratedSourceFile(
+-                "test",
+-                "IntroductionTestParent",
+-                element
+-            ).ifPresent(sourceFile -> {
+-                try {
+-                    sourceFile.write(writer -> writer.write("""
+-                        package test;
+-
+-                        public interface IntroductionTestParent {
+-                            String getParentMethod();
+-                        }
+-                        """));
+-                } catch (Exception e) {
+-                    throw new ProcessingException(element, "Failed to generate a Parent introduction: " + e.getMessage(), e);
+-                }
+-            });
+-    }
+-
+-}
+diff --git a/inject-java/src/test/groovy/io/micronaut/visitors/PostponedVisitorsSpec.groovy b/inject-java/src/test/groovy/io/micronaut/visitors/PostponedVisitorsSpec.groovy
+index fdb5168156..e2a6d86f44 100644
+--- a/inject-java/src/test/groovy/io/micronaut/visitors/PostponedVisitorsSpec.groovy
++++ b/inject-java/src/test/groovy/io/micronaut/visitors/PostponedVisitorsSpec.groovy
+@@ -2,11 +2,10 @@ package io.micronaut.visitors
+ 
+ 
+ import io.micronaut.annotation.processing.test.AbstractTypeElementSpec
+-import io.micronaut.inject.writer.BeanDefinitionVisitor
+ 
+ class PostponedVisitorsSpec extends AbstractTypeElementSpec {
+ 
+-    void 'test postpone introspection generation implementing generated interface'() {
++    void 'test'() {
+         when:
+             def definition = buildBeanIntrospection('test.Walrus', '''
+ package test;
+@@ -29,41 +28,4 @@ public record Walrus (
+         then:
+             definition
+     }
+-
+-    void 'test postpone introduction generation implementing generated interface'() {
+-        when:
+-        def context = buildContext('test.MyIntroduction' + BeanDefinitionVisitor.PROXY_SUFFIX, '''
+-package test;
+-
+-import io.micronaut.core.annotation.Introspected;
+-import io.micronaut.core.annotation.NonNull;
+-import io.micronaut.visitors.IntroductionTest;
+-import io.micronaut.visitors.IntroductionTestGen;
+-import io.micronaut.aop.InterceptorBean;
+-import io.micronaut.aop.MethodInterceptor;
+-import io.micronaut.aop.MethodInvocationContext;
+-
+-
+-@IntroductionTestGen
+-class Foo {}
+-
+-@IntroductionTest
+-interface MyIntroduction extends IntroductionTestParent  {
+-}
+-
+-
+-@InterceptorBean(IntroductionTest.class)
+-class IntroductionTestInterceptor
+-    implements MethodInterceptor<Object, Object> {
+-    @Override
+-    public Object intercept(MethodInvocationContext<Object, Object> context) {
+-        return "good";
+-    }
+-}
+-''')
+-        def introduction = getBean(context, 'test.MyIntroduction')
+-
+-        then:
+-        introduction.getParentMethod() == 'good'
+-    }
+ }
+diff --git a/inject-java/src/test/resources/META-INF/services/io.micronaut.inject.visitor.TypeElementVisitor b/inject-java/src/test/resources/META-INF/services/io.micronaut.inject.visitor.TypeElementVisitor
+index 2b6bc21382..e8e846e183 100644
+--- a/inject-java/src/test/resources/META-INF/services/io.micronaut.inject.visitor.TypeElementVisitor
++++ b/inject-java/src/test/resources/META-INF/services/io.micronaut.inject.visitor.TypeElementVisitor
+@@ -20,4 +20,3 @@ io.micronaut.annotation.AnnotateClassSpec$AnnotateClassVisitor
+ io.micronaut.annotation.AnnotateTypeArgSpec$AnnotateTypeArgVisitor
+ io.micronaut.aop.introduction.beans.MyRepoVisitor2
+ io.micronaut.visitors.WitherVisitor
+-io.micronaut.visitors.IntroductionTestVisitor

@@ -1,0 +1,393 @@
+diff --git a/okhttp-testing-support/src/main/kotlin/okhttp3/TestValueFactory.kt b/okhttp-testing-support/src/main/kotlin/okhttp3/TestValueFactory.kt
+index b62a68477..f6ef42ac7 100644
+--- a/okhttp-testing-support/src/main/kotlin/okhttp3/TestValueFactory.kt
++++ b/okhttp-testing-support/src/main/kotlin/okhttp3/TestValueFactory.kt
+@@ -171,17 +171,11 @@ class TestValueFactory : Closeable {
+     )
+   }
+ 
+-  fun newRequest(address: Address): Request {
+-    return Request.Builder()
+-      .url(address.url)
+-      .build()
+-  }
+-
+   fun newRoutePlanner(
+     client: OkHttpClient,
+     address: Address = newAddress(),
+   ): RealRoutePlanner {
+-    val call = RealCall(client, newRequest(address), forWebSocket = false)
++    val call = RealCall(client, Request(address.url), forWebSocket = false)
+     return RealRoutePlanner(client, address, call, newChain(call))
+   }
+ 
+diff --git a/okhttp/api/okhttp.api b/okhttp/api/okhttp.api
+index 1477d10eb..daf1f011b 100644
+--- a/okhttp/api/okhttp.api
++++ b/okhttp/api/okhttp.api
+@@ -999,6 +999,8 @@ public final class okhttp3/Request {
+ 	public final fun -deprecated_headers ()Lokhttp3/Headers;
+ 	public final fun -deprecated_method ()Ljava/lang/String;
+ 	public final fun -deprecated_url ()Lokhttp3/HttpUrl;
++	public fun <init> (Lokhttp3/HttpUrl;Lokhttp3/Headers;Ljava/lang/String;Lokhttp3/RequestBody;)V
++	public synthetic fun <init> (Lokhttp3/HttpUrl;Lokhttp3/Headers;Ljava/lang/String;Lokhttp3/RequestBody;ILkotlin/jvm/internal/DefaultConstructorMarker;)V
+ 	public final fun body ()Lokhttp3/RequestBody;
+ 	public final fun cacheControl ()Lokhttp3/CacheControl;
+ 	public final fun header (Ljava/lang/String;)Ljava/lang/String;
+diff --git a/okhttp/src/commonMain/kotlin/okhttp3/Request.kt b/okhttp/src/commonMain/kotlin/okhttp3/Request.kt
+index a298636a6..be491f333 100644
+--- a/okhttp/src/commonMain/kotlin/okhttp3/Request.kt
++++ b/okhttp/src/commonMain/kotlin/okhttp3/Request.kt
+@@ -22,7 +22,7 @@ import okhttp3.internal.commonEmptyRequestBody
+  * An HTTP request. Instances of this class are immutable if their [body] is null or itself
+  * immutable.
+  */
+-expect class Request {
++expect class Request private constructor(builder: Builder) {
+   val url: HttpUrlRepresentation
+   val method: String
+   val headers: Headers
+diff --git a/okhttp/src/jvmMain/kotlin/okhttp3/Cache.kt b/okhttp/src/jvmMain/kotlin/okhttp3/Cache.kt
+index 93d6a135e..78bc29aa3 100644
+--- a/okhttp/src/jvmMain/kotlin/okhttp3/Cache.kt
++++ b/okhttp/src/jvmMain/kotlin/okhttp3/Cache.kt
+@@ -15,6 +15,15 @@
+  */
+ package okhttp3
+ 
++import java.io.Closeable
++import java.io.File
++import java.io.Flushable
++import java.io.IOException
++import java.security.cert.Certificate
++import java.security.cert.CertificateEncodingException
++import java.security.cert.CertificateException
++import java.security.cert.CertificateFactory
++import java.util.TreeSet
+ import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+ import okhttp3.MediaType.Companion.toMediaTypeOrNull
+ import okhttp3.internal.EMPTY_HEADERS
+@@ -23,6 +32,7 @@ import okhttp3.internal.cache.CacheStrategy
+ import okhttp3.internal.cache.DiskLruCache
+ import okhttp3.internal.closeQuietly
+ import okhttp3.internal.concurrent.TaskRunner
++import okhttp3.internal.http.HttpMethod
+ import okhttp3.internal.http.StatusLine
+ import okhttp3.internal.platform.Platform
+ import okhttp3.internal.platform.Platform.Companion.WARN
+@@ -41,17 +51,6 @@ import okio.Path.Companion.toOkioPath
+ import okio.Sink
+ import okio.Source
+ import okio.buffer
+-import java.io.Closeable
+-import java.io.File
+-import java.io.Flushable
+-import java.io.IOException
+-import java.security.cert.Certificate
+-import java.security.cert.CertificateEncodingException
+-import java.security.cert.CertificateException
+-import java.security.cert.CertificateFactory
+-import java.util.NoSuchElementException
+-import java.util.TreeSet
+-import okhttp3.internal.http.HttpMethod
+ 
+ /**
+  * Caches HTTP and HTTPS responses to the filesystem so they may be reused, saving time and
+@@ -648,11 +647,7 @@ class Cache(
+     fun response(snapshot: DiskLruCache.Snapshot): Response {
+       val contentType = responseHeaders["Content-Type"]
+       val contentLength = responseHeaders["Content-Length"]
+-      val cacheRequest = Request.Builder()
+-        .url(url)
+-        .method(requestMethod, null)
+-        .headers(varyHeaders)
+-        .build()
++      val cacheRequest = Request(url, varyHeaders, requestMethod)
+       return Response.Builder()
+         .request(cacheRequest)
+         .protocol(protocol)
+diff --git a/okhttp/src/jvmMain/kotlin/okhttp3/Request.kt b/okhttp/src/jvmMain/kotlin/okhttp3/Request.kt
+index 205164492..15303d1d5 100644
+--- a/okhttp/src/jvmMain/kotlin/okhttp3/Request.kt
++++ b/okhttp/src/jvmMain/kotlin/okhttp3/Request.kt
+@@ -32,18 +32,52 @@ import okhttp3.internal.commonPut
+ import okhttp3.internal.commonRemoveHeader
+ import okhttp3.internal.toImmutableMap
+ 
+-actual class Request internal constructor(
+-  @get:JvmName("url") actual val url: HttpUrl,
+-  @get:JvmName("method") actual val method: String,
+-  @get:JvmName("headers") actual val headers: Headers,
+-  @get:JvmName("body") actual val body: RequestBody?,
+-  internal val tags: Map<Class<*>, Any>
+-) {
++actual class Request internal actual constructor(builder: Builder) {
++  @get:JvmName("url")
++  actual val url: HttpUrl = checkNotNull(builder.url) { "url == null" }
++
++  @get:JvmName("method")
++  actual val method: String = builder.method
++
++  @get:JvmName("headers")
++  actual val headers: Headers = builder.headers.build()
++
++  @get:JvmName("body")
++  actual val body: RequestBody? = builder.body
++
++  internal val tags: Map<Class<*>, Any> = builder.tags.toImmutableMap()
++
+   internal actual var lazyCacheControl: CacheControl? = null
+ 
+   actual val isHttps: Boolean
+     get() = url.isHttps
+ 
++  /**
++   * Constructs a new request.
++   *
++   * Use [Builder] for more fluent construction, including helper methods for various HTTP methods.
++   *
++   * @param method defaults to "GET" if [body] is null, and "POST" otherwise.
++   */
++  constructor(
++    url: HttpUrl,
++    headers: Headers = Headers.headersOf(),
++    method: String = "\u0000", // Sentinel value chooses based on what the body is.
++    body: RequestBody? = null,
++  ) : this(
++    Builder()
++      .url(url)
++      .headers(headers)
++      .method(
++        when {
++          method != "\u0000" -> method
++          body != null -> "POST"
++          else -> "GET"
++        },
++        body
++      )
++  )
++
+   actual fun header(name: String): String? = commonHeader(name)
+ 
+   actual fun headers(name: String): List<String> = commonHeaders(name)
+@@ -222,14 +256,6 @@ actual class Request internal constructor(
+       }
+     }
+ 
+-    actual open fun build(): Request {
+-      return Request(
+-          checkNotNull(url) { "url == null" },
+-          method,
+-          headers.build(),
+-          body,
+-          tags.toImmutableMap()
+-      )
+-    }
++    actual open fun build() = Request(this)
+   }
+ }
+diff --git a/okhttp/src/jvmMain/kotlin/okhttp3/internal/http1/Http1ExchangeCodec.kt b/okhttp/src/jvmMain/kotlin/okhttp3/internal/http1/Http1ExchangeCodec.kt
+index eac6e533b..694173287 100644
+--- a/okhttp/src/jvmMain/kotlin/okhttp3/internal/http1/Http1ExchangeCodec.kt
++++ b/okhttp/src/jvmMain/kotlin/okhttp3/internal/http1/Http1ExchangeCodec.kt
+@@ -88,7 +88,7 @@ class Http1ExchangeCodec(
+ 
+   override fun createRequestBody(request: Request, contentLength: Long): Sink {
+     return when {
+-      request.body != null && request.body.isDuplex() -> throw ProtocolException(
++      request.body?.isDuplex() == true -> throw ProtocolException(
+           "Duplex connections are not supported for HTTP/1")
+       request.isChunked -> newChunkedSink() // Stream a request body of unknown length.
+       contentLength != -1L -> newKnownLengthSink() // Stream a request body of a known length.
+diff --git a/okhttp/src/nonJvmMain/kotlin/okhttp3/Request.kt b/okhttp/src/nonJvmMain/kotlin/okhttp3/Request.kt
+index 082ad6dc4..77a117f1c 100644
+--- a/okhttp/src/nonJvmMain/kotlin/okhttp3/Request.kt
++++ b/okhttp/src/nonJvmMain/kotlin/okhttp3/Request.kt
+@@ -30,17 +30,43 @@ import okhttp3.internal.commonPost
+ import okhttp3.internal.commonPut
+ import okhttp3.internal.commonRemoveHeader
+ 
+-actual class Request internal constructor(
+-  actual val url: String,
+-  actual val method: String,
+-  actual val headers: Headers,
+-  actual val body: RequestBody?,
+-) {
++actual class Request internal actual constructor(builder: Builder) {
++  actual val url: String = checkNotNull(builder.url) { "url == null" }
++  actual val method: String = builder.method
++  actual val headers: Headers = builder.headers.build()
++  actual val body: RequestBody? = builder.body
++
+   internal actual var lazyCacheControl: CacheControl? = null
+ 
+   actual val isHttps: Boolean
+     get() = url.startsWith("https://")
+ 
++  /**
++   * Constructs a new request.
++   *
++   * Use [Builder] for more fluent construction, including helper methods for various HTTP methods.
++   *
++   * @param method defaults to "GET" if [body] is null, and "POST" otherwise.
++   */
++  constructor(
++    url: String,
++    headers: Headers = Headers.headersOf(),
++    method: String = "\u0000", // Sentinel value chooses based on what the body is.
++    body: RequestBody? = null,
++  ) : this(
++    Builder()
++      .url(url)
++      .headers(headers)
++      .method(
++        when {
++          method != "\u0000" -> method
++          body != null -> "POST"
++          else -> "GET"
++        },
++        body
++      )
++  )
++
+   actual fun header(name: String): String? = commonHeader(name)
+ 
+   actual fun headers(name: String): List<String> = commonHeaders(name)
+@@ -153,13 +179,6 @@ actual class Request internal constructor(
+     //   }
+     // }
+ 
+-    actual open fun build(): Request {
+-      return Request(
+-          checkNotNull(url) { "url == null" },
+-          method,
+-          headers.build(),
+-          body,
+-      )
+-    }
++    actual open fun build() = Request(this)
+   }
+ }
+diff --git a/samples/guide/src/main/java/okhttp3/recipes/kt/DevServer.kt b/samples/guide/src/main/java/okhttp3/recipes/kt/DevServer.kt
+index 50288f12d..a3c1b5812 100644
+--- a/samples/guide/src/main/java/okhttp3/recipes/kt/DevServer.kt
++++ b/samples/guide/src/main/java/okhttp3/recipes/kt/DevServer.kt
+@@ -46,9 +46,7 @@ class DevServer {
+ 
+   fun run() {
+     try {
+-      val request = Request.Builder()
+-          .url(server.url("/"))
+-          .build()
++      val request = Request(server.url("/"))
+ 
+       client.newCall(request).execute().use { response ->
+         if (!response.isSuccessful) throw IOException("Unexpected code $response")
+diff --git a/samples/guide/src/main/java/okhttp3/recipes/kt/PostFile.kt b/samples/guide/src/main/java/okhttp3/recipes/kt/PostFile.kt
+index b55a4b31b..a1f9f55a4 100644
+--- a/samples/guide/src/main/java/okhttp3/recipes/kt/PostFile.kt
++++ b/samples/guide/src/main/java/okhttp3/recipes/kt/PostFile.kt
+@@ -17,6 +17,7 @@ package okhttp3.recipes.kt
+ 
+ import java.io.File
+ import java.io.IOException
++import okhttp3.HttpUrl.Companion.toHttpUrl
+ import okhttp3.MediaType.Companion.toMediaType
+ import okhttp3.OkHttpClient
+ import okhttp3.Request
+@@ -28,10 +29,10 @@ class PostFile {
+   fun run() {
+     val file = File("README.md")
+ 
+-    val request = Request.Builder()
+-        .url("https://api.github.com/markdown/raw")
+-        .post(file.asRequestBody(MEDIA_TYPE_MARKDOWN))
+-        .build()
++    val request = Request(
++      url = "https://api.github.com/markdown/raw".toHttpUrl(),
++      body = file.asRequestBody(MEDIA_TYPE_MARKDOWN),
++    )
+ 
+     client.newCall(request).execute().use { response ->
+       if (!response.isSuccessful) throw IOException("Unexpected code $response")
+diff --git a/samples/guide/src/main/java/okhttp3/recipes/kt/PostForm.kt b/samples/guide/src/main/java/okhttp3/recipes/kt/PostForm.kt
+index 617b64818..ed38886a9 100644
+--- a/samples/guide/src/main/java/okhttp3/recipes/kt/PostForm.kt
++++ b/samples/guide/src/main/java/okhttp3/recipes/kt/PostForm.kt
+@@ -17,6 +17,7 @@ package okhttp3.recipes.kt
+ 
+ import java.io.IOException
+ import okhttp3.FormBody
++import okhttp3.HttpUrl.Companion.toHttpUrl
+ import okhttp3.OkHttpClient
+ import okhttp3.Request
+ 
+@@ -27,10 +28,10 @@ class PostForm {
+     val formBody = FormBody.Builder()
+         .add("search", "Jurassic Park")
+         .build()
+-    val request = Request.Builder()
+-        .url("https://en.wikipedia.org/w/index.php")
+-        .post(formBody)
+-        .build()
++    val request = Request(
++      url = "https://en.wikipedia.org/w/index.php".toHttpUrl(),
++      body = formBody,
++    )
+ 
+     client.newCall(request).execute().use { response ->
+       if (!response.isSuccessful) throw IOException("Unexpected code $response")
+diff --git a/samples/guide/src/main/java/okhttp3/recipes/kt/PostStreaming.kt b/samples/guide/src/main/java/okhttp3/recipes/kt/PostStreaming.kt
+index a0abf3078..017b8a00f 100644
+--- a/samples/guide/src/main/java/okhttp3/recipes/kt/PostStreaming.kt
++++ b/samples/guide/src/main/java/okhttp3/recipes/kt/PostStreaming.kt
+@@ -16,6 +16,7 @@
+ package okhttp3.recipes.kt
+ 
+ import java.io.IOException
++import okhttp3.HttpUrl.Companion.toHttpUrl
+ import okhttp3.MediaType.Companion.toMediaType
+ import okhttp3.OkHttpClient
+ import okhttp3.Request
+@@ -46,10 +47,10 @@ class PostStreaming {
+       }
+     }
+ 
+-    val request = Request.Builder()
+-        .url("https://api.github.com/markdown/raw")
+-        .post(requestBody)
+-        .build()
++    val request = Request(
++      url = "https://api.github.com/markdown/raw".toHttpUrl(),
++      body = requestBody,
++    )
+ 
+     client.newCall(request).execute().use { response ->
+       if (!response.isSuccessful) throw IOException("Unexpected code $response")
+diff --git a/samples/guide/src/main/java/okhttp3/recipes/kt/PostString.kt b/samples/guide/src/main/java/okhttp3/recipes/kt/PostString.kt
+index ea19558e6..d2a6ac8c8 100644
+--- a/samples/guide/src/main/java/okhttp3/recipes/kt/PostString.kt
++++ b/samples/guide/src/main/java/okhttp3/recipes/kt/PostString.kt
+@@ -16,6 +16,7 @@
+ package okhttp3.recipes.kt
+ 
+ import java.io.IOException
++import okhttp3.HttpUrl.Companion.toHttpUrl
+ import okhttp3.MediaType.Companion.toMediaType
+ import okhttp3.OkHttpClient
+ import okhttp3.Request
+@@ -34,10 +35,10 @@ class PostString {
+         | * _1.2_ August 11, 2013
+         |""".trimMargin()
+ 
+-    val request = Request.Builder()
+-        .url("https://api.github.com/markdown/raw")
+-        .post(postBody.toRequestBody(MEDIA_TYPE_MARKDOWN))
+-        .build()
++    val request = Request(
++      url = "https://api.github.com/markdown/raw".toHttpUrl(),
++      body = postBody.toRequestBody(MEDIA_TYPE_MARKDOWN),
++    )
+ 
+     client.newCall(request).execute().use { response ->
+       if (!response.isSuccessful) throw IOException("Unexpected code $response")

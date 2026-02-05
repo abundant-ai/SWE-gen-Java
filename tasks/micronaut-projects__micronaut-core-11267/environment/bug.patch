@@ -1,0 +1,186 @@
+diff --git a/.github/workflows/gradle.yml b/.github/workflows/gradle.yml
+index bec738f30e..909b5fd20d 100644
+--- a/.github/workflows/gradle.yml
++++ b/.github/workflows/gradle.yml
+@@ -45,7 +45,7 @@ jobs:
+           fetch-depth: 0
+ 
+       - name: "🔧 Setup GraalVM CE"
+-        uses: graalvm/setup-graalvm@v1.2.4
++        uses: graalvm/setup-graalvm@v1.2.3
+         with:
+           distribution: 'graalvm'
+           java-version: ${{ matrix.java }}
+diff --git a/http-server-netty/src/main/java/io/micronaut/http/server/netty/binders/NettyBodyAnnotationBinder.java b/http-server-netty/src/main/java/io/micronaut/http/server/netty/binders/NettyBodyAnnotationBinder.java
+index a8a0531adb..b54d7b7ca8 100644
+--- a/http-server-netty/src/main/java/io/micronaut/http/server/netty/binders/NettyBodyAnnotationBinder.java
++++ b/http-server-netty/src/main/java/io/micronaut/http/server/netty/binders/NettyBodyAnnotationBinder.java
+@@ -157,6 +157,10 @@ final class NettyBodyAnnotationBinder<T> extends DefaultBodyAnnotationBinder<T>
+         if (mediaType != null && (reader == null || !reader.isReadable(context.getArgument(), mediaType))) {
+             reader = bodyHandlerRegistry.findReader(context.getArgument(), List.of(mediaType)).orElse(null);
+         }
++        if (reader != null && context.getArgument().getType().equals(Object.class)) {
++            // Prevent random object convertors
++            reader = null;
++        }
+         if (reader == null && nhr.isFormOrMultipartData()) {
+             FormDataHttpContentProcessor processor = new FormDataHttpContentProcessor(nhr, httpServerConfiguration);
+             ByteBuf buf = AvailableNettyByteBody.toByteBuf(imm);
+@@ -198,8 +202,9 @@ final class NettyBodyAnnotationBinder<T> extends DefaultBodyAnnotationBinder<T>
+             nhr.setLegacyBody(converted.orElse(null));
+             return converted;
+         }
++        ByteBuffer<?> byteBuffer = imm.toByteBuffer();
+         if (reader != null) {
+-            T result = read(context, reader, nhr.getHeaders(), mediaType, imm.toByteBuffer());
++            T result = read(context, reader, nhr.getHeaders(), mediaType, byteBuffer);
+             nhr.setLegacyBody(result);
+             return Optional.ofNullable(result);
+         }
+diff --git a/http-server-netty/src/test/groovy/io/micronaut/http/server/netty/body/BodyConversionSpec.groovy b/http-server-netty/src/test/groovy/io/micronaut/http/server/netty/body/BodyConversionSpec.groovy
+deleted file mode 100644
+index 731c87638c..0000000000
+--- a/http-server-netty/src/test/groovy/io/micronaut/http/server/netty/body/BodyConversionSpec.groovy
++++ /dev/null
+@@ -1,90 +0,0 @@
+-package io.micronaut.http.server.netty.body
+-
+-import io.micronaut.context.ApplicationContext
+-import io.micronaut.context.annotation.Requires
+-import io.micronaut.core.convert.MutableConversionService
+-import io.micronaut.core.convert.TypeConverterRegistrar
+-import io.micronaut.http.HttpRequest
+-import io.micronaut.http.annotation.Body
+-import io.micronaut.http.annotation.Consumes
+-import io.micronaut.http.annotation.Controller
+-import io.micronaut.http.annotation.Post
+-import io.micronaut.http.client.HttpClient
+-import io.micronaut.runtime.server.EmbeddedServer
+-import io.netty.buffer.ByteBuf
+-import jakarta.inject.Singleton
+-import spock.lang.Specification
+-
+-import java.nio.charset.StandardCharsets
+-
+-class BodyConversionSpec extends Specification {
+-    static final String WEIRD_CONTENT_TYPE = "application/x-weird"
+-
+-    def 'weird content type, object param'() {
+-        given:
+-        def ctx = ApplicationContext.run(['spec.name': 'BodyConversionSpec'])
+-        def server = ctx.getBean(EmbeddedServer)
+-        server.start()
+-        def client = ctx.createBean(HttpClient, server.URI).toBlocking()
+-
+-        when:
+-        def response = client.retrieve(HttpRequest.POST('/body-conversion/weird-object', "foo")
+-                .contentType(WEIRD_CONTENT_TYPE), String)
+-        then:
+-        response == 'body: foo'
+-
+-        cleanup:
+-        client.close()
+-        server.stop()
+-    }
+-
+-    def 'weird content type, converted param'() {
+-        given:
+-        def ctx = ApplicationContext.run(['spec.name': 'BodyConversionSpec'])
+-        def server = ctx.getBean(EmbeddedServer)
+-        server.start()
+-        def client = ctx.createBean(HttpClient, server.URI).toBlocking()
+-
+-        when:
+-        def response = client.retrieve(HttpRequest.POST('/body-conversion/weird-converted', "foo")
+-                .contentType(WEIRD_CONTENT_TYPE), String)
+-        then:
+-        response == 'body: MyRecord[s=foo]'
+-
+-        cleanup:
+-        client.close()
+-        server.stop()
+-    }
+-
+-    @Controller("/body-conversion")
+-    @Requires(property = "spec.name", value = "BodyConversionSpec")
+-    static class MyCtrl {
+-        @Consumes(WEIRD_CONTENT_TYPE)
+-        @Post("/weird-object")
+-        String object(@Body Object o) {
+-            def text = ((ByteBuf) o).toString(StandardCharsets.UTF_8)
+-            o.release()
+-            return "body: " + text
+-        }
+-
+-        @Consumes(WEIRD_CONTENT_TYPE)
+-        @Post("/weird-converted")
+-        String converted(@Body MyRecord o) {
+-            return "body: " + o
+-        }
+-    }
+-
+-    @Singleton
+-    @Requires(property = "spec.name", value = "BodyConversionSpec")
+-    static class MyConverter implements TypeConverterRegistrar {
+-        @Override
+-        void register(MutableConversionService conversionService) {
+-            conversionService.addConverter(ByteBuf.class, MyRecord.class, buf -> {
+-                return new MyRecord(buf.toString(StandardCharsets.UTF_8))
+-            })
+-        }
+-    }
+-
+-    record MyRecord(String s) {
+-    }
+-}
+diff --git a/http-server-tck/src/main/java/io/micronaut/http/server/tck/tests/BodyTest.java b/http-server-tck/src/main/java/io/micronaut/http/server/tck/tests/BodyTest.java
+index 5833ec35aa..8db11424f4 100644
+--- a/http-server-tck/src/main/java/io/micronaut/http/server/tck/tests/BodyTest.java
++++ b/http-server-tck/src/main/java/io/micronaut/http/server/tck/tests/BodyTest.java
+@@ -184,19 +184,6 @@ public class BodyTest {
+             .run();
+     }
+ 
+-    @Test
+-    void testObjectBody() throws IOException {
+-        TestScenario.builder()
+-            .specName(SPEC_NAME)
+-            .request(HttpRequest.POST("/response-body/object", Map.of("fizz", "buzz")))
+-            .assertion((server, request) -> AssertionUtils.assertDoesNotThrow(server, request,
+-                HttpResponseAssertion.builder()
+-                    .status(HttpStatus.CREATED)
+-                    .body("obj: {fizz=buzz}")
+-                    .build()))
+-            .run();
+-    }
+-
+     @Controller("/response-body")
+     @Requires(property = "spec.name", value = SPEC_NAME)
+     static class BodyController {
+@@ -266,14 +253,6 @@ public class BodyTest {
+         CompletableFuture<HttpResponse<?>> redirectFuture() {
+             return CompletableFuture.completedFuture(HttpResponse.status(HttpStatus.FOUND).header("Location", "https://example.com"));
+         }
+-
+-        @SuppressWarnings("DefaultAnnotationParam")
+-        @Post(uri = "/object", consumes = MediaType.TEXT_PLAIN)
+-        @Status(HttpStatus.CREATED)
+-        @Consumes(MediaType.APPLICATION_JSON)
+-        String objectBody(@Body Object obj) {
+-            return "obj: " + obj;
+-        }
+     }
+ 
+     @Introspected
+diff --git a/http/src/main/java/io/micronaut/http/body/TypedMessageBodyReader.java b/http/src/main/java/io/micronaut/http/body/TypedMessageBodyReader.java
+index 31ac2706f1..c37182f260 100644
+--- a/http/src/main/java/io/micronaut/http/body/TypedMessageBodyReader.java
++++ b/http/src/main/java/io/micronaut/http/body/TypedMessageBodyReader.java
+@@ -38,6 +38,6 @@ public interface TypedMessageBodyReader<T> extends MessageBodyReader<T> {
+ 
+     @Override
+     default boolean isReadable(Argument<T> type, MediaType mediaType) {
+-        return type.isAssignableFrom(getType()) && !type.getType().equals(Object.class);
++        return type.isAssignableFrom(getType());
+     }
+ }

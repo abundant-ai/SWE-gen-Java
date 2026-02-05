@@ -1,0 +1,368 @@
+diff --git a/build.gradle b/build.gradle
+index 08d1c3d37..4aeeb9a96 100644
+--- a/build.gradle
++++ b/build.gradle
+@@ -69,7 +69,6 @@ apply from: 'gradle/root/coverage.gradle'
+ apply from: 'gradle/root/gradle-fix.gradle'
+ apply from: 'gradle/root/release.gradle'
+ 
+-apply from: 'gradle/mockito-core/inline-mock.gradle'
+ apply from: 'gradle/mockito-core/osgi.gradle'
+ apply from: 'gradle/mockito-core/javadoc.gradle'
+ apply from: 'gradle/mockito-core/license.gradle'
+diff --git a/gradle/mockito-core/inline-mock.gradle b/gradle/mockito-core/inline-mock.gradle
+deleted file mode 100644
+index b67300a26..000000000
+--- a/gradle/mockito-core/inline-mock.gradle
++++ /dev/null
+@@ -1,14 +0,0 @@
+-task copyMockMethodDispatcher(type: Copy) {
+-    dependsOn compileJava
+-    from "${buildDir}/classes/main/org/mockito/internal/creation/bytebuddy"
+-    into "${buildDir}/classes/main/org/mockito/internal/creation/bytebuddy"
+-    include "MockMethodDispatcher.class"
+-    rename { String fileName ->
+-        fileName.replace('.class', '.raw')
+-    }
+-}
+-classes.dependsOn(copyMockMethodDispatcher)
+-
+-jar {
+-    exclude("org/mockito/internal/creation/bytebuddy/MockMethodDispatcher.class")
+-}
+diff --git a/src/main/java/org/mockito/internal/creation/bytebuddy/InlineByteBuddyMockMaker.java b/src/main/java/org/mockito/internal/creation/bytebuddy/InlineByteBuddyMockMaker.java
+index 882d12b76..c747e9460 100644
+--- a/src/main/java/org/mockito/internal/creation/bytebuddy/InlineByteBuddyMockMaker.java
++++ b/src/main/java/org/mockito/internal/creation/bytebuddy/InlineByteBuddyMockMaker.java
+@@ -5,6 +5,7 @@
+ package org.mockito.internal.creation.bytebuddy;
+ 
+ import net.bytebuddy.agent.ByteBuddyAgent;
++import net.bytebuddy.dynamic.ClassFileLocator;
+ import org.mockito.Incubating;
+ import org.mockito.exceptions.base.MockitoException;
+ import org.mockito.exceptions.base.MockitoInitializationException;
+@@ -19,7 +20,6 @@ import org.mockito.mock.MockCreationSettings;
+ import java.io.File;
+ import java.io.FileOutputStream;
+ import java.io.IOException;
+-import java.io.InputStream;
+ import java.lang.instrument.Instrumentation;
+ import java.lang.reflect.Modifier;
+ import java.util.jar.JarEntry;
+@@ -90,91 +90,59 @@ import static org.mockito.internal.util.StringJoiner.join;
+ @Incubating
+ public class InlineByteBuddyMockMaker implements ClassCreatingMockMaker {
+ 
+-    private static final Instrumentation INSTRUMENTATION;
++    private final Instrumentation instrumentation;
+ 
+-    private static final Throwable INITIALIZATION_ERROR;
++    private final BytecodeGenerator bytecodeGenerator;
++
++    private final WeakConcurrentMap<Object, MockMethodInterceptor> mocks = new WeakConcurrentMap.WithInlinedExpunction<Object, MockMethodInterceptor>();
+ 
+-    static {
+-        Instrumentation instrumentation;
+-        Throwable initializationError = null;
++    public InlineByteBuddyMockMaker() {
+         try {
++            instrumentation = ByteBuddyAgent.install();
++            if (!instrumentation.isRetransformClassesSupported()) {
++                throw new MockitoInitializationException(join(
++                        "Byte Buddy requires retransformation for creating inline mocks. This feature is unavailable on the current VM.",
++                        "",
++                        "You cannot use this mock maker on this VM:",
++                        Platform.describe()));
++            }
++            File boot = File.createTempFile("mockitoboot", "jar");
++            boot.deleteOnExit();
++            JarOutputStream outputStream = new JarOutputStream(new FileOutputStream(boot));
+             try {
+-                instrumentation = ByteBuddyAgent.install();
+-                if (!instrumentation.isRetransformClassesSupported()) {
+-                    throw new IllegalStateException(join(
+-                            "Byte Buddy requires retransformation for creating inline mocks. This feature is unavailable on the current VM.",
+-                            "",
+-                            "You cannot use this mock maker on this VM"));
+-                }
+-                File boot = File.createTempFile("mockitoboot", ".jar");
+-                boot.deleteOnExit();
+-                JarOutputStream outputStream = new JarOutputStream(new FileOutputStream(boot));
+-                try {
+-                    String source = "org/mockito/internal/creation/bytebuddy/MockMethodDispatcher";
+-                    InputStream inputStream = InlineByteBuddyMockMaker.class.getClassLoader().getResourceAsStream(source + ".raw");
+-                    if (inputStream == null) {
+-                        throw new IllegalStateException(join(
+-                                "The MockMethodDispatcher class file is not locatable: " + source + ".raw",
+-                                "",
+-                                "The class loader responsible for looking up the resource: " + InlineByteBuddyMockMaker.class.getClassLoader()
+-                        ));
+-                    }
+-                    outputStream.putNextEntry(new JarEntry(source + ".class"));
+-                    try {
+-                        int length;
+-                        byte[] buffer = new byte[1024];
+-                        while ((length = inputStream.read(buffer)) != -1) {
+-                            outputStream.write(buffer, 0, length);
+-                        }
+-                    } finally {
+-                        inputStream.close();
+-                    }
+-                    outputStream.closeEntry();
+-                } finally {
+-                    outputStream.close();
+-                }
+-                instrumentation.appendToBootstrapClassLoaderSearch(new JarFile(boot));
+-                try {
+-                    Class<?> dispatcher = Class.forName("org.mockito.internal.creation.bytebuddy.MockMethodDispatcher");
+-                    if (dispatcher.getClassLoader() != null) {
+-                        throw new IllegalStateException(join(
+-                                "The MockMethodDispatcher must not be loaded manually but must be injected into the bootstrap class loader.",
+-                                "",
+-                                "The dispatcher class was already loaded by: " + dispatcher.getClassLoader()));
+-                    }
+-                } catch (ClassNotFoundException cnfe) {
+-                    throw new IllegalStateException(join(
+-                            "Mockito failed to inject the MockMethodDispatcher class into the bootstrap class loader",
++                outputStream.putNextEntry(new JarEntry("org/mockito/internal/creation/bytebuddy/MockMethodDispatcher.class"));
++                outputStream.write(ClassFileLocator.ForClassLoader.of(InlineByteBuddyMockMaker.class.getClassLoader())
++                        .locate("org.mockito.internal.creation.bytebuddy.MockMethodDispatcher")
++                        .resolve());
++                outputStream.closeEntry();
++            } finally {
++                outputStream.close();
++            }
++            instrumentation.appendToBootstrapClassLoaderSearch(new JarFile(boot));
++            try {
++                Class<?> dispatcher = Class.forName("org.mockito.internal.creation.bytebuddy.MockMethodDispatcher");
++                if (dispatcher.getClassLoader() != null) {
++                    throw new MockitoInitializationException(join(
++                            "The MockMethodDispatcher must not be loaded manually but must be injected into the bootstrap class loader.",
+                             "",
+-                            "It seems like your current VM does not support the instrumentation API correctly."), cnfe);
++                            "The dispatcher class was already loaded by: " + dispatcher.getClassLoader()));
+                 }
+-            } catch (IOException ioe) {
+-                throw new IllegalStateException(join(
+-                        "Mockito could not self-attach a Java agent to the current VM. This feature is required for inline mocking.",
+-                        "This error occured due to an I/O error during the creation of this agent: " + ioe,
++            } catch (ClassNotFoundException cnfe) {
++                throw new MockitoInitializationException(join(
++                        "Mockito failed to inject the MockMethodDispatcher class into the bootstrap class loader",
+                         "",
+-                        "Potentially, the current VM does not support the instrumentation API correctly"), ioe);
++                        "It seems like your current VM does not support the instrumentation API correctly:",
++                        Platform.describe()), cnfe);
+             }
+-        } catch (Throwable throwable) {
+-            instrumentation = null;
+-            initializationError = throwable;
+-        }
+-        INSTRUMENTATION = instrumentation;
+-        INITIALIZATION_ERROR = initializationError;
+-    }
+-
+-    private final BytecodeGenerator bytecodeGenerator;
+-
+-    private final WeakConcurrentMap<Object, MockMethodInterceptor> mocks = new WeakConcurrentMap.WithInlinedExpunction<Object, MockMethodInterceptor>();
+-
+-    public InlineByteBuddyMockMaker() {
+-        if (INITIALIZATION_ERROR != null) {
++            bytecodeGenerator = new TypeCachingBytecodeGenerator(new InlineBytecodeGenerator(instrumentation, mocks), true);
++        } catch (IOException ioe) {
+             throw new MockitoInitializationException(join(
+-                    "Could not initialize inline Byte Buddy mock maker. (This mock maker is not supported on Android.)",
++                    "Mockito could not self-attach a Java agent to the current VM. This feature is required for inline mocking.",
++                    "This error occured due to an I/O error during the creation of this agent: " + ioe,
+                     "",
+-                    Platform.describe()), INITIALIZATION_ERROR);
++                    "Potentially, the current VM does not support the instrumentation API correctly:",
++                    Platform.describe()), ioe);
+         }
+-        bytecodeGenerator = new TypeCachingBytecodeGenerator(new InlineBytecodeGenerator(INSTRUMENTATION, mocks), true);
+     }
+ 
+     @Override
+@@ -292,7 +260,7 @@ public class InlineByteBuddyMockMaker implements ClassCreatingMockMaker {
+         return new TypeMockability() {
+             @Override
+             public boolean mockable() {
+-                return INSTRUMENTATION.isModifiableClass(type) && !EXCLUDES.contains(type);
++                return instrumentation.isModifiableClass(type) && !EXCLUDES.contains(type);
+             }
+ 
+             @Override
+@@ -310,24 +278,4 @@ public class InlineByteBuddyMockMaker implements ClassCreatingMockMaker {
+             }
+         };
+     }
+-
+-    static Throwable hideRecursiveCall(Throwable throwable, int current, Class<?> targetType) {
+-        try {
+-            StackTraceElement[] stack = throwable.getStackTrace();
+-            int skip = 0;
+-            StackTraceElement next;
+-            do {
+-                next = stack[stack.length - current - ++skip];
+-            } while (!next.getClassName().equals(targetType.getName()));
+-            int top = stack.length - current - skip;
+-            StackTraceElement[] cleared = new StackTraceElement[stack.length - skip];
+-            System.arraycopy(stack, 0, cleared, 0, top);
+-            System.arraycopy(stack, top + skip, cleared, top, current);
+-            throwable.setStackTrace(cleared);
+-            return throwable;
+-        } catch (RuntimeException ignored) {
+-            // This should not happen unless someone instrumented or manipulated exception stack traces.
+-            return throwable;
+-        }
+-    }
+ }
+diff --git a/src/main/java/org/mockito/internal/creation/bytebuddy/MockMethodAdvice.java b/src/main/java/org/mockito/internal/creation/bytebuddy/MockMethodAdvice.java
+index 394bd2d2e..7f6483fc7 100644
+--- a/src/main/java/org/mockito/internal/creation/bytebuddy/MockMethodAdvice.java
++++ b/src/main/java/org/mockito/internal/creation/bytebuddy/MockMethodAdvice.java
+@@ -23,8 +23,6 @@ import java.lang.reflect.Method;
+ import java.lang.reflect.Modifier;
+ import java.util.concurrent.Callable;
+ 
+-import static org.mockito.internal.creation.bytebuddy.InlineByteBuddyMockMaker.hideRecursiveCall;
+-
+ public class MockMethodAdvice extends MockMethodDispatcher {
+ 
+     final WeakConcurrentMap<Object, MockMethodInterceptor> interceptors;
+@@ -182,6 +180,26 @@ public class MockMethodAdvice extends MockMethodDispatcher {
+         }
+     }
+ 
++    static Throwable hideRecursiveCall(Throwable throwable, int current, Class<?> targetType) {
++        try {
++            StackTraceElement[] stack = throwable.getStackTrace();
++            int skip = 0;
++            StackTraceElement next;
++            do {
++                next = stack[stack.length - current - ++skip];
++            } while (!next.getClassName().equals(targetType.getName()));
++            int top = stack.length - current - skip;
++            StackTraceElement[] cleared = new StackTraceElement[stack.length - skip];
++            System.arraycopy(stack, 0, cleared, 0, top);
++            System.arraycopy(stack, top + skip, cleared, top, current);
++            throwable.setStackTrace(cleared);
++            return throwable;
++        } catch (RuntimeException ignored) {
++            // This should not happen unless someone instrumented or manipulated exception stack traces.
++            return throwable;
++        }
++    }
++
+     private static class ReturnValueWrapper implements Callable<Object> {
+ 
+         private final Object returned;
+diff --git a/src/test/java/org/mockito/internal/creation/bytebuddy/InlineByteBuddyMockMakerTest.java b/src/test/java/org/mockito/internal/creation/bytebuddy/InlineByteBuddyMockMakerTest.java
+index ee36f6de7..3b5256dae 100644
+--- a/src/test/java/org/mockito/internal/creation/bytebuddy/InlineByteBuddyMockMakerTest.java
++++ b/src/test/java/org/mockito/internal/creation/bytebuddy/InlineByteBuddyMockMakerTest.java
+@@ -1,5 +1,10 @@
+ package org.mockito.internal.creation.bytebuddy;
+ 
++import java.util.HashMap;
++import java.util.List;
++import java.util.Observable;
++import java.util.Observer;
++import java.util.regex.Pattern;
+ import net.bytebuddy.ByteBuddy;
+ import net.bytebuddy.ClassFileVersion;
+ import net.bytebuddy.description.modifier.Visibility;
+@@ -16,12 +21,6 @@ import org.mockito.mock.MockCreationSettings;
+ import org.mockito.mock.SerializableMode;
+ import org.mockito.plugins.MockMaker;
+ 
+-import java.util.HashMap;
+-import java.util.List;
+-import java.util.Observable;
+-import java.util.Observer;
+-import java.util.regex.Pattern;
+-
+ import static net.bytebuddy.ClassFileVersion.JAVA_V8;
+ import static net.bytebuddy.ClassFileVersion.JAVA_V9;
+ import static net.bytebuddy.matcher.ElementMatchers.named;
+@@ -158,7 +157,7 @@ public class InlineByteBuddyMockMakerTest extends AbstractByteBuddyMockMakerTest
+ 
+         Throwable throwable = new Throwable();
+         throwable.setStackTrace(stack);
+-        throwable = InlineByteBuddyMockMaker.hideRecursiveCall(throwable, 2, SampleInterface.class);
++        throwable = MockMethodAdvice.hideRecursiveCall(throwable, 2, SampleInterface.class);
+ 
+         assertThat(throwable.getStackTrace()).isEqualTo(new StackTraceElement[]{
+                 new StackTraceElement("foo", "", "", -1),
+@@ -171,7 +170,7 @@ public class InlineByteBuddyMockMakerTest extends AbstractByteBuddyMockMakerTest
+     public void should_handle_missing_or_inconsistent_stack_trace() throws Exception {
+         Throwable throwable = new Throwable();
+         throwable.setStackTrace(new StackTraceElement[0]);
+-        assertThat(InlineByteBuddyMockMaker.hideRecursiveCall(throwable, 0, SampleInterface.class)).isSameAs(throwable);
++        assertThat(MockMethodAdvice.hideRecursiveCall(throwable, 0, SampleInterface.class)).isSameAs(throwable);
+     }
+ 
+     @Test
+@@ -264,11 +263,6 @@ public class InlineByteBuddyMockMakerTest extends AbstractByteBuddyMockMakerTest
+         return mockSettings;
+     }
+ 
+-    @Test
+-    public void testMockDispatcherIsRelocated() throws Exception {
+-        assertThat(InlineByteBuddyMockMaker.class.getClassLoader().getResource("org/mockito/internal/creation/bytebuddy/MockMethodDispatcher.raw")).isNotNull();
+-    }
+-
+     private static final class FinalClass {
+ 
+         public String foo() {
+diff --git a/src/test/java/org/mockito/internal/junit/JUnitRuleTest.java b/src/test/java/org/mockito/internal/junit/JUnitRuleTest.java
+index 8ae318b57..b7da8bb5f 100644
+--- a/src/test/java/org/mockito/internal/junit/JUnitRuleTest.java
++++ b/src/test/java/org/mockito/internal/junit/JUnitRuleTest.java
+@@ -44,4 +44,4 @@ public class JUnitRuleTest {
+         Mockito.when(mock.simpleMethod()); // <--- unfinished stubbing
+         throw new RuntimeException("foo"); // <--- some failure
+     }
+-}
++}
+\ No newline at end of file
+diff --git a/src/test/java/org/mockitointegration/NoJUnitDependenciesTest.java b/src/test/java/org/mockitointegration/NoJUnitDependenciesTest.java
+index d39fa1429..59f766fed 100644
+--- a/src/test/java/org/mockitointegration/NoJUnitDependenciesTest.java
++++ b/src/test/java/org/mockitointegration/NoJUnitDependenciesTest.java
+@@ -1,7 +1,6 @@
+ package org.mockitointegration;
+ 
+ import net.bytebuddy.ByteBuddy;
+-import net.bytebuddy.agent.ByteBuddyAgent;
+ import org.hamcrest.Matcher;
+ import org.junit.Assume;
+ import org.junit.Test;
+@@ -10,7 +9,6 @@ import org.mockito.internal.configuration.plugins.Plugins;
+ import org.mockitoutil.ClassLoaders;
+ import org.objenesis.Objenesis;
+ 
+-import java.util.Arrays;
+ import java.util.Set;
+ 
+ import static org.mockitoutil.ClassLoaders.coverageTool;
+@@ -26,7 +24,6 @@ public class NoJUnitDependenciesTest {
+                         Mockito.class,
+                         Matcher.class,
+                         ByteBuddy.class,
+-                        ByteBuddyAgent.class,
+                         Objenesis.class
+                 )
+                 .withCodeSourceUrlOf(coverageTool())
+@@ -35,10 +32,6 @@ public class NoJUnitDependenciesTest {
+ 
+         Set<String> pureMockitoAPIClasses = ClassLoaders.in(classLoader_without_JUnit).omit("runners", "junit", "JUnit").listOwnedClasses();
+ 
+-        // The later class is required to be initialized before any inline mock maker classes can be loaded.
+-        checkDependency(classLoader_without_JUnit, "org.mockito.internal.creation.bytebuddy.InlineByteBuddyMockMaker");
+-        pureMockitoAPIClasses.remove("org.mockito.internal.creation.bytebuddy.InlineByteBuddyMockMaker");
+-
+         for (String pureMockitoAPIClass : pureMockitoAPIClasses) {
+             checkDependency(classLoader_without_JUnit, pureMockitoAPIClass);
+         }

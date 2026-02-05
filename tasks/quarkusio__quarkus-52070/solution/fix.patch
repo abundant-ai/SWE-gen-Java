@@ -1,0 +1,393 @@
+diff --git a/core/runtime/src/main/java/io/quarkus/runtime/Startup.java b/core/runtime/src/main/java/io/quarkus/runtime/Startup.java
+index e7f79520f62..988f2cf9e10 100644
+--- a/core/runtime/src/main/java/io/quarkus/runtime/Startup.java
++++ b/core/runtime/src/main/java/io/quarkus/runtime/Startup.java
+@@ -59,6 +59,25 @@
+  * }
+  * </pre>
+  *
++ * <h2>Reactive startup methods</h2>
++ *
++ * <p>
++ * You can also declare startup methods that return a <code>Uni</code>, in which case your startup method will
++ * be executed in a non-blocking thread.
++ * </p>
++ *
++ * <pre>
++ * &#064;ApplicationScoped
++ * class Bean4 {
++ *
++ *     &#064;Startup
++ *     Uni&lt;Void&gt; init() {
++ *         // place the logic here
++ *         return Uni.createFrom().voidItem();
++ *     }
++ * }
++ * </pre>
++ *
+  * @see StartupEvent
+  */
+ @Target({ TYPE, METHOD, FIELD })
+diff --git a/docs/src/main/asciidoc/cdi-reference.adoc b/docs/src/main/asciidoc/cdi-reference.adoc
+index 76a4f5cd53c..f652c8f9738 100644
+--- a/docs/src/main/asciidoc/cdi-reference.adoc
++++ b/docs/src/main/asciidoc/cdi-reference.adoc
+@@ -1519,6 +1519,12 @@ Further, if the observer declares a return type of `Uni<>`, the returned `Uni` w
+ 
+ Therefore, it is recommended that observer methods, both synchronous and asynchronous, are always declared `void`.
+ 
++=== Reactive startup methods
++
++As documented in xref:lifecycle.adoc#startup_annotation[the `@Startup` method documentation], you may define startup
++methods that return a `Uni`, in which case they will be invoked on an event thread instead of a blocking thread, and
++their returned `Uni` will be subscribed to and awaited.
++
+ [[build_time_apis]]
+ == Build Time Extensions
+ 
+diff --git a/docs/src/main/asciidoc/hibernate-panache-next.adoc b/docs/src/main/asciidoc/hibernate-panache-next.adoc
+index 3d253544fb3..97ac09b5be6 100644
+--- a/docs/src/main/asciidoc/hibernate-panache-next.adoc
++++ b/docs/src/main/asciidoc/hibernate-panache-next.adoc
+@@ -1067,25 +1067,18 @@ public class OnStart {
+ }
+ ----
+ 
+-For reactive operations, it is a little more complex at the moment, because you need a regular `@Startup` method,
+-from which you invoke your reactive `@WithTransaction` method from within a call to
+-`VertxContextSupport.subscribeAndAwait` (don't worry, we are working on making this easier):
++For reactive operations, it is fairly similar:
+ 
+ [source,java]
+ ----
+ import io.quarkus.hibernate.reactive.panache.common.WithTransaction;
+ import io.quarkus.runtime.Startup;
+-import io.quarkus.vertx.VertxContextSupport;
+ import io.smallrye.mutiny.Uni;
+ 
+ public class OnStart {
+     @Startup
+-    public void start() throws Throwable {
+-        VertxContextSupport.subscribeAndAwait(() -> runit());
+-    }
+-
+     @WithTransaction
+-    Uni<Void> runit(){
++    Uni<Void> startupMethod(){
+         return Cat_.repo().deleteAll().replaceWithVoid();
+     }
+ }
+diff --git a/docs/src/main/asciidoc/lifecycle.adoc b/docs/src/main/asciidoc/lifecycle.adoc
+index 9d3324121e1..51360c547f8 100644
+--- a/docs/src/main/asciidoc/lifecycle.adoc
++++ b/docs/src/main/asciidoc/lifecycle.adoc
+@@ -264,9 +264,17 @@ public class EagerAppBean {
+    void init() { <1>
+      doSomeCoolInit();
+    }
++
++   @Startup
++   Uni<Void> initReactive() { <2>
++     return doSomeCoolReactiveInit();
++   }
+ }
+ ----
+ <1> The bean is created and the `init()` method is invoked upon the contextual instance when the application starts.
++<2> The bean is created and the `initReactive()` method is invoked upon the contextual instance when the application
++starts, on a non-blocking thread, which requires the Quarkus Vert.x extension (there will be an error if it is not
++present).
+ 
+ [[shutdown_annotation]]
+ === Using `@Shutdown` to execute a business method of a CDI bean during application shutdown
+diff --git a/extensions/arc/deployment/src/main/java/io/quarkus/arc/deployment/StartupBuildSteps.java b/extensions/arc/deployment/src/main/java/io/quarkus/arc/deployment/StartupBuildSteps.java
+index 4bdeca3784d..ce5c139d084 100644
+--- a/extensions/arc/deployment/src/main/java/io/quarkus/arc/deployment/StartupBuildSteps.java
++++ b/extensions/arc/deployment/src/main/java/io/quarkus/arc/deployment/StartupBuildSteps.java
+@@ -3,12 +3,14 @@
+ import static io.quarkus.arc.processor.Annotations.getAnnotations;
+ import static org.jboss.jandex.gizmo2.Jandex2Gizmo.methodDescOf;
+ 
++import java.io.IOException;
+ import java.lang.reflect.Modifier;
+ import java.util.ArrayList;
+ import java.util.Collection;
+ import java.util.List;
+ import java.util.OptionalInt;
+ import java.util.function.Predicate;
++import java.util.function.Supplier;
+ 
+ import jakarta.enterprise.context.spi.Contextual;
+ import jakarta.enterprise.context.spi.CreationalContext;
+@@ -22,6 +24,7 @@
+ import org.jboss.jandex.DotName;
+ import org.jboss.jandex.IndexView;
+ import org.jboss.jandex.MethodInfo;
++import org.jboss.jandex.Type;
+ import org.jboss.logging.Logger;
+ 
+ import io.quarkus.arc.Arc;
+@@ -40,20 +43,26 @@
+ import io.quarkus.arc.processor.DotNames;
+ import io.quarkus.arc.processor.InjectionPointInfo;
+ import io.quarkus.arc.processor.ObserverConfigurator;
++import io.quarkus.arc.runtime.NonBlockingSupport;
++import io.quarkus.arc.spi.NonBlockingProvider;
+ import io.quarkus.deployment.annotations.BuildProducer;
+ import io.quarkus.deployment.annotations.BuildStep;
++import io.quarkus.deployment.util.ServiceUtil;
+ import io.quarkus.gizmo2.Const;
+ import io.quarkus.gizmo2.Expr;
+ import io.quarkus.gizmo2.LocalVar;
++import io.quarkus.gizmo2.Var;
+ import io.quarkus.gizmo2.creator.BlockCreator;
+ import io.quarkus.gizmo2.desc.ConstructorDesc;
+ import io.quarkus.gizmo2.desc.MethodDesc;
+ import io.quarkus.runtime.Startup;
+ import io.quarkus.runtime.StartupEvent;
++import io.smallrye.mutiny.Uni;
+ 
+ public class StartupBuildSteps {
+ 
+     static final DotName STARTUP_NAME = DotName.createSimple(Startup.class.getName());
++    static final DotName DOTNAME_UNI = DotName.createSimple(Uni.class.getName());
+ 
+     static final MethodDesc ARC_CONTAINER = MethodDesc.of(Arc.class, "container", ArcContainer.class);
+     static final MethodDesc ARC_CONTAINER_BEAN = MethodDesc.of(ArcContainer.class, "bean",
+@@ -69,6 +78,8 @@ public class StartupBuildSteps {
+             void.class, Object.class, CreationalContext.class);
+     static final ConstructorDesc CREATIONAL_CONTEXT_IMPL_CTOR = ConstructorDesc.of(CreationalContextImpl.class,
+             Contextual.class);
++    static final MethodDesc SUBSCRIBE_AND_AWAIT = MethodDesc.of(NonBlockingSupport.class, "subscribeAndAwait",
++            Object.class, Supplier.class);
+ 
+     private static final Logger LOG = Logger.getLogger(StartupBuildSteps.class);
+ 
+@@ -119,10 +130,10 @@ public boolean test(BeanInfo bean) {
+ 
+     @BuildStep
+     void registerStartupObservers(ObserverRegistrationPhaseBuildItem observerRegistration,
+-            BuildProducer<ObserverConfiguratorBuildItem> configurators) {
++            BuildProducer<ObserverConfiguratorBuildItem> configurators) throws IOException {
+ 
+         AnnotationStore annotationStore = observerRegistration.getContext().get(BuildExtension.Key.ANNOTATION_STORE);
+-
++        boolean checkNonBlockingProviders = false;
+         for (BeanInfo bean : observerRegistration.getContext().beans()) {
+             if (bean.isSynthetic()) {
+                 OptionalInt startupPriority = bean.getStartupPriority();
+@@ -151,6 +162,9 @@ void registerStartupObservers(ObserverRegistrationPhaseBuildItem observerRegistr
+                                     && method.parametersCount() == 0
+                                     && !annotationStore.hasAnnotation(method, DotNames.PRODUCES)) {
+                                 startupMethods.add(method);
++                                if (isUniReturningMethod(method)) {
++                                    checkNonBlockingProviders = true;
++                                }
+                             } else {
+                                 if (!annotationStore.hasAnnotation(method, DotNames.PRODUCES)) {
+                                     // Producer methods annotated with @Startup are valid and processed above
+@@ -171,6 +185,13 @@ void registerStartupObservers(ObserverRegistrationPhaseBuildItem observerRegistr
+                 }
+             }
+         }
++        // Verify at build-time that we do have the non-blocking provider
++        if (checkNonBlockingProviders) {
++            if (ServiceUtil.classNamesNamedIn(Thread.currentThread().getContextClassLoader(),
++                    "META-INF/services/" + NonBlockingProvider.class.getName()).isEmpty()) {
++                throw new IllegalStateException(NonBlockingSupport.ERROR_MSG);
++            }
++        }
+     }
+ 
+     private void registerStartupObserver(ObserverRegistrationPhaseBuildItem observerRegistration, BeanInfo btBean, String id,
+@@ -217,7 +238,7 @@ private void registerStartupObserver(ObserverRegistrationPhaseBuildItem observer
+                 if (startupMethod != null) {
+                     b0.try_(tc -> {
+                         tc.body(b1 -> {
+-                            b1.invokeVirtual(methodDescOf(startupMethod), instance);
++                            invokeStartupMethod(startupMethod, b1, instance);
+                         });
+                         tc.catch_(Exception.class, "e", (b1, e) -> {
+                             b1.invokeInterface(CONTEXTUAL_DESTROY, rtBean, instance, creationalContext);
+@@ -233,12 +254,13 @@ private void registerStartupObserver(ObserverRegistrationPhaseBuildItem observer
+                 // InstanceHandle<Foo> handle = Arc.container().instance(bean);
+                 Expr instanceHandle = b0.invokeInterface(ARC_CONTAINER_INSTANCE, arc, rtBean);
+                 Expr instance = b0.invokeInterface(INSTANCE_HANDLE_GET, instanceHandle);
++                LocalVar instanceVar = b0.localVar("instance", instance);
+                 if (startupMethod != null) {
+-                    b0.invokeVirtual(methodDescOf(startupMethod), instance);
++                    invokeStartupMethod(startupMethod, b0, instanceVar);
+                 } else if (btBean.getScope().isNormal()) {
+                     // We need to unwrap the client proxy
+                     // ((ClientProxy) handle.get()).arc_contextualInstance();
+-                    Expr proxy = b0.cast(instance, ClientProxy.class);
++                    Expr proxy = b0.cast(instanceVar, ClientProxy.class);
+                     b0.invokeInterface(CLIENT_PROXY_CONTEXTUAL_INSTANCE, proxy);
+                 }
+             }
+@@ -246,4 +268,26 @@ private void registerStartupObserver(ObserverRegistrationPhaseBuildItem observer
+         });
+         configurator.done();
+     }
++
++    private static void invokeStartupMethod(MethodInfo startupMethod, BlockCreator b0, LocalVar instanceVar) {
++        // If the startup method returns a Uni, delegate it to a non-blocking thread
++        if (isUniReturningMethod(startupMethod)) {
++            b0.invokeStatic(
++                    SUBSCRIBE_AND_AWAIT,
++                    b0.lambda(Supplier.class, lc -> {
++                        Var capture = lc.capture(instanceVar);
++                        lc.body(lbc -> {
++                            lbc.return_(lbc.invokeVirtual(methodDescOf(startupMethod), capture));
++                        });
++                    }));
++        } else {
++            b0.invokeVirtual(methodDescOf(startupMethod), instanceVar);
++        }
++    }
++
++    private static boolean isUniReturningMethod(MethodInfo startupMethod) {
++        return startupMethod.returnType().kind() == Type.Kind.PARAMETERIZED_TYPE
++                && startupMethod.returnType().asParameterizedType().name()
++                        .equals(DOTNAME_UNI);
++    }
+ }
+diff --git a/extensions/arc/runtime/src/main/java/io/quarkus/arc/runtime/NonBlockingSupport.java b/extensions/arc/runtime/src/main/java/io/quarkus/arc/runtime/NonBlockingSupport.java
+new file mode 100644
+index 00000000000..4d2468c4c94
+--- /dev/null
++++ b/extensions/arc/runtime/src/main/java/io/quarkus/arc/runtime/NonBlockingSupport.java
+@@ -0,0 +1,44 @@
++package io.quarkus.arc.runtime;
++
++import java.util.Optional;
++import java.util.ServiceLoader;
++import java.util.function.Supplier;
++
++import io.quarkus.arc.spi.NonBlockingProvider;
++import io.smallrye.mutiny.Uni;
++
++/**
++ * Utility class that allows invoking non-blocking startup methods on non-blocking threads when the Quarkus Vert.x
++ * extension is present (which provides us with support for this). This is used to avoid a circular dependency with
++ * it. This is also checked at build time so we should never have a runtime error.
++ */
++public class NonBlockingSupport {
++    private final static NonBlockingProvider PROVIDER;
++    public static final String ERROR_MSG = "Failed to find any non-blocking provider for startup actions. Either import the quarkus-vertx module, or do not declare non-blocking startup actions.";
++
++    static {
++        // If Vert.x is not present, we will complain at run-time (should not happen since we check at build time)
++        ServiceLoader<NonBlockingProvider> loader = ServiceLoader.load(NonBlockingProvider.class);
++        Optional<NonBlockingProvider> first = loader.findFirst();
++        if (first.isEmpty()) {
++            PROVIDER = null;
++        } else {
++            PROVIDER = first.get();
++        }
++    }
++
++    /**
++     * Delegates this call to the declared {@link NonBlockingProvider} implementation, hopefully Quarkus Vert.x, if
++     * it is available.
++     *
++     * @throws RuntimeException if the Quarkus Vert.x extension is not present.
++     * @see NonBlockingProvider#subscribeAndAwait(Supplier)
++     */
++    public static <T> T subscribeAndAwait(Supplier<Uni<T>> uniSupplier) throws Throwable {
++        if (PROVIDER == null) {
++            throw new RuntimeException(
++                    ERROR_MSG);
++        }
++        return PROVIDER.subscribeAndAwait(uniSupplier);
++    }
++}
+diff --git a/extensions/arc/runtime/src/main/java/io/quarkus/arc/spi/NonBlockingProvider.java b/extensions/arc/runtime/src/main/java/io/quarkus/arc/spi/NonBlockingProvider.java
+new file mode 100644
+index 00000000000..4b8e1d15c6d
+--- /dev/null
++++ b/extensions/arc/runtime/src/main/java/io/quarkus/arc/spi/NonBlockingProvider.java
+@@ -0,0 +1,21 @@
++package io.quarkus.arc.spi;
++
++import java.util.function.Supplier;
++
++import io.smallrye.mutiny.Uni;
++
++/**
++ * This class allows us to offload a non-blocking startup method to a non-blocking thread. This is implemented in the
++ * Quarkus Vert.x extension.
++ */
++public interface NonBlockingProvider {
++    /**
++     * Subscribes to the supplied {@link Uni} on a Vertx duplicated context; blocks the current thread and waits for the result.
++     * <p>
++     * If it's necessary, the CDI request context is activated during execution of the asynchronous code.
++     *
++     * @param uniSupplier
++     * @throws IllegalStateException If called on an event loop thread.
++     */
++    <T> T subscribeAndAwait(Supplier<Uni<T>> uniSupplier) throws Throwable;
++}
+diff --git a/extensions/vertx/deployment/src/main/java/io/quarkus/vertx/deployment/VertxProcessor.java b/extensions/vertx/deployment/src/main/java/io/quarkus/vertx/deployment/VertxProcessor.java
+index 3fa67c40437..71c644d6601 100644
+--- a/extensions/vertx/deployment/src/main/java/io/quarkus/vertx/deployment/VertxProcessor.java
++++ b/extensions/vertx/deployment/src/main/java/io/quarkus/vertx/deployment/VertxProcessor.java
+@@ -40,6 +40,7 @@
+ import io.quarkus.arc.processor.InvokerBuilder;
+ import io.quarkus.arc.processor.InvokerInfo;
+ import io.quarkus.arc.processor.KotlinUtils;
++import io.quarkus.arc.spi.NonBlockingProvider;
+ import io.quarkus.bootstrap.classloading.QuarkusClassLoader;
+ import io.quarkus.deployment.Capabilities;
+ import io.quarkus.deployment.Capability;
+@@ -77,6 +78,7 @@
+ import io.quarkus.vertx.deployment.spi.EventConsumerInvokerCustomizerBuildItem;
+ import io.quarkus.vertx.runtime.EventConsumerInfo;
+ import io.quarkus.vertx.runtime.VertxEventBusConsumerRecorder;
++import io.quarkus.vertx.runtime.VertxNonBlockingProvider;
+ import io.quarkus.vertx.runtime.VertxProducer;
+ import io.smallrye.common.annotation.Blocking;
+ import io.smallrye.common.annotation.RunOnVirtualThread;
+@@ -266,6 +268,11 @@ void faultToleranceIntegration(Capabilities capabilities, BuildProducer<ServiceP
+         }
+     }
+ 
++    @BuildStep
++    ServiceProviderBuildItem arcIntegration() {
++        return new ServiceProviderBuildItem(NonBlockingProvider.class.getName(), VertxNonBlockingProvider.class.getName());
++    }
++
+     /**
+      * Reinitialize vertx classes that are known to cause issues with Netty in native mode
+      */
+diff --git a/extensions/vertx/runtime/src/main/java/io/quarkus/vertx/runtime/VertxNonBlockingProvider.java b/extensions/vertx/runtime/src/main/java/io/quarkus/vertx/runtime/VertxNonBlockingProvider.java
+new file mode 100644
+index 00000000000..8bdf6c31cff
+--- /dev/null
++++ b/extensions/vertx/runtime/src/main/java/io/quarkus/vertx/runtime/VertxNonBlockingProvider.java
+@@ -0,0 +1,18 @@
++package io.quarkus.vertx.runtime;
++
++import java.util.function.Supplier;
++
++import io.quarkus.arc.spi.NonBlockingProvider;
++import io.quarkus.vertx.VertxContextSupport;
++import io.smallrye.mutiny.Uni;
++
++/**
++ * This is used by the Quarkus Arc extension to delegate non-blocking @Startup methods
++ * to VertxContextSupport without depending on this extension
++ */
++public class VertxNonBlockingProvider implements NonBlockingProvider {
++    @Override
++    public <T> T subscribeAndAwait(Supplier<Uni<T>> uniSupplier) throws Throwable {
++        return VertxContextSupport.subscribeAndAwait(uniSupplier);
++    }
++}
+diff --git a/extensions/vertx/runtime/src/main/resources/META-INF/services/io.quarkus.arc.spi.NonBlockingProvider b/extensions/vertx/runtime/src/main/resources/META-INF/services/io.quarkus.arc.spi.NonBlockingProvider
+new file mode 100644
+index 00000000000..243b2670123
+--- /dev/null
++++ b/extensions/vertx/runtime/src/main/resources/META-INF/services/io.quarkus.arc.spi.NonBlockingProvider
+@@ -0,0 +1 @@
++io.quarkus.vertx.runtime.VertxNonBlockingProvider

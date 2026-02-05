@@ -1,0 +1,850 @@
+diff --git a/mockwebserver-junit5/build.gradle.kts b/mockwebserver-junit5/build.gradle.kts
+index eadead027..129fb32b9 100644
+--- a/mockwebserver-junit5/build.gradle.kts
++++ b/mockwebserver-junit5/build.gradle.kts
+@@ -28,8 +28,6 @@ dependencies {
+   testRuntimeOnly(libs.junit.jupiter.engine)
+   testImplementation(libs.assertj.core)
+   testImplementation(libs.kotlin.junit5)
+-  testImplementation(projects.okhttpTestingSupport)
+-  testImplementation(libs.assertj.core)
+ }
+ 
+ mavenPublishing {
+diff --git a/mockwebserver-junit5/src/main/kotlin/mockwebserver3/junit5/internal/MockWebServerExtension.kt b/mockwebserver-junit5/src/main/kotlin/mockwebserver3/junit5/internal/MockWebServerExtension.kt
+index 726d59324..52a7e1453 100644
+--- a/mockwebserver-junit5/src/main/kotlin/mockwebserver3/junit5/internal/MockWebServerExtension.kt
++++ b/mockwebserver-junit5/src/main/kotlin/mockwebserver3/junit5/internal/MockWebServerExtension.kt
+@@ -20,85 +20,72 @@ import java.util.logging.Level
+ import java.util.logging.Logger
+ import mockwebserver3.MockWebServer
+ import org.codehaus.mojo.animal_sniffer.IgnoreJRERequirement
++import org.junit.jupiter.api.extension.AfterAllCallback
+ import org.junit.jupiter.api.extension.AfterEachCallback
++import org.junit.jupiter.api.extension.BeforeAllCallback
+ import org.junit.jupiter.api.extension.BeforeEachCallback
+ import org.junit.jupiter.api.extension.ExtensionContext
+ import org.junit.jupiter.api.extension.ParameterContext
+ import org.junit.jupiter.api.extension.ParameterResolver
+ 
+-/**
+- * Runs MockWebServer for the duration of a single test method.
+- *
+- * Specifically while junit instances passes into test constructor
+- * are typically shares amongst all tests, a fresh instance will be
+- * received here. Use with @BeforeAll and @AfterAll, is not supported.
+- *
+- * There are 3 ids for instances
+- * - The test instance default (passed into constructor)
+- * - The test lifecycle default (passed into test method, plus @BeforeEach, @AfterEach)
+- * - named instances with @MockWebServerInstance.
+- */
++/** Runs MockWebServer for the duration of a single test method. */
+ class MockWebServerExtension
+-  : BeforeEachCallback, AfterEachCallback, ParameterResolver {
+-  private val ExtensionContext.resource: ServersForTest
+-    get() = getStore(namespace).getOrComputeIfAbsent(this.uniqueId) {
+-      ServersForTest()
+-    } as ServersForTest
++  : BeforeAllCallback, BeforeEachCallback, AfterAllCallback, AfterEachCallback, ParameterResolver {
++  private val ExtensionContext.resource: Resource
++    get() {
++      val store = getStore(namespace)
++      var result = store.get(uniqueId) as Resource?
++      if (result == null) {
++        result = Resource()
++        store.put(uniqueId, result)
++      }
++      return result
++    }
+ 
+-  private class ServersForTest {
+-    private val servers = mutableMapOf<String, MockWebServer>()
++  private class Resource {
++    private val servers = mutableListOf<MockWebServer>()
+     private var started = false
+ 
+-    fun server(name: String): MockWebServer {
+-      return servers.getOrPut(name) {
+-        MockWebServer().also {
+-          if (started) it.start()
++    fun newServer(): MockWebServer {
++      return MockWebServer()
++        .also { result ->
++          if (started) result.start()
++          servers += result
+         }
+-      }
+     }
+ 
+     fun startAll() {
+       started = true
+-      for (server in servers.values) {
++      for (server in servers) {
+         server.start()
+       }
+     }
+ 
+     fun shutdownAll() {
+       try {
+-        for (server in servers.values) {
++        for (server in servers) {
+           server.shutdown()
+         }
+-        servers.clear()
+       } catch (e: IOException) {
+         logger.log(Level.WARNING, "MockWebServer shutdown failed", e)
+       }
+     }
+   }
+ 
+-  @Suppress("NewApi")
+   @IgnoreJRERequirement
+   override fun supportsParameter(
+     parameterContext: ParameterContext,
+     extensionContext: ExtensionContext
+-  ): Boolean {
+-    // Not supported on constructors, or static contexts
+-    return parameterContext.parameter.type === MockWebServer::class.java
+-      && extensionContext.testMethod.isPresent
+-  }
++  ): Boolean = parameterContext.parameter.type === MockWebServer::class.java
+ 
+-  @Suppress("NewApi")
+   override fun resolveParameter(
+     parameterContext: ParameterContext,
+     extensionContext: ExtensionContext
+-  ): Any {
+-    val nameAnnotation = parameterContext.findAnnotation(MockWebServerInstance::class.java)
+-    val name = if (nameAnnotation.isPresent) {
+-      nameAnnotation.get().name
+-    } else {
+-      defaultName
+-    }
+-    return extensionContext.resource.server(name)
++  ): Any = extensionContext.resource.newServer()
++
++  /** Start the servers passed in as test class constructor parameters. */
++  override fun beforeAll(context: ExtensionContext) {
++    context.resource.startAll()
+   }
+ 
+   /** Start the servers passed in as test method parameters. */
+@@ -110,9 +97,12 @@ class MockWebServerExtension
+     context.resource.shutdownAll()
+   }
+ 
++  override fun afterAll(context: ExtensionContext) {
++    context.resource.shutdownAll()
++  }
++
+   companion object {
+     private val logger = Logger.getLogger(MockWebServerExtension::class.java.name)
+     private val namespace = ExtensionContext.Namespace.create(MockWebServerExtension::class.java)
+-    private val defaultName = MockWebServerExtension::class.java.simpleName
+   }
+ }
+diff --git a/mockwebserver-junit5/src/test/java/mockwebserver3/junit5/internal/ExtensionLifecycleTest.kt b/mockwebserver-junit5/src/test/java/mockwebserver3/junit5/internal/ExtensionLifecycleTest.kt
+deleted file mode 100644
+index ff37eb535..000000000
+--- a/mockwebserver-junit5/src/test/java/mockwebserver3/junit5/internal/ExtensionLifecycleTest.kt
++++ /dev/null
+@@ -1,58 +0,0 @@
+-/*
+- * Copyright (C) 2022 Square, Inc.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-package mockwebserver3.junit5.internal
+-
+-import mockwebserver3.MockResponse
+-import mockwebserver3.MockWebServer
+-import okhttp3.OkHttpClientTestRule
+-import okhttp3.Request
+-import org.assertj.core.api.Assertions.assertThat
+-import org.junit.jupiter.api.AfterEach
+-import org.junit.jupiter.api.BeforeEach
+-import org.junit.jupiter.api.Test
+-import org.junit.jupiter.api.extension.ExtendWith
+-import org.junit.jupiter.api.extension.RegisterExtension
+-
+-@ExtendWith(MockWebServerExtension::class)
+-class ExtensionLifecycleTest {
+-  @RegisterExtension
+-  val clientTestRule: OkHttpClientTestRule = OkHttpClientTestRule()
+-
+-  lateinit var _server: MockWebServer
+-
+-  @BeforeEach
+-  fun setup(server: MockWebServer) {
+-    _server = server
+-    assertThat(server.started).isTrue()
+-    server.enqueue(MockResponse().setResponseCode(200))
+-  }
+-
+-  @AfterEach
+-  fun tearDown(server: MockWebServer) {
+-    assertThat(_server).isSameAs(server)
+-    assertThat(server.started).isTrue()
+-    server.enqueue(MockResponse().setResponseCode(200))
+-  }
+-
+-  @Test
+-  fun testClient(server: MockWebServer) {
+-    assertThat(_server).isSameAs(server)
+-    assertThat(server.started).isTrue()
+-    clientTestRule.newClient().newCall(Request(server.url("/"))).execute().use {
+-      assertThat(it.code).isEqualTo(200)
+-    }
+-  }
+-}
+diff --git a/mockwebserver-junit5/src/test/java/mockwebserver3/junit5/internal/ExtensionMultipleInstancesTest.kt b/mockwebserver-junit5/src/test/java/mockwebserver3/junit5/internal/ExtensionMultipleInstancesTest.kt
+deleted file mode 100644
+index fbbc89b70..000000000
+--- a/mockwebserver-junit5/src/test/java/mockwebserver3/junit5/internal/ExtensionMultipleInstancesTest.kt
++++ /dev/null
+@@ -1,68 +0,0 @@
+-/*
+- * Copyright (C) 2022 Square, Inc.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-package mockwebserver3.junit5.internal
+-
+-import mockwebserver3.MockWebServer
+-import org.assertj.core.api.Assertions.assertThat
+-import org.junit.jupiter.api.AfterEach
+-import org.junit.jupiter.api.BeforeEach
+-import org.junit.jupiter.api.Test
+-import org.junit.jupiter.api.extension.ExtendWith
+-
+-@ExtendWith(MockWebServerExtension::class)
+-class ExtensionMultipleInstancesTest {
+-  var defaultInstancePort: Int = -1
+-  var instanceAPort: Int = -1
+-  var instanceBPort: Int = -1
+-
+-  @BeforeEach
+-  fun setup(
+-    defaultInstance: MockWebServer,
+-    @MockWebServerInstance("A") instanceA: MockWebServer,
+-    @MockWebServerInstance("B") instanceB: MockWebServer
+-  ) {
+-    defaultInstancePort = defaultInstance.port
+-    instanceAPort = instanceA.port
+-    instanceBPort = instanceB.port
+-    assertThat(defaultInstance.started).isTrue()
+-    assertThat(instanceA.started).isTrue()
+-    assertThat(instanceB.started).isTrue()
+-    assertThat(defaultInstancePort).isNotEqualTo(instanceAPort)
+-    assertThat(defaultInstancePort).isNotEqualTo(instanceBPort)
+-  }
+-
+-  @AfterEach
+-  fun tearDown(
+-    defaultInstance: MockWebServer,
+-    @MockWebServerInstance("A") instanceA: MockWebServer,
+-    @MockWebServerInstance("B") instanceB: MockWebServer
+-  ) {
+-    assertThat(defaultInstance.port).isEqualTo(defaultInstancePort)
+-    assertThat(instanceA.port).isEqualTo(instanceAPort)
+-    assertThat(instanceB.port).isEqualTo(instanceBPort)
+-  }
+-
+-  @Test
+-  fun testClient(
+-    defaultInstance: MockWebServer,
+-    @MockWebServerInstance("A") instanceA: MockWebServer,
+-    @MockWebServerInstance("B") instanceB: MockWebServer
+-  ) {
+-    assertThat(defaultInstance.port).isEqualTo(defaultInstancePort)
+-    assertThat(instanceA.port).isEqualTo(instanceAPort)
+-    assertThat(instanceB.port).isEqualTo(instanceBPort)
+-  }
+-}
+diff --git a/mockwebserver-junit5/src/test/java/mockwebserver3/junit5/internal/ExtensionMultipleTestsTest.kt b/mockwebserver-junit5/src/test/java/mockwebserver3/junit5/internal/ExtensionMultipleTestsTest.kt
+deleted file mode 100644
+index 441c9cefd..000000000
+--- a/mockwebserver-junit5/src/test/java/mockwebserver3/junit5/internal/ExtensionMultipleTestsTest.kt
++++ /dev/null
+@@ -1,47 +0,0 @@
+-/*
+- * Copyright (C) 2022 Square, Inc.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-package mockwebserver3.junit5.internal
+-
+-import mockwebserver3.MockWebServer
+-import org.assertj.core.api.Assertions.assertThat
+-import org.junit.jupiter.api.Test
+-import org.junit.jupiter.api.TestInstance
+-import org.junit.jupiter.api.extension.ExtendWith
+-
+-@ExtendWith(MockWebServerExtension::class)
+-class ExtensionMultipleTestsTest() {
+-  @Test
+-  fun testClient1(
+-    defaultInstance: MockWebServer,
+-    @MockWebServerInstance("A") instanceA: MockWebServer,
+-  ) {
+-    assertThat(seenInstances.add(defaultInstance.port)).isTrue()
+-    assertThat(seenInstances.add(instanceA.port)).isTrue()
+-  }
+-
+-  @Test
+-  fun testClient2(
+-    defaultInstance: MockWebServer,
+-    @MockWebServerInstance("A") instanceA: MockWebServer,
+-  ) {
+-    assertThat(seenInstances.add(defaultInstance.port)).isTrue()
+-    assertThat(seenInstances.add(instanceA.port)).isTrue()
+-  }
+-
+-  companion object {
+-    val seenInstances = mutableSetOf<Int>()
+-  }
+-}
+diff --git a/mockwebserver-junit5/src/main/kotlin/mockwebserver3/junit5/internal/MockWebServerInstance.kt b/mockwebserver-junit5/src/test/java/mockwebserver3/junit5/internal/InjectedConstructorTest.kt
+similarity index 65%
+rename from mockwebserver-junit5/src/main/kotlin/mockwebserver3/junit5/internal/MockWebServerInstance.kt
+rename to mockwebserver-junit5/src/test/java/mockwebserver3/junit5/internal/InjectedConstructorTest.kt
+index 6bee48c54..ed1b969b2 100644
+--- a/mockwebserver-junit5/src/main/kotlin/mockwebserver3/junit5/internal/MockWebServerInstance.kt
++++ b/mockwebserver-junit5/src/test/java/mockwebserver3/junit5/internal/InjectedConstructorTest.kt
+@@ -15,6 +15,20 @@
+  */
+ package mockwebserver3.junit5.internal
+ 
+-annotation class MockWebServerInstance(
+-  val name: String
+-)
++import mockwebserver3.MockWebServer
++import org.assertj.core.api.Assertions.assertThat
++import org.junit.jupiter.api.Test
++
++class InjectedConstructorTest(
++  private val server: MockWebServer
++) {
++  @Test
++  fun testOne() {
++    assertThat(server.started).isTrue()
++  }
++
++  @Test
++  fun testTwo() {
++    assertThat(server.started).isTrue()
++  }
++}
+diff --git a/mockwebserver-junit5/src/test/java/mockwebserver3/junit5/internal/InjectedParameterTest.kt b/mockwebserver-junit5/src/test/java/mockwebserver3/junit5/internal/InjectedParameterTest.kt
+new file mode 100644
+index 000000000..f01b53213
+--- /dev/null
++++ b/mockwebserver-junit5/src/test/java/mockwebserver3/junit5/internal/InjectedParameterTest.kt
+@@ -0,0 +1,32 @@
++/*
++ * Copyright (C) 2020 Square, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package mockwebserver3.junit5.internal
++
++import mockwebserver3.MockWebServer
++import org.assertj.core.api.Assertions.assertThat
++import org.junit.jupiter.api.Test
++
++class InjectedParameterTest {
++  @Test
++  fun testOne(server: MockWebServer) {
++    assertThat(server.started).isTrue()
++  }
++
++  @Test
++  fun testTwo(server: MockWebServer) {
++    assertThat(server.started).isTrue()
++  }
++}
+diff --git a/mockwebserver-junit5/src/test/java/mockwebserver3/junit5/internal/MultipleServersTest.kt b/mockwebserver-junit5/src/test/java/mockwebserver3/junit5/internal/MultipleServersTest.kt
+new file mode 100644
+index 000000000..72c93d1a6
+--- /dev/null
++++ b/mockwebserver-junit5/src/test/java/mockwebserver3/junit5/internal/MultipleServersTest.kt
+@@ -0,0 +1,31 @@
++/*
++ * Copyright (C) 2020 Square, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package mockwebserver3.junit5.internal
++
++import mockwebserver3.MockWebServer
++import org.assertj.core.api.Assertions.assertThat
++import org.junit.jupiter.api.Test
++
++class MultipleServersTest(
++  private val serverA: MockWebServer
++) {
++  @Test
++  fun test(serverB: MockWebServer) {
++    assertThat(serverA).isNotSameAs(serverB)
++    assertThat(serverA.started).isTrue()
++    assertThat(serverB.started).isTrue()
++  }
++}
+diff --git a/okhttp-coroutines/src/jvmTest/kotlin/okhttp3/SuspendCallTest.kt b/okhttp-coroutines/src/jvmTest/kotlin/okhttp3/SuspendCallTest.kt
+index e5f8662aa..999984588 100644
+--- a/okhttp-coroutines/src/jvmTest/kotlin/okhttp3/SuspendCallTest.kt
++++ b/okhttp-coroutines/src/jvmTest/kotlin/okhttp3/SuspendCallTest.kt
+@@ -39,24 +39,17 @@ import org.junit.jupiter.api.fail
+ import java.io.IOException
+ import java.util.concurrent.TimeUnit
+ import kotlin.time.Duration.Companion.seconds
+-import kotlin.time.ExperimentalTime
+-import org.junit.jupiter.api.BeforeEach
+ 
+ @ExtendWith(MockWebServerExtension::class)
+-class SuspendCallTest {
++class SuspendCallTest(
++  private val server: MockWebServer,
++) {
+   @RegisterExtension
+   val clientTestRule = OkHttpClientTestRule()
+ 
+   private var client = clientTestRule.newClientBuilder().build()
+ 
+-  private lateinit var server: MockWebServer
+-
+-  val request by lazy { Request(server.url("/")) }
+-
+-  @BeforeEach
+-  fun setup(server: MockWebServer) {
+-    this.server = server
+-  }
++  val request = Request(server.url("/"))
+ 
+   @Test
+   fun suspendCall() {
+diff --git a/okhttp/src/jvmTest/java/okhttp3/BouncyCastleTest.kt b/okhttp/src/jvmTest/java/okhttp3/BouncyCastleTest.kt
+index c10041982..fe1663d2c 100644
+--- a/okhttp/src/jvmTest/java/okhttp3/BouncyCastleTest.kt
++++ b/okhttp/src/jvmTest/java/okhttp3/BouncyCastleTest.kt
+@@ -23,15 +23,15 @@ import org.junit.jupiter.api.BeforeEach
+ import org.junit.jupiter.api.Test
+ import org.junit.jupiter.api.extension.RegisterExtension
+ 
+-class BouncyCastleTest {
++class BouncyCastleTest(
++  val server: MockWebServer
++) {
+   @JvmField @RegisterExtension var platform = PlatformRule()
+   @JvmField @RegisterExtension val clientTestRule = OkHttpClientTestRule()
+   var client = clientTestRule.newClient()
+-  private lateinit var server: MockWebServer
+ 
+   @BeforeEach
+-  fun setUp(server: MockWebServer) {
+-    this.server = server
++  fun setUp() {
+     OkHttpDebugLogging.enable("org.bouncycastle.jsse")
+     platform.assumeBouncyCastle()
+   }
+diff --git a/okhttp/src/jvmTest/java/okhttp3/CacheCorruptionTest.kt b/okhttp/src/jvmTest/java/okhttp3/CacheCorruptionTest.kt
+index be0bc4a47..95438e08c 100644
+--- a/okhttp/src/jvmTest/java/okhttp3/CacheCorruptionTest.kt
++++ b/okhttp/src/jvmTest/java/okhttp3/CacheCorruptionTest.kt
+@@ -39,7 +39,9 @@ import java.util.concurrent.TimeUnit
+ import javax.net.ssl.HostnameVerifier
+ import javax.net.ssl.SSLSession
+ 
+-class CacheCorruptionTest {
++class CacheCorruptionTest(
++  var server: MockWebServer
++) {
+   var fileSystem = FakeFileSystem()
+ 
+   @JvmField
+@@ -55,12 +57,9 @@ class CacheCorruptionTest {
+   private lateinit var cache: Cache
+   private val NULL_HOSTNAME_VERIFIER = HostnameVerifier { _: String?, _: SSLSession? -> true }
+   private val cookieManager = CookieManager()
+-  private lateinit var server: MockWebServer
+ 
+   @BeforeEach
+-  fun setUp(server: MockWebServer) {
+-    this.server = server
+-
++  fun setUp() {
+     platform.assumeNotOpenJSSE()
+     platform.assumeNotBouncyCastle()
+     server.protocolNegotiationEnabled = false
+diff --git a/okhttp/src/jvmTest/java/okhttp3/CacheTest.java b/okhttp/src/jvmTest/java/okhttp3/CacheTest.java
+index ff73e2df5..f910c72ac 100644
+--- a/okhttp/src/jvmTest/java/okhttp3/CacheTest.java
++++ b/okhttp/src/jvmTest/java/okhttp3/CacheTest.java
+@@ -37,7 +37,6 @@ import java.util.TimeZone;
+ import mockwebserver3.MockResponse;
+ import mockwebserver3.MockWebServer;
+ import mockwebserver3.RecordedRequest;
+-import mockwebserver3.junit5.internal.MockWebServerInstance;
+ import okhttp3.internal.Internal;
+ import okhttp3.internal.platform.Platform;
+ import okhttp3.testing.PlatformRule;
+@@ -79,11 +78,7 @@ public final class CacheTest {
+   private Cache cache;
+   private final CookieManager cookieManager = new CookieManager();
+ 
+-  @BeforeEach
+-  public void setUp(
+-    @MockWebServerInstance(name = "1") MockWebServer server,
+-    @MockWebServerInstance(name = "2") MockWebServer server2
+-  ) throws Exception {
++  @BeforeEach public void setUp(MockWebServer server, MockWebServer server2) throws Exception {
+     this.server = server;
+     this.server2 = server2;
+ 
+diff --git a/okhttp/src/jvmTest/java/okhttp3/CallKotlinTest.kt b/okhttp/src/jvmTest/java/okhttp3/CallKotlinTest.kt
+index 6d07977e2..8a1230888 100644
+--- a/okhttp/src/jvmTest/java/okhttp3/CallKotlinTest.kt
++++ b/okhttp/src/jvmTest/java/okhttp3/CallKotlinTest.kt
+@@ -43,7 +43,9 @@ import org.junit.jupiter.api.extension.RegisterExtension
+ import org.junit.jupiter.api.fail
+ 
+ @Timeout(30)
+-class CallKotlinTest {
++class CallKotlinTest(
++  val server: MockWebServer
++) {
+   @JvmField @RegisterExtension val platform = PlatformRule()
+   @JvmField @RegisterExtension val clientTestRule = OkHttpClientTestRule().apply {
+     recordFrames = true
+@@ -52,11 +54,9 @@ class CallKotlinTest {
+ 
+   private var client = clientTestRule.newClient()
+   private val handshakeCertificates = localhost()
+-  private lateinit var server: MockWebServer
+ 
+   @BeforeEach
+-  fun setUp(server: MockWebServer) {
+-    this.server = server
++  fun setup() {
+     platform.assumeNotBouncyCastle()
+   }
+ 
+diff --git a/okhttp/src/jvmTest/java/okhttp3/CallTest.kt b/okhttp/src/jvmTest/java/okhttp3/CallTest.kt
+index 99a5a9703..959dfed0c 100644
+--- a/okhttp/src/jvmTest/java/okhttp3/CallTest.kt
++++ b/okhttp/src/jvmTest/java/okhttp3/CallTest.kt
+@@ -49,7 +49,6 @@ import mockwebserver3.MockWebServer
+ import mockwebserver3.QueueDispatcher
+ import mockwebserver3.RecordedRequest
+ import mockwebserver3.SocketPolicy
+-import mockwebserver3.junit5.internal.MockWebServerInstance
+ import okhttp3.CallEvent.CallEnd
+ import okhttp3.CallEvent.ConnectStart
+ import okhttp3.CallEvent.ConnectionAcquired
+@@ -97,7 +96,10 @@ import org.junit.jupiter.api.Timeout
+ import org.junit.jupiter.api.extension.RegisterExtension
+ 
+ @Timeout(30)
+-open class CallTest {
++open class CallTest(
++  private val server: MockWebServer,
++  private val server2: MockWebServer
++) {
+   private val fileSystem = FakeFileSystem()
+ 
+   @RegisterExtension
+@@ -109,9 +111,6 @@ open class CallTest {
+   @RegisterExtension
+   val testLogHandler = TestLogHandler(OkHttpClient::class.java)
+ 
+-  private lateinit var server: MockWebServer
+-  private lateinit var server2: MockWebServer
+-
+   private var listener = RecordingEventListener()
+   private val handshakeCertificates = localhost()
+   private var client = clientTestRule.newClientBuilder()
+@@ -124,13 +123,7 @@ open class CallTest {
+     fileSystem = LoggingFilesystem(fileSystem)
+   )
+ 
+-  @BeforeEach fun setUp(
+-    server: MockWebServer,
+-    @MockWebServerInstance("server2") server2: MockWebServer
+-  ) {
+-    this.server = server
+-    this.server2 = server2
+-
++  @BeforeEach fun setUp() {
+     platform.assumeNotOpenJSSE()
+     platform.assumeNotBouncyCastle()
+   }
+@@ -1298,7 +1291,7 @@ open class CallTest {
+     val serverCertificates = HandshakeCertificates.Builder()
+       .build()
+     server.useHttps(
+-      socketFactoryWithCipherSuite(serverCertificates.sslSocketFactory(), cipherSuite)
++        socketFactoryWithCipherSuite(serverCertificates.sslSocketFactory(), cipherSuite)
+     )
+     executeSynchronously("/")
+       .assertFailure(SSLHandshakeException::class.java)
+@@ -3924,10 +3917,8 @@ open class CallTest {
+         .addHeader("Test", "Redirect from /a to /b")
+         .setBody("/a has moved!")
+     )
+-    server.enqueue(
+-      MockResponse()
+-        .setBody("this is the redirect target")
+-    )
++    server.enqueue(MockResponse()
++      .setBody("this is the redirect target"))
+ 
+     val call = client.newCall(Request(server.url("/")))
+     val response = call.execute()
+diff --git a/okhttp/src/jvmTest/java/okhttp3/InsecureForHostTest.kt b/okhttp/src/jvmTest/java/okhttp3/InsecureForHostTest.kt
+index 702663d84..14c0eda3c 100644
+--- a/okhttp/src/jvmTest/java/okhttp3/InsecureForHostTest.kt
++++ b/okhttp/src/jvmTest/java/okhttp3/InsecureForHostTest.kt
+@@ -23,22 +23,16 @@ import okhttp3.tls.HandshakeCertificates
+ import okhttp3.tls.HeldCertificate
+ import okhttp3.tls.internal.TlsUtil.localhost
+ import org.assertj.core.api.Assertions.assertThat
+-import org.junit.jupiter.api.BeforeEach
+ import org.junit.jupiter.api.Test
+ import org.junit.jupiter.api.extension.RegisterExtension
+ import org.junit.jupiter.api.fail
+ 
+-class InsecureForHostTest {
++class InsecureForHostTest(
++  val server: MockWebServer
++) {
+   @RegisterExtension @JvmField val platform = PlatformRule()
+   @RegisterExtension @JvmField val clientTestRule = OkHttpClientTestRule()
+ 
+-  private lateinit var server: MockWebServer
+-
+-  @BeforeEach
+-  fun setup(server: MockWebServer) {
+-    this.server = server
+-  }
+-
+   @Test fun `untrusted host in insecureHosts connects successfully`() {
+     val serverCertificates = localhost()
+     server.useHttps(serverCertificates.sslSocketFactory())
+diff --git a/okhttp/src/jvmTest/java/okhttp3/JSSETest.kt b/okhttp/src/jvmTest/java/okhttp3/JSSETest.kt
+index 8c6a6c5da..daa008cfa 100644
+--- a/okhttp/src/jvmTest/java/okhttp3/JSSETest.kt
++++ b/okhttp/src/jvmTest/java/okhttp3/JSSETest.kt
+@@ -33,7 +33,9 @@ import org.junit.jupiter.api.extension.RegisterExtension
+ import javax.net.ssl.SSLSocket
+ import javax.net.ssl.SSLSocketFactory
+ 
+-class JSSETest {
++class JSSETest(
++  val server: MockWebServer
++) {
+   @JvmField @RegisterExtension var platform = PlatformRule()
+   @JvmField @RegisterExtension val clientTestRule = OkHttpClientTestRule()
+ 
+@@ -41,12 +43,8 @@ class JSSETest {
+ 
+   var client = clientTestRule.newClient()
+ 
+-  private lateinit var server: MockWebServer
+-
+   @BeforeEach
+-  fun setUp(server: MockWebServer) {
+-    this.server = server
+-
++  fun setUp() {
+     // Default after JDK 14, but we are avoiding tests that assume special setup.
+     // System.setProperty("jdk.tls.client.enableSessionTicketExtension", "true")
+     // System.setProperty("jdk.tls.server.enableSessionTicketExtension", "true")
+diff --git a/okhttp/src/jvmTest/java/okhttp3/OpenJSSETest.kt b/okhttp/src/jvmTest/java/okhttp3/OpenJSSETest.kt
+index be477d0d0..a171329b2 100644
+--- a/okhttp/src/jvmTest/java/okhttp3/OpenJSSETest.kt
++++ b/okhttp/src/jvmTest/java/okhttp3/OpenJSSETest.kt
+@@ -34,17 +34,16 @@ import org.junit.jupiter.api.extension.RegisterExtension
+ import org.openjsse.sun.security.ssl.SSLSocketFactoryImpl
+ import org.openjsse.sun.security.ssl.SSLSocketImpl
+ 
+-class OpenJSSETest {
++class OpenJSSETest(
++  val server: MockWebServer
++) {
+   @JvmField @RegisterExtension var platform = PlatformRule()
+   @JvmField @RegisterExtension val clientTestRule = OkHttpClientTestRule()
+ 
+   var client = clientTestRule.newClient()
+ 
+-  private lateinit var server: MockWebServer
+-
+   @BeforeEach
+-  fun setUp(server: MockWebServer) {
+-    this.server = server
++  fun setUp() {
+     platform.assumeOpenJSSE()
+   }
+ 
+diff --git a/okhttp/src/jvmTest/java/okhttp3/ServerTruncatesRequestTest.kt b/okhttp/src/jvmTest/java/okhttp3/ServerTruncatesRequestTest.kt
+index 76a39072d..32e924f56 100644
+--- a/okhttp/src/jvmTest/java/okhttp3/ServerTruncatesRequestTest.kt
++++ b/okhttp/src/jvmTest/java/okhttp3/ServerTruncatesRequestTest.kt
+@@ -38,7 +38,9 @@ import org.junit.jupiter.api.fail
+ 
+ @Timeout(30)
+ @Tag("Slowish")
+-class ServerTruncatesRequestTest {
++class ServerTruncatesRequestTest(
++  val server: MockWebServer
++) {
+   @RegisterExtension @JvmField val platform = PlatformRule()
+   @RegisterExtension @JvmField var clientTestRule = OkHttpClientTestRule()
+ 
+@@ -49,11 +51,7 @@ class ServerTruncatesRequestTest {
+       .eventListenerFactory(clientTestRule.wrap(listener))
+       .build()
+ 
+-  private lateinit var server: MockWebServer
+-
+-  @BeforeEach
+-  fun setUp(server: MockWebServer) {
+-    this.server = server
++  @BeforeEach fun setUp() {
+     platform.assumeNotOpenJSSE()
+     platform.assumeHttp2Support()
+     platform.assumeNotBouncyCastle()
+diff --git a/okhttp/src/jvmTest/java/okhttp3/SessionReuseTest.kt b/okhttp/src/jvmTest/java/okhttp3/SessionReuseTest.kt
+index f3537ee07..fc6c316a5 100644
+--- a/okhttp/src/jvmTest/java/okhttp3/SessionReuseTest.kt
++++ b/okhttp/src/jvmTest/java/okhttp3/SessionReuseTest.kt
+@@ -32,7 +32,9 @@ import org.junit.jupiter.params.ParameterizedTest
+ import org.junit.jupiter.params.provider.ValueSource
+ import javax.net.ssl.SSLSocket
+ 
+-class SessionReuseTest {
++class SessionReuseTest(
++  val server: MockWebServer
++) {
+   @JvmField @RegisterExtension var platform = PlatformRule()
+   @JvmField @RegisterExtension val clientTestRule = OkHttpClientTestRule()
+ 
+@@ -40,12 +42,8 @@ class SessionReuseTest {
+ 
+   var client = clientTestRule.newClient()
+ 
+-  private lateinit var server: MockWebServer
+-
+   @BeforeEach
+-  fun setUp(server: MockWebServer) {
+-    this.server = server
+-
++  fun setUp() {
+     // Default after JDK 14, but we are avoiding tests that assume special setup.
+     // System.setProperty("jdk.tls.client.enableSessionTicketExtension", "true")
+     // System.setProperty("jdk.tls.server.enableSessionTicketExtension", "true")
+diff --git a/okhttp/src/jvmTest/java/okhttp3/SocketChannelTest.kt b/okhttp/src/jvmTest/java/okhttp3/SocketChannelTest.kt
+index b723e996d..34d14ac45 100644
+--- a/okhttp/src/jvmTest/java/okhttp3/SocketChannelTest.kt
++++ b/okhttp/src/jvmTest/java/okhttp3/SocketChannelTest.kt
+@@ -45,12 +45,13 @@ import javax.net.ssl.SNIMatcher
+ import javax.net.ssl.SNIServerName
+ import javax.net.ssl.SSLSocket
+ import javax.net.ssl.StandardConstants
+-import org.junit.jupiter.api.BeforeEach
+ 
+ @Suppress("UsePropertyAccessSyntax")
+ @Timeout(6)
+ @Tag("slow")
+-class SocketChannelTest {
++class SocketChannelTest(
++  val server: MockWebServer
++) {
+   @JvmField @RegisterExtension val platform = PlatformRule()
+   @JvmField @RegisterExtension val clientTestRule = OkHttpClientTestRule().apply {
+     recordFrames = true
+@@ -72,13 +73,6 @@ class SocketChannelTest {
+   }
+   private var acceptedHostName: String? = null
+ 
+-  private lateinit var server: MockWebServer
+-
+-  @BeforeEach
+-  fun setUp(server: MockWebServer) {
+-    this.server = server
+-  }
+-
+   @ParameterizedTest
+   @MethodSource("connectionTypes")
+   fun testConnection(socketMode: SocketMode) {
+diff --git a/okhttp/src/jvmTest/java/okhttp3/URLConnectionTest.kt b/okhttp/src/jvmTest/java/okhttp3/URLConnectionTest.kt
+index cbbb2c1ae..e4561802c 100644
+--- a/okhttp/src/jvmTest/java/okhttp3/URLConnectionTest.kt
++++ b/okhttp/src/jvmTest/java/okhttp3/URLConnectionTest.kt
+@@ -54,7 +54,6 @@ import javax.net.ssl.X509TrustManager
+ import mockwebserver3.MockResponse
+ import mockwebserver3.MockWebServer
+ import mockwebserver3.SocketPolicy
+-import mockwebserver3.junit5.internal.MockWebServerInstance
+ import okhttp3.Credentials.basic
+ import okhttp3.HttpUrl.Companion.toHttpUrl
+ import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+@@ -106,7 +105,7 @@ class URLConnectionTest {
+   private var cache: Cache? = null
+ 
+   @BeforeEach
+-  fun setUp(server: MockWebServer, @MockWebServerInstance("server2") server2: MockWebServer) {
++  fun setUp(server: MockWebServer, server2: MockWebServer) {
+     this.server = server
+     this.server2 = server2
+     platform.assumeNotBouncyCastle()

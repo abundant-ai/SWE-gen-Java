@@ -1,0 +1,160 @@
+diff --git a/retry/src/main/java/io/micronaut/retry/RetryState.java b/retry/src/main/java/io/micronaut/retry/RetryState.java
+index b7ff951a2f..8eec2d5fd0 100644
+--- a/retry/src/main/java/io/micronaut/retry/RetryState.java
++++ b/retry/src/main/java/io/micronaut/retry/RetryState.java
+@@ -68,6 +68,13 @@ public interface RetryState {
+      */
+     Optional<Duration> getMaxDelay();
+ 
++    /**
++     * @return The jitter factor used to apply random deviation to retry delays
++     */
++    default OptionalDouble getJitter() {
++        return OptionalDouble.empty();
++    }
++
+     /**
+      * @return The retry predicate checking for includes/excludes throwable classes
+      */
+diff --git a/retry/src/main/java/io/micronaut/retry/annotation/Retryable.java b/retry/src/main/java/io/micronaut/retry/annotation/Retryable.java
+index fa892989c7..515ef77ae3 100644
+--- a/retry/src/main/java/io/micronaut/retry/annotation/Retryable.java
++++ b/retry/src/main/java/io/micronaut/retry/annotation/Retryable.java
+@@ -91,4 +91,10 @@ public @interface Retryable {
+      * @return The capture exception types (defaults to RuntimeException)
+      */
+     Class<? extends Throwable> capturedException() default RuntimeException.class;
++
++    /**
++     * @return The jitter factor used to apply random deviation to retry delays
++     */
++    @Digits(integer = 1, fraction = 2)
++    String jitter() default "0.0";
+ }
+diff --git a/retry/src/main/java/io/micronaut/retry/intercept/AnnotationRetryStateBuilder.java b/retry/src/main/java/io/micronaut/retry/intercept/AnnotationRetryStateBuilder.java
+index 500764414e..803be2f543 100644
+--- a/retry/src/main/java/io/micronaut/retry/intercept/AnnotationRetryStateBuilder.java
++++ b/retry/src/main/java/io/micronaut/retry/intercept/AnnotationRetryStateBuilder.java
+@@ -43,6 +43,7 @@ class AnnotationRetryStateBuilder implements RetryStateBuilder {
+     private static final String EXCLUDES = "excludes";
+     private static final String PREDICATE = "predicate";
+     private static final String CAPTURED_EXCEPTION = "capturedException";
++    private static final String JITTER = "jitter";
+     private static final int DEFAULT_RETRY_ATTEMPTS = 3;
+ 
+     private final AnnotationMetadata annotationMetadata;
+@@ -76,7 +77,8 @@ class AnnotationRetryStateBuilder implements RetryStateBuilder {
+             delay,
+             retry.get(MAX_DELAY, Duration.class).orElse(null),
+             predicate,
+-            capturedException
++            capturedException,
++            retry.get(JITTER, Double.class).orElse(0d)
+         );
+     }
+ 
+diff --git a/retry/src/main/java/io/micronaut/retry/intercept/CircuitBreakerRetry.java b/retry/src/main/java/io/micronaut/retry/intercept/CircuitBreakerRetry.java
+index b99552ee20..faddc1fa3e 100644
+--- a/retry/src/main/java/io/micronaut/retry/intercept/CircuitBreakerRetry.java
++++ b/retry/src/main/java/io/micronaut/retry/intercept/CircuitBreakerRetry.java
+@@ -162,6 +162,11 @@ class CircuitBreakerRetry implements MutableRetryState {
+         return childState.getCapturedException();
+     }
+ 
++    @Override
++    public OptionalDouble getJitter() {
++        return childState.getJitter();
++    }
++
+     /**
+      * @return The current state
+      */
+diff --git a/retry/src/main/java/io/micronaut/retry/intercept/SimpleRetry.java b/retry/src/main/java/io/micronaut/retry/intercept/SimpleRetry.java
+index c4f06fe796..12c30a9435 100644
+--- a/retry/src/main/java/io/micronaut/retry/intercept/SimpleRetry.java
++++ b/retry/src/main/java/io/micronaut/retry/intercept/SimpleRetry.java
+@@ -23,6 +23,7 @@ import io.micronaut.retry.annotation.RetryPredicate;
+ import java.time.Duration;
+ import java.util.Optional;
+ import java.util.OptionalDouble;
++import java.util.concurrent.ThreadLocalRandom;
+ import java.util.concurrent.atomic.AtomicInteger;
+ import java.util.concurrent.atomic.AtomicLong;
+ 
+@@ -44,6 +45,7 @@ class SimpleRetry implements RetryState, MutableRetryState {
+     private final AtomicLong overallDelay = new AtomicLong(0);
+     private final RetryPredicate predicate;
+     private final Class<? extends Throwable> capturedException;
++    private final double jitter;
+ 
+     /**
+      * @param maxAttempts The maximum number of attempts
+@@ -59,7 +61,8 @@ class SimpleRetry implements RetryState, MutableRetryState {
+         Duration delay,
+         Duration maxDelay,
+         RetryPredicate predicate,
+-        Class<? extends Throwable> capturedException) {
++        Class<? extends Throwable> capturedException,
++        double jitter) {
+ 
+         this.maxAttempts = maxAttempts;
+         this.multiplier = multiplier;
+@@ -67,6 +70,7 @@ class SimpleRetry implements RetryState, MutableRetryState {
+         this.maxDelay = maxDelay;
+         this.predicate = predicate;
+         this.capturedException = capturedException;
++        this.jitter = jitter;
+     }
+ 
+     /**
+@@ -75,18 +79,20 @@ class SimpleRetry implements RetryState, MutableRetryState {
+      * @param delay The overall delay so far
+      * @param maxDelay The maximum overall delay
+      * @param capturedException The capture exception types
++     * @param jitter The jitter factor used to apply random deviation to retry delays
+      */
+-    SimpleRetry(int maxAttempts, double multiplier, Duration delay, Duration maxDelay, Class<? extends Throwable> capturedException) {
+-        this(maxAttempts, multiplier, delay, maxDelay, new DefaultRetryPredicate(), capturedException);
++    SimpleRetry(int maxAttempts, double multiplier, Duration delay, Duration maxDelay, Class<? extends Throwable> capturedException, double jitter) {
++        this(maxAttempts, multiplier, delay, maxDelay, new DefaultRetryPredicate(), capturedException, jitter);
+     }
+ 
+     /**
+      * @param maxAttempts The maximum number of attempts
+      * @param multiplier The multiplier to use between delays
+      * @param delay The overall delay so far
++     * @param jitter The jitter factor used to apply random deviation to retry delays
+      */
+-    SimpleRetry(int maxAttempts, double multiplier, Duration delay) {
+-        this(maxAttempts, multiplier, delay, null, null);
++    SimpleRetry(int maxAttempts, double multiplier, Duration delay, double jitter) {
++        this(maxAttempts, multiplier, delay, null, null, jitter);
+     }
+ 
+     /**
+@@ -165,6 +171,14 @@ class SimpleRetry implements RetryState, MutableRetryState {
+         return capturedException;
+     }
+ 
++    /**
++     * @return The jitter factor used to apply random deviation to retry delays
++     */
++    @Override
++    public OptionalDouble getJitter() {
++        return jitter > 0 ? OptionalDouble.of(jitter) : OptionalDouble.empty();
++    }
++
+     /**
+      * @return Return the millisecond value for the next delay
+      */
+@@ -173,6 +187,10 @@ class SimpleRetry implements RetryState, MutableRetryState {
+     public long nextDelay() {
+         double multiplier = getMultiplier().orElse(1.0);
+         long delay = (long) ((getDelay().toMillis()) * pow(multiplier, attemptNumber.get() - 1));
++        double jitter = getJitter().orElse(0);
++        if (jitter > 0) {
++            delay = Math.max(0, (long) (delay * (1.0 + ThreadLocalRandom.current().nextDouble(-jitter, jitter))));
++        }
+         overallDelay.addAndGet(delay);
+         return delay;
+     }

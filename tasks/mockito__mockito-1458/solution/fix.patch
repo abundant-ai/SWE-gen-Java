@@ -1,0 +1,256 @@
+diff --git a/src/main/java/org/mockito/internal/handler/MockHandlerImpl.java b/src/main/java/org/mockito/internal/handler/MockHandlerImpl.java
+index bd50535ad..8a6165195 100644
+--- a/src/main/java/org/mockito/internal/handler/MockHandlerImpl.java
++++ b/src/main/java/org/mockito/internal/handler/MockHandlerImpl.java
+@@ -7,7 +7,6 @@ package org.mockito.internal.handler;
+ import org.mockito.internal.creation.settings.CreationSettings;
+ import org.mockito.internal.invocation.InvocationMatcher;
+ import org.mockito.internal.invocation.MatchersBinder;
+-import org.mockito.internal.listeners.StubbingLookupListener;
+ import org.mockito.internal.stubbing.InvocationContainerImpl;
+ import org.mockito.internal.stubbing.OngoingStubbingImpl;
+ import org.mockito.internal.stubbing.StubbedInvocationMatcher;
+@@ -18,13 +17,10 @@ import org.mockito.invocation.Invocation;
+ import org.mockito.invocation.InvocationContainer;
+ import org.mockito.invocation.MockHandler;
+ import org.mockito.mock.MockCreationSettings;
+-import org.mockito.stubbing.Stubbing;
+ import org.mockito.verification.VerificationMode;
+ 
+-import java.util.Collection;
+-import java.util.List;
+-
+ import static org.mockito.internal.exceptions.Reporter.stubPassedToVerify;
++import static org.mockito.internal.listeners.StubbingLookupNotifier.notifyStubbedAnswerLookup;
+ import static org.mockito.internal.progress.ThreadSafeMockingProgress.mockingProgress;
+ 
+ /**
+@@ -46,7 +42,7 @@ public class MockHandlerImpl<T> implements MockHandler<T> {
+         this.mockSettings = mockSettings;
+ 
+         this.matchersBinder = new MatchersBinder();
+-        this.invocationContainer = new InvocationContainerImpl( mockSettings);
++        this.invocationContainer = new InvocationContainerImpl(mockSettings);
+     }
+ 
+     public Object handle(Invocation invocation) throws Throwable {
+@@ -90,7 +86,9 @@ public class MockHandlerImpl<T> implements MockHandler<T> {
+ 
+         // look for existing answer for this invocation
+         StubbedInvocationMatcher stubbing = invocationContainer.findAnswerFor(invocation);
+-        notifyStubbedAnswerLookup(invocation, stubbing);
++        // TODO #793 - when completed, we should be able to get rid of the casting below
++        notifyStubbedAnswerLookup(invocation, stubbing, invocationContainer.getStubbingsAscending(),
++                                  (CreationSettings) mockSettings);
+ 
+         if (stubbing != null) {
+             stubbing.captureArgumentsFrom(invocation);
+@@ -131,14 +129,4 @@ public class MockHandlerImpl<T> implements MockHandler<T> {
+ 
+         return new VerificationDataImpl(invocationContainer, invocationMatcher);
+     }
+-
+-    private void notifyStubbedAnswerLookup(Invocation invocation, Stubbing stubbingFound) {
+-        //TODO #793 - when completed, we should be able to get rid of the casting below
+-        List<StubbingLookupListener> listeners = ((CreationSettings) this.mockSettings).getStubbingLookupListeners();
+-        for (StubbingLookupListener listener : listeners) {
+-            Collection<Stubbing> stubbings = this.invocationContainer.getStubbingsAscending();
+-            listener.onStubbingLookup(invocation, stubbingFound, stubbings, this.mockSettings);
+-        }
+-    }
+ }
+-
+diff --git a/src/main/java/org/mockito/internal/junit/DefaultStubbingLookupListener.java b/src/main/java/org/mockito/internal/junit/DefaultStubbingLookupListener.java
+index 5c99068ef..4885d6339 100644
+--- a/src/main/java/org/mockito/internal/junit/DefaultStubbingLookupListener.java
++++ b/src/main/java/org/mockito/internal/junit/DefaultStubbingLookupListener.java
+@@ -5,10 +5,10 @@
+ package org.mockito.internal.junit;
+ 
+ import org.mockito.internal.exceptions.Reporter;
++import org.mockito.internal.listeners.StubbingLookupEvent;
+ import org.mockito.internal.listeners.StubbingLookupListener;
+ import org.mockito.internal.stubbing.UnusedStubbingReporting;
+ import org.mockito.invocation.Invocation;
+-import org.mockito.mock.MockCreationSettings;
+ import org.mockito.quality.Strictness;
+ import org.mockito.stubbing.Stubbing;
+ 
+@@ -31,25 +31,25 @@ class DefaultStubbingLookupListener implements StubbingLookupListener {
+         this.currentStrictness = strictness;
+     }
+ 
+-    public void onStubbingLookup(Invocation invocation, Stubbing stubbingFound, Collection<Stubbing> allStubbings, MockCreationSettings mockSettings) {
+-        Strictness actualStrictness = determineStrictness(stubbingFound, mockSettings, currentStrictness);
++    public void onStubbingLookup(StubbingLookupEvent event) {
++        Strictness actualStrictness = determineStrictness(event.getStubbingFound(), event.getMockSettings(), currentStrictness);
+ 
+         if (actualStrictness != Strictness.STRICT_STUBS) {
+             return;
+         }
+ 
+-        if (stubbingFound == null) {
++        if (event.getStubbingFound() == null) {
+             //If stubbing was not found for invocation it means that either the mock invocation was not stubbed or
+             //we have a stubbing arg mismatch.
+-            List<Invocation> argMismatchStubbings = potentialArgMismatches(invocation, allStubbings);
++            List<Invocation> argMismatchStubbings = potentialArgMismatches(event.getInvocation(), event.getAllStubbings());
+             if (!argMismatchStubbings.isEmpty()) {
+                 mismatchesReported = true;
+-                Reporter.potentialStubbingProblem(invocation, argMismatchStubbings);
++                Reporter.potentialStubbingProblem(event.getInvocation(), argMismatchStubbings);
+             }
+         } else {
+             //when strict stubs are in use, every time a stub is realized in the code it is implicitly marked as verified
+             //this way, the users don't have to repeat themselves to verify stubbed invocations (DRY)
+-            invocation.markVerified();
++            event.getInvocation().markVerified();
+         }
+     }
+ 
+diff --git a/src/main/java/org/mockito/internal/listeners/StubbingLookupEvent.java b/src/main/java/org/mockito/internal/listeners/StubbingLookupEvent.java
+new file mode 100644
+index 000000000..0d45edd34
+--- /dev/null
++++ b/src/main/java/org/mockito/internal/listeners/StubbingLookupEvent.java
+@@ -0,0 +1,36 @@
++/*
++ * Copyright (c) 2018 Mockito contributors
++ * This program is made available under the terms of the MIT License.
++ */
++package org.mockito.internal.listeners;
++
++import org.mockito.invocation.Invocation;
++import org.mockito.mock.MockCreationSettings;
++import org.mockito.stubbing.Stubbing;
++
++import java.util.Collection;
++
++/**
++ * Represent an information about the looked up stubbing
++ */
++public interface StubbingLookupEvent {
++    /**
++     * @return The invocation that causes stubbing lookup
++     */
++    Invocation getInvocation();
++
++    /**
++     * @return Looked up stubbing. It can be <code>null</code>, which indicates that the invocation was not stubbed
++     */
++    Stubbing getStubbingFound();
++
++    /**
++     * @return All stubbings declared on the mock object that we are invoking
++     */
++    Collection<Stubbing> getAllStubbings();
++
++    /**
++     * @return Settings of the mock object that we are invoking
++     */
++    MockCreationSettings getMockSettings();
++}
+diff --git a/src/main/java/org/mockito/internal/listeners/StubbingLookupListener.java b/src/main/java/org/mockito/internal/listeners/StubbingLookupListener.java
+index fa7daf391..6fa37a159 100644
+--- a/src/main/java/org/mockito/internal/listeners/StubbingLookupListener.java
++++ b/src/main/java/org/mockito/internal/listeners/StubbingLookupListener.java
+@@ -4,12 +4,6 @@
+  */
+ package org.mockito.internal.listeners;
+ 
+-import org.mockito.invocation.Invocation;
+-import org.mockito.mock.MockCreationSettings;
+-import org.mockito.stubbing.Stubbing;
+-
+-import java.util.Collection;
+-
+ /**
+  * Listens to attempts to look up stubbing answer for given mocks. This class is internal for now.
+  * <p>
+@@ -30,13 +24,7 @@ public interface StubbingLookupListener {
+     /**
+      * Called by the framework when Mockito looked up an answer for invocation on a mock.
+      *
+-     * TODO when making this public, we should have an event object instead of multiple arguments in the listener.
+-     *
+-     * @param invocation - the invocation that causes stubbing lookup
+-     * @param stubbingFound - can be null - it indicates that the invocation was not stubbed.
+-     * @param allStubbings - all stubbings declared on the mock object that we are invoking.
+-     * @param mockSettings - settings of the mock object that we are invoking
++     * @param stubbingLookupEvent - Information about the looked up stubbing
+      */
+-    void onStubbingLookup(Invocation invocation, Stubbing stubbingFound, Collection<Stubbing> allStubbings, MockCreationSettings mockSettings);
+-
++    void onStubbingLookup(StubbingLookupEvent stubbingLookupEvent);
+ }
+diff --git a/src/main/java/org/mockito/internal/listeners/StubbingLookupNotifier.java b/src/main/java/org/mockito/internal/listeners/StubbingLookupNotifier.java
+new file mode 100644
+index 000000000..3e550013a
+--- /dev/null
++++ b/src/main/java/org/mockito/internal/listeners/StubbingLookupNotifier.java
+@@ -0,0 +1,65 @@
++/*
++ * Copyright (c) 2018 Mockito contributors
++ * This program is made available under the terms of the MIT License.
++ */
++package org.mockito.internal.listeners;
++
++import org.mockito.internal.creation.settings.CreationSettings;
++import org.mockito.invocation.Invocation;
++import org.mockito.mock.MockCreationSettings;
++import org.mockito.stubbing.Stubbing;
++
++import java.util.Collection;
++import java.util.List;
++
++public class StubbingLookupNotifier {
++
++    public static void notifyStubbedAnswerLookup(Invocation invocation, Stubbing stubbingFound,
++                                                 Collection<Stubbing> allStubbings, CreationSettings creationSettings) {
++        List<StubbingLookupListener> listeners = creationSettings.getStubbingLookupListeners();
++        if (listeners.isEmpty()) {
++            return;
++        }
++        StubbingLookupEvent event = new Event(invocation, stubbingFound, allStubbings, creationSettings);
++        for (StubbingLookupListener listener : listeners) {
++            listener.onStubbingLookup(event);
++        }
++    }
++
++    static class Event implements StubbingLookupEvent {
++        final private Invocation invocation;
++        final private Stubbing stubbing;
++        final private Collection<Stubbing> allStubbings;
++        final private MockCreationSettings mockSettings;
++
++        public Event(Invocation invocation,
++                     Stubbing stubbing,
++                     Collection<Stubbing> allStubbings,
++                     MockCreationSettings mockSettings) {
++            this.invocation = invocation;
++            this.stubbing = stubbing;
++            this.allStubbings = allStubbings;
++            this.mockSettings = mockSettings;
++        }
++
++        @Override
++        public Invocation getInvocation() {
++            return invocation;
++        }
++
++        @Override
++        public Stubbing getStubbingFound() {
++            return stubbing;
++        }
++
++        @Override
++        public Collection<Stubbing> getAllStubbings() {
++            return allStubbings;
++        }
++
++        @Override
++        public MockCreationSettings getMockSettings() {
++            return mockSettings;
++        }
++    }
++}

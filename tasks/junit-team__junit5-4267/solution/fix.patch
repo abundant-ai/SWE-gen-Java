@@ -1,0 +1,253 @@
+diff --git a/junit-jupiter-api/src/main/java/org/junit/jupiter/api/parallel/ResourceLocksProvider.java b/junit-jupiter-api/src/main/java/org/junit/jupiter/api/parallel/ResourceLocksProvider.java
+index d94024d99..2cffc5d61 100644
+--- a/junit-jupiter-api/src/main/java/org/junit/jupiter/api/parallel/ResourceLocksProvider.java
++++ b/junit-jupiter-api/src/main/java/org/junit/jupiter/api/parallel/ResourceLocksProvider.java
+@@ -14,6 +14,7 @@ import static java.util.Collections.emptySet;
+ import static org.apiguardian.api.API.Status.EXPERIMENTAL;
+ 
+ import java.lang.reflect.Method;
++import java.util.List;
+ import java.util.Objects;
+ import java.util.Set;
+ 
+@@ -43,7 +44,7 @@ import org.junit.platform.commons.util.ToStringBuilder;
+ public interface ResourceLocksProvider {
+ 
+ 	/**
+-	 * Add shared resources to a test class.
++	 * Add shared resources for a test class.
+ 	 *
+ 	 * <p>Invoked in case a test class or its parent class is annotated with
+ 	 * {@code @ResourceLock(providers)}.
+@@ -60,8 +61,8 @@ public interface ResourceLocksProvider {
+ 	}
+ 
+ 	/**
+-	 * Add shared resources to a {@linkplain org.junit.jupiter.api.Nested @Nested}
+-	 * test class.
++	 * Add shared resources for a
++	 * {@link org.junit.jupiter.api.Nested @Nested} test class.
+ 	 *
+ 	 * <p>Invoked in case:
+ 	 * <ul>
+@@ -75,16 +76,24 @@ public interface ResourceLocksProvider {
+ 	 * the same semantics as annotating a nested test class with an analogous
+ 	 * {@code @ResourceLock(value, mode)} declaration.
+ 	 *
++	 * @implNote The classes supplied as {@code enclosingInstanceTypes} may
++	 * differ from the classes returned from invocations of
++	 * {@link Class#getEnclosingClass()} &mdash; for example, when a nested test
++	 * class is inherited from a superclass.
++	 *
++	 * @param enclosingInstanceTypes the runtime types of the enclosing
++	 * instances for the test class, ordered from outermost to innermost,
++	 * excluding {@code testClass}; never {@code null}
+ 	 * @param testClass a nested test class for which to add shared resources
+ 	 * @return a set of {@link Lock}; may be empty
+ 	 * @see org.junit.jupiter.api.Nested @Nested
+ 	 */
+-	default Set<Lock> provideForNestedClass(Class<?> testClass) {
++	default Set<Lock> provideForNestedClass(List<Class<?>> enclosingInstanceTypes, Class<?> testClass) {
+ 		return emptySet();
+ 	}
+ 
+ 	/**
+-	 * Add shared resources to a test method.
++	 * Add shared resources for a test method.
+ 	 *
+ 	 * <p>Invoked in case:
+ 	 * <ul>
+@@ -97,13 +106,24 @@ public interface ResourceLocksProvider {
+ 	 * has the same semantics as annotating a test method
+ 	 * with analogous {@code @ResourceLock(value, mode)}.
+ 	 *
++	 * @implNote The classes supplied as {@code enclosingInstanceTypes} may
++	 * differ from the classes returned from invocations of
++	 * {@link Class#getEnclosingClass()} &mdash; for example, when a nested test
++	 * class is inherited from a superclass. Similarly, the class instance
++	 * supplied as {@code testClass} may differ from the class returned by
++	 * {@code testMethod.getDeclaringClass()} &mdash; for example, when a test
++	 * method is inherited from a superclass.
++	 *
++	 * @param enclosingInstanceTypes the runtime types of the enclosing
++	 * instances for the test class, ordered from outermost to innermost,
++	 * excluding {@code testClass}; never {@code null}
+ 	 * @param testClass the test class or {@link org.junit.jupiter.api.Nested @Nested}
+ 	 * test class that contains the {@code testMethod}
+ 	 * @param testMethod a test method for which to add shared resources
+ 	 * @return a set of {@link Lock}; may be empty
+ 	 * @see org.junit.jupiter.api.Nested @Nested
+ 	 */
+-	default Set<Lock> provideForMethod(Class<?> testClass, Method testMethod) {
++	default Set<Lock> provideForMethod(List<Class<?>> enclosingInstanceTypes, Class<?> testClass, Method testMethod) {
+ 		return emptySet();
+ 	}
+ 
+diff --git a/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/descriptor/ClassTestDescriptor.java b/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/descriptor/ClassTestDescriptor.java
+index 7c2a55716..e935db38e 100644
+--- a/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/descriptor/ClassTestDescriptor.java
++++ b/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/descriptor/ClassTestDescriptor.java
+@@ -18,6 +18,7 @@ import java.util.LinkedHashSet;
+ import java.util.List;
+ import java.util.Optional;
+ import java.util.Set;
++import java.util.function.Function;
+ 
+ import org.apiguardian.api.API;
+ import org.junit.jupiter.api.extension.TestInstances;
+@@ -79,8 +80,8 @@ public class ClassTestDescriptor extends ClassBasedTestDescriptor {
+ 	}
+ 
+ 	@Override
+-	public Set<ResourceLocksProvider.Lock> evaluateResourceLocksProvider(ResourceLocksProvider provider) {
+-		return provider.provideForClass(getTestClass());
++	public Function<ResourceLocksProvider, Set<ResourceLocksProvider.Lock>> getResourceLocksProviderEvaluator() {
++		return provider -> provider.provideForClass(getTestClass());
+ 	}
+ 
+ }
+diff --git a/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/descriptor/MethodBasedTestDescriptor.java b/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/descriptor/MethodBasedTestDescriptor.java
+index 52bf3c4ef..3a5b78559 100644
+--- a/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/descriptor/MethodBasedTestDescriptor.java
++++ b/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/descriptor/MethodBasedTestDescriptor.java
+@@ -13,14 +13,17 @@ package org.junit.jupiter.engine.descriptor;
+ import static org.apiguardian.api.API.Status.INTERNAL;
+ import static org.junit.jupiter.api.parallel.ResourceLockTarget.CHILDREN;
+ import static org.junit.jupiter.engine.descriptor.DisplayNameUtils.determineDisplayNameForMethod;
++import static org.junit.jupiter.engine.descriptor.ResourceLockAware.enclosingInstanceTypesDependentResourceLocksProviderEvaluator;
+ import static org.junit.platform.commons.util.CollectionUtils.forEachInReverseOrder;
+ 
+ import java.lang.reflect.Method;
++import java.util.Collections;
+ import java.util.LinkedHashSet;
+ import java.util.List;
+ import java.util.Optional;
+ import java.util.Set;
+ import java.util.function.Consumer;
++import java.util.function.Function;
+ import java.util.function.Supplier;
+ 
+ import org.apiguardian.api.API;
+@@ -97,8 +100,18 @@ public abstract class MethodBasedTestDescriptor extends JupiterTestDescriptor im
+ 	}
+ 
+ 	@Override
+-	public Set<ResourceLocksProvider.Lock> evaluateResourceLocksProvider(ResourceLocksProvider provider) {
+-		return provider.provideForMethod(getTestClass(), getTestMethod());
++	public Function<ResourceLocksProvider, Set<ResourceLocksProvider.Lock>> getResourceLocksProviderEvaluator() {
++		return enclosingInstanceTypesDependentResourceLocksProviderEvaluator(this::getEnclosingTestClasses,
++			(provider, enclosingInstanceTypes) -> provider.provideForMethod(enclosingInstanceTypes, getTestClass(),
++				getTestMethod()));
++	}
++
++	private List<Class<?>> getEnclosingTestClasses() {
++		return getParent() //
++				.filter(ClassBasedTestDescriptor.class::isInstance) //
++				.map(ClassBasedTestDescriptor.class::cast) //
++				.map(ClassBasedTestDescriptor::getEnclosingTestClasses) //
++				.orElseGet(Collections::emptyList);
+ 	}
+ 
+ 	@Override
+diff --git a/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/descriptor/NestedClassTestDescriptor.java b/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/descriptor/NestedClassTestDescriptor.java
+index 72d11ce5b..b0619fa09 100644
+--- a/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/descriptor/NestedClassTestDescriptor.java
++++ b/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/descriptor/NestedClassTestDescriptor.java
+@@ -13,12 +13,14 @@ package org.junit.jupiter.engine.descriptor;
+ import static java.util.Collections.emptyList;
+ import static org.apiguardian.api.API.Status.INTERNAL;
+ import static org.junit.jupiter.engine.descriptor.DisplayNameUtils.createDisplayNameSupplierForNestedClass;
++import static org.junit.jupiter.engine.descriptor.ResourceLockAware.enclosingInstanceTypesDependentResourceLocksProviderEvaluator;
+ 
+ import java.util.ArrayList;
+ import java.util.LinkedHashSet;
+ import java.util.List;
+ import java.util.Optional;
+ import java.util.Set;
++import java.util.function.Function;
+ import java.util.function.Supplier;
+ 
+ import org.apiguardian.api.API;
+@@ -94,8 +96,9 @@ public class NestedClassTestDescriptor extends ClassBasedTestDescriptor {
+ 	}
+ 
+ 	@Override
+-	public Set<ResourceLocksProvider.Lock> evaluateResourceLocksProvider(ResourceLocksProvider provider) {
+-		return provider.provideForNestedClass(getTestClass());
++	public Function<ResourceLocksProvider, Set<ResourceLocksProvider.Lock>> getResourceLocksProviderEvaluator() {
++		return enclosingInstanceTypesDependentResourceLocksProviderEvaluator(this::getEnclosingTestClasses, (provider,
++				enclosingInstanceTypes) -> provider.provideForNestedClass(enclosingInstanceTypes, getTestClass()));
+ 	}
+ 
+ }
+diff --git a/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/descriptor/ResourceLockAware.java b/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/descriptor/ResourceLockAware.java
+index e7aa88ede..c4f427989 100644
+--- a/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/descriptor/ResourceLockAware.java
++++ b/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/descriptor/ResourceLockAware.java
+@@ -14,7 +14,11 @@ import static org.junit.jupiter.api.parallel.ResourceLockTarget.CHILDREN;
+ 
+ import java.util.ArrayDeque;
+ import java.util.Deque;
++import java.util.List;
+ import java.util.Set;
++import java.util.function.BiFunction;
++import java.util.function.Function;
++import java.util.function.Supplier;
+ import java.util.stream.Stream;
+ 
+ import org.junit.jupiter.api.parallel.ResourceLocksProvider;
+@@ -35,8 +39,10 @@ interface ResourceLockAware extends TestDescriptor {
+ 			parent = parent.getParent().orElse(null);
+ 		}
+ 
++		Function<ResourceLocksProvider, Set<ResourceLocksProvider.Lock>> evaluator = getResourceLocksProviderEvaluator();
++
+ 		if (ancestors.isEmpty()) {
+-			return determineOwnExclusiveResources();
++			return determineOwnExclusiveResources(evaluator);
+ 		}
+ 
+ 		Stream<ExclusiveResource> parentStaticResourcesForChildren = ancestors.getLast() //
+@@ -44,18 +50,37 @@ interface ResourceLockAware extends TestDescriptor {
+ 
+ 		Stream<ExclusiveResource> ancestorDynamicResources = ancestors.stream() //
+ 				.map(ResourceLockAware::getExclusiveResourceCollector) //
+-				.flatMap(collector -> collector.getDynamicResources(this::evaluateResourceLocksProvider));
++				.flatMap(collector -> collector.getDynamicResources(evaluator));
+ 
+-		return Stream.of(ancestorDynamicResources, parentStaticResourcesForChildren, determineOwnExclusiveResources())//
++		return Stream.of(ancestorDynamicResources, parentStaticResourcesForChildren,
++			determineOwnExclusiveResources(evaluator))//
+ 				.flatMap(s -> s);
+ 	}
+ 
+-	default Stream<ExclusiveResource> determineOwnExclusiveResources() {
+-		return this.getExclusiveResourceCollector().getAllExclusiveResources(this::evaluateResourceLocksProvider);
++	default Stream<ExclusiveResource> determineOwnExclusiveResources(
++			Function<ResourceLocksProvider, Set<ResourceLocksProvider.Lock>> providerToLocks) {
++		return this.getExclusiveResourceCollector().getAllExclusiveResources(providerToLocks);
+ 	}
+ 
+ 	ExclusiveResourceCollector getExclusiveResourceCollector();
+ 
+-	Set<ResourceLocksProvider.Lock> evaluateResourceLocksProvider(ResourceLocksProvider provider);
++	Function<ResourceLocksProvider, Set<ResourceLocksProvider.Lock>> getResourceLocksProviderEvaluator();
++
++	static Function<ResourceLocksProvider, Set<ResourceLocksProvider.Lock>> enclosingInstanceTypesDependentResourceLocksProviderEvaluator(
++			Supplier<List<Class<?>>> enclosingInstanceTypesSupplier,
++			BiFunction<ResourceLocksProvider, List<Class<?>>, Set<ResourceLocksProvider.Lock>> evaluator) {
++		return new Function<ResourceLocksProvider, Set<ResourceLocksProvider.Lock>>() {
++
++			private List<Class<?>> enclosingInstanceTypes;
++
++			@Override
++			public Set<ResourceLocksProvider.Lock> apply(ResourceLocksProvider provider) {
++				if (this.enclosingInstanceTypes == null) {
++					this.enclosingInstanceTypes = enclosingInstanceTypesSupplier.get();
++				}
++				return evaluator.apply(provider, this.enclosingInstanceTypes);
++			}
++		};
++	}
+ 
+ }

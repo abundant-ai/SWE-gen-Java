@@ -1,0 +1,728 @@
+diff --git a/core/deployment/src/main/java/io/quarkus/deployment/dev/RecompilationDependenciesBuildItem.java b/core/deployment/src/main/java/io/quarkus/deployment/dev/RecompilationDependenciesBuildItem.java
+deleted file mode 100644
+index 9312f4bd570..00000000000
+--- a/core/deployment/src/main/java/io/quarkus/deployment/dev/RecompilationDependenciesBuildItem.java
++++ /dev/null
+@@ -1,50 +0,0 @@
+-package io.quarkus.deployment.dev;
+-
+-import java.util.Map;
+-import java.util.Set;
+-
+-import org.jboss.jandex.DotName;
+-
+-import io.quarkus.builder.item.MultiBuildItem;
+-
+-/**
+- * Defines the relationship between classes for the purposes of recompilation.
+- * <p/>
+- * Idea is that multiple classes can be dependent on one other class. For this BuildItem a class can be an outermost class, a
+- * nested class, an annotation, an interface, an enum, or basically anything that has an FQN.
+- * A consolidation step in {@link RecompilationDependenciesProcessor} cleans up the collected recompilation dependencies and
+- * removes duplicates.
+- * <p/>
+- * The collected recompilation dependencies are used to build a relationship tree between the classes in the
+- * {@link RuntimeUpdatesProcessor}, which is build and traversed from the root up and outwards. Class a -> Set of Class -> where
+- * each element class can resolve to another set of classes.
+- * <p/>
+- * The collected recompilation dependencies are used to determine the set of classes which need to additionally be recompiled
+- * when one other class changes.
+- * <p/>
+- * For performance reasons, the scope of the collected recompilation dependencies should be quite narrow. For an
+- * example, the quarkus-mapstruct extension uses this BuildItem to recompile the dependent Mapper classes, once any of the
+- * referenced model classes
+- * changes.
+- */
+-public final class RecompilationDependenciesBuildItem extends MultiBuildItem {
+-
+-    private final Map<DotName, Set<DotName>> classToRecompilationTargets;
+-
+-    public RecompilationDependenciesBuildItem(Map<DotName, Set<DotName>> classToRecompilationTargets) {
+-        this.classToRecompilationTargets = classToRecompilationTargets;
+-    }
+-
+-    /**
+-     * Returns the map of recompilation dependencies.
+-     * <p>
+-     * The key is a dependency class name, while the value is a set of dependent class names that need to be recompiled as well
+-     * when the
+-     * dependency class changes.
+-     *
+-     * @return a map where each key is a dependency class name and each value is a set of class names that depend on it
+-     */
+-    public Map<DotName, Set<DotName>> getClassToRecompilationTargets() {
+-        return classToRecompilationTargets;
+-    }
+-}
+diff --git a/core/deployment/src/main/java/io/quarkus/deployment/dev/RecompilationDependenciesProcessor.java b/core/deployment/src/main/java/io/quarkus/deployment/dev/RecompilationDependenciesProcessor.java
+deleted file mode 100644
+index 5366c15b094..00000000000
+--- a/core/deployment/src/main/java/io/quarkus/deployment/dev/RecompilationDependenciesProcessor.java
++++ /dev/null
+@@ -1,82 +0,0 @@
+-package io.quarkus.deployment.dev;
+-
+-import java.util.HashMap;
+-import java.util.HashSet;
+-import java.util.List;
+-import java.util.Map;
+-import java.util.Set;
+-
+-import org.jboss.jandex.ClassInfo;
+-import org.jboss.jandex.DotName;
+-import org.jboss.jandex.IndexView;
+-
+-import io.quarkus.deployment.annotations.BuildStep;
+-import io.quarkus.deployment.annotations.Produce;
+-import io.quarkus.deployment.builditem.CombinedIndexBuildItem;
+-import io.quarkus.deployment.builditem.ServiceStartBuildItem;
+-
+-public class RecompilationDependenciesProcessor {
+-
+-    /**
+-     * Consolidation step, which prepares recompilation of dependent classes.
+-     * <p/>
+-     * Resolves inner classes to their outer classes. Inner classes and outer classes share
+-     * source file (at least in java). For our goal of recompilation we therefore only need to outer class.
+-     * <p/>
+-     * After resolving outer classes, all the mappings classToRecompilationTargets are combined into one mapping,
+-     * deduplicated by class name, and
+-     * then given to the {@link RuntimeUpdatesProcessor#setClassToRecompilationTargets(Map)}.
+-     *
+-     * @param combinedIndexBuildItem Index, only the precomputed index is used, since for the purpose of (re)compilation the
+-     *        class has to be in an application source path - which are always indexed.
+-     * @param recompilationDependenciesBuildItems Provides the dependencies between classes. Currently, produced only by
+-     *        extensions.
+-     */
+-    @BuildStep
+-    @Produce(ServiceStartBuildItem.class)
+-    public void consolidateRecompilationDependencies(CombinedIndexBuildItem combinedIndexBuildItem,
+-            List<RecompilationDependenciesBuildItem> recompilationDependenciesBuildItems) {
+-
+-        // Cleanup and combine all the classToRecompilationTargets maps:
+-        // - Resolve inner classes to their top-level class names
+-        // - Remove entries where the class is not in the index
+-        // - combine all classToRecompilationTargets values based on their keys
+-
+-        Map<DotName, Set<DotName>> classToRecompilationTargets = new HashMap<>();
+-        for (RecompilationDependenciesBuildItem buildItem : recompilationDependenciesBuildItems) {
+-            buildItem.getClassToRecompilationTargets().forEach((dependency, recompilationTargets) -> {
+-                dependency = resolveOutermostClassName(dependency, combinedIndexBuildItem.getIndex());
+-                if (dependency == null) {
+-                    return;
+-                }
+-
+-                for (DotName recompilationTarget : recompilationTargets) {
+-                    recompilationTarget = resolveOutermostClassName(recompilationTarget, combinedIndexBuildItem.getIndex());
+-                    if (recompilationTarget == null) {
+-                        continue;
+-                    }
+-
+-                    classToRecompilationTargets.computeIfAbsent(dependency, k -> new HashSet<>()).add(recompilationTarget);
+-                }
+-            });
+-        }
+-
+-        if (RuntimeUpdatesProcessor.INSTANCE != null) {
+-            RuntimeUpdatesProcessor.INSTANCE.setClassToRecompilationTargets(classToRecompilationTargets);
+-        }
+-    }
+-
+-    private DotName resolveOutermostClassName(DotName name, IndexView index) {
+-
+-        ClassInfo classInfo = index.getClassByName(name);
+-        if (classInfo == null) {
+-            return null;
+-        }
+-
+-        if (classInfo.nestingType() != ClassInfo.NestingType.TOP_LEVEL) {
+-            return resolveOutermostClassName(classInfo.enclosingClassAlways(), index);
+-        }
+-
+-        return name;
+-    }
+-}
+diff --git a/core/deployment/src/main/java/io/quarkus/deployment/dev/RuntimeUpdatesProcessor.java b/core/deployment/src/main/java/io/quarkus/deployment/dev/RuntimeUpdatesProcessor.java
+index 36e525c876a..c4ba5228fcb 100644
+--- a/core/deployment/src/main/java/io/quarkus/deployment/dev/RuntimeUpdatesProcessor.java
++++ b/core/deployment/src/main/java/io/quarkus/deployment/dev/RuntimeUpdatesProcessor.java
+@@ -2,6 +2,7 @@
+ 
+ import static java.util.Arrays.asList;
+ import static java.util.Collections.singletonList;
++import static java.util.stream.Collectors.groupingBy;
+ 
+ import java.io.ByteArrayInputStream;
+ import java.io.Closeable;
+@@ -20,11 +21,9 @@
+ import java.nio.file.StandardCopyOption;
+ import java.nio.file.attribute.BasicFileAttributes;
+ import java.nio.file.attribute.FileTime;
+-import java.util.ArrayDeque;
+ import java.util.ArrayList;
+ import java.util.Collection;
+ import java.util.Collections;
+-import java.util.Deque;
+ import java.util.HashMap;
+ import java.util.HashSet;
+ import java.util.Iterator;
+@@ -53,7 +52,6 @@
+ import java.util.stream.Stream;
+ 
+ import org.jboss.jandex.ClassInfo;
+-import org.jboss.jandex.DotName;
+ import org.jboss.jandex.Index;
+ import org.jboss.jandex.IndexView;
+ import org.jboss.jandex.Indexer;
+@@ -106,7 +104,6 @@ public class RuntimeUpdatesProcessor implements HotReplacementContext, Closeable
+     private final TimestampSet main = new TimestampSet();
+     private final TimestampSet test = new TimestampSet();
+     final Map<Path, Long> sourceFileTimestamps = new ConcurrentHashMap<>();
+-    private Map<DotName, Set<DotName>> classToRecompilationTargets = new HashMap<>();
+ 
+     private final List<Runnable> preScanSteps = new CopyOnWriteArrayList<>();
+     private final List<Runnable> postRestartSteps = new CopyOnWriteArrayList<>();
+@@ -712,24 +709,6 @@ ClassScanResult checkForChangedTestClasses(boolean firstScan) {
+         return ret;
+     }
+ 
+-    private void collectRecompilationTargets(DotName changedDependency, Set<DotName> knownRecompilationTargets) {
+-        Deque<DotName> toResolve = new ArrayDeque<>();
+-        toResolve.add(changedDependency);
+-        while (!toResolve.isEmpty()) {
+-            DotName currentDependency = toResolve.poll();
+-
+-            Set<DotName> recompilationTargets = classToRecompilationTargets.get(currentDependency);
+-
+-            if (recompilationTargets != null) {
+-                for (DotName className : recompilationTargets) {
+-                    if (knownRecompilationTargets.add(className)) {
+-                        toResolve.add(className);
+-                    }
+-                }
+-            }
+-        }
+-    }
+-
+     /**
+      * A first scan is considered done when we have visited all modules at least once.
+      * This is useful in two ways.
+@@ -741,81 +720,33 @@ ClassScanResult checkForChangedClasses(QuarkusCompiler compiler,
+             Function<DevModeContext.ModuleInfo, DevModeContext.CompilationUnit> cuf, boolean firstScan,
+             TimestampSet timestampSet, boolean compilingTests) {
+         ClassScanResult classScanResult = new ClassScanResult();
+-
+-        record RecompilableLocationsBySourcePath(Path sourcePath, Set<File> changedFiles, Set<File> changedDependencies) {
+-        }
+-        record ChangeDetectionResult(DevModeContext.ModuleInfo moduleInfo,
+-                List<RecompilableLocationsBySourcePath> changedLocations) {
+-        }
+-        List<ChangeDetectionResult> changeDetectionResults = new ArrayList<>();
+-        Set<DotName> knownRecompilationTargets = new HashSet<>();
++        boolean ignoreFirstScanChanges = firstScan;
+ 
+         for (DevModeContext.ModuleInfo module : context.getAllModules()) {
+-            ChangeDetectionResult changeDetectionResult = new ChangeDetectionResult(module, new ArrayList<>());
++            final List<Path> moduleChangedSourceFilePaths = new ArrayList<>();
+ 
+             for (Path sourcePath : cuf.apply(module).getSourcePaths()) {
+                 if (!Files.exists(sourcePath)) {
+                     continue;
+                 }
+-
+                 final Set<File> changedSourceFiles;
+                 try (final Stream<Path> sourcesStream = Files.walk(sourcePath)) {
+                     changedSourceFiles = sourcesStream
+                             .parallel()
+                             .filter(p -> matchingHandledExtension(p).isPresent()
+-                                    && sourceFileWasRecentModified(p, firstScan, firstScan))
++                                    && sourceFileWasRecentModified(p, ignoreFirstScanChanges, firstScan))
+                             .map(Path::toFile)
+                             //Needing a concurrent Set, not many standard options:
+                             .collect(Collectors.toCollection(ConcurrentSkipListSet::new));
+                 } catch (IOException e) {
+                     throw new RuntimeException(e);
+                 }
+-
+                 if (!changedSourceFiles.isEmpty()) {
+-                    RecompilableLocationsBySourcePath recompilableLocationsBySourcePath = new RecompilableLocationsBySourcePath(
+-                            sourcePath, changedSourceFiles, new HashSet<>());
+-                    changeDetectionResult.changedLocations().add(recompilableLocationsBySourcePath);
+-
+-                    for (File changedSourceFile : changedSourceFiles) {
+-                        String changedDependency = convertFileToClassname(sourcePath, changedSourceFile);
+-
+-                        collectRecompilationTargets(DotName.createSimple(changedDependency), knownRecompilationTargets);
+-                    }
+-                }
+-            }
+-            changeDetectionResults.add(changeDetectionResult);
+-        }
+-
+-        for (DotName recompilationTarget : knownRecompilationTargets) {
+-            String partialRelativePath = recompilationTarget.toString('/');
+-
+-            OUT: for (ChangeDetectionResult changeDetectionResult : changeDetectionResults) {
+-                for (RecompilableLocationsBySourcePath recompilableLocationsBySourcePath : changeDetectionResult
+-                        .changedLocations()) {
+-                    for (String extension : compiler.allHandledExtensions()) {
+-                        Path resolved = recompilableLocationsBySourcePath.sourcePath().resolve(partialRelativePath + extension);
+-
+-                        if (Files.exists(resolved)) {
+-                            recompilableLocationsBySourcePath.changedDependencies().add(resolved.toFile());
+-                            break OUT;
+-                        }
+-                    }
+-                }
+-            }
+-        }
+-
+-        for (ChangeDetectionResult changeDetectionResult : changeDetectionResults) {
+-            final List<Path> moduleChangedSourceFilePaths = new ArrayList<>();
+-            for (RecompilableLocationsBySourcePath recompilableLocationsBySourcePath : changeDetectionResult
+-                    .changedLocations()) {
+-                Path sourcePath = recompilableLocationsBySourcePath.sourcePath();
+-                Set<File> changedSourceFiles = recompilableLocationsBySourcePath.changedFiles();
+-                if (!changedSourceFiles.isEmpty() || !recompilableLocationsBySourcePath.changedDependencies().isEmpty()) {
+                     classScanResult.compilationHappened = true;
+                     //so this is pretty yuck, but on a lot of systems a write is actually a truncate + write
+                     //its possible we see the truncated file timestamp, then the write updates the timestamp
+                     //which will then re-trigger continuous testing/live reload
+-                    //the empty file does not normally cause issues as by the time we actually compile it the write
++                    //the empty fine does not normally cause issues as by the time we actually compile it the write
+                     //has completed (but the old timestamp is used)
+                     for (File i : changedSourceFiles) {
+                         if (i.length() == 0) {
+@@ -830,7 +761,6 @@ && sourceFileWasRecentModified(p, firstScan, firstScan))
+                             }
+                         }
+                     }
+-
+                     Map<File, Long> compileTimestamps = new HashMap<>();
+ 
+                     //now we record the timestamps as they are before the compile phase
+@@ -839,18 +769,12 @@ && sourceFileWasRecentModified(p, firstScan, firstScan))
+                     }
+                     for (;;) {
+                         try {
+-                            Map<String, Set<File>> changedFilesByExtension = new HashMap<>();
+-                            Set<Path> changedPaths = new HashSet<>();
+-                            Stream.concat(changedSourceFiles.stream(),
+-                                    recompilableLocationsBySourcePath.changedDependencies.stream()).forEach(file -> {
+-                                        changedPaths.add(file.toPath());
+-
+-                                        Set<File> files = changedFilesByExtension.computeIfAbsent(this.getFileExtension(file),
+-                                                k -> new HashSet<>());
+-                                        files.add(file);
+-                                    });
++                            final Set<Path> changedPaths = changedSourceFiles.stream()
++                                    .map(File::toPath)
++                                    .collect(Collectors.toSet());
+                             moduleChangedSourceFilePaths.addAll(changedPaths);
+-                            compiler.compile(sourcePath.toString(), changedFilesByExtension);
++                            compiler.compile(sourcePath.toString(), changedSourceFiles.stream()
++                                    .collect(groupingBy(this::getFileExtension, Collectors.toSet())));
+                             compileProblem = null;
+                             if (compilingTests) {
+                                 testCompileProblem = null;
+@@ -888,10 +812,12 @@ && sourceFileWasRecentModified(p, firstScan, firstScan))
+                         sourceFileTimestamps.put(entry.getKey().toPath(), entry.getValue());
+                     }
+                 }
++
+             }
+-            checkForClassFilesChangesInModule(changeDetectionResult.moduleInfo(), moduleChangedSourceFilePaths,
+-                    firstScan, classScanResult,
++
++            checkForClassFilesChangesInModule(module, moduleChangedSourceFilePaths, ignoreFirstScanChanges, classScanResult,
+                     cuf, timestampSet);
++
+         }
+ 
+         return classScanResult;
+@@ -996,19 +922,6 @@ private String getFileExtension(File file) {
+         return name.substring(lastIndexOf);
+     }
+ 
+-    // convert a filename to a class name with package
+-    private String convertFileToClassname(Path sourcePath, File file) {
+-        String className = sourcePath.relativize(file.toPath())
+-                .toString();
+-        className = className.replace(File.separatorChar, '.');
+-
+-        int lastIndexOf = className.lastIndexOf('.');
+-        if (lastIndexOf > 0) {
+-            className = className.substring(0, lastIndexOf);
+-        }
+-        return className;
+-    }
+-
+     Set<String> checkForFileChange() {
+         return checkForFileChange(DevModeContext.ModuleInfo::getMain, main);
+     }
+@@ -1242,11 +1155,6 @@ public RuntimeUpdatesProcessor setDisableInstrumentationForIndexPredicate(
+         return this;
+     }
+ 
+-    public RuntimeUpdatesProcessor setClassToRecompilationTargets(Map<DotName, Set<DotName>> classToRecompilationTargets) {
+-        this.classToRecompilationTargets = classToRecompilationTargets;
+-        return this;
+-    }
+-
+     public RuntimeUpdatesProcessor setWatchedFilePaths(Map<String, Boolean> watchedFilePaths,
+             List<Entry<Predicate<String>, Boolean>> watchedFilePredicates, boolean isTest) {
+         if (isTest) {
+diff --git a/core/deployment/src/test/java/io/quarkus/deployment/dev/RecompilationDependenciesProcessorTest.java b/core/deployment/src/test/java/io/quarkus/deployment/dev/RecompilationDependenciesProcessorTest.java
+deleted file mode 100644
+index c25c248090d..00000000000
+--- a/core/deployment/src/test/java/io/quarkus/deployment/dev/RecompilationDependenciesProcessorTest.java
++++ /dev/null
+@@ -1,123 +0,0 @@
+-package io.quarkus.deployment.dev;
+-
+-import static org.junit.jupiter.api.Assertions.assertEquals;
+-import static org.junit.jupiter.api.Assertions.assertTrue;
+-
+-import java.io.IOException;
+-import java.util.List;
+-import java.util.Map;
+-import java.util.Set;
+-import java.util.concurrent.ConcurrentHashMap;
+-
+-import org.jboss.jandex.DotName;
+-import org.jboss.jandex.Index;
+-import org.jboss.jandex.Indexer;
+-import org.junit.jupiter.api.BeforeEach;
+-import org.junit.jupiter.api.Test;
+-
+-import io.quarkus.deployment.builditem.CombinedIndexBuildItem;
+-import io.quarkus.deployment.dev.recompile_dependencies.model.Address;
+-import io.quarkus.deployment.dev.recompile_dependencies.model.ContactMapper;
+-import io.quarkus.deployment.dev.recompile_dependencies.model.ContactMapperWhichIsDetectedMultipleTimes;
+-
+-class RecompilationDependenciesProcessorTest {
+-    private RecompilationDependenciesProcessor processor;
+-
+-    @BeforeEach
+-    void setup() {
+-        processor = new RecompilationDependenciesProcessor();
+-        RuntimeUpdatesProcessor.INSTANCE = new TestRuntimeUpdatesProcessor();
+-    }
+-
+-    @Test
+-    void testConsolidateResolvesOutermostClass() throws IOException {
+-        class A {
+-            static class B {
+-                static class C {
+-                }
+-            }
+-        }
+-
+-        Index index = buildIndex(A.class, A.B.class, A.B.C.class, RecompilationDependenciesProcessorTest.class);
+-
+-        RecompilationDependenciesBuildItem b1 = new RecompilationDependenciesBuildItem(
+-                Map.of(DotName.createSimple(A.B.C.class), Set.of(DotName.createSimple(A.B.C.class))));
+-
+-        processor.consolidateRecompilationDependencies(new CombinedIndexBuildItem(index, index), List.of(b1));
+-
+-        Map<DotName, Set<DotName>> recompilationDependencies = ((TestRuntimeUpdatesProcessor) RuntimeUpdatesProcessor.INSTANCE).recompilationDependencies;
+-
+-        assertEquals(1, recompilationDependencies.size());
+-
+-        // The inner class A.B.C is dropped, and resolve to the outer Most class, which is RecompilationDependenciesProcessorTest
+-        assertAffectedClasses(recompilationDependencies, RecompilationDependenciesProcessorTest.class,
+-                RecompilationDependenciesProcessorTest.class);
+-    }
+-
+-    @Test
+-    void testConsolidationOfMultipleRecompilationDependenciesBuildItems() throws IOException {
+-
+-        Index index = buildIndex(Address.class, ContactMapper.class, ContactMapperWhichIsDetectedMultipleTimes.class);
+-
+-        List<RecompilationDependenciesBuildItem> buildItems = List.of(
+-                new RecompilationDependenciesBuildItem(Map.of(//
+-                        DotName.createSimple(Address.class),
+-                        Set.of(DotName.createSimple(ContactMapperWhichIsDetectedMultipleTimes.class)))//
+-                ), //
+-                new RecompilationDependenciesBuildItem(Map.of(//
+-                        DotName.createSimple(Address.class),
+-                        Set.of(DotName.createSimple(ContactMapperWhichIsDetectedMultipleTimes.class)))//
+-                ), //
+-                new RecompilationDependenciesBuildItem(Map.of(//
+-                        DotName.createSimple(Address.class), Set.of(DotName.createSimple(ContactMapper.class)))//
+-                )//
+-        );
+-
+-        processor.consolidateRecompilationDependencies(new CombinedIndexBuildItem(index, index), buildItems);
+-
+-        Map<DotName, Set<DotName>> recompilationDependencies = ((TestRuntimeUpdatesProcessor) RuntimeUpdatesProcessor.INSTANCE).recompilationDependencies;
+-
+-        // In the end only one entry in the resulting dependency map
+-        // Address -> ContactMapperWhichIsDetectedMultipleTimes, ContactMapper
+-        assertEquals(1, recompilationDependencies.size());
+-        assertAffectedClasses(recompilationDependencies, Address.class, ContactMapperWhichIsDetectedMultipleTimes.class,
+-                ContactMapper.class);
+-    }
+-
+-    private void assertAffectedClasses(Map<DotName, Set<DotName>> dependencies, Class<?> clazz,
+-            Class<?>... affectedClasses) {
+-        DotName className = DotName.createSimple(clazz.getName());
+-        assertTrue(dependencies.containsKey(className));
+-        assertEquals(affectedClasses.length, dependencies.get(className).size());
+-        for (Class<?> affectedClass : affectedClasses) {
+-            DotName affectedClassName = DotName.createSimple(affectedClass.getName());
+-            assertTrue(dependencies.get(className).contains(affectedClassName));
+-        }
+-    }
+-
+-    private Index buildIndex(Class<?>... classes) throws IOException {
+-        assertTrue(classes.length > 0);
+-
+-        Indexer indexer = new Indexer();
+-
+-        for (Class<?> clazz : classes) {
+-            indexer.indexClass(clazz);
+-        }
+-
+-        return indexer.complete();
+-    }
+-
+-    private static class TestRuntimeUpdatesProcessor extends RuntimeUpdatesProcessor {
+-
+-        private Map<DotName, Set<DotName>> recompilationDependencies = new ConcurrentHashMap<>();
+-
+-        public TestRuntimeUpdatesProcessor() {
+-            super(null, null, null, null, null, null, null, null, null);
+-        }
+-
+-        public RuntimeUpdatesProcessor setClassToRecompilationTargets(Map<DotName, Set<DotName>> classToRecompilationTargets) {
+-            this.recompilationDependencies = classToRecompilationTargets;
+-            return this;
+-        }
+-    }
+-}
+diff --git a/core/deployment/src/test/java/io/quarkus/deployment/dev/recompile_dependencies/model/Address.java b/core/deployment/src/test/java/io/quarkus/deployment/dev/recompile_dependencies/model/Address.java
+deleted file mode 100644
+index 0759f409782..00000000000
+--- a/core/deployment/src/test/java/io/quarkus/deployment/dev/recompile_dependencies/model/Address.java
++++ /dev/null
+@@ -1,6 +0,0 @@
+-package io.quarkus.deployment.dev.recompile_dependencies.model;
+-
+-public class Address {
+-    private String city;
+-
+-}
+diff --git a/core/deployment/src/test/java/io/quarkus/deployment/dev/recompile_dependencies/model/ContactMapper.java b/core/deployment/src/test/java/io/quarkus/deployment/dev/recompile_dependencies/model/ContactMapper.java
+deleted file mode 100644
+index a24f0edf368..00000000000
+--- a/core/deployment/src/test/java/io/quarkus/deployment/dev/recompile_dependencies/model/ContactMapper.java
++++ /dev/null
+@@ -1,5 +0,0 @@
+-package io.quarkus.deployment.dev.recompile_dependencies.model;
+-
+-public interface ContactMapper {
+-    void mapToData(Address contact);
+-}
+diff --git a/core/deployment/src/test/java/io/quarkus/deployment/dev/recompile_dependencies/model/ContactMapperWhichIsDetectedMultipleTimes.java b/core/deployment/src/test/java/io/quarkus/deployment/dev/recompile_dependencies/model/ContactMapperWhichIsDetectedMultipleTimes.java
+deleted file mode 100644
+index 734345f0e5f..00000000000
+--- a/core/deployment/src/test/java/io/quarkus/deployment/dev/recompile_dependencies/model/ContactMapperWhichIsDetectedMultipleTimes.java
++++ /dev/null
+@@ -1,4 +0,0 @@
+-package io.quarkus.deployment.dev.recompile_dependencies.model;
+-
+-public interface ContactMapperWhichIsDetectedMultipleTimes extends ContactMapper {
+-}
+diff --git a/integration-tests/devmode/src/test/java/io/quarkus/test/reload/AddressData.java b/integration-tests/devmode/src/test/java/io/quarkus/test/reload/AddressData.java
+deleted file mode 100644
+index d149c96c68e..00000000000
+--- a/integration-tests/devmode/src/test/java/io/quarkus/test/reload/AddressData.java
++++ /dev/null
+@@ -1,7 +0,0 @@
+-package io.quarkus.test.reload;
+-
+-public class AddressData {
+-    public String name1;
+-
+-    public ContactData contactData;
+-}
+diff --git a/integration-tests/devmode/src/test/java/io/quarkus/test/reload/AddressMapper.java b/integration-tests/devmode/src/test/java/io/quarkus/test/reload/AddressMapper.java
+deleted file mode 100644
+index e2977f008ef..00000000000
+--- a/integration-tests/devmode/src/test/java/io/quarkus/test/reload/AddressMapper.java
++++ /dev/null
+@@ -1,11 +0,0 @@
+-package io.quarkus.test.reload;
+-
+-import jakarta.enterprise.context.ApplicationScoped;
+-
+-@ApplicationScoped
+-public class AddressMapper {
+-
+-    public String map(AddressData address) {
+-        return address.name1;
+-    }
+-}
+diff --git a/integration-tests/devmode/src/test/java/io/quarkus/test/reload/ContactData.java b/integration-tests/devmode/src/test/java/io/quarkus/test/reload/ContactData.java
+deleted file mode 100644
+index 6b383dbb4c2..00000000000
+--- a/integration-tests/devmode/src/test/java/io/quarkus/test/reload/ContactData.java
++++ /dev/null
+@@ -1,4 +0,0 @@
+-package io.quarkus.test.reload;
+-
+-public class ContactData {
+-}
+diff --git a/integration-tests/devmode/src/test/java/io/quarkus/test/reload/RecompilationDependenciesBuildCompatibleExtension.java b/integration-tests/devmode/src/test/java/io/quarkus/test/reload/RecompilationDependenciesBuildCompatibleExtension.java
+deleted file mode 100644
+index a0472d47b38..00000000000
+--- a/integration-tests/devmode/src/test/java/io/quarkus/test/reload/RecompilationDependenciesBuildCompatibleExtension.java
++++ /dev/null
+@@ -1,21 +0,0 @@
+-package io.quarkus.test.reload;
+-
+-import java.util.Map;
+-import java.util.Set;
+-
+-import jakarta.enterprise.inject.build.compatible.spi.BuildCompatibleExtension;
+-import jakarta.enterprise.inject.build.compatible.spi.Discovery;
+-
+-import org.jboss.jandex.DotName;
+-
+-import io.quarkus.deployment.dev.RuntimeUpdatesProcessor;
+-
+-public class RecompilationDependenciesBuildCompatibleExtension implements BuildCompatibleExtension {
+-    @Discovery
+-    void x() {
+-        RuntimeUpdatesProcessor.INSTANCE.setClassToRecompilationTargets(Map.of(//
+-                DotName.createSimple(AddressData.class), Set.of(DotName.createSimple(AddressMapper.class)), //
+-                DotName.createSimple(ContactData.class), Set.of(DotName.createSimple(AddressMapper.class))//
+-        ));
+-    }
+-}
+diff --git a/integration-tests/devmode/src/test/java/io/quarkus/test/reload/RecompilationDependenciesDevModeTest.java b/integration-tests/devmode/src/test/java/io/quarkus/test/reload/RecompilationDependenciesDevModeTest.java
+deleted file mode 100644
+index acf415c7926..00000000000
+--- a/integration-tests/devmode/src/test/java/io/quarkus/test/reload/RecompilationDependenciesDevModeTest.java
++++ /dev/null
+@@ -1,119 +0,0 @@
+-package io.quarkus.test.reload;
+-
+-import static org.hamcrest.Matchers.greaterThan;
+-import static org.hamcrest.Matchers.is;
+-
+-import java.io.IOException;
+-import java.net.URISyntaxException;
+-import java.nio.file.Files;
+-import java.util.Map;
+-import java.util.logging.LogRecord;
+-
+-import jakarta.enterprise.context.ApplicationScoped;
+-import jakarta.ws.rs.GET;
+-import jakarta.ws.rs.Path;
+-import jakarta.ws.rs.Produces;
+-import jakarta.ws.rs.core.MediaType;
+-
+-import org.jboss.shrinkwrap.api.asset.StringAsset;
+-import org.junit.jupiter.api.Assertions;
+-import org.junit.jupiter.api.Test;
+-import org.junit.jupiter.api.extension.RegisterExtension;
+-
+-import io.quarkus.commons.classloading.ClassLoaderHelper;
+-import io.quarkus.test.QuarkusDevModeTest;
+-import io.restassured.RestAssured;
+-import io.restassured.http.ContentType;
+-
+-class RecompilationDependenciesDevModeTest {
+-
+-    @RegisterExtension
+-    static final QuarkusDevModeTest TEST = new QuarkusDevModeTest()
+-            .withApplicationRoot((jar) -> jar
+-                    .addClass(AddressData.class)
+-                    .addClass(ContactData.class)
+-                    .addClass(AddressMapper.class)
+-                    .addClass(RecompilationDependenciesResource.class)
+-                    // load with TCCL so that arc can load this extension during build time
+-                    .addClass("io.quarkus.test.reload.RecompilationDependenciesBuildCompatibleExtension")
+-                    .addAsResource(new StringAsset("io.quarkus.test.reload.RecompilationDependenciesBuildCompatibleExtension"),
+-                            "META-INF/services/jakarta.enterprise.inject.build.compatible.spi.BuildCompatibleExtension")
+-                    .addAsResource(new StringAsset(
+-                            """
+-                                    quarkus.grpc.dev-mode.force-server-start=false
+-                                    """),
+-                            "application.properties"))
+-            .setLogRecordPredicate(r -> true);
+-
+-    // mostly meant as smoke test to ensure the recompile-dependencies has any effect
+-    // more testing is done as Unit Tests in RecompilationDependenciesProcessorTest
+-    // See also RecompilationDependenciesBuildCompatibleExtension, which acts as source of recompilation dependency tree
+-    // Since no extension is around to produce an actual RecompilationDependenciesBuildItem
+-    @Test
+-    void testDependencyChangeTriggersRecompilationOfRecompilationTargets() {
+-        Map<String, Long> originalFileTimes = RestAssured.given().accept(ContentType.JSON)
+-                .get("/recompile-dependencies/test").then().extract().body()
+-                .as(Map.class);
+-
+-        // just a file change to make quarkus hot reload on next rest call
+-        TEST.modifySourceFile(ContactData.class, oldSource -> oldSource.replace(
+-                "}",
+-                "public String email;}"));
+-
+-        // ContactData -> AddressMapper recompile
+-        // but not AddressData
+-        // since not present in builditems
+-
+-        // First check that both files have been recompiled
+-        RestAssured.given().accept(ContentType.JSON).get("/recompile-dependencies/test").then()
+-                .body(AddressData.class.getSimpleName(), is(originalFileTimes.get(AddressData.class.getSimpleName())))
+-                .body(ContactData.class.getSimpleName(), greaterThan(originalFileTimes.get(ContactData.class.getSimpleName())))
+-                .body(AddressMapper.class.getSimpleName(),
+-                        greaterThan(originalFileTimes.get(AddressMapper.class.getSimpleName())));
+-
+-        // and just to be safe, check that this is also presented to user
+-        boolean found = false;
+-        for (LogRecord logRecord : TEST.getLogRecords()) {
+-            if (logRecord.getLoggerName().equals("io.quarkus.deployment.dev.RuntimeUpdatesProcessor")
+-                    && (logRecord.getParameters()[0].equals("AddressMapper.class, ContactData.class")
+-                            || logRecord.getParameters()[0].equals("ContactData.class, AddressMapper.class"))) {
+-                found = true;
+-            }
+-        }
+-        Assertions.assertTrue(found, "Did not find a log record from RuntimeUpdatesProcessor for AddressMapper class");
+-    }
+-
+-    @ApplicationScoped
+-    @Path("/recompile-dependencies")
+-    public static class RecompilationDependenciesResource {
+-
+-        @GET
+-        @Path("/test")
+-        @Produces(MediaType.WILDCARD)
+-        public String test() throws URISyntaxException, IOException {
+-
+-            return """
+-                    {
+-                        "%s": %s,
+-                        "%s": %s,
+-                        "%s": %s
+-                    }
+-                    """.formatted(//
+-                    AddressData.class.getSimpleName(), fileTime(AddressData.class), //
+-                    ContactData.class.getSimpleName(), fileTime(ContactData.class), //
+-                    AddressMapper.class.getSimpleName(), fileTime(AddressMapper.class)//
+-            );
+-        }
+-
+-        private long fileTime(Class<?> clazz) throws URISyntaxException, IOException {
+-            return Files.getLastModifiedTime(pathToClass(clazz))
+-                    .toMillis();
+-        }
+-
+-        private static java.nio.file.Path pathToClass(Class<?> clazz) throws URISyntaxException {
+-            return java.nio.file.Path
+-                    .of(clazz.getClassLoader().getResource(ClassLoaderHelper.fromClassNameToResourceName(clazz.getName()))
+-                            .toURI());
+-        }
+-    }
+-}

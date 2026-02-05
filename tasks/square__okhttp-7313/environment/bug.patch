@@ -1,0 +1,463 @@
+diff --git a/mockwebserver-deprecated/src/main/kotlin/okhttp3/mockwebserver/bridge.kt b/mockwebserver-deprecated/src/main/kotlin/okhttp3/mockwebserver/bridge.kt
+index 5fa1ce1a6..326110580 100644
+--- a/mockwebserver-deprecated/src/main/kotlin/okhttp3/mockwebserver/bridge.kt
++++ b/mockwebserver-deprecated/src/main/kotlin/okhttp3/mockwebserver/bridge.kt
+@@ -61,10 +61,6 @@ internal fun MockResponse.wrap(): mockwebserver3.MockResponse {
+       result.add100Continue()
+       mockwebserver3.SocketPolicy.KEEP_OPEN
+     }
+-    SocketPolicy.UPGRADE_TO_SSL_AT_END -> {
+-      result.inTunnel()
+-      mockwebserver3.SocketPolicy.KEEP_OPEN
+-    }
+     else -> socketPolicy.wrap()
+   }
+   result.http2ErrorCode = http2ErrorCode
+diff --git a/mockwebserver/src/main/kotlin/mockwebserver3/MockResponse.kt b/mockwebserver/src/main/kotlin/mockwebserver3/MockResponse.kt
+index bfe09425e..f5dce3d23 100644
+--- a/mockwebserver/src/main/kotlin/mockwebserver3/MockResponse.kt
++++ b/mockwebserver/src/main/kotlin/mockwebserver3/MockResponse.kt
+@@ -25,9 +25,6 @@ import okio.Buffer
+ 
+ /** A scripted response to be replayed by the mock web server. */
+ class MockResponse : Cloneable {
+-  var inTunnel = false
+-    private set
+-
+   var informationalResponses: List<MockResponse> = listOf()
+     private set
+ 
+@@ -365,18 +362,6 @@ class MockResponse : Cloneable {
+     webSocketListener = listener
+   }
+ 
+-  /**
+-   * Configures this response to be served as a response to an HTTP CONNECT request, either for
+-   * doing HTTPS through an HTTP proxy, or HTTP/2 prior knowledge through an HTTP proxy.
+-   *
+-   * When a new connection is received, all in-tunnel responses are served before the connection is
+-   * upgraded to HTTPS or HTTP/2.
+-   */
+-  fun inTunnel() = apply {
+-    removeHeader("Content-Length")
+-    inTunnel = true
+-  }
+-
+   /**
+    * Adds an HTTP 1xx response to precede this response. Note that this response's
+    * [headers delay][setHeadersDelay] applies after this response is transmitted. Set a
+diff --git a/mockwebserver/src/main/kotlin/mockwebserver3/MockWebServer.kt b/mockwebserver/src/main/kotlin/mockwebserver3/MockWebServer.kt
+index 5add3a87a..c3d99dcc3 100644
+--- a/mockwebserver/src/main/kotlin/mockwebserver3/MockWebServer.kt
++++ b/mockwebserver/src/main/kotlin/mockwebserver3/MockWebServer.kt
+@@ -58,6 +58,7 @@ import mockwebserver3.SocketPolicy.SHUTDOWN_INPUT_AT_END
+ import mockwebserver3.SocketPolicy.SHUTDOWN_OUTPUT_AT_END
+ import mockwebserver3.SocketPolicy.SHUTDOWN_SERVER_AFTER_RESPONSE
+ import mockwebserver3.SocketPolicy.STALL_SOCKET_AT_START
++import mockwebserver3.SocketPolicy.UPGRADE_TO_SSL_AT_END
+ import mockwebserver3.internal.duplex.DuplexResponseBody
+ import okhttp3.Headers
+ import okhttp3.Headers.Companion.headersOf
+@@ -131,6 +132,7 @@ class MockWebServer : Closeable {
+ 
+   private var serverSocket: ServerSocket? = null
+   private var sslSocketFactory: SSLSocketFactory? = null
++  private var tunnelProxy: Boolean = false
+   private var clientAuth = CLIENT_AUTH_NONE
+ 
+   /**
+@@ -281,6 +283,7 @@ class MockWebServer : Closeable {
+    */
+   fun useHttps(sslSocketFactory: SSLSocketFactory, tunnelProxy: Boolean) {
+     this.sslSocketFactory = sslSocketFactory
++    this.tunnelProxy = tunnelProxy
+   }
+ 
+   /**
+@@ -481,13 +484,14 @@ class MockWebServer : Closeable {
+ 
+     @Throws(Exception::class)
+     fun handle() {
+-      if (!processTunnelRequests()) return
+-
+       val socketPolicy = dispatcher.peek().socketPolicy
+-      val protocol: Protocol
++      var protocol = Protocol.HTTP_1_1
+       val socket: Socket
+       when {
+         sslSocketFactory != null -> {
++          if (tunnelProxy) {
++            createTunnel()
++          }
+           if (socketPolicy === FAIL_HANDSHAKE) {
+             dispatchBookkeepingRequest(sequenceNumber, raw)
+             processHandshakeFailure(raw)
+@@ -513,23 +517,17 @@ class MockWebServer : Closeable {
+ 
+           if (protocolNegotiationEnabled) {
+             val protocolString = Platform.get().getSelectedProtocol(sslSocket)
+-            protocol = when {
+-              protocolString != null -> Protocol.get(protocolString)
+-              else -> Protocol.HTTP_1_1
+-            }
++            protocol =
++              if (protocolString != null) Protocol.get(protocolString) else Protocol.HTTP_1_1
+             Platform.get().afterHandshake(sslSocket)
+-          } else {
+-            protocol = Protocol.HTTP_1_1
+           }
+           openClientSockets.remove(raw)
+         }
+-        else -> {
+-          protocol = when {
+-            Protocol.H2_PRIOR_KNOWLEDGE in protocols -> Protocol.H2_PRIOR_KNOWLEDGE
+-            else -> Protocol.HTTP_1_1
+-          }
++        Protocol.H2_PRIOR_KNOWLEDGE in protocols -> {
+           socket = raw
++          protocol = Protocol.H2_PRIOR_KNOWLEDGE
+         }
++        else -> socket = raw
+       }
+ 
+       if (socketPolicy === STALL_SOCKET_AT_START) {
+@@ -568,26 +566,17 @@ class MockWebServer : Closeable {
+     }
+ 
+     /**
+-     * Respond to `CONNECT` requests until a non-tunnel response is peeked. Returns true if further
+-     * calls should be attempted on the socket.
++     * Respond to CONNECT requests until a SWITCH_TO_SSL_AT_END response is
++     * dispatched.
+      */
+     @Throws(IOException::class, InterruptedException::class)
+-    private fun processTunnelRequests(): Boolean {
+-      if (!dispatcher.peek().inTunnel) return true // No tunnel requests.
+-
++    private fun createTunnel() {
+       val source = raw.source().buffer()
+       val sink = raw.sink().buffer()
+       while (true) {
+-        val socketStillGood = processOneRequest(raw, source, sink)
+-
+-        // Clean up after the last exchange on a socket.
+-        if (!socketStillGood) {
+-          raw.close()
+-          openClientSockets.remove(raw)
+-          return false
+-        }
+-
+-        if (!dispatcher.peek().inTunnel) return true // No more tunnel requests.
++        val socketPolicy = dispatcher.peek().socketPolicy
++        check(processOneRequest(raw, source, sink)) { "Tunnel without any CONNECT!" }
++        if (socketPolicy === UPGRADE_TO_SSL_AT_END) return
+       }
+     }
+ 
+diff --git a/mockwebserver/src/main/kotlin/mockwebserver3/SocketPolicy.kt b/mockwebserver/src/main/kotlin/mockwebserver3/SocketPolicy.kt
+index 6ac2c5aef..0071a0ad2 100644
+--- a/mockwebserver/src/main/kotlin/mockwebserver3/SocketPolicy.kt
++++ b/mockwebserver/src/main/kotlin/mockwebserver3/SocketPolicy.kt
+@@ -51,6 +51,12 @@ enum class SocketPolicy {
+    */
+   DISCONNECT_AT_END,
+ 
++  /**
++   * Wrap the socket with SSL at the completion of this request/response pair. Used for CONNECT
++   * messages to tunnel SSL over an HTTP proxy.
++   */
++  UPGRADE_TO_SSL_AT_END,
++
+   /**
+    * Request immediate close of connection without even reading the request. Use to simulate buggy
+    * SSL servers closing connections in response to unrecognized TLS extensions.
+diff --git a/okhttp/src/jvmTest/java/okhttp3/CallTest.kt b/okhttp/src/jvmTest/java/okhttp3/CallTest.kt
+index ed9be3ebd..75c030bb1 100644
+--- a/okhttp/src/jvmTest/java/okhttp3/CallTest.kt
++++ b/okhttp/src/jvmTest/java/okhttp3/CallTest.kt
+@@ -2910,7 +2910,8 @@ open class CallTest(
+     server.useHttps(handshakeCertificates.sslSocketFactory(), true)
+     server.enqueue(
+       MockResponse()
+-        .inTunnel()
++        .setSocketPolicy(SocketPolicy.UPGRADE_TO_SSL_AT_END)
++        .clearHeaders()
+     )
+     server.enqueue(
+       MockResponse()
+@@ -2979,13 +2980,13 @@ open class CallTest(
+     server.useHttps(handshakeCertificates.sslSocketFactory(), true)
+     server.enqueue(
+       MockResponse()
+-        .inTunnel()
+         .setResponseCode(407)
+         .addHeader("Proxy-Authenticate: Basic realm=\"localhost\"")
+     )
+     server.enqueue(
+       MockResponse()
+-        .inTunnel()
++        .setSocketPolicy(SocketPolicy.UPGRADE_TO_SSL_AT_END)
++        .clearHeaders()
+     )
+     server.enqueue(
+       MockResponse()
+@@ -3049,14 +3050,14 @@ open class CallTest(
+     server.protocols = listOf<Protocol>(Protocol.HTTP_1_1)
+     server.enqueue(
+       MockResponse()
+-        .inTunnel()
+         .setResponseCode(407)
+         .addHeader("Proxy-Authenticate: Basic realm=\"localhost\"")
+         .addHeader("Connection: close")
+     )
+     server.enqueue(
+       MockResponse()
+-        .inTunnel()
++        .setSocketPolicy(SocketPolicy.UPGRADE_TO_SSL_AT_END)
++        .clearHeaders()
+     )
+     server.enqueue(
+       MockResponse()
+@@ -3122,7 +3123,8 @@ open class CallTest(
+     server.useHttps(handshakeCertificates.sslSocketFactory(), true)
+     server.enqueue(
+       MockResponse()
+-        .inTunnel()
++        .setSocketPolicy(SocketPolicy.UPGRADE_TO_SSL_AT_END)
++        .clearHeaders()
+     )
+     server.enqueue(
+       MockResponse()
+@@ -3153,7 +3155,8 @@ open class CallTest(
+     server.useHttps(handshakeCertificates.sslSocketFactory(), true)
+     server.enqueue(
+       MockResponse()
+-        .inTunnel()
++        .setSocketPolicy(SocketPolicy.UPGRADE_TO_SSL_AT_END)
++        .clearHeaders()
+     )
+     server.enqueue(
+       MockResponse()
+@@ -3194,14 +3197,14 @@ open class CallTest(
+     server.useHttps(handshakeCertificates.sslSocketFactory(), true)
+     server.enqueue(
+       MockResponse()
+-        .inTunnel()
+         .setResponseCode(HttpURLConnection.HTTP_PROXY_AUTH)
+         .addHeader("Proxy-Authenticate", "Basic realm=\"localhost\"")
+         .setBody("proxy auth required")
+     )
+     server.enqueue(
+       MockResponse()
+-        .inTunnel()
++        .setSocketPolicy(SocketPolicy.UPGRADE_TO_SSL_AT_END)
++        .clearHeaders()
+     )
+     server.enqueue(MockResponse())
+     val challengeSchemes: MutableList<String?> = ArrayList()
+@@ -3237,7 +3240,6 @@ open class CallTest(
+     server.useHttps(handshakeCertificates.sslSocketFactory(), true)
+     server.enqueue(
+       MockResponse()
+-        .inTunnel()
+         .setSocketPolicy(SocketPolicy.DISCONNECT_AFTER_REQUEST)
+     )
+     client = client.newBuilder()
+@@ -3596,7 +3598,8 @@ open class CallTest(
+     }
+     server.enqueue(
+       MockResponse()
+-        .inTunnel()
++        .setSocketPolicy(SocketPolicy.UPGRADE_TO_SSL_AT_END)
++        .clearHeaders()
+     )
+     client = client.newBuilder()
+       .sslSocketFactory(
+diff --git a/okhttp/src/jvmTest/java/okhttp3/EventListenerTest.java b/okhttp/src/jvmTest/java/okhttp3/EventListenerTest.java
+index cd80520ae..7a8457049 100644
+--- a/okhttp/src/jvmTest/java/okhttp3/EventListenerTest.java
++++ b/okhttp/src/jvmTest/java/okhttp3/EventListenerTest.java
+@@ -696,12 +696,11 @@ public final class EventListenerTest {
+   @Test public void authenticatingTunnelProxyConnect() throws IOException {
+     enableTlsWithTunnel(true);
+     server.enqueue(new MockResponse()
+-        .inTunnel()
+         .setResponseCode(407)
+         .addHeader("Proxy-Authenticate: Basic realm=\"localhost\"")
+         .addHeader("Connection: close"));
+     server.enqueue(new MockResponse()
+-        .inTunnel());
++        .setSocketPolicy(SocketPolicy.UPGRADE_TO_SSL_AT_END));
+     server.enqueue(new MockResponse());
+ 
+     client = client.newBuilder()
+@@ -769,7 +768,7 @@ public final class EventListenerTest {
+   @Test public void secureConnectWithTunnel() throws IOException {
+     enableTlsWithTunnel(true);
+     server.enqueue(new MockResponse()
+-        .inTunnel());
++        .setSocketPolicy(SocketPolicy.UPGRADE_TO_SSL_AT_END));
+     server.enqueue(new MockResponse());
+ 
+     client = client.newBuilder()
+diff --git a/okhttp/src/jvmTest/java/okhttp3/URLConnectionTest.kt b/okhttp/src/jvmTest/java/okhttp3/URLConnectionTest.kt
+index 24f6b92ba..ff1e5a84e 100644
+--- a/okhttp/src/jvmTest/java/okhttp3/URLConnectionTest.kt
++++ b/okhttp/src/jvmTest/java/okhttp3/URLConnectionTest.kt
+@@ -910,7 +910,8 @@ class URLConnectionTest {
+     server.useHttps(handshakeCertificates.sslSocketFactory(), true)
+     server.enqueue(
+       MockResponse()
+-        .inTunnel()
++        .setSocketPolicy(SocketPolicy.UPGRADE_TO_SSL_AT_END)
++        .clearHeaders()
+     )
+     server.enqueue(
+       MockResponse()
+@@ -944,11 +945,10 @@ class URLConnectionTest {
+     initResponseCache()
+     server.useHttps(handshakeCertificates.sslSocketFactory(), true)
+     // The inclusion of a body in the response to a CONNECT is key to reproducing b/6754912.
+-    server.enqueue(
+-      MockResponse()
+-        .inTunnel()
+-        .setBody("bogus proxy connect response content")
+-    )
++    val badProxyResponse = MockResponse()
++      .setSocketPolicy(SocketPolicy.UPGRADE_TO_SSL_AT_END)
++      .setBody("bogus proxy connect response content")
++    server.enqueue(badProxyResponse)
+     server.enqueue(
+       MockResponse()
+         .setBody("response")
+@@ -991,7 +991,8 @@ class URLConnectionTest {
+     server.useHttps(handshakeCertificates.sslSocketFactory(), true)
+     server.enqueue(
+       MockResponse()
+-        .inTunnel()
++        .setSocketPolicy(SocketPolicy.UPGRADE_TO_SSL_AT_END)
++        .clearHeaders()
+     )
+     server.enqueue(
+       MockResponse()
+@@ -1030,13 +1031,13 @@ class URLConnectionTest {
+     server.useHttps(handshakeCertificates.sslSocketFactory(), true)
+     server.enqueue(
+       MockResponse()
+-        .inTunnel()
+         .setResponseCode(407)
+         .addHeader("Proxy-Authenticate: Basic realm=\"localhost\"")
+     )
+     server.enqueue(
+       MockResponse()
+-        .inTunnel()
++        .setSocketPolicy(SocketPolicy.UPGRADE_TO_SSL_AT_END)
++        .clearHeaders()
+     )
+     server.enqueue(
+       MockResponse()
+@@ -1075,7 +1076,8 @@ class URLConnectionTest {
+     server.useHttps(handshakeCertificates.sslSocketFactory(), true)
+     server.enqueue(
+       MockResponse()
+-        .inTunnel()
++        .setSocketPolicy(SocketPolicy.UPGRADE_TO_SSL_AT_END)
++        .clearHeaders()
+     )
+     server.enqueue(
+       MockResponse()
+@@ -1104,7 +1106,8 @@ class URLConnectionTest {
+     server.useHttps(socketFactory, true)
+     server.enqueue(
+       MockResponse()
+-        .inTunnel()
++        .setSocketPolicy(SocketPolicy.UPGRADE_TO_SSL_AT_END)
++        .clearHeaders()
+     )
+     server.enqueue(
+       MockResponse()
+diff --git a/okhttp/src/jvmTest/java/okhttp3/internal/http2/HttpOverHttp2Test.kt b/okhttp/src/jvmTest/java/okhttp3/internal/http2/HttpOverHttp2Test.kt
+index faa0c08e2..84ff3ac1a 100644
+--- a/okhttp/src/jvmTest/java/okhttp3/internal/http2/HttpOverHttp2Test.kt
++++ b/okhttp/src/jvmTest/java/okhttp3/internal/http2/HttpOverHttp2Test.kt
+@@ -76,7 +76,6 @@ import okio.BufferedSink
+ import okio.GzipSink
+ import okio.buffer
+ import org.assertj.core.api.Assertions.assertThat
+-import org.assertj.core.api.Assumptions.assumeThat
+ import org.assertj.core.data.Offset
+ import org.junit.jupiter.api.AfterEach
+ import org.junit.jupiter.api.Assertions.fail
+@@ -155,7 +154,7 @@ class HttpOverHttp2Test {
+ 
+   @ParameterizedTest
+   @ArgumentsSource(ProtocolParamProvider::class)
+-  fun get(protocol: Protocol, mockWebServer: MockWebServer) {
++  operator fun get(protocol: Protocol, mockWebServer: MockWebServer) {
+     setUp(protocol, mockWebServer)
+     server.enqueue(
+       MockResponse()
+@@ -1843,11 +1842,13 @@ class HttpOverHttp2Test {
+     val queueDispatcher = QueueDispatcher()
+     queueDispatcher.enqueueResponse(
+       MockResponse()
+-        .inTunnel()
++        .setSocketPolicy(SocketPolicy.UPGRADE_TO_SSL_AT_END)
++        .clearHeaders()
+     )
+     queueDispatcher.enqueueResponse(
+       MockResponse()
+-        .inTunnel()
++        .setSocketPolicy(SocketPolicy.UPGRADE_TO_SSL_AT_END)
++        .clearHeaders()
+     )
+     queueDispatcher.enqueueResponse(
+       MockResponse()
+@@ -2025,47 +2026,6 @@ class HttpOverHttp2Test {
+     assertThat(recordedRequest.failure).hasMessage("stream was reset: CANCEL")
+   }
+ 
+-  @ParameterizedTest
+-  @ArgumentsSource(ProtocolParamProvider::class)
+-  fun http2WithProxy(protocol: Protocol, mockWebServer: MockWebServer) {
+-    // TODO(jwilson): fix H2_PRIOR_KNOWLEDGE
+-    assumeThat(protocol).isEqualTo(Protocol.HTTP_2)
+-
+-    setUp(protocol, mockWebServer)
+-    server.enqueue(
+-      MockResponse()
+-        .inTunnel()
+-    )
+-    server.enqueue(
+-      MockResponse()
+-        .setBody("ABCDE")
+-        .setStatus("HTTP/1.1 200 Sweet")
+-    )
+-    val client = client.newBuilder()
+-      .proxy(server.toProxyAddress())
+-      .build()
+-
+-    val call = client.newCall(
+-      Request(
+-        server.url("/").resolve("//android.com/foo")!!
+-      )
+-    )
+-
+-    val response = call.execute()
+-    assertThat(response.body.string()).isEqualTo("ABCDE")
+-    assertThat(response.code).isEqualTo(200)
+-    assertThat(response.message).isEqualTo("")
+-    assertThat(response.protocol).isEqualTo(protocol)
+-
+-    val tunnelRequest = server.takeRequest()
+-    assertThat(tunnelRequest.requestLine).isEqualTo("CONNECT android.com:443 HTTP/1.1")
+-
+-    val request = server.takeRequest()
+-    assertThat(request.requestLine).isEqualTo("GET /foo HTTP/1.1")
+-    assertThat(request.getHeader(":scheme")).isEqualTo(scheme)
+-    assertThat(request.getHeader(":authority")).isEqualTo("android.com")
+-  }
+-
+   companion object {
+     // Flaky https://github.com/square/okhttp/issues/4632
+     // Flaky https://github.com/square/okhttp/issues/4633

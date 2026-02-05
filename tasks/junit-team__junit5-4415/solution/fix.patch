@@ -1,0 +1,203 @@
+diff --git a/junit-jupiter-api/src/main/java/org/junit/jupiter/api/extension/ClassTemplateInvocationLifecycleMethod.java b/junit-jupiter-api/src/main/java/org/junit/jupiter/api/extension/ClassTemplateInvocationLifecycleMethod.java
+index ed311c323..8f2dd238d 100644
+--- a/junit-jupiter-api/src/main/java/org/junit/jupiter/api/extension/ClassTemplateInvocationLifecycleMethod.java
++++ b/junit-jupiter-api/src/main/java/org/junit/jupiter/api/extension/ClassTemplateInvocationLifecycleMethod.java
+@@ -32,8 +32,14 @@ import org.apiguardian.api.API;
+ public @interface ClassTemplateInvocationLifecycleMethod {
+ 
+ 	/**
+-	 * The actual annotation class for reporting of discovery issues.
++	 * The corresponding {@link org.junit.jupiter.api.ClassTemplate}-derived
++	 * annotation class.
+ 	 */
+-	Class<? extends Annotation> value();
++	Class<? extends Annotation> classTemplateAnnotation();
++
++	/**
++	 * The actual lifecycle method annotation class.
++	 */
++	Class<? extends Annotation> lifecycleMethodAnnotation();
+ 
+ }
+diff --git a/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/descriptor/ClassBasedTestDescriptor.java b/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/descriptor/ClassBasedTestDescriptor.java
+index 7186b34f3..eb4a5141c 100644
+--- a/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/descriptor/ClassBasedTestDescriptor.java
++++ b/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/descriptor/ClassBasedTestDescriptor.java
+@@ -133,12 +133,21 @@ public abstract class ClassBasedTestDescriptor extends JupiterTestDescriptor
+ 	// --- Validatable ---------------------------------------------------------
+ 
+ 	@Override
+-	public void validate(DiscoveryIssueReporter reporter) {
++	public final void validate(DiscoveryIssueReporter reporter) {
++		validateCoreLifecycleMethods(reporter);
++		validateClassTemplateInvocationLifecycleMethods(reporter);
++	}
++
++	protected void validateCoreLifecycleMethods(DiscoveryIssueReporter reporter) {
+ 		List<DiscoveryIssue> discoveryIssues = this.lifecycleMethods.discoveryIssues;
+ 		discoveryIssues.forEach(reporter::reportIssue);
+ 		discoveryIssues.clear();
+ 	}
+ 
++	protected void validateClassTemplateInvocationLifecycleMethods(DiscoveryIssueReporter reporter) {
++		LifecycleMethodUtils.validateNoClassTemplateInvocationLifecycleMethodsAreDeclared(getTestClass(), reporter);
++	}
++
+ 	// --- Node ----------------------------------------------------------------
+ 
+ 	@Override
+diff --git a/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/descriptor/ClassTemplateTestDescriptor.java b/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/descriptor/ClassTemplateTestDescriptor.java
+index b91c39bb4..b3be1dfa5 100644
+--- a/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/descriptor/ClassTemplateTestDescriptor.java
++++ b/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/descriptor/ClassTemplateTestDescriptor.java
+@@ -14,7 +14,7 @@ import static java.util.stream.Collectors.toCollection;
+ import static java.util.stream.Collectors.toList;
+ import static org.apiguardian.api.API.Status.INTERNAL;
+ import static org.junit.jupiter.api.TestInstance.Lifecycle.PER_METHOD;
+-import static org.junit.jupiter.engine.descriptor.LifecycleMethodUtils.validateClassTemplateInvocationLifecycleMethods;
++import static org.junit.jupiter.engine.descriptor.LifecycleMethodUtils.validateClassTemplateInvocationLifecycleMethodsAreDeclaredCorrectly;
+ 
+ import java.util.ArrayList;
+ import java.util.Collection;
+@@ -80,10 +80,14 @@ public class ClassTemplateTestDescriptor extends ClassBasedTestDescriptor implem
+ 	// --- Validatable ---------------------------------------------------------
+ 
+ 	@Override
+-	public void validate(DiscoveryIssueReporter reporter) {
+-		this.delegate.validate(reporter);
++	protected void validateCoreLifecycleMethods(DiscoveryIssueReporter reporter) {
++		this.delegate.validateCoreLifecycleMethods(reporter);
++	}
++
++	@Override
++	protected void validateClassTemplateInvocationLifecycleMethods(DiscoveryIssueReporter reporter) {
+ 		boolean requireStatic = this.classInfo.lifecycle == PER_METHOD;
+-		validateClassTemplateInvocationLifecycleMethods(getTestClass(), requireStatic, reporter);
++		validateClassTemplateInvocationLifecycleMethodsAreDeclaredCorrectly(getTestClass(), requireStatic, reporter);
+ 	}
+ 
+ 	// --- Filterable ----------------------------------------------------------
+diff --git a/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/descriptor/LifecycleMethodUtils.java b/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/descriptor/LifecycleMethodUtils.java
+index 7eee75e47..5103639ab 100644
+--- a/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/descriptor/LifecycleMethodUtils.java
++++ b/junit-jupiter-engine/src/main/java/org/junit/jupiter/engine/descriptor/LifecycleMethodUtils.java
+@@ -11,12 +11,14 @@
+ package org.junit.jupiter.engine.descriptor;
+ 
+ import static org.junit.platform.commons.support.AnnotationSupport.findAnnotatedMethods;
++import static org.junit.platform.commons.support.AnnotationSupport.findAnnotation;
+ import static org.junit.platform.commons.util.CollectionUtils.toUnmodifiableList;
+ import static org.junit.platform.engine.support.discovery.DiscoveryIssueReporter.Condition.allOf;
+ 
+ import java.lang.annotation.Annotation;
+ import java.lang.reflect.Method;
+ import java.util.List;
++import java.util.Optional;
+ import java.util.function.Function;
+ import java.util.function.Supplier;
+ import java.util.stream.Stream;
+@@ -26,7 +28,6 @@ import org.junit.jupiter.api.AfterEach;
+ import org.junit.jupiter.api.BeforeAll;
+ import org.junit.jupiter.api.BeforeEach;
+ import org.junit.jupiter.api.extension.ClassTemplateInvocationLifecycleMethod;
+-import org.junit.platform.commons.support.AnnotationSupport;
+ import org.junit.platform.commons.support.HierarchyTraversalMode;
+ import org.junit.platform.commons.support.ModifierSupport;
+ import org.junit.platform.commons.util.ReflectionUtils;
+@@ -69,17 +70,24 @@ final class LifecycleMethodUtils {
+ 			issueReporter);
+ 	}
+ 
+-	static void validateClassTemplateInvocationLifecycleMethods(Class<?> testClass, boolean requireStatic,
++	static void validateNoClassTemplateInvocationLifecycleMethodsAreDeclared(Class<?> testClass,
+ 			DiscoveryIssueReporter issueReporter) {
+ 
+-		Stream<Method> allMethods = Stream.concat( //
+-			findAnnotatedMethods(testClass, ClassTemplateInvocationLifecycleMethod.class,
+-				HierarchyTraversalMode.TOP_DOWN).stream(), //
+-			findAnnotatedMethods(testClass, ClassTemplateInvocationLifecycleMethod.class,
+-				HierarchyTraversalMode.BOTTOM_UP).stream() //
+-		);
+-		allMethods //
+-				.distinct() //
++		findAllClassTemplateInvocationLifecycleMethods(testClass) //
++				.forEach(method -> findClassTemplateInvocationLifecycleMethodAnnotation(method) //
++						.ifPresent(annotation -> {
++							String message = String.format(
++								"@%s method '%s' must not be declared in test class '%s' because it is not annotated with @%s.",
++								annotation.lifecycleMethodAnnotation().getSimpleName(), method.toGenericString(),
++								testClass.getName(), annotation.classTemplateAnnotation().getSimpleName());
++							issueReporter.reportIssue(createIssue(Severity.ERROR, message, method));
++						}));
++	}
++
++	static void validateClassTemplateInvocationLifecycleMethodsAreDeclaredCorrectly(Class<?> testClass,
++			boolean requireStatic, DiscoveryIssueReporter issueReporter) {
++
++		findAllClassTemplateInvocationLifecycleMethods(testClass) //
+ 				.forEach(allOf( //
+ 					isNotPrivateError(issueReporter), //
+ 					returnsPrimitiveVoid(issueReporter,
+@@ -91,6 +99,16 @@ final class LifecycleMethodUtils {
+ 				));
+ 	}
+ 
++	private static Stream<Method> findAllClassTemplateInvocationLifecycleMethods(Class<?> testClass) {
++		Stream<Method> allMethods = Stream.concat( //
++			findAnnotatedMethods(testClass, ClassTemplateInvocationLifecycleMethod.class,
++				HierarchyTraversalMode.TOP_DOWN).stream(), //
++			findAnnotatedMethods(testClass, ClassTemplateInvocationLifecycleMethod.class,
++				HierarchyTraversalMode.BOTTOM_UP).stream() //
++		);
++		return allMethods.distinct();
++	}
++
+ 	private static List<Method> findMethodsAndCheckStatic(Class<?> testClass, boolean requireStatic,
+ 			Class<? extends Annotation> annotationType, HierarchyTraversalMode traversalMode,
+ 			DiscoveryIssueReporter issueReporter) {
+@@ -168,11 +186,17 @@ final class LifecycleMethodUtils {
+ 	}
+ 
+ 	private static String classTemplateInvocationLifecycleMethodAnnotationName(Method method) {
+-		return AnnotationSupport.findAnnotation(method, ClassTemplateInvocationLifecycleMethod.class) //
+-				.map(ClassTemplateInvocationLifecycleMethod::value).map(Class::getSimpleName) //
++		return findClassTemplateInvocationLifecycleMethodAnnotation(method) //
++				.map(ClassTemplateInvocationLifecycleMethod::lifecycleMethodAnnotation) //
++				.map(Class::getSimpleName) //
+ 				.orElseGet(ClassTemplateInvocationLifecycleMethod.class::getSimpleName);
+ 	}
+ 
++	private static Optional<ClassTemplateInvocationLifecycleMethod> findClassTemplateInvocationLifecycleMethodAnnotation(
++			Method method) {
++		return findAnnotation(method, ClassTemplateInvocationLifecycleMethod.class);
++	}
++
+ 	private static DiscoveryIssue createIssue(Severity severity, String message, Method method) {
+ 		return DiscoveryIssue.builder(severity, message).source(MethodSource.from(method)).build();
+ 	}
+diff --git a/junit-jupiter-params/src/main/java/org/junit/jupiter/params/AfterParameterizedClassInvocation.java b/junit-jupiter-params/src/main/java/org/junit/jupiter/params/AfterParameterizedClassInvocation.java
+index 112347a0b..b7cb8fd63 100644
+--- a/junit-jupiter-params/src/main/java/org/junit/jupiter/params/AfterParameterizedClassInvocation.java
++++ b/junit-jupiter-params/src/main/java/org/junit/jupiter/params/AfterParameterizedClassInvocation.java
+@@ -158,7 +158,7 @@ import org.junit.jupiter.params.aggregator.ArgumentsAccessor;
+ @Retention(RetentionPolicy.RUNTIME)
+ @Documented
+ @API(status = EXPERIMENTAL, since = "5.13")
+-@ClassTemplateInvocationLifecycleMethod(AfterParameterizedClassInvocation.class)
++@ClassTemplateInvocationLifecycleMethod(classTemplateAnnotation = ParameterizedClass.class, lifecycleMethodAnnotation = AfterParameterizedClassInvocation.class)
+ public @interface AfterParameterizedClassInvocation {
+ 
+ 	/**
+diff --git a/junit-jupiter-params/src/main/java/org/junit/jupiter/params/BeforeParameterizedClassInvocation.java b/junit-jupiter-params/src/main/java/org/junit/jupiter/params/BeforeParameterizedClassInvocation.java
+index 0ede11363..a71573eb1 100644
+--- a/junit-jupiter-params/src/main/java/org/junit/jupiter/params/BeforeParameterizedClassInvocation.java
++++ b/junit-jupiter-params/src/main/java/org/junit/jupiter/params/BeforeParameterizedClassInvocation.java
+@@ -159,7 +159,7 @@ import org.junit.jupiter.params.aggregator.ArgumentsAccessor;
+ @Retention(RetentionPolicy.RUNTIME)
+ @Documented
+ @API(status = EXPERIMENTAL, since = "5.13")
+-@ClassTemplateInvocationLifecycleMethod(BeforeParameterizedClassInvocation.class)
++@ClassTemplateInvocationLifecycleMethod(classTemplateAnnotation = ParameterizedClass.class, lifecycleMethodAnnotation = BeforeParameterizedClassInvocation.class)
+ public @interface BeforeParameterizedClassInvocation {
+ 
+ 	/**

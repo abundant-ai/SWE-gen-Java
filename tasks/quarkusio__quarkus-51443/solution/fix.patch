@@ -1,0 +1,184 @@
+diff --git a/extensions/kubernetes/vanilla/deployment/src/main/java/io/quarkus/kubernetes/deployment/AddNamespaceDecorator.java b/extensions/kubernetes/vanilla/deployment/src/main/java/io/quarkus/kubernetes/deployment/AddNamespaceDecorator.java
+index 30a3ed5d7d6..a374eb8e3dc 100644
+--- a/extensions/kubernetes/vanilla/deployment/src/main/java/io/quarkus/kubernetes/deployment/AddNamespaceDecorator.java
++++ b/extensions/kubernetes/vanilla/deployment/src/main/java/io/quarkus/kubernetes/deployment/AddNamespaceDecorator.java
+@@ -4,6 +4,7 @@
+ import java.util.Objects;
+ import java.util.stream.Collectors;
+ 
++import io.dekorate.kubernetes.decorator.AddSidecarDecorator;
+ import io.dekorate.kubernetes.decorator.Decorator;
+ import io.dekorate.kubernetes.decorator.ResourceProvidingDecorator;
+ import io.fabric8.kubernetes.api.model.HasMetadata;
+diff --git a/extensions/kubernetes/vanilla/deployment/src/main/java/io/quarkus/kubernetes/deployment/AddSidecarDecorator.java b/extensions/kubernetes/vanilla/deployment/src/main/java/io/quarkus/kubernetes/deployment/AddSidecarDecorator.java
+deleted file mode 100644
+index c2bfd91bf60..00000000000
+--- a/extensions/kubernetes/vanilla/deployment/src/main/java/io/quarkus/kubernetes/deployment/AddSidecarDecorator.java
++++ /dev/null
+@@ -1,42 +0,0 @@
+-package io.quarkus.kubernetes.deployment;
+-
+-import io.dekorate.kubernetes.adapter.ContainerAdapter;
+-import io.dekorate.kubernetes.config.Container;
+-import io.dekorate.kubernetes.decorator.Decorator;
+-import io.dekorate.kubernetes.decorator.NamedResourceDecorator;
+-import io.dekorate.kubernetes.decorator.ResourceProvidingDecorator;
+-import io.fabric8.kubernetes.api.model.ObjectMeta;
+-import io.fabric8.kubernetes.api.model.PodSpecBuilder;
+-
+-/**
+- * Copied from dekorate in order to fix some issues.
+- * TODO: This decorator should be removed and replaced by the Dekorate AddSidecarDecorator class after
+- * https://github.com/dekorateio/dekorate/pull/1234 is merged and Dekorate is bumped.
+- */
+-class AddSidecarDecorator extends NamedResourceDecorator<PodSpecBuilder> {
+-
+-    private final Container container;
+-
+-    public AddSidecarDecorator(Container container) {
+-        this(ANY, container);
+-    }
+-
+-    public AddSidecarDecorator(String deployment, Container container) {
+-        super(deployment);
+-        this.container = container;
+-    }
+-
+-    @Override
+-    public void andThenVisit(PodSpecBuilder podSpec, ObjectMeta resourceMeta) {
+-        // this was changed to use our patched adapter
+-        var sidecarContainer = ContainerAdapter.adapt(container);
+-        // This is necessary because of the issue that this pull request fixes https://github.com/dekorateio/dekorate/pull/1234
+-        sidecarContainer.setWorkingDir(container.getWorkingDir());
+-        podSpec.addToContainers(sidecarContainer);
+-    }
+-
+-    public Class<? extends Decorator>[] after() {
+-        return new Class[] { ResourceProvidingDecorator.class };
+-    }
+-
+-}
+diff --git a/extensions/kubernetes/vanilla/deployment/src/main/java/io/quarkus/kubernetes/deployment/KubernetesCommonHelper.java b/extensions/kubernetes/vanilla/deployment/src/main/java/io/quarkus/kubernetes/deployment/KubernetesCommonHelper.java
+index 910b1508378..54355af921f 100644
+--- a/extensions/kubernetes/vanilla/deployment/src/main/java/io/quarkus/kubernetes/deployment/KubernetesCommonHelper.java
++++ b/extensions/kubernetes/vanilla/deployment/src/main/java/io/quarkus/kubernetes/deployment/KubernetesCommonHelper.java
+@@ -50,6 +50,7 @@
+ import io.dekorate.kubernetes.decorator.AddReadinessProbeDecorator;
+ import io.dekorate.kubernetes.decorator.AddSecretVolumeDecorator;
+ import io.dekorate.kubernetes.decorator.AddSelectorToDeploymentSpecDecorator;
++import io.dekorate.kubernetes.decorator.AddSidecarDecorator;
+ import io.dekorate.kubernetes.decorator.AddStartupProbeDecorator;
+ import io.dekorate.kubernetes.decorator.ApplicationContainerDecorator;
+ import io.dekorate.kubernetes.decorator.ApplyArgsDecorator;
+@@ -217,7 +218,7 @@ public static void printMessageAboutPortsThatCantChange(String target, List<Kube
+             if (enabled) {
+                 String name = "quarkus." + target + ".ports." + port.getName() + ".container-port";
+                 Optional<Integer> value = Optional.ofNullable(configuration.ports().get(port.getName()))
+-                        .map(p -> p.containerPort())
++                        .map(PortConfig::containerPort)
+                         .filter(OptionalInt::isPresent)
+                         .map(OptionalInt::getAsInt);
+                 @SuppressWarnings({ "rawtypes", "unchecked" })
+@@ -579,14 +580,14 @@ private static Collection<DecoratorBuildItem> createLabelDecorators(String targe
+     private static List<DecoratorBuildItem> createCommandDecorator(String target, String name,
+             PlatformConfiguration config, Optional<KubernetesCommandBuildItem> command) {
+         List<DecoratorBuildItem> result = new ArrayList<>();
++        // If not, we use the command that has been provided in other extensions (if any).
+         if (config.command().isPresent()) {
+             // If command has been set in configuration, we use it
+             result.add(new DecoratorBuildItem(target,
+                     new ApplyCommandDecorator(name, config.command().get().toArray(new String[0]))));
+-        } else if (command.isPresent()) {
+-            // If not, we use the command that has been provided in other extensions (if any).
+-            result.add(new DecoratorBuildItem(target,
+-                    new ApplyCommandDecorator(name, command.get().getCommand().toArray(new String[0]))));
++        } else {
++            command.ifPresent(kubeCmdBI -> result.add(new DecoratorBuildItem(target,
++                    new ApplyCommandDecorator(name, kubeCmdBI.getCommand().toArray(new String[0])))));
+         }
+ 
+         return result;
+@@ -862,7 +863,7 @@ private static List<DecoratorBuildItem> createPodDecorators(String target, Strin
+         config.initContainers().entrySet().forEach(e -> result
+                 .add(new DecoratorBuildItem(target, new AddInitContainerDecorator(name, ContainerConverter.convert(e)))));
+ 
+-        config.getSidecars().entrySet().forEach(
++        config.sidecars().entrySet().forEach(
+                 e -> result.add(new DecoratorBuildItem(target, new AddSidecarDecorator(name, ContainerConverter.convert(e)))));
+ 
+         config.resources().limits().cpu()
+@@ -1065,7 +1066,7 @@ public static DecoratorBuildItem createProbeHttpPortDecorator(String name, Strin
+                 .or(() -> portName.map(KubernetesProbePortNameBuildItem::getName))
+                 .orElse(HTTP_PORT);
+ 
+-        Integer port;
++        int port;
+         PortConfig portFromConfig = portsFromConfig.get(httpPortName);
+         if (probeConfig.httpActionPort().isPresent()) {
+             port = probeConfig.httpActionPort().get();
+@@ -1086,12 +1087,12 @@ public static DecoratorBuildItem createProbeHttpPortDecorator(String name, Strin
+             scheme = SCHEME_HTTPS;
+         } else if (portName.isPresent()
+                 && portName.get().getScheme() != null
+-                && portName.get().getName().equals(httpPortName)) {
++                && httpPortName.equals(portName.get().getName())) {
+             // 3. Extensions
+             scheme = portName.get().getScheme();
+         } else {
+             // 4. Using the port number.
+-            scheme = port != null && (port == 443 || port == 8443) ? SCHEME_HTTPS : SCHEME_HTTP;
++            scheme = port == 443 || port == 8443 ? SCHEME_HTTPS : SCHEME_HTTP;
+         }
+ 
+         // Applying to all deployments to mimic the same logic as the rest of probes in the method createProbeDecorators.
+diff --git a/extensions/kubernetes/vanilla/deployment/src/main/java/io/quarkus/kubernetes/deployment/OpenShiftConfig.java b/extensions/kubernetes/vanilla/deployment/src/main/java/io/quarkus/kubernetes/deployment/OpenShiftConfig.java
+index f58c57bc42e..5e58c855774 100644
+--- a/extensions/kubernetes/vanilla/deployment/src/main/java/io/quarkus/kubernetes/deployment/OpenShiftConfig.java
++++ b/extensions/kubernetes/vanilla/deployment/src/main/java/io/quarkus/kubernetes/deployment/OpenShiftConfig.java
+@@ -62,14 +62,6 @@ enum OpenshiftFlavor {
+      */
+     OptionalInt nodePort();
+ 
+-    /**
+-     * Sidecar containers
+-     *
+-     * @deprecated Use the {@code sidecars} property instead
+-     */
+-    @Deprecated
+-    Map<String, ContainerConfig> containers();
+-
+     /**
+      * OpenShift route configuration
+      */
+@@ -147,17 +139,4 @@ default DeploymentResourceKind getDeploymentResourceKind(Capabilities capabiliti
+         }
+         return (flavor() == OpenshiftFlavor.v3) ? DeploymentResourceKind.DeploymentConfig : DeploymentResourceKind.Deployment;
+     }
+-
+-    @Deprecated
+-    default Map<String, ContainerConfig> getSidecars() {
+-        if (!containerName().isEmpty() && !sidecars().isEmpty()) {
+-            // done in order to make migration to the new property straight-forward
+-            throw new IllegalStateException(
+-                    "'quarkus.openshift.sidecars' and 'quarkus.openshift.containers' cannot be used together. Please use the former as the latter has been deprecated");
+-        }
+-        if (!containers().isEmpty()) {
+-            return containers();
+-        }
+-        return sidecars();
+-    }
+ }
+diff --git a/extensions/kubernetes/vanilla/deployment/src/main/java/io/quarkus/kubernetes/deployment/PlatformConfiguration.java b/extensions/kubernetes/vanilla/deployment/src/main/java/io/quarkus/kubernetes/deployment/PlatformConfiguration.java
+index 51a8e40ab7f..5fdb213e3d1 100644
+--- a/extensions/kubernetes/vanilla/deployment/src/main/java/io/quarkus/kubernetes/deployment/PlatformConfiguration.java
++++ b/extensions/kubernetes/vanilla/deployment/src/main/java/io/quarkus/kubernetes/deployment/PlatformConfiguration.java
+@@ -247,9 +247,4 @@ public interface PlatformConfiguration extends EnvVarHolder {
+      * VCS URI annotation configuration.
+      */
+     VCSUriConfig vcsUri();
+-
+-    @Deprecated
+-    default Map<String, ContainerConfig> getSidecars() {
+-        return sidecars();
+-    }
+ }

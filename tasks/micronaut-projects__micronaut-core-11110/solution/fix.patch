@@ -1,0 +1,256 @@
+diff --git a/http-client/src/main/java/io/micronaut/http/client/netty/CompositeNettyClientCustomizer.java b/http-client/src/main/java/io/micronaut/http/client/netty/CompositeNettyClientCustomizer.java
+index aa2baf4cd2..1122e6bb2b 100644
+--- a/http-client/src/main/java/io/micronaut/http/client/netty/CompositeNettyClientCustomizer.java
++++ b/http-client/src/main/java/io/micronaut/http/client/netty/CompositeNettyClientCustomizer.java
+@@ -16,7 +16,9 @@
+ package io.micronaut.http.client.netty;
+ 
+ import io.micronaut.core.annotation.Internal;
++import io.micronaut.core.annotation.NonNull;
+ import io.micronaut.http.netty.AbstractCompositeCustomizer;
++import io.netty.bootstrap.Bootstrap;
+ import io.netty.channel.Channel;
+ 
+ import java.util.Collections;
+@@ -42,6 +44,11 @@ final class CompositeNettyClientCustomizer
+         return member.specializeForChannel(channel, role);
+     }
+ 
++    @Override
++    public @NonNull NettyClientCustomizer specializeForBootstrap(@NonNull Bootstrap bootstrap) {
++        return specialize(ch -> ch.specializeForBootstrap(bootstrap));
++    }
++
+     @Override
+     protected NettyClientCustomizer makeNewComposite(List<NettyClientCustomizer> members) {
+         return new CompositeNettyClientCustomizer(members);
+diff --git a/http-client/src/main/java/io/micronaut/http/client/netty/ConnectionManager.java b/http-client/src/main/java/io/micronaut/http/client/netty/ConnectionManager.java
+index 33899a5c31..62517dfb9a 100644
+--- a/http-client/src/main/java/io/micronaut/http/client/netty/ConnectionManager.java
++++ b/http-client/src/main/java/io/micronaut/http/client/netty/ConnectionManager.java
+@@ -141,6 +141,8 @@ import java.util.function.Supplier;
+ @Internal
+ public class ConnectionManager {
+ 
++    final NettyClientCustomizer clientCustomizer;
++
+     private final HttpVersionSelection httpVersion;
+     private final Logger log;
+     private final Map<DefaultHttpClient.RequestKey, Pool> pools = new ConcurrentHashMap<>();
+@@ -161,7 +163,6 @@ public class ConnectionManager {
+     private volatile SslContext sslContext;
+     private volatile /* QuicSslContext */ Object http3SslContext;
+     private volatile SslContext websocketSslContext;
+-    private final NettyClientCustomizer clientCustomizer;
+     private final String informationalServiceId;
+ 
+     /**
+@@ -438,7 +439,7 @@ public class ConnectionManager {
+      * @param channelInitializer The initializer to use
+      * @return Future that terminates when the TCP connection is established.
+      */
+-    ChannelFuture doConnect(DefaultHttpClient.RequestKey requestKey, ChannelInitializer<?> channelInitializer) {
++    ChannelFuture doConnect(DefaultHttpClient.RequestKey requestKey, CustomizerAwareInitializer channelInitializer) {
+         String host = requestKey.getHost();
+         int port = requestKey.getPort();
+         Bootstrap localBootstrap = bootstrap.clone();
+@@ -446,8 +447,10 @@ public class ConnectionManager {
+         if (proxy.type() != Proxy.Type.DIRECT) {
+             localBootstrap.resolver(NoopAddressResolverGroup.INSTANCE);
+         }
+-        localBootstrap.handler(channelInitializer);
+-        return localBootstrap.connect(host, port);
++        localBootstrap.handler(channelInitializer)
++            .remoteAddress(host, port);
++        channelInitializer.bootstrappedCustomizer = clientCustomizer.specializeForBootstrap(localBootstrap);
++        return localBootstrap.connect();
+     }
+ 
+     /**
+@@ -518,7 +521,7 @@ public class ConnectionManager {
+     final Mono<?> connectForWebsocket(DefaultHttpClient.RequestKey requestKey, ChannelHandler handler) {
+         Sinks.Empty<Object> initial = new CancellableMonoSink<>(null);
+ 
+-        ChannelFuture connectFuture = doConnect(requestKey, new ChannelInitializer<Channel>() {
++        ChannelFuture connectFuture = doConnect(requestKey, new CustomizerAwareInitializer() {
+             @Override
+             protected void initChannel(@NonNull Channel ch) {
+                 addLogHandler(ch);
+@@ -546,7 +549,7 @@ public class ConnectionManager {
+                         ch.pipeline().addLast(WebSocketClientCompressionHandler.INSTANCE);
+                     }
+                     ch.pipeline().addLast(ChannelPipelineCustomizer.HANDLER_MICRONAUT_WEBSOCKET_CLIENT, handler);
+-                    clientCustomizer.specializeForChannel(ch, NettyClientCustomizer.ChannelRole.CONNECTION).onInitialPipelineBuilt();
++                    bootstrappedCustomizer.specializeForChannel(ch, NettyClientCustomizer.ChannelRole.CONNECTION).onInitialPipelineBuilt();
+                     if (initial.tryEmitEmpty().isSuccess()) {
+                         return;
+                     }
+@@ -741,11 +744,15 @@ public class ConnectionManager {
+         return HttpClientExceptionUtils.populateServiceId(exc, informationalServiceId, configuration);
+     }
+ 
++    abstract static class CustomizerAwareInitializer extends ChannelInitializer<Channel> {
++        NettyClientCustomizer bootstrappedCustomizer;
++    }
++
+     /**
+      * Initializer for TLS channels. After ALPN we will proceed either with
+      * {@link #initHttp1(Channel)} or {@link #initHttp2(Pool, Channel, NettyClientCustomizer)}.
+      */
+-    private final class AdaptiveAlpnChannelInitializer extends ChannelInitializer<Channel> {
++    private final class AdaptiveAlpnChannelInitializer extends CustomizerAwareInitializer {
+         private final Pool pool;
+ 
+         private final SslContext sslContext;
+@@ -767,7 +774,7 @@ public class ConnectionManager {
+          */
+         @Override
+         protected void initChannel(@NonNull Channel ch) {
+-            NettyClientCustomizer channelCustomizer = clientCustomizer.specializeForChannel(ch, NettyClientCustomizer.ChannelRole.CONNECTION);
++            NettyClientCustomizer channelCustomizer = bootstrappedCustomizer.specializeForChannel(ch, NettyClientCustomizer.ChannelRole.CONNECTION);
+ 
+             configureProxy(ch.pipeline(), true, host, port);
+ 
+@@ -822,7 +829,7 @@ public class ConnectionManager {
+      * Initializer for H2C connections. Will proceed with
+      * {@link #initHttp2(Pool, Channel, NettyClientCustomizer)} when the upgrade is done.
+      */
+-    private final class Http2UpgradeInitializer extends ChannelInitializer<Channel> {
++    private final class Http2UpgradeInitializer extends CustomizerAwareInitializer {
+         private final Pool pool;
+ 
+         Http2UpgradeInitializer(Pool pool) {
+@@ -831,7 +838,7 @@ public class ConnectionManager {
+ 
+         @Override
+         protected void initChannel(@NonNull Channel ch) throws Exception {
+-            NettyClientCustomizer connectionCustomizer = clientCustomizer.specializeForChannel(ch, NettyClientCustomizer.ChannelRole.CONNECTION);
++            NettyClientCustomizer connectionCustomizer = bootstrappedCustomizer.specializeForChannel(ch, NettyClientCustomizer.ChannelRole.CONNECTION);
+ 
+             Http2FrameCodec frameCodec = makeFrameCodec();
+ 
+@@ -877,6 +884,8 @@ public class ConnectionManager {
+         private final String host;
+         private final int port;
+ 
++        private NettyClientCustomizer bootstrappedCustomizer;
++
+         Http3ChannelInitializer(Pool pool, String host, int port) {
+             this.pool = pool;
+             this.host = host;
+@@ -905,7 +914,7 @@ public class ConnectionManager {
+         }
+ 
+         private void initChannel(Channel ch) {
+-            NettyClientCustomizer channelCustomizer = clientCustomizer.specializeForChannel(ch, NettyClientCustomizer.ChannelRole.CONNECTION);
++            NettyClientCustomizer channelCustomizer = bootstrappedCustomizer.specializeForChannel(ch, NettyClientCustomizer.ChannelRole.CONNECTION);
+ 
+             ch.pipeline()
+                 .addLast(Http3.newQuicClientCodecBuilder()
+@@ -1099,12 +1108,15 @@ public class ConnectionManager {
+         }
+ 
+         private ChannelFuture openConnectionFuture() {
+-            ChannelInitializer<?> initializer;
++            CustomizerAwareInitializer initializer;
+             if (requestKey.isSecure()) {
+                 if (httpVersion.isHttp3()) {
+-                    return udpBootstrap.clone()
+-                        .handler(new Http3ChannelInitializer(this, requestKey.getHost(), requestKey.getPort()))
+-                        .bind(0);
++                    Http3ChannelInitializer channelInitializer = new Http3ChannelInitializer(this, requestKey.getHost(), requestKey.getPort());
++                    Bootstrap localBootstrap = udpBootstrap.clone()
++                        .handler(channelInitializer)
++                        .localAddress(0);
++                    channelInitializer.bootstrappedCustomizer = clientCustomizer.specializeForBootstrap(localBootstrap);
++                    return localBootstrap.bind();
+                 }
+ 
+                 initializer = new AdaptiveAlpnChannelInitializer(
+@@ -1115,7 +1127,7 @@ public class ConnectionManager {
+                 );
+             } else {
+                 initializer = switch (httpVersion.getPlaintextMode()) {
+-                    case HTTP_1 -> new ChannelInitializer<>() {
++                    case HTTP_1 -> new CustomizerAwareInitializer() {
+                         @Override
+                         protected void initChannel(@NonNull Channel ch) throws Exception {
+                             configureProxy(ch.pipeline(), false, requestKey.getHost(), requestKey.getPort());
+@@ -1125,7 +1137,7 @@ public class ConnectionManager {
+                                 public void channelActive(@NonNull ChannelHandlerContext ctx) throws Exception {
+                                     super.channelActive(ctx);
+                                     ctx.pipeline().remove(this);
+-                                    NettyClientCustomizer channelCustomizer = clientCustomizer.specializeForChannel(ch, NettyClientCustomizer.ChannelRole.CONNECTION);
++                                    NettyClientCustomizer channelCustomizer = bootstrappedCustomizer.specializeForChannel(ch, NettyClientCustomizer.ChannelRole.CONNECTION);
+                                     new Http1ConnectionHolder(ch, channelCustomizer).init(true);
+                                 }
+                             });
+diff --git a/http-client/src/main/java/io/micronaut/http/client/netty/NettyClientCustomizer.java b/http-client/src/main/java/io/micronaut/http/client/netty/NettyClientCustomizer.java
+index a95e029f37..d96148fad8 100644
+--- a/http-client/src/main/java/io/micronaut/http/client/netty/NettyClientCustomizer.java
++++ b/http-client/src/main/java/io/micronaut/http/client/netty/NettyClientCustomizer.java
+@@ -15,7 +15,9 @@
+  */
+ package io.micronaut.http.client.netty;
+ 
++import io.micronaut.core.annotation.Experimental;
+ import io.micronaut.core.annotation.NonNull;
++import io.netty.bootstrap.Bootstrap;
+ import io.netty.channel.Channel;
+ 
+ /**
+@@ -47,6 +49,17 @@ public interface NettyClientCustomizer {
+         return this;
+     }
+ 
++    /**
++     * @param bootstrap The bootstrap that will be used to connect
++     * @return The new customizer, or {@code this} if no specialization needs to take place.
++     * @since 4.7.0
++     */
++    @Experimental
++    @NonNull
++    default NettyClientCustomizer specializeForBootstrap(@NonNull Bootstrap bootstrap) {
++        return this;
++    }
++
+     /**
+      * Called when the <i>initial</i> connection pipeline has been built, before any incoming data
+      * has been processed.
+diff --git a/http-netty/src/main/java/io/micronaut/http/netty/AbstractCompositeCustomizer.java b/http-netty/src/main/java/io/micronaut/http/netty/AbstractCompositeCustomizer.java
+index b2a09408a3..6ebcf83ecb 100644
+--- a/http-netty/src/main/java/io/micronaut/http/netty/AbstractCompositeCustomizer.java
++++ b/http-netty/src/main/java/io/micronaut/http/netty/AbstractCompositeCustomizer.java
+@@ -28,6 +28,7 @@ import java.util.List;
+ import java.util.Objects;
+ import java.util.concurrent.CopyOnWriteArrayList;
+ import java.util.function.Consumer;
++import java.util.function.UnaryOperator;
+ 
+ /**
+  * Base class for the composite customizers for the client and server. The APIs are structured
+@@ -75,12 +76,23 @@ public abstract class AbstractCompositeCustomizer<C, R> {
+ 
+     @NonNull
+     public final C specializeForChannel(@NonNull Channel channel, @NonNull R role) {
++        return specialize(c -> specializeForChannel(c, channel, role));
++    }
++
++    /**
++     * Specialize all members with the given action.
++     *
++     * @param specializeAction The specialization action. Input is the old member customizer, output
++     *                         is the new member customizer.
++     * @return The specialized composite customizer
++     */
++    protected final C specialize(UnaryOperator<C> specializeAction) {
+         List<C> specialized = null;
+         for (int i = 0; i < this.members.size(); i++) {
+             C old = this.members.get(i);
+             C nev;
+             try {
+-                nev = specializeForChannel(old, channel, role);
++                nev = specializeAction.apply(old);
+                 Objects.requireNonNull(nev, "specializeForChannel must not return null");
+             } catch (Exception e) {
+                 LOG.error("Failed to specialize customizer", e);

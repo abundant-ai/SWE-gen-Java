@@ -1,0 +1,526 @@
+diff --git a/extensions/arc/deployment/pom.xml b/extensions/arc/deployment/pom.xml
+index e4760e55666..55c07286bfc 100644
+--- a/extensions/arc/deployment/pom.xml
++++ b/extensions/arc/deployment/pom.xml
+@@ -38,24 +38,28 @@
+             <artifactId>arc-processor</artifactId>
+         </dependency>
+ 
++        <!--
++          - The following 2 dependencies must NOT be test-scoped, because test-scoped dependencies
++          - are always loaded by the Runtime CL (not by Base Runtime CL) and so are considered
++          - application archives. All tests using them require a NON-application archive.
++          -->
+         <dependency>
+             <groupId>io.quarkus</groupId>
+-            <artifactId>quarkus-junit5-internal</artifactId>
+-            <scope>test</scope>
++            <artifactId>quarkus-arc-test-supplement</artifactId>
+         </dependency>
+         <dependency>
+-            <groupId>org.assertj</groupId>
+-            <artifactId>assertj-core</artifactId>
+-            <scope>test</scope>
++            <groupId>io.quarkus</groupId>
++            <artifactId>quarkus-arc-test-supplement-decorator</artifactId>
+         </dependency>
++
+         <dependency>
+             <groupId>io.quarkus</groupId>
+-            <artifactId>quarkus-arc-test-supplement</artifactId>
++            <artifactId>quarkus-junit5-internal</artifactId>
+             <scope>test</scope>
+         </dependency>
+         <dependency>
+-            <groupId>io.quarkus</groupId>
+-            <artifactId>quarkus-arc-test-supplement-decorator</artifactId>
++            <groupId>org.assertj</groupId>
++            <artifactId>assertj-core</artifactId>
+             <scope>test</scope>
+         </dependency>
+         <!-- Used to test wrong @Singleton detection -->
+diff --git a/extensions/hibernate-orm/deployment/src/main/java/io/quarkus/hibernate/orm/deployment/HibernateOrmProcessor.java b/extensions/hibernate-orm/deployment/src/main/java/io/quarkus/hibernate/orm/deployment/HibernateOrmProcessor.java
+index 60ffbd8c88d..f6aee2c5683 100644
+--- a/extensions/hibernate-orm/deployment/src/main/java/io/quarkus/hibernate/orm/deployment/HibernateOrmProcessor.java
++++ b/extensions/hibernate-orm/deployment/src/main/java/io/quarkus/hibernate/orm/deployment/HibernateOrmProcessor.java
+@@ -63,8 +63,6 @@
+ import org.jboss.logging.Logger;
+ import org.jboss.logmanager.Level;
+ 
+-import com.fasterxml.jackson.databind.Module;
+-
+ import io.quarkus.agroal.spi.JdbcDataSourceBuildItem;
+ import io.quarkus.agroal.spi.JdbcDataSourceSchemaReadyBuildItem;
+ import io.quarkus.arc.deployment.BeanContainerBuildItem;
+@@ -322,19 +320,6 @@ public ImpliedBlockingPersistenceUnitTypeBuildItem defineTypeOfImpliedPU(
+         }
+     }
+ 
+-    @BuildStep
+-    public void allowJacksonModuleDiscovery(Capabilities capabilities,
+-            List<PersistenceUnitDescriptorBuildItem> persistenceUnits,
+-            BuildProducer<ServiceProviderBuildItem> serviceProviders) {
+-        if (capabilities.isMissing(Capability.JACKSON) || persistenceUnits.isEmpty()) {
+-            // We won't be using Hibernate's default FormatMapper relying on Jackson for sure
+-            return;
+-        }
+-        // Hibernate's default FormatMapper relying on Jackson requires
+-        // service loading to discover modules in the classpath.
+-        serviceProviders.produce(ServiceProviderBuildItem.allProvidersFromClassPath(Module.class.getName()));
+-    }
+-
+     @BuildStep
+     @Record(RUNTIME_INIT)
+     public void configurationDescriptorBuilding(
+diff --git a/independent-projects/arc/processor/src/main/java/io/quarkus/arc/processor/BeanDeployment.java b/independent-projects/arc/processor/src/main/java/io/quarkus/arc/processor/BeanDeployment.java
+index 9e4e58fa266..ca30c30a30b 100644
+--- a/independent-projects/arc/processor/src/main/java/io/quarkus/arc/processor/BeanDeployment.java
++++ b/independent-projects/arc/processor/src/main/java/io/quarkus/arc/processor/BeanDeployment.java
+@@ -52,6 +52,9 @@
+ import io.quarkus.arc.processor.BuildExtension.Key;
+ import io.quarkus.arc.processor.Types.TypeClosure;
+ import io.quarkus.arc.processor.bcextensions.ExtensionsEntryPoint;
++import io.quarkus.gizmo.ClassTransformer;
++import io.quarkus.gizmo.FieldDescriptor;
++import io.quarkus.gizmo.MethodDescriptor;
+ import io.quarkus.gizmo2.Expr;
+ 
+ public class BeanDeployment {
+@@ -519,6 +522,7 @@ ValidationContext validate(List<BeanDeploymentValidator> validators,
+         // First, validate all beans internally
+         validateBeans(errors, bytecodeTransformerConsumer);
+         validateInterceptorsAndDecorators(errors, bytecodeTransformerConsumer);
++        validateNonAppBeansWithAppDecorators(errors, bytecodeTransformerConsumer);
+         ValidationContextImpl validationContext = new ValidationContextImpl(buildContext);
+         for (Throwable error : errors) {
+             validationContext.addDeploymentProblem(error);
+@@ -1790,6 +1794,97 @@ private void validateBeans(List<Throwable> errors, Consumer<BytecodeTransformer>
+         }
+     }
+ 
++    private void validateNonAppBeansWithAppDecorators(List<Throwable> errors,
++            Consumer<BytecodeTransformer> bytecodeTransformer) {
++        for (BeanInfo bean : beans) {
++            boolean isNonAppBeanWithAppDecorators = bean.isClassBean() // only class-based beans can be decorated
++                    && !applicationClassPredicate.test(bean.getBeanClass())
++                    && bean.hasBoundDecoratorMatching(applicationClassPredicate);
++
++            if (!isNonAppBeanWithAppDecorators) {
++                continue;
++            }
++
++            // in case of a non-app bean with app decorators, we only turn the generated `_Bean` and `_Subclass`
++            // classes into app classes, so the only thing we need to transform here are injection points
++            //
++            // we specifically do _not_ turn the generated `_ClientProxy` class into app class,
++            // so method invocations on normal scoped beans work even if the methods are not `public`
++            //
++            // producers, disposers and observers in non-app beans have their own generated classes
++            // which are _non-app_, so there's no cross-classloader access
++
++            Set<AnnotationTarget> nonPublicInjectionPoints = new HashSet<>();
++            for (InjectionPointInfo ip : bean.getAllInjectionPoints()) {
++                AnnotationTarget target = ip.getAnnotationTarget();
++                if (target == null) {
++                    continue;
++                }
++
++                if (target.kind() == AnnotationTarget.Kind.FIELD
++                        && !Modifier.isPublic(target.asField().flags())) {
++                    nonPublicInjectionPoints.add(target);
++                } else if (target.kind() == AnnotationTarget.Kind.METHOD_PARAMETER
++                        && !Modifier.isPublic(target.asMethodParameter().method().flags())) {
++                    nonPublicInjectionPoints.add(target.asMethodParameter().method());
++                }
++            }
++
++            if (nonPublicInjectionPoints.isEmpty()) {
++                continue;
++            }
++
++            Collection<ClassInfo> beanSubclasses = getBeanArchiveIndex().getAllKnownSubclasses(bean.getBeanClass());
++            if (!beanSubclasses.isEmpty()) {
++                StringBuilder error = new StringBuilder();
++                error.append("Non-application bean ")
++                        .append(bean.getBeanClass())
++                        .append(" has bound application decorator(s):");
++                for (DecoratorInfo decorator : bean.getBoundDecorators()) {
++                    DotName decoratorName = decorator.getImplClazz().name();
++                    if (applicationClassPredicate.test(decoratorName)) {
++                        error.append("\n\t- ").append(decoratorName);
++                    }
++                }
++                error.append("\nThis bean has non-public injection point(s):");
++                for (AnnotationTarget ip : nonPublicInjectionPoints) {
++                    if (ip.kind() == AnnotationTarget.Kind.FIELD) {
++                        error.append("\n\t- field `").append(ip.asField().name()).append("`");
++                    } else if (ip.kind() == AnnotationTarget.Kind.METHOD) {
++                        error.append("\n\t- method `").append(ip.asMethod().name()).append("()`");
++                    }
++                }
++                error.append("\nBytecode transformation would be required to make these injection points public,")
++                        .append(" but the bean also has subclasses that could be broken:");
++                for (ClassInfo beanSubclass : beanSubclasses) {
++                    error.append("\n\t- ").append(beanSubclass.name());
++                }
++                error.append("\nThe only possible fix on the application side is removing the decorator(s).");
++                errors.add(new DeploymentException(error.toString()));
++            } else {
++                bytecodeTransformer.accept(new BytecodeTransformer(bean.getBeanClass().toString(), (name, visitor) -> {
++                    ClassTransformer transformer = new ClassTransformer(name);
++
++                    // turn non-`public` injection points into `public`
++                    for (AnnotationTarget ip : nonPublicInjectionPoints) {
++                        if (ip.kind() == AnnotationTarget.Kind.FIELD) {
++                            transformer.modifyField(FieldDescriptor.of(ip.asField()))
++                                    .removeModifiers(Modifier.PRIVATE | Modifier.PROTECTED)
++                                    .addModifiers(Modifier.PUBLIC);
++                        } else if (ip.kind() == AnnotationTarget.Kind.METHOD) {
++                            MethodDescriptor desc = MethodDescriptor.of(ip.asMethod());
++                            transformer.modifyMethod(desc)
++                                    .removeModifiers(Modifier.PRIVATE | Modifier.PROTECTED)
++                                    .addModifiers(Modifier.PUBLIC);
++                        }
++                    }
++
++                    return transformer.applyTo(visitor);
++                }));
++            }
++        }
++    }
++
+     private void findNamespaces(BeanInfo bean, Set<String> namespaces) {
+         if (!strictCompatibility) {
+             return;
+diff --git a/independent-projects/arc/processor/src/main/java/io/quarkus/arc/processor/BeanGenerator.java b/independent-projects/arc/processor/src/main/java/io/quarkus/arc/processor/BeanGenerator.java
+index 18c4999c9f3..61a1c3351ba 100644
+--- a/independent-projects/arc/processor/src/main/java/io/quarkus/arc/processor/BeanGenerator.java
++++ b/independent-projects/arc/processor/src/main/java/io/quarkus/arc/processor/BeanGenerator.java
+@@ -222,7 +222,7 @@ Collection<Resource> generate(BeanInfo bean) {
+ 
+         boolean isApplicationClass = applicationClassPredicate.test(clazz.name())
+                 || bean.isForceApplicationClass()
+-                || bean.hasBoundDecoratorWhichIsApplicationClass(applicationClassPredicate);
++                || bean.hasBoundDecoratorMatching(applicationClassPredicate);
+         ResourceClassOutput classOutput = new ResourceClassOutput(isApplicationClass,
+                 name -> name.equals(generatedName) ? SpecialType.BEAN : null, generateSources);
+ 
+diff --git a/independent-projects/arc/processor/src/main/java/io/quarkus/arc/processor/BeanInfo.java b/independent-projects/arc/processor/src/main/java/io/quarkus/arc/processor/BeanInfo.java
+index 81e900bb2cd..b46b7c396cd 100644
+--- a/independent-projects/arc/processor/src/main/java/io/quarkus/arc/processor/BeanInfo.java
++++ b/independent-projects/arc/processor/src/main/java/io/quarkus/arc/processor/BeanInfo.java
+@@ -415,10 +415,8 @@ Map<MethodDesc, DecoratorMethod> getNextDecorators(DecoratorInfo decorator) {
+                     break;
+                 }
+             }
+-            if (index != -1) {
+-                if (index != (decoratorMethods.size() - 1)) {
+-                    next.put(methodDescOf(entry.getKey()), decoratorMethods.get(index + 1));
+-                }
++            if (index != -1 && index != (decoratorMethods.size() - 1)) {
++                next.put(methodDescOf(entry.getKey()), decoratorMethods.get(index + 1));
+             }
+         }
+         return next;
+@@ -525,9 +523,9 @@ public List<DecoratorInfo> getBoundDecorators() {
+         return bound;
+     }
+ 
+-    boolean hasBoundDecoratorWhichIsApplicationClass(Predicate<DotName> isApplicationClass) {
++    boolean hasBoundDecoratorMatching(Predicate<DotName> predicate) {
+         for (DecoratorInfo decorator : getBoundDecorators()) {
+-            if (isApplicationClass.test(decorator.getImplClazz().name())) {
++            if (predicate.test(decorator.getImplClazz().name())) {
+                 return true;
+             }
+         }
+@@ -841,36 +839,33 @@ private void addDecoratedMethods(Map<MethodKey, DecorationInfo> decoratedMethods
+     }
+ 
+     private List<DecoratorMethod> findMatchingDecorators(MethodInfo method, List<DecoratorInfo> decorators) {
+-        List<Type> methodParams = method.parameterTypes();
+         List<DecoratorMethod> matching = new ArrayList<>(decorators.size());
+-        for (DecoratorInfo decorator : decorators) {
++        IndexView index = beanDeployment.getBeanArchiveIndex();
++        outermost: for (DecoratorInfo decorator : decorators) {
+             for (Type decoratedType : decorator.getDecoratedTypes()) {
+-                ClassInfo decoratedTypeClass = decorator.getDeployment().getBeanArchiveIndex()
+-                        .getClassByName(decoratedType.name());
+-                if (decoratedTypeClass == null) {
+-                    throw new DefinitionException(
+-                            "The class of the decorated type " + decoratedType + " was not found in the index");
++                ClassInfo decoratedInterface = index.getClassByName(decoratedType.name());
++                if (decoratedInterface == null) {
++                    throw new DefinitionException("Decorated interface " + decoratedType.name() + " not found in the index");
+                 }
+ 
+-                Map<String, Type> resolvedTypeParameters = Types.resolveDecoratedTypeParams(decoratedTypeClass,
+-                        decorator);
++                Map<String, Type> resolvedTypeParameters = Types.resolveDecoratedTypeParams(decoratedInterface, decorator);
+ 
+-                for (MethodInfo decoratedMethod : decoratedTypeClass.methods()) {
++                // it's enough to look at methods declared directly on the decorated interface,
++                // because its superinterfaces are present in the set of decorated types
++                for (MethodInfo decoratedMethod : decoratedInterface.methods()) {
+                     if (!method.name().equals(decoratedMethod.name())) {
+                         continue;
+                     }
+-                    List<Type> decoratedMethodParams = decoratedMethod.parameterTypes();
+-                    if (methodParams.size() != decoratedMethodParams.size()) {
++                    if (method.parametersCount() != decoratedMethod.parametersCount()) {
+                         continue;
+                     }
++
+                     // Match the resolved parameter types
+                     boolean matches = true;
+-                    decoratedMethodParams = Types.getResolvedParameters(decoratedTypeClass, resolvedTypeParameters,
+-                            decoratedMethod,
+-                            beanDeployment.getBeanArchiveIndex());
+-                    methodParams = Types.getResolvedParameters(decoratedTypeClass, resolvedTypeParameters,
+-                            method,
+-                            beanDeployment.getBeanArchiveIndex());
++                    List<Type> decoratedMethodParams = Types.getResolvedParameters(decoratedInterface, resolvedTypeParameters,
++                            decoratedMethod, index);
++                    List<Type> methodParams = Types.getResolvedParameters(decoratedInterface, resolvedTypeParameters,
++                            method, index);
+                     for (int i = 0; i < methodParams.size(); i++) {
+                         BeanResolver resolver = beanDeployment.getDelegateInjectionPointResolver();
+                         Type decoratedParam = decoratedMethodParams.get(i);
+@@ -886,6 +881,12 @@ private List<DecoratorMethod> findMatchingDecorators(MethodInfo method, List<Dec
+                     }
+                     if (matches) {
+                         matching.add(new DecoratorMethod(decorator, decoratedMethod));
++                        // It is possible that multiple methods from one decorator match, in case multiple decorated
++                        // types of the decorator declare the same method. It doesn't matter which one we remember,
++                        // because all decorated methods (public methods on decorated types, which are all interfaces)
++                        // are virtual and are invoked as such and virtual invocation has consistent semantics
++                        // regardless of which exact method declaration is named by the invoked method descriptor.
++                        continue outermost;
+                     }
+                 }
+             }
+diff --git a/independent-projects/arc/processor/src/main/java/io/quarkus/arc/processor/ClientProxyGenerator.java b/independent-projects/arc/processor/src/main/java/io/quarkus/arc/processor/ClientProxyGenerator.java
+index 40a8a7fdfcc..96e7fec1ce2 100644
+--- a/independent-projects/arc/processor/src/main/java/io/quarkus/arc/processor/ClientProxyGenerator.java
++++ b/independent-projects/arc/processor/src/main/java/io/quarkus/arc/processor/ClientProxyGenerator.java
+@@ -105,8 +105,7 @@ Collection<Resource> generate(BeanInfo bean, String beanClassName,
+             return Collections.emptyList();
+         }
+ 
+-        boolean isApplicationClass = applicationClassPredicate.test(getApplicationClassTestName(bean))
+-                || bean.hasBoundDecoratorWhichIsApplicationClass(applicationClassPredicate);
++        boolean isApplicationClass = applicationClassPredicate.test(getApplicationClassTestName(bean));
+         ResourceClassOutput classOutput = new ResourceClassOutput(isApplicationClass,
+                 name -> name.equals(generatedName) ? SpecialType.CLIENT_PROXY : null, generateSources);
+ 
+diff --git a/independent-projects/arc/processor/src/main/java/io/quarkus/arc/processor/DecoratorGenerator.java b/independent-projects/arc/processor/src/main/java/io/quarkus/arc/processor/DecoratorGenerator.java
+index 057419e1d4e..1ce93a794dd 100644
+--- a/independent-projects/arc/processor/src/main/java/io/quarkus/arc/processor/DecoratorGenerator.java
++++ b/independent-projects/arc/processor/src/main/java/io/quarkus/arc/processor/DecoratorGenerator.java
+@@ -6,9 +6,12 @@
+ 
+ import java.lang.constant.ClassDesc;
+ import java.lang.constant.MethodTypeDesc;
++import java.lang.reflect.Modifier;
++import java.util.ArrayDeque;
+ import java.util.ArrayList;
+ import java.util.Collection;
+ import java.util.Collections;
++import java.util.Deque;
+ import java.util.HashMap;
+ import java.util.HashSet;
+ import java.util.List;
+@@ -27,7 +30,6 @@
+ import org.jboss.jandex.MethodInfo;
+ import org.jboss.jandex.MethodParameterInfo;
+ import org.jboss.jandex.Type;
+-import org.jboss.jandex.TypeVariable;
+ 
+ import io.quarkus.arc.InjectableDecorator;
+ import io.quarkus.arc.processor.BeanProcessor.PrivateMembersCollector;
+@@ -255,21 +257,51 @@ private String generateAbstractDecoratorImplementation(Gizmo gizmo, String baseN
+                 });
+             });
+ 
++            // remember all implemented (not `abstract`) methods that are either declared on the decorator class
++            // or inherited from superclasses and superinterfaces
++            // since decorated types are interfaces, the implemented methods must be `public`, otherwise
++            // they wouldn't be inherited
++            // we later use it to figure out if a decorated method is implemented by the decorator,
++            // so order does not matter
++            List<MethodInfo> decoratorMethods = new ArrayList<>();
++            Deque<ClassInfo> worklist = new ArrayDeque<>();
++            Set<DotName> seen = new HashSet<>();
++            worklist.add(decoratorClass);
++            while (!worklist.isEmpty()) {
++                ClassInfo clazz = worklist.poll();
++                if (!seen.add(clazz.name())) {
++                    continue;
++                }
++
++                for (MethodInfo decoratorMethod : clazz.methods()) {
++                    if (!decoratorMethod.isAbstract() && Modifier.isPublic(decoratorMethod.flags())) {
++                        decoratorMethods.add(decoratorMethod);
++                    }
++                }
++
++                if (!clazz.isInterface() && clazz.superName() != null) {
++                    worklist.add(index.getClassByName(clazz.superName()));
++                }
++                for (DotName iface : clazz.interfaceNames()) {
++                    worklist.add(index.getClassByName(iface));
++                }
++            }
++
+             // Find non-decorated methods from all decorated types
+             Set<MethodDesc> abstractMethods = new HashSet<>();
+             Map<MethodDesc, MethodDesc> bridgeMethods = new HashMap<>();
+             for (Type decoratedType : decorator.getDecoratedTypes()) {
+-                ClassInfo decoratedTypeClass = index.getClassByName(decoratedType.name());
+-                if (decoratedTypeClass == null) {
++                ClassInfo decoratedInterface = index.getClassByName(decoratedType.name());
++                if (decoratedInterface == null) {
+                     throw new IllegalStateException("Decorated type not found in the bean archive index: " + decoratedType);
+                 }
+ 
+                 // A decorated type can declare type parameters
+                 // For example Converter<String> should result in a T -> String mapping
+-                List<TypeVariable> typeParameters = decoratedTypeClass.typeParameters();
+-                Map<String, Type> resolvedTypeParameters = Types.resolveDecoratedTypeParams(decoratedTypeClass, decorator);
++                boolean isDecoratedInterfaceGeneric = !decoratedInterface.typeParameters().isEmpty();
++                Map<String, Type> resolvedTypeParameters = Types.resolveDecoratedTypeParams(decoratedInterface, decorator);
+ 
+-                for (MethodInfo method : decoratedTypeClass.methods()) {
++                for (MethodInfo method : decoratedInterface.methods()) {
+                     if (Methods.skipForDelegateSubclass(method)) {
+                         continue;
+                     }
+@@ -278,9 +310,9 @@ private String generateAbstractDecoratorImplementation(Gizmo gizmo, String baseN
+                     // Create a resolved descriptor variant if a param contains a type variable
+                     // E.g. ping(T) -> ping(String)
+                     MethodDesc resolvedMethodDesc;
+-                    if (!typeParameters.isEmpty() && (Methods.containsTypeVariableParameter(method)
++                    if (isDecoratedInterfaceGeneric && (Methods.containsTypeVariableParameter(method)
+                             || Types.containsTypeVariable(method.returnType()))) {
+-                        List<Type> paramTypes = Types.getResolvedParameters(decoratedTypeClass, resolvedTypeParameters,
++                        List<Type> paramTypes = Types.getResolvedParameters(decoratedInterface, resolvedTypeParameters,
+                                 method, index);
+                         Type returnType = Types.resolveTypeParam(method.returnType(), resolvedTypeParameters, index);
+                         ClassDesc[] paramTypesArray = new ClassDesc[paramTypes.size()];
+@@ -294,7 +326,7 @@ private String generateAbstractDecoratorImplementation(Gizmo gizmo, String baseN
+                     }
+ 
+                     boolean include = true;
+-                    for (MethodInfo decoratorMethod : decoratorClass.methods()) {
++                    for (MethodInfo decoratorMethod : decoratorMethods) {
+                         if (decoratorMethod.isConstructor() || decoratorMethod.isStaticInitializer()) {
+                             // we cannot build a `MethodDesc` for constructors and static initializers
+                             // (`methodDescOf()` below would throw) and they cannot be decorated anyway
+diff --git a/independent-projects/arc/processor/src/main/java/io/quarkus/arc/processor/Decorators.java b/independent-projects/arc/processor/src/main/java/io/quarkus/arc/processor/Decorators.java
+index 5571482a0c8..5dd691f766a 100644
+--- a/independent-projects/arc/processor/src/main/java/io/quarkus/arc/processor/Decorators.java
++++ b/independent-projects/arc/processor/src/main/java/io/quarkus/arc/processor/Decorators.java
+@@ -5,7 +5,6 @@
+ import java.lang.reflect.Modifier;
+ import java.util.ArrayList;
+ import java.util.HashSet;
+-import java.util.LinkedList;
+ import java.util.List;
+ import java.util.Set;
+ 
+@@ -39,7 +38,7 @@ static DecoratorInfo createDecorator(ClassInfo decoratorClass, BeanDeployment be
+             InjectionPointModifier transformer) {
+ 
+         // Find the delegate injection point
+-        List<InjectionPointInfo> delegateInjectionPoints = new LinkedList<>();
++        List<InjectionPointInfo> delegateInjectionPoints = new ArrayList<>();
+         List<Injection> injections = Injection.forBean(decoratorClass, null, beanDeployment, transformer,
+                 Injection.BeanType.DECORATOR);
+         for (Injection injection : injections) {
+@@ -118,6 +117,10 @@ static DecoratorInfo createDecorator(ClassInfo decoratorClass, BeanDeployment be
+         }
+ 
+         if (Modifier.isAbstract(decoratorClass.flags())) {
++            // TODO this check is not precise: we check that decorators do not declare _any_ abstract methods,
++            //  but the spec says that decorators may not declare abstract methods that do not belong
++            //  to a decorated type
++            //  also, we only check methods declared on the decorator class itself, not inherited methods
+             List<MethodInfo> abstractMethods = new ArrayList<>();
+             for (MethodInfo method : decoratorClass.methods()) {
+                 if (Modifier.isAbstract(method.flags())) {
+diff --git a/independent-projects/arc/processor/src/main/java/io/quarkus/arc/processor/SubclassGenerator.java b/independent-projects/arc/processor/src/main/java/io/quarkus/arc/processor/SubclassGenerator.java
+index 5fde9a710d2..c733e79f1df 100644
+--- a/independent-projects/arc/processor/src/main/java/io/quarkus/arc/processor/SubclassGenerator.java
++++ b/independent-projects/arc/processor/src/main/java/io/quarkus/arc/processor/SubclassGenerator.java
+@@ -110,7 +110,7 @@ Collection<Resource> generate(BeanInfo bean, String beanClassName) {
+         }
+ 
+         boolean isApplicationClass = applicationClassPredicate.test(bean.getBeanClass())
+-                || bean.hasBoundDecoratorWhichIsApplicationClass(applicationClassPredicate);
++                || bean.hasBoundDecoratorMatching(applicationClassPredicate);
+         ResourceClassOutput classOutput = new ResourceClassOutput(isApplicationClass,
+                 name -> name.equals(generatedName) ? SpecialType.SUBCLASS : null,
+                 generateSources);
+@@ -592,16 +592,9 @@ private void processDecorator(Gizmo gizmo, ClassCreator subclass,
+         // First generate the delegate subclass
+         // An instance of this subclass is injected in the delegate injection point of a decorator instance
+         ClassInfo decoratorClass = decorator.getTarget().get().asClass();
+-        String baseName;
+-        if (decoratorClass.enclosingClass() != null) {
+-            baseName = decoratorClass.enclosingClass().withoutPackagePrefix() + UNDERSCORE
+-                    + decoratorClass.name().withoutPackagePrefix();
+-        } else {
+-            baseName = decoratorClass.name().withoutPackagePrefix();
+-        }
+         // Name: AlphaDecorator_FooBeanId_Delegate_Subclass
+         String generatedName = generatedName(providerType.name(),
+-                baseName + UNDERSCORE + bean.getIdentifier() + UNDERSCORE + "Delegate");
++                decoratorClass.name().withoutPackagePrefix() + UNDERSCORE + bean.getIdentifier() + UNDERSCORE + "Delegate");
+ 
+         Set<MethodInfo> decoratedMethods = bean.getDecoratedMethods(decorator);
+         Set<MethodDesc> decoratedMethodDescriptors = new HashSet<>(decoratedMethods.size());
+@@ -813,7 +806,7 @@ && isDecorated(decoratedMethodDescriptors, methodDescriptor, resolvedMethodDesc,
+         for (DecoratorInfo decoratorParameter : decoratorParameters) {
+             LocalVar decoratorVar = decoratorToLocalVar.get(decoratorParameter.getIdentifier());
+             if (decoratorVar == null) {
+-                throw new IllegalStateException("Decorator var must not be null");
++                throw new IllegalStateException("Unknown next " + decoratorParameter + " when generating " + generatedName);
+             }
+             params[paramIdx] = decoratorVar;
+             paramIdx++;
+diff --git a/independent-projects/arc/processor/src/main/java/io/quarkus/arc/processor/Types.java b/independent-projects/arc/processor/src/main/java/io/quarkus/arc/processor/Types.java
+index 52831583030..ba20a943058 100644
+--- a/independent-projects/arc/processor/src/main/java/io/quarkus/arc/processor/Types.java
++++ b/independent-projects/arc/processor/src/main/java/io/quarkus/arc/processor/Types.java
+@@ -493,10 +493,10 @@ static Set<Type> getClassUnrestrictedTypeClosure(ClassInfo classInfo, BeanDeploy
+         return types;
+     }
+ 
+-    static Map<String, Type> resolveDecoratedTypeParams(ClassInfo decoratedTypeClass, DecoratorInfo decorator) {
++    static Map<String, Type> resolveDecoratedTypeParams(ClassInfo decoratedInterface, DecoratorInfo decorator) {
+         // A decorated type can declare type parameters
+         // For example Converter<String> should result in a T -> String mapping
+-        List<TypeVariable> typeParameters = decoratedTypeClass.typeParameters();
++        List<TypeVariable> typeParameters = decoratedInterface.typeParameters();
+         Map<String, org.jboss.jandex.Type> resolvedTypeParameters = Collections.emptyMap();
+         if (!typeParameters.isEmpty()) {
+             resolvedTypeParameters = new HashMap<>();
+diff --git a/pom.xml b/pom.xml
+index f262545f2f3..a7ef4b3e336 100644
+--- a/pom.xml
++++ b/pom.xml
+@@ -71,12 +71,12 @@
+         <jacoco.version>0.8.14</jacoco.version>
+         <kubernetes-client.version>7.4.0</kubernetes-client.version> <!-- Please check with Java Operator SDK team before updating -->
+         <rest-assured.version>5.5.6</rest-assured.version>
+-        <hibernate-orm.version>7.1.10.Final</hibernate-orm.version> <!-- WARNING when updating, also align the versions below -->
++        <hibernate-orm.version>7.1.6.Final</hibernate-orm.version> <!-- WARNING when updating, also align the versions below -->
+         <jakarta.persistence-api.version>3.2.0</jakarta.persistence-api.version> <!-- version controlled by Hibernate ORM's needs -->
+         <antlr.version>4.13.2</antlr.version> <!-- version controlled by Hibernate ORM's needs -->
+         <bytebuddy.version>1.17.6</bytebuddy.version> <!-- version controlled by Hibernate ORM's needs -->
+         <hibernate-models.version>1.0.1</hibernate-models.version> <!-- version controlled by Hibernate ORM's needs -->
+-        <hibernate-reactive.version>3.1.9.Final</hibernate-reactive.version> <!-- highly sensitive to Hibernate ORM upgrades -->
++        <hibernate-reactive.version>3.1.8.Final</hibernate-reactive.version> <!-- highly sensitive to Hibernate ORM upgrades -->
+         <hibernate-validator.version>9.1.0.Final</hibernate-validator.version>
+         <hibernate-search.version>8.1.2.Final</hibernate-search.version>
+         <hibernate-tools.version>7.1.6.Final</hibernate-tools.version>

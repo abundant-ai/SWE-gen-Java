@@ -1,0 +1,174 @@
+diff --git a/okhttp-sse/api/okhttp-sse.api b/okhttp-sse/api/okhttp-sse.api
+index d1baa0735..e9265a686 100644
+--- a/okhttp-sse/api/okhttp-sse.api
++++ b/okhttp-sse/api/okhttp-sse.api
+@@ -17,8 +17,7 @@ public abstract class okhttp3/sse/EventSourceListener {
+ 
+ public final class okhttp3/sse/EventSources {
+ 	public static final field INSTANCE Lokhttp3/sse/EventSources;
+-	public static final fun createFactory (Lokhttp3/Call$Factory;)Lokhttp3/sse/EventSource$Factory;
+-	public static final synthetic fun createFactory (Lokhttp3/OkHttpClient;)Lokhttp3/sse/EventSource$Factory;
++	public static final fun createFactory (Lokhttp3/OkHttpClient;)Lokhttp3/sse/EventSource$Factory;
+ 	public static final fun processResponse (Lokhttp3/Response;Lokhttp3/sse/EventSourceListener;)V
+ }
+ 
+diff --git a/okhttp-sse/src/main/kotlin/okhttp3/sse/EventSources.kt b/okhttp-sse/src/main/kotlin/okhttp3/sse/EventSources.kt
+index f3dc002f3..cb6a3c1e7 100644
+--- a/okhttp-sse/src/main/kotlin/okhttp3/sse/EventSources.kt
++++ b/okhttp-sse/src/main/kotlin/okhttp3/sse/EventSources.kt
+@@ -15,21 +15,13 @@
+  */
+ package okhttp3.sse
+ 
+-import okhttp3.Call
+ import okhttp3.OkHttpClient
+ import okhttp3.Response
+ import okhttp3.sse.internal.RealEventSource
+ 
+ object EventSources {
+-  @Deprecated(
+-    message = "required for binary-compatibility!",
+-    level = DeprecationLevel.HIDDEN,
+-  )
+   @JvmStatic
+-  fun createFactory(client: OkHttpClient) = createFactory(client as Call.Factory)
+-
+-  @JvmStatic
+-  fun createFactory(callFactory: Call.Factory): EventSource.Factory {
++  fun createFactory(client: OkHttpClient): EventSource.Factory {
+     return EventSource.Factory { request, listener ->
+       val actualRequest =
+         if (request.header("Accept") == null) {
+@@ -39,7 +31,7 @@ object EventSources {
+         }
+ 
+       RealEventSource(actualRequest, listener).apply {
+-        connect(callFactory)
++        connect(client)
+       }
+     }
+   }
+diff --git a/okhttp-sse/src/main/kotlin/okhttp3/sse/internal/RealEventSource.kt b/okhttp-sse/src/main/kotlin/okhttp3/sse/internal/RealEventSource.kt
+index 1cd3d135d..1346b2809 100644
+--- a/okhttp-sse/src/main/kotlin/okhttp3/sse/internal/RealEventSource.kt
++++ b/okhttp-sse/src/main/kotlin/okhttp3/sse/internal/RealEventSource.kt
+@@ -18,9 +18,12 @@ package okhttp3.sse.internal
+ import java.io.IOException
+ import okhttp3.Call
+ import okhttp3.Callback
++import okhttp3.EventListener
++import okhttp3.OkHttpClient
+ import okhttp3.Request
+ import okhttp3.Response
+ import okhttp3.ResponseBody
++import okhttp3.internal.connection.RealCall
+ import okhttp3.internal.stripBody
+ import okhttp3.sse.EventSource
+ import okhttp3.sse.EventSourceListener
+@@ -29,13 +32,16 @@ internal class RealEventSource(
+   private val request: Request,
+   private val listener: EventSourceListener
+ ) : EventSource, ServerSentEventReader.Callback, Callback {
+-  private var call: Call? = null
++  private var call: RealCall? = null
+   @Volatile private var canceled = false
+ 
+-  fun connect(callFactory: Call.Factory) {
+-    call = callFactory.newCall(request).apply {
+-      enqueue(this@RealEventSource)
+-    }
++  fun connect(client: OkHttpClient) {
++    val client = client.newBuilder()
++        .eventListener(EventListener.NONE)
++        .build()
++    val realCall = client.newCall(request) as RealCall
++    call = realCall
++    realCall.enqueue(this)
+   }
+ 
+   override fun onResponse(call: Call, response: Response) {
+@@ -58,7 +64,7 @@ internal class RealEventSource(
+       }
+ 
+       // This is a long-lived response. Cancel full-call timeouts.
+-      call?.timeout()?.cancel()
++      call?.timeoutEarlyExit()
+ 
+       // Replace the body with a stripped one so the callbacks can't see real data.
+       val response = response.stripBody()
+diff --git a/okhttp-sse/src/test/java/okhttp3/sse/internal/EventSourceHttpTest.java b/okhttp-sse/src/test/java/okhttp3/sse/internal/EventSourceHttpTest.java
+index 418a595df..19229fead 100644
+--- a/okhttp-sse/src/test/java/okhttp3/sse/internal/EventSourceHttpTest.java
++++ b/okhttp-sse/src/test/java/okhttp3/sse/internal/EventSourceHttpTest.java
+@@ -23,7 +23,6 @@ import mockwebserver3.MockWebServer;
+ import mockwebserver3.junit5.internal.MockWebServerExtension;
+ import okhttp3.OkHttpClient;
+ import okhttp3.OkHttpClientTestRule;
+-import okhttp3.RecordingEventListener;
+ import okhttp3.Request;
+ import okhttp3.sse.EventSource;
+ import okhttp3.sse.EventSources;
+@@ -35,6 +34,7 @@ import org.junit.jupiter.api.Test;
+ import org.junit.jupiter.api.extension.ExtendWith;
+ import org.junit.jupiter.api.extension.RegisterExtension;
+ import org.junitpioneer.jupiter.RetryingTest;
++
+ import static org.assertj.core.api.Assertions.assertThat;
+ 
+ @Tag("Slowish")
+@@ -45,12 +45,8 @@ public final class EventSourceHttpTest {
+   private MockWebServer server;
+   @RegisterExtension public final OkHttpClientTestRule clientTestRule = new OkHttpClientTestRule();
+ 
+-  private final RecordingEventListener eventListener = new RecordingEventListener();
+-
+   private final EventSourceRecorder listener = new EventSourceRecorder();
+-  private OkHttpClient client = clientTestRule.newClientBuilder()
+-    .eventListenerFactory(clientTestRule.wrap(eventListener))
+-    .build();
++  private OkHttpClient client = clientTestRule.newClient();
+ 
+   @BeforeEach public void before(MockWebServer server) {
+     this.server = server;
+@@ -181,41 +177,6 @@ public final class EventSourceHttpTest {
+     assertThat(server.takeRequest().getHeaders().get("Accept")).isEqualTo("text/event-stream");
+   }
+ 
+-  @Test public void eventListenerEvents() {
+-    server.enqueue(new MockResponse.Builder()
+-        .body(""
+-          + "data: hey\n"
+-          + "\n").setHeader("content-type", "text/event-stream")
+-        .build());
+-
+-    EventSource source = newEventSource();
+-
+-    assertThat(source.request().url().encodedPath()).isEqualTo("/");
+-
+-    listener.assertOpen();
+-    listener.assertEvent(null, null, "hey");
+-    listener.assertClose();
+-
+-    assertThat(eventListener.recordedEventTypes()).containsExactly(
+-        "CallStart",
+-        "ProxySelectStart",
+-        "ProxySelectEnd",
+-        "DnsStart",
+-        "DnsEnd",
+-        "ConnectStart",
+-        "ConnectEnd",
+-        "ConnectionAcquired",
+-        "RequestHeadersStart",
+-        "RequestHeadersEnd",
+-        "ResponseHeadersStart",
+-        "ResponseHeadersEnd",
+-        "ResponseBodyStart",
+-        "ResponseBodyEnd",
+-        "ConnectionReleased",
+-        "CallEnd"
+-    );
+-  }
+-
+   private EventSource newEventSource() {
+     return newEventSource(null);
+   }

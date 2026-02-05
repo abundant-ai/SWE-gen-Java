@@ -1,0 +1,450 @@
+diff --git a/core/src/test/scala/unit/kafka/server/ConsumerGroupHeartbeatRequestTest.scala b/core/src/test/scala/unit/kafka/server/ConsumerGroupHeartbeatRequestTest.scala
+index e5b4d7493c..f974f2ec3f 100644
+--- a/core/src/test/scala/unit/kafka/server/ConsumerGroupHeartbeatRequestTest.scala
++++ b/core/src/test/scala/unit/kafka/server/ConsumerGroupHeartbeatRequestTest.scala
+@@ -157,7 +157,8 @@ class ConsumerGroupHeartbeatRequestTest(cluster: ClusterInstance) extends GroupC
+     // in this test because it does not use FindCoordinator API.
+     createOffsetsTopic()
+ 
+-    try {// Heartbeat request to join the group. Note that the member subscribes
++    try {
++      // Heartbeat request to join the group. Note that the member subscribes
+       // to a nonexistent topic.
+       var consumerGroupHeartbeatRequest = new ConsumerGroupHeartbeatRequest.Builder(
+         new ConsumerGroupHeartbeatRequestData()
+diff --git a/streams/src/main/java/org/apache/kafka/streams/internals/metrics/OpenIterators.java b/streams/src/main/java/org/apache/kafka/streams/internals/metrics/OpenIterators.java
+new file mode 100644
+index 0000000000..b3cb052b10
+--- /dev/null
++++ b/streams/src/main/java/org/apache/kafka/streams/internals/metrics/OpenIterators.java
+@@ -0,0 +1,81 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements. See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License. You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.kafka.streams.internals.metrics;
++
++import org.apache.kafka.common.MetricName;
++import org.apache.kafka.streams.processor.TaskId;
++import org.apache.kafka.streams.processor.internals.metrics.StreamsMetricsImpl;
++import org.apache.kafka.streams.state.internals.MeteredIterator;
++import org.apache.kafka.streams.state.internals.metrics.StateStoreMetrics;
++
++import java.util.Comparator;
++import java.util.Iterator;
++import java.util.NavigableSet;
++import java.util.concurrent.ConcurrentSkipListSet;
++import java.util.concurrent.atomic.AtomicLong;
++
++public class OpenIterators {
++    private final TaskId taskId;
++    private final String metricsScope;
++    private final String name;
++    private final StreamsMetricsImpl streamsMetrics;
++
++    private final NavigableSet<MeteredIterator> openIterators = new ConcurrentSkipListSet<>(Comparator.comparingLong(MeteredIterator::startTimestamp));
++    private final AtomicLong oldestStartTimestamp = new AtomicLong();
++
++    private MetricName metricName;
++
++    public OpenIterators(final TaskId taskId,
++                         final String metricsScope,
++                         final String name,
++                         final StreamsMetricsImpl streamsMetrics) {
++        this.taskId = taskId;
++        this.metricsScope = metricsScope;
++        this.name = name;
++        this.streamsMetrics = streamsMetrics;
++    }
++
++    public void add(final MeteredIterator iterator) {
++        openIterators.add(iterator);
++        updateOldestStartTimestamp();
++
++        if (openIterators.size() == 1) {
++            metricName = StateStoreMetrics.addOldestOpenIteratorGauge(taskId.toString(), metricsScope, name, streamsMetrics,
++                (config, now) -> oldestStartTimestamp.get()
++            );
++        }
++    }
++
++    public void remove(final MeteredIterator iterator) {
++        if (openIterators.size() == 1) {
++            streamsMetrics.removeStoreLevelMetric(metricName);
++        }
++        openIterators.remove(iterator);
++        updateOldestStartTimestamp();
++    }
++
++    public long sum() {
++        return openIterators.size();
++    }
++
++    private void updateOldestStartTimestamp() {
++        final Iterator<MeteredIterator> openIteratorsIterator = openIterators.iterator();
++        if (openIteratorsIterator.hasNext()) {
++            oldestStartTimestamp.set(openIteratorsIterator.next().startTimestamp());
++        }
++    }
++}
+diff --git a/streams/src/main/java/org/apache/kafka/streams/state/internals/MeteredKeyValueStore.java b/streams/src/main/java/org/apache/kafka/streams/state/internals/MeteredKeyValueStore.java
+index f29427a638..a89bf0c62c 100644
+--- a/streams/src/main/java/org/apache/kafka/streams/state/internals/MeteredKeyValueStore.java
++++ b/streams/src/main/java/org/apache/kafka/streams/state/internals/MeteredKeyValueStore.java
+@@ -23,6 +23,7 @@ import org.apache.kafka.common.utils.Bytes;
+ import org.apache.kafka.common.utils.Time;
+ import org.apache.kafka.streams.KeyValue;
+ import org.apache.kafka.streams.errors.ProcessorStateException;
++import org.apache.kafka.streams.internals.metrics.OpenIterators;
+ import org.apache.kafka.streams.kstream.internals.Change;
+ import org.apache.kafka.streams.kstream.internals.WrappingNullableUtils;
+ import org.apache.kafka.streams.processor.StateStore;
+@@ -48,15 +49,9 @@ import org.apache.kafka.streams.state.internals.StoreQueryUtils.QueryHandler;
+ import org.apache.kafka.streams.state.internals.metrics.StateStoreMetrics;
+ 
+ import java.util.ArrayList;
+-import java.util.Comparator;
+-import java.util.Iterator;
+ import java.util.List;
+ import java.util.Map;
+-import java.util.NavigableSet;
+-import java.util.NoSuchElementException;
+ import java.util.Objects;
+-import java.util.concurrent.ConcurrentSkipListSet;
+-import java.util.concurrent.atomic.LongAdder;
+ import java.util.function.Function;
+ 
+ import static org.apache.kafka.common.utils.Utils.mkEntry;
+@@ -98,9 +93,7 @@ public class MeteredKeyValueStore<K, V>
+     private TaskId taskId;
+     private Sensor restoreSensor;
+ 
+-    protected LongAdder numOpenIterators = new LongAdder();
+-    protected NavigableSet<MeteredIterator> openIterators = new ConcurrentSkipListSet<>(Comparator.comparingLong(MeteredIterator::startTimestamp));
+-
++    protected OpenIterators openIterators;
+ 
+     @SuppressWarnings("rawtypes")
+     private final Map<Class, QueryHandler> queryHandlers =
+@@ -155,16 +148,8 @@ public class MeteredKeyValueStore<K, V>
+         e2eLatencySensor = StateStoreMetrics.e2ELatencySensor(taskId.toString(), metricsScope, name(), streamsMetrics);
+         iteratorDurationSensor = StateStoreMetrics.iteratorDurationSensor(taskId.toString(), metricsScope, name(), streamsMetrics);
+         StateStoreMetrics.addNumOpenIteratorsGauge(taskId.toString(), metricsScope, name(), streamsMetrics,
+-                (config, now) -> numOpenIterators.sum());
+-        StateStoreMetrics.addOldestOpenIteratorGauge(taskId.toString(), metricsScope, name(), streamsMetrics,
+-            (config, now) -> {
+-                try {
+-                    final Iterator<MeteredIterator> iter = openIterators.iterator();
+-                    return iter.hasNext() ? iter.next().startTimestamp() : 0L;
+-                } catch (final NoSuchElementException e) {
+-                    return 0L;
+-                }
+-            });
++                (config, now) -> openIterators.sum());
++        openIterators = new OpenIterators(taskId, metricsScope, name(), streamsMetrics);
+     }
+ 
+     @Override
+@@ -455,7 +440,6 @@ public class MeteredKeyValueStore<K, V>
+             this.sensor = sensor;
+             this.startTimestamp = time.milliseconds();
+             this.startNs = time.nanoseconds();
+-            numOpenIterators.increment();
+             openIterators.add(this);
+         }
+ 
+@@ -485,7 +469,6 @@ public class MeteredKeyValueStore<K, V>
+                 final long duration = time.nanoseconds() - startNs;
+                 sensor.record(duration);
+                 iteratorDurationSensor.record(duration);
+-                numOpenIterators.decrement();
+                 openIterators.remove(this);
+             }
+         }
+@@ -514,7 +497,6 @@ public class MeteredKeyValueStore<K, V>
+             this.valueDeserializer = valueDeserializer;
+             this.startTimestamp = time.milliseconds();
+             this.startNs = time.nanoseconds();
+-            numOpenIterators.increment();
+             openIterators.add(this);
+         }
+ 
+@@ -544,7 +526,6 @@ public class MeteredKeyValueStore<K, V>
+                 final long duration = time.nanoseconds() - startNs;
+                 sensor.record(duration);
+                 iteratorDurationSensor.record(duration);
+-                numOpenIterators.decrement();
+                 openIterators.remove(this);
+             }
+         }
+diff --git a/streams/src/main/java/org/apache/kafka/streams/state/internals/MeteredMultiVersionedKeyQueryIterator.java b/streams/src/main/java/org/apache/kafka/streams/state/internals/MeteredMultiVersionedKeyQueryIterator.java
+index b6787a311e..b27e6a78d8 100644
+--- a/streams/src/main/java/org/apache/kafka/streams/state/internals/MeteredMultiVersionedKeyQueryIterator.java
++++ b/streams/src/main/java/org/apache/kafka/streams/state/internals/MeteredMultiVersionedKeyQueryIterator.java
+@@ -18,11 +18,10 @@ package org.apache.kafka.streams.state.internals;
+ 
+ import org.apache.kafka.common.metrics.Sensor;
+ import org.apache.kafka.common.utils.Time;
++import org.apache.kafka.streams.internals.metrics.OpenIterators;
+ import org.apache.kafka.streams.state.VersionedRecord;
+ import org.apache.kafka.streams.state.VersionedRecordIterator;
+ 
+-import java.util.Set;
+-import java.util.concurrent.atomic.LongAdder;
+ import java.util.function.Function;
+ 
+ class MeteredMultiVersionedKeyQueryIterator<V> implements VersionedRecordIterator<V>, MeteredIterator {
+@@ -33,24 +32,20 @@ class MeteredMultiVersionedKeyQueryIterator<V> implements VersionedRecordIterato
+     private final Time time;
+     private final long startNs;
+     private final long startTimestampMs;
+-    private final Set<MeteredIterator> openIterators;
+-    private final LongAdder numOpenIterators;
++    private final OpenIterators openIterators;
+ 
+     public MeteredMultiVersionedKeyQueryIterator(final VersionedRecordIterator<byte[]> iterator,
+                                                  final Sensor sensor,
+                                                  final Time time,
+                                                  final Function<VersionedRecord<byte[]>, VersionedRecord<V>> deserializeValue,
+-                                                 final LongAdder numOpenIterators,
+-                                                 final Set<MeteredIterator> openIterators) {
++                                                 final OpenIterators openIterators) {
+         this.iterator = iterator;
+         this.deserializeValue = deserializeValue;
+-        this.numOpenIterators = numOpenIterators;
+         this.openIterators = openIterators;
+         this.sensor = sensor;
+         this.time = time;
+         this.startNs = time.nanoseconds();
+         this.startTimestampMs = time.milliseconds();
+-        numOpenIterators.increment();
+         openIterators.add(this);
+     }
+ 
+@@ -65,7 +60,6 @@ class MeteredMultiVersionedKeyQueryIterator<V> implements VersionedRecordIterato
+             iterator.close();
+         } finally {
+             sensor.record(time.nanoseconds() - startNs);
+-            numOpenIterators.decrement();
+             openIterators.remove(this);
+         }
+     }
+diff --git a/streams/src/main/java/org/apache/kafka/streams/state/internals/MeteredVersionedKeyValueStore.java b/streams/src/main/java/org/apache/kafka/streams/state/internals/MeteredVersionedKeyValueStore.java
+index 66eb3206de..6afb4d1531 100644
+--- a/streams/src/main/java/org/apache/kafka/streams/state/internals/MeteredVersionedKeyValueStore.java
++++ b/streams/src/main/java/org/apache/kafka/streams/state/internals/MeteredVersionedKeyValueStore.java
+@@ -269,7 +269,6 @@ public class MeteredVersionedKeyValueStore<K, V>
+                             iteratorDurationSensor,
+                             time,
+                             StoreQueryUtils.deserializeValue(plainValueSerdes),
+-                            numOpenIterators,
+                             openIterators
+                         );
+                 final QueryResult<MeteredMultiVersionedKeyQueryIterator<V>> typedQueryResult =
+diff --git a/streams/src/main/java/org/apache/kafka/streams/state/internals/metrics/StateStoreMetrics.java b/streams/src/main/java/org/apache/kafka/streams/state/internals/metrics/StateStoreMetrics.java
+index cfaece063e..bb60c30468 100644
+--- a/streams/src/main/java/org/apache/kafka/streams/state/internals/metrics/StateStoreMetrics.java
++++ b/streams/src/main/java/org/apache/kafka/streams/state/internals/metrics/StateStoreMetrics.java
+@@ -467,7 +467,7 @@ public class StateStoreMetrics {
+                 storeName,
+                 OLDEST_ITERATOR_OPEN_SINCE_MS,
+                 OLDEST_ITERATOR_OPEN_SINCE_MS_DESCRIPTION,
+-                RecordingLevel.DEBUG,
++                RecordingLevel.INFO,
+                 oldestOpenIteratorGauge
+         );
+     }
+diff --git a/streams/src/test/java/org/apache/kafka/streams/internals/metrics/OpenIteratorsTest.java b/streams/src/test/java/org/apache/kafka/streams/internals/metrics/OpenIteratorsTest.java
+new file mode 100644
+index 0000000000..daaacb7bec
+--- /dev/null
++++ b/streams/src/test/java/org/apache/kafka/streams/internals/metrics/OpenIteratorsTest.java
+@@ -0,0 +1,73 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements. See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License. You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.kafka.streams.internals.metrics;
++
++import org.apache.kafka.common.metrics.Gauge;
++import org.apache.kafka.streams.processor.TaskId;
++import org.apache.kafka.streams.processor.internals.metrics.StreamsMetricsImpl;
++import org.apache.kafka.streams.state.internals.MeteredIterator;
++
++import org.junit.jupiter.api.Test;
++import org.mockito.ArgumentCaptor;
++
++import static org.hamcrest.CoreMatchers.is;
++import static org.hamcrest.CoreMatchers.not;
++import static org.hamcrest.MatcherAssert.assertThat;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.reset;
++import static org.mockito.Mockito.verify;
++
++public class OpenIteratorsTest {
++
++    private final StreamsMetricsImpl streamsMetrics = mock(StreamsMetricsImpl.class);
++
++    @SuppressWarnings("unchecked")
++    @Test
++    public void shouldCalculateOldestStartTimestampCorrectly() {
++        final OpenIterators openIterators = new OpenIterators(new TaskId(0, 0), "scope", "name", streamsMetrics);
++
++        final MeteredIterator meteredIterator1 = () -> 5;
++        final MeteredIterator meteredIterator2 = () -> 2;
++        final MeteredIterator meteredIterator3 = () -> 6;
++
++        openIterators.add(meteredIterator1);
++        final ArgumentCaptor<Gauge<Long>> gaugeCaptor = ArgumentCaptor.forClass(Gauge.class);
++        verify(streamsMetrics).addStoreLevelMutableMetric(any(), any(), any(), any(), any(), any(), gaugeCaptor.capture());
++        final Gauge<Long> gauge = gaugeCaptor.getValue();
++        assertThat(gauge.value(null, 0), is(5L));
++        reset(streamsMetrics);
++
++        openIterators.add(meteredIterator2);
++        verify(streamsMetrics, never()).addStoreLevelMutableMetric(any(), any(), any(), any(), any(), any(), gaugeCaptor.capture());
++        assertThat(gauge.value(null, 0), is(2L));
++
++        openIterators.remove(meteredIterator2);
++        verify(streamsMetrics, never()).removeStoreLevelMetric(any());
++        assertThat(gauge.value(null, 0), is(5L));
++
++        openIterators.remove(meteredIterator1);
++        verify(streamsMetrics).removeStoreLevelMetric(any());
++        assertThat(gauge.value(null, 0), is(5L));
++
++        openIterators.add(meteredIterator3);
++        verify(streamsMetrics).addStoreLevelMutableMetric(any(), any(), any(), any(), any(), any(), gaugeCaptor.capture());
++        assertThat(gaugeCaptor.getValue(), not(gauge));
++        assertThat(gaugeCaptor.getValue().value(null, 0), is(6L));
++    }
++}
+diff --git a/streams/src/test/java/org/apache/kafka/streams/state/internals/MeteredKeyValueStoreTest.java b/streams/src/test/java/org/apache/kafka/streams/state/internals/MeteredKeyValueStoreTest.java
+index f92304f360..4aba278497 100644
+--- a/streams/src/test/java/org/apache/kafka/streams/state/internals/MeteredKeyValueStoreTest.java
++++ b/streams/src/test/java/org/apache/kafka/streams/state/internals/MeteredKeyValueStoreTest.java
+@@ -527,13 +527,16 @@ public class MeteredKeyValueStoreTest {
+         when(inner.all()).thenReturn(KeyValueIterators.emptyIterator());
+         init();
+ 
+-        final KafkaMetric oldestIteratorTimestampMetric = metric("oldest-iterator-open-since-ms");
+-        assertThat(oldestIteratorTimestampMetric, not(nullValue()));
++        KafkaMetric oldestIteratorTimestampMetric = metric("oldest-iterator-open-since-ms");
++        assertThat(oldestIteratorTimestampMetric, nullValue());
+ 
+         KeyValueIterator<String, String> second = null;
+         final long secondTimestamp;
+         try {
+             try (final KeyValueIterator<String, String> unused = metered.all()) {
++                oldestIteratorTimestampMetric = metric("oldest-iterator-open-since-ms");
++                assertThat(oldestIteratorTimestampMetric, not(nullValue()));
++
+                 final long oldestTimestamp = mockTime.milliseconds();
+                 assertThat((Long) oldestIteratorTimestampMetric.metricValue(), equalTo(oldestTimestamp));
+                 mockTime.sleep(100);
+@@ -552,8 +555,9 @@ public class MeteredKeyValueStoreTest {
+                 second.close();
+             }
+         }
+-        // no open iterators left, timestamp should be reset to 0
+-        assertThat((Long) oldestIteratorTimestampMetric.metricValue(), equalTo(0L));
++
++        oldestIteratorTimestampMetric = metric("oldest-iterator-open-since-ms");
++        assertThat(oldestIteratorTimestampMetric, nullValue());
+     }
+ 
+     private KafkaMetric metric(final MetricName metricName) {
+diff --git a/streams/src/test/java/org/apache/kafka/streams/state/internals/MeteredTimestampedKeyValueStoreTest.java b/streams/src/test/java/org/apache/kafka/streams/state/internals/MeteredTimestampedKeyValueStoreTest.java
+index 0f3f303c8a..9b5d33db96 100644
+--- a/streams/src/test/java/org/apache/kafka/streams/state/internals/MeteredTimestampedKeyValueStoreTest.java
++++ b/streams/src/test/java/org/apache/kafka/streams/state/internals/MeteredTimestampedKeyValueStoreTest.java
+@@ -503,13 +503,15 @@ public class MeteredTimestampedKeyValueStoreTest {
+         when(inner.all()).thenReturn(KeyValueIterators.emptyIterator());
+         init();
+ 
+-        final KafkaMetric oldestIteratorTimestampMetric = metric("oldest-iterator-open-since-ms");
+-        assertThat(oldestIteratorTimestampMetric, not(nullValue()));
++        KafkaMetric oldestIteratorTimestampMetric = metric("oldest-iterator-open-since-ms");
++        assertThat(oldestIteratorTimestampMetric, nullValue());
+ 
+         KeyValueIterator<String, ValueAndTimestamp<String>> second = null;
+         final long secondTimestamp;
+         try {
+             try (final KeyValueIterator<String, ValueAndTimestamp<String>> unused = metered.all()) {
++                oldestIteratorTimestampMetric = metric("oldest-iterator-open-since-ms");
++                assertThat(oldestIteratorTimestampMetric, not(nullValue()));
+ 
+                 final long oldestTimestamp = mockTime.milliseconds();
+                 assertThat((Long) oldestIteratorTimestampMetric.metricValue(), equalTo(oldestTimestamp));
+@@ -529,7 +531,8 @@ public class MeteredTimestampedKeyValueStoreTest {
+                 second.close();
+             }
+         }
+-        // now that all iterators are closed, the metric should be zero
+-        assertThat((Long) oldestIteratorTimestampMetric.metricValue(), equalTo(0L));
++
++        oldestIteratorTimestampMetric = metric("oldest-iterator-open-since-ms");
++        assertThat(oldestIteratorTimestampMetric, nullValue());
+     }
+ }
+diff --git a/streams/src/test/java/org/apache/kafka/streams/state/internals/MeteredVersionedKeyValueStoreTest.java b/streams/src/test/java/org/apache/kafka/streams/state/internals/MeteredVersionedKeyValueStoreTest.java
+index 123b08b150..56fe45630d 100644
+--- a/streams/src/test/java/org/apache/kafka/streams/state/internals/MeteredVersionedKeyValueStoreTest.java
++++ b/streams/src/test/java/org/apache/kafka/streams/state/internals/MeteredVersionedKeyValueStoreTest.java
+@@ -419,14 +419,16 @@ public class MeteredVersionedKeyValueStoreTest {
+         when(inner.query(any(), any(), any())).thenReturn(
+                 QueryResult.forResult(new LogicalSegmentIterator(Collections.emptyListIterator(), RAW_KEY, 0L, 0L, ResultOrder.ANY)));
+ 
+-        final KafkaMetric oldestIteratorTimestampMetric = getMetric("oldest-iterator-open-since-ms");
+-        assertThat(oldestIteratorTimestampMetric, not(nullValue()));
++        KafkaMetric oldestIteratorTimestampMetric = getMetric("oldest-iterator-open-since-ms");
++        assertThat(oldestIteratorTimestampMetric, nullValue());
+ 
+         final QueryResult<VersionedRecordIterator<String>> first = store.query(query, bound, config);
+         VersionedRecordIterator<String> secondIterator = null;
+         final long secondTime;
+         try {
+             try (final VersionedRecordIterator<String> unused = first.getResult()) {
++                oldestIteratorTimestampMetric = getMetric("oldest-iterator-open-since-ms");
++                assertThat(oldestIteratorTimestampMetric, not(nullValue()));
+ 
+                 final long oldestTimestamp = mockTime.milliseconds();
+                 assertThat((Long) oldestIteratorTimestampMetric.metricValue(), equalTo(oldestTimestamp));
+@@ -448,8 +450,9 @@ public class MeteredVersionedKeyValueStoreTest {
+                 secondIterator.close();
+             }
+         }
+-        // no open iterators left, timestamp should be reset to 0
+-        assertThat((Long) oldestIteratorTimestampMetric.metricValue(), equalTo(0L));
++
++        oldestIteratorTimestampMetric = getMetric("oldest-iterator-open-since-ms");
++        assertThat(oldestIteratorTimestampMetric, nullValue());
+     }
+ 
+     private KafkaMetric getMetric(final String name) {

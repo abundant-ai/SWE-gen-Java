@@ -1,0 +1,393 @@
+diff --git a/gradle/plugins/build-parameters/build.gradle.kts b/gradle/plugins/build-parameters/build.gradle.kts
+index bed7fe291..8a1276886 100644
+--- a/gradle/plugins/build-parameters/build.gradle.kts
++++ b/gradle/plugins/build-parameters/build.gradle.kts
+@@ -39,7 +39,7 @@ buildParameters {
+ 			group("predictiveTestSelection") {
+ 				bool("enabled") {
+ 					description = "Whether or not to use Predictive Test Selection for selecting tests to execute"
+-					defaultValue = false
++					defaultValue = true
+ 				}
+ 				bool("selectRemainingTests") {
+ 					// see https://docs.gradle.com/develocity/predictive-test-selection/#gradle-selection-mode
+diff --git a/junit-platform-launcher/src/main/java/org/junit/platform/launcher/LauncherConstants.java b/junit-platform-launcher/src/main/java/org/junit/platform/launcher/LauncherConstants.java
+index b356e376b..a18a71b45 100644
+--- a/junit-platform-launcher/src/main/java/org/junit/platform/launcher/LauncherConstants.java
++++ b/junit-platform-launcher/src/main/java/org/junit/platform/launcher/LauncherConstants.java
+@@ -225,9 +225,10 @@ public class LauncherConstants {
+ 	 *
+ 	 * <p>If an engine reports an issue with a severity equal to or higher than
+ 	 * the configured critical severity, its tests will not be executed.
+-	 * Instead, the engine will be reported as failed during execution with a
++	 * Depending on {@link #DISCOVERY_ISSUE_FAILURE_PHASE_PROPERTY_NAME}, a
+ 	 * {@link org.junit.platform.launcher.core.DiscoveryIssueException} listing
+-	 * all critical issues.
++	 * all critical issues will be thrown during discovery or be reported as
++	 * engine-level failure during execution.
+ 	 *
+ 	 * <h4>Supported Values</h4>
+ 	 *
+@@ -244,6 +245,27 @@ public class LauncherConstants {
+ 	@API(status = EXPERIMENTAL, since = "1.13")
+ 	public static final String CRITICAL_DISCOVERY_ISSUE_SEVERITY_PROPERTY_NAME = "junit.platform.discovery.issue.severity.critical";
+ 
++	/**
++	 * Property name used to configure the phase that critical discovery issues
++	 * should cause a failure
++	 *
++	 * <h4>Supported Values</h4>
++	 *
++	 * <p>Supported values are "discovery" or "execution".
++	 *
++	 * <p>If not specified, the {@code Launcher} will report discovery issues
++	 * during the discovery phase if
++	 * {@link Launcher#discover(LauncherDiscoveryRequest)} is called, and during
++	 * the execution phase if
++	 * {@link Launcher#execute(LauncherDiscoveryRequest, TestExecutionListener...)}
++	 * is called.
++	 *
++	 * @since 1.13
++	 * @see #CRITICAL_DISCOVERY_ISSUE_SEVERITY_PROPERTY_NAME
++	 */
++	@API(status = EXPERIMENTAL, since = "1.13")
++	public static final String DISCOVERY_ISSUE_FAILURE_PHASE_PROPERTY_NAME = "junit.platform.discovery.issue.failure.phase";
++
+ 	private LauncherConstants() {
+ 		/* no-op */
+ 	}
+diff --git a/junit-platform-launcher/src/main/java/org/junit/platform/launcher/core/DefaultLauncher.java b/junit-platform-launcher/src/main/java/org/junit/platform/launcher/core/DefaultLauncher.java
+index 2a9fa3bf1..c4691503b 100644
+--- a/junit-platform-launcher/src/main/java/org/junit/platform/launcher/core/DefaultLauncher.java
++++ b/junit-platform-launcher/src/main/java/org/junit/platform/launcher/core/DefaultLauncher.java
+@@ -12,8 +12,8 @@ package org.junit.platform.launcher.core;
+ 
+ import static java.util.Collections.unmodifiableCollection;
+ import static org.junit.platform.engine.support.store.NamespacedHierarchicalStore.CloseAction.closeAutoCloseables;
+-import static org.junit.platform.launcher.core.EngineDiscoveryOrchestrator.Phase.DISCOVERY;
+-import static org.junit.platform.launcher.core.EngineDiscoveryOrchestrator.Phase.EXECUTION;
++import static org.junit.platform.launcher.core.LauncherPhase.DISCOVERY;
++import static org.junit.platform.launcher.core.LauncherPhase.EXECUTION;
+ 
+ import java.util.Collection;
+ 
+@@ -100,8 +100,7 @@ class DefaultLauncher implements Launcher {
+ 		execute((InternalTestPlan) testPlan, listeners);
+ 	}
+ 
+-	private LauncherDiscoveryResult discover(LauncherDiscoveryRequest discoveryRequest,
+-			EngineDiscoveryOrchestrator.Phase phase) {
++	private LauncherDiscoveryResult discover(LauncherDiscoveryRequest discoveryRequest, LauncherPhase phase) {
+ 		return discoveryOrchestrator.discover(discoveryRequest, phase);
+ 	}
+ 
+diff --git a/junit-platform-launcher/src/main/java/org/junit/platform/launcher/core/EngineDiscoveryOrchestrator.java b/junit-platform-launcher/src/main/java/org/junit/platform/launcher/core/EngineDiscoveryOrchestrator.java
+index 00bcdae9a..5c989b32d 100644
+--- a/junit-platform-launcher/src/main/java/org/junit/platform/launcher/core/EngineDiscoveryOrchestrator.java
++++ b/junit-platform-launcher/src/main/java/org/junit/platform/launcher/core/EngineDiscoveryOrchestrator.java
+@@ -13,12 +13,12 @@ package org.junit.platform.launcher.core;
+ import static java.util.stream.Collectors.joining;
+ import static org.apiguardian.api.API.Status.INTERNAL;
+ import static org.junit.platform.engine.Filter.composeFilters;
++import static org.junit.platform.launcher.core.LauncherPhase.getDiscoveryIssueFailurePhase;
+ 
+ import java.util.Collection;
+ import java.util.LinkedHashMap;
+ import java.util.LinkedList;
+ import java.util.List;
+-import java.util.Locale;
+ import java.util.Map;
+ import java.util.Optional;
+ import java.util.function.Function;
+@@ -28,6 +28,7 @@ import org.junit.platform.commons.JUnitException;
+ import org.junit.platform.commons.logging.Logger;
+ import org.junit.platform.commons.logging.LoggerFactory;
+ import org.junit.platform.commons.util.UnrecoverableExceptions;
++import org.junit.platform.engine.ConfigurationParameters;
+ import org.junit.platform.engine.Filter;
+ import org.junit.platform.engine.FilterResult;
+ import org.junit.platform.engine.TestDescriptor;
+@@ -68,15 +69,19 @@ public class EngineDiscoveryOrchestrator {
+ 	}
+ 
+ 	/**
+-	 * Discovers tests for the supplied request in the supplied phase using the
+-	 * configured test engines.
++	 * Discovers tests for the supplied request using the configured test
++	 * engines.
+ 	 *
+ 	 * <p>Applies {@linkplain org.junit.platform.launcher.EngineFilter engine
+ 	 * filters} and {@linkplain PostDiscoveryFilter post-discovery filters} and
+ 	 * {@linkplain TestDescriptor#prune() prunes} the resulting test tree.
+ 	 */
+-	public LauncherDiscoveryResult discover(LauncherDiscoveryRequest request, Phase phase) {
+-		return discover(request, phase, UniqueId::forEngine);
++	public LauncherDiscoveryResult discover(LauncherDiscoveryRequest request) {
++		return discover(request, Optional.empty(), UniqueId::forEngine);
++	}
++
++	LauncherDiscoveryResult discover(LauncherDiscoveryRequest request, LauncherPhase phase) {
++		return discover(request, Optional.of(phase), UniqueId::forEngine);
+ 	}
+ 
+ 	/**
+@@ -93,12 +98,12 @@ public class EngineDiscoveryOrchestrator {
+ 	 * {@link EngineExecutionOrchestrator} will not emit start or emit events
+ 	 * for engines without tests.
+ 	 */
+-	public LauncherDiscoveryResult discover(LauncherDiscoveryRequest request, Phase phase, UniqueId parentId) {
+-		LauncherDiscoveryResult result = discover(request, phase, parentId::appendEngine);
++	public LauncherDiscoveryResult discover(LauncherDiscoveryRequest request, UniqueId parentId) {
++		LauncherDiscoveryResult result = discover(request, Optional.empty(), parentId::appendEngine);
+ 		return result.withRetainedEngines(TestDescriptor::containsTests);
+ 	}
+ 
+-	private LauncherDiscoveryResult discover(LauncherDiscoveryRequest request, Phase phase,
++	private LauncherDiscoveryResult discover(LauncherDiscoveryRequest request, Optional<LauncherPhase> phase,
+ 			Function<String, UniqueId> uniqueIdCreator) {
+ 		DiscoveryIssueCollector issueCollector = new DiscoveryIssueCollector(request.getConfigurationParameters());
+ 		LauncherDiscoveryListener listener = getLauncherDiscoveryListener(request, issueCollector);
+@@ -109,19 +114,48 @@ public class EngineDiscoveryOrchestrator {
+ 			}
+ 		};
+ 		listener.launcherDiscoveryStarted(request);
++		LauncherDiscoveryResult discoveryResult;
+ 		try {
+ 			Map<TestEngine, EngineResultInfo> testEngineResults = discoverSafely(delegatingRequest, phase,
+ 				issueCollector, uniqueIdCreator);
+-			return new LauncherDiscoveryResult(testEngineResults, request.getConfigurationParameters(),
++			discoveryResult = new LauncherDiscoveryResult(testEngineResults, request.getConfigurationParameters(),
+ 				request.getOutputDirectoryProvider());
+ 		}
+ 		finally {
+ 			listener.launcherDiscoveryFinished(request);
+ 		}
++		if (shouldReportDiscoveryIssues(request, phase)) {
++			reportDiscoveryIssues(discoveryResult);
++		}
++		return discoveryResult;
+ 	}
+ 
+-	private Map<TestEngine, EngineResultInfo> discoverSafely(LauncherDiscoveryRequest request, Phase phase,
+-			DiscoveryIssueCollector issueCollector, Function<String, UniqueId> uniqueIdCreator) {
++	private static boolean shouldReportDiscoveryIssues(LauncherDiscoveryRequest request,
++			Optional<LauncherPhase> phase) {
++		ConfigurationParameters configurationParameters = request.getConfigurationParameters();
++		return getDiscoveryIssueFailurePhase(configurationParameters).orElse(
++			phase.orElse(null)) == LauncherPhase.DISCOVERY;
++	}
++
++	private static void reportDiscoveryIssues(LauncherDiscoveryResult discoveryResult) {
++		DiscoveryIssueException exception = null;
++		for (TestEngine testEngine : discoveryResult.getTestEngines()) {
++			EngineResultInfo engineResult = discoveryResult.getEngineResult(testEngine);
++			DiscoveryIssueNotifier discoveryIssueNotifier = engineResult.getDiscoveryIssueNotifier();
++			discoveryIssueNotifier.logCriticalIssues(testEngine);
++			discoveryIssueNotifier.logNonCriticalIssues(testEngine);
++			if (exception == null) {
++				exception = discoveryIssueNotifier.createExceptionForCriticalIssues(testEngine);
++			}
++		}
++		if (exception != null) {
++			throw exception;
++		}
++	}
++
++	private Map<TestEngine, EngineResultInfo> discoverSafely(LauncherDiscoveryRequest request,
++			Optional<LauncherPhase> phase, DiscoveryIssueCollector issueCollector,
++			Function<String, UniqueId> uniqueIdCreator) {
+ 		Map<TestEngine, EngineResultInfo> testEngineDescriptors = new LinkedHashMap<>();
+ 		EngineFilterer engineFilterer = new EngineFilterer(request.getEngineFilters());
+ 
+@@ -129,14 +163,13 @@ public class EngineDiscoveryOrchestrator {
+ 			boolean engineIsExcluded = engineFilterer.isExcluded(testEngine);
+ 
+ 			if (engineIsExcluded) {
+-				logger.debug(() -> String.format(
+-					"Test discovery for engine '%s' was skipped due to an EngineFilter in %s phase.",
+-					testEngine.getId(), phase));
++				logger.debug(() -> String.format("Test discovery for engine '%s' was skipped due to an EngineFilter%s.",
++					testEngine.getId(), phase.map(it -> String.format(" in %s phase", it)).orElse("")));
+ 				continue;
+ 			}
+ 
+-			logger.debug(() -> String.format("Discovering tests during Launcher %s phase in engine '%s'.", phase,
+-				testEngine.getId()));
++			logger.debug(() -> String.format("Discovering tests%s in engine '%s'.",
++				phase.map(it -> String.format(" during Launcher %s phase", it)).orElse(""), testEngine.getId()));
+ 
+ 			EngineResultInfo engineResult = discoverEngineRoot(testEngine, request, issueCollector, uniqueIdCreator);
+ 			testEngineDescriptors.put(testEngine, engineResult);
+@@ -241,13 +274,4 @@ public class EngineDiscoveryOrchestrator {
+ 		testEngineResults.values().forEach(result -> result.getRootDescriptor().accept(visitor));
+ 	}
+ 
+-	public enum Phase {
+-		DISCOVERY, EXECUTION;
+-
+-		@Override
+-		public String toString() {
+-			return name().toLowerCase(Locale.ENGLISH);
+-		}
+-	}
+-
+ }
+diff --git a/junit-platform-launcher/src/main/java/org/junit/platform/launcher/core/EngineExecutionOrchestrator.java b/junit-platform-launcher/src/main/java/org/junit/platform/launcher/core/EngineExecutionOrchestrator.java
+index eccb29fd8..1cf63758f 100644
+--- a/junit-platform-launcher/src/main/java/org/junit/platform/launcher/core/EngineExecutionOrchestrator.java
++++ b/junit-platform-launcher/src/main/java/org/junit/platform/launcher/core/EngineExecutionOrchestrator.java
+@@ -13,6 +13,7 @@ package org.junit.platform.launcher.core;
+ import static org.apiguardian.api.API.Status.INTERNAL;
+ import static org.junit.platform.launcher.LauncherConstants.DRY_RUN_PROPERTY_NAME;
+ import static org.junit.platform.launcher.LauncherConstants.STACKTRACE_PRUNING_ENABLED_PROPERTY_NAME;
++import static org.junit.platform.launcher.core.LauncherPhase.getDiscoveryIssueFailurePhase;
+ import static org.junit.platform.launcher.core.ListenerRegistry.forEngineExecutionListeners;
+ 
+ import java.util.Optional;
+@@ -185,7 +186,9 @@ public class EngineExecutionOrchestrator {
+ 	private void failOrExecuteEngine(LauncherDiscoveryResult discoveryResult, EngineExecutionListener listener,
+ 			TestEngine testEngine, NamespacedHierarchicalStore<Namespace> requestLevelStore) {
+ 		EngineResultInfo engineDiscoveryResult = discoveryResult.getEngineResult(testEngine);
+-		DiscoveryIssueNotifier discoveryIssueNotifier = engineDiscoveryResult.getDiscoveryIssueNotifier();
++		DiscoveryIssueNotifier discoveryIssueNotifier = shouldReportDiscoveryIssues(discoveryResult) //
++				? engineDiscoveryResult.getDiscoveryIssueNotifier() //
++				: DiscoveryIssueNotifier.NO_ISSUES;
+ 		TestDescriptor engineDescriptor = engineDiscoveryResult.getRootDescriptor();
+ 		Throwable failure = engineDiscoveryResult.getCause() //
+ 				.orElseGet(() -> discoveryIssueNotifier.createExceptionForCriticalIssues(testEngine));
+@@ -203,6 +206,12 @@ public class EngineExecutionOrchestrator {
+ 		}
+ 	}
+ 
++	private static boolean shouldReportDiscoveryIssues(LauncherDiscoveryResult discoveryResult) {
++		ConfigurationParameters configurationParameters = discoveryResult.getConfigurationParameters();
++		return getDiscoveryIssueFailurePhase(configurationParameters).orElse(
++			LauncherPhase.EXECUTION) == LauncherPhase.EXECUTION;
++	}
++
+ 	private ListenerRegistry<TestExecutionListener> buildListenerRegistryForExecution(
+ 			TestExecutionListener... listeners) {
+ 		if (listeners.length == 0) {
+diff --git a/junit-platform-launcher/src/main/java/org/junit/platform/launcher/core/LauncherPhase.java b/junit-platform-launcher/src/main/java/org/junit/platform/launcher/core/LauncherPhase.java
+new file mode 100644
+index 000000000..107bcf971
+--- /dev/null
++++ b/junit-platform-launcher/src/main/java/org/junit/platform/launcher/core/LauncherPhase.java
+@@ -0,0 +1,51 @@
++/*
++ * Copyright 2015-2025 the original author or authors.
++ *
++ * All rights reserved. This program and the accompanying materials are
++ * made available under the terms of the Eclipse Public License v2.0 which
++ * accompanies this distribution and is available at
++ *
++ * https://www.eclipse.org/legal/epl-v20.html
++ */
++
++package org.junit.platform.launcher.core;
++
++import static org.junit.platform.launcher.LauncherConstants.DISCOVERY_ISSUE_FAILURE_PHASE_PROPERTY_NAME;
++
++import java.util.Locale;
++import java.util.Optional;
++
++import org.junit.platform.commons.logging.Logger;
++import org.junit.platform.commons.logging.LoggerFactory;
++import org.junit.platform.engine.ConfigurationParameters;
++
++/**
++ * The phase the {@link org.junit.platform.launcher.Launcher} is in.
++ *
++ * @since 1.13
++ */
++enum LauncherPhase {
++
++	DISCOVERY, EXECUTION;
++
++	private static final Logger logger = LoggerFactory.getLogger(LauncherPhase.class);
++
++	static Optional<LauncherPhase> getDiscoveryIssueFailurePhase(ConfigurationParameters configurationParameters) {
++		return configurationParameters.get(DISCOVERY_ISSUE_FAILURE_PHASE_PROPERTY_NAME, value -> {
++			try {
++				return LauncherPhase.valueOf(value.toUpperCase(Locale.ROOT));
++			}
++			catch (Exception e) {
++				logger.warn(
++					() -> String.format("Ignoring invalid LauncherPhase '%s' set via the '%s' configuration parameter.",
++						value, DISCOVERY_ISSUE_FAILURE_PHASE_PROPERTY_NAME));
++				return null;
++			}
++		});
++	}
++
++	@Override
++	public String toString() {
++		return name().toLowerCase(Locale.ENGLISH);
++	}
++}
+diff --git a/junit-platform-suite-engine/src/main/java/org/junit/platform/suite/engine/SuiteLauncher.java b/junit-platform-suite-engine/src/main/java/org/junit/platform/suite/engine/SuiteLauncher.java
+index 6e3bf311c..640d90f98 100644
+--- a/junit-platform-suite-engine/src/main/java/org/junit/platform/suite/engine/SuiteLauncher.java
++++ b/junit-platform-suite-engine/src/main/java/org/junit/platform/suite/engine/SuiteLauncher.java
+@@ -23,7 +23,6 @@ import org.junit.platform.engine.support.store.Namespace;
+ import org.junit.platform.engine.support.store.NamespacedHierarchicalStore;
+ import org.junit.platform.launcher.LauncherDiscoveryRequest;
+ import org.junit.platform.launcher.core.EngineDiscoveryOrchestrator;
+-import org.junit.platform.launcher.core.EngineDiscoveryOrchestrator.Phase;
+ import org.junit.platform.launcher.core.EngineExecutionOrchestrator;
+ import org.junit.platform.launcher.core.LauncherDiscoveryResult;
+ import org.junit.platform.launcher.core.ServiceLoaderTestEngineRegistry;
+@@ -56,7 +55,7 @@ class SuiteLauncher {
+ 	}
+ 
+ 	LauncherDiscoveryResult discover(LauncherDiscoveryRequest discoveryRequest, UniqueId parentId) {
+-		return discoveryOrchestrator.discover(discoveryRequest, Phase.DISCOVERY, parentId);
++		return discoveryOrchestrator.discover(discoveryRequest, parentId);
+ 	}
+ 
+ 	TestExecutionSummary execute(LauncherDiscoveryResult discoveryResult,
+diff --git a/junit-platform-testkit/src/main/java/org/junit/platform/testkit/engine/EngineTestKit.java b/junit-platform-testkit/src/main/java/org/junit/platform/testkit/engine/EngineTestKit.java
+index 9f7f3e185..37398b4ef 100644
+--- a/junit-platform-testkit/src/main/java/org/junit/platform/testkit/engine/EngineTestKit.java
++++ b/junit-platform-testkit/src/main/java/org/junit/platform/testkit/engine/EngineTestKit.java
+@@ -17,8 +17,6 @@ import static org.apiguardian.api.API.Status.EXPERIMENTAL;
+ import static org.apiguardian.api.API.Status.MAINTAINED;
+ import static org.apiguardian.api.API.Status.STABLE;
+ import static org.junit.platform.engine.support.store.NamespacedHierarchicalStore.CloseAction.closeAutoCloseables;
+-import static org.junit.platform.launcher.core.EngineDiscoveryOrchestrator.Phase.DISCOVERY;
+-import static org.junit.platform.launcher.core.EngineDiscoveryOrchestrator.Phase.EXECUTION;
+ 
+ import java.nio.file.Path;
+ import java.util.List;
+@@ -190,7 +188,7 @@ public final class EngineTestKit {
+ 	public static EngineDiscoveryResults discover(TestEngine testEngine, LauncherDiscoveryRequest discoveryRequest) {
+ 		Preconditions.notNull(testEngine, "TestEngine must not be null");
+ 		Preconditions.notNull(discoveryRequest, "EngineDiscoveryRequest must not be null");
+-		LauncherDiscoveryResult discoveryResult = discover(testEngine, discoveryRequest, DISCOVERY);
++		LauncherDiscoveryResult discoveryResult = discoverUsingOrchestrator(testEngine, discoveryRequest);
+ 		TestDescriptor engineDescriptor = discoveryResult.getEngineTestDescriptor(testEngine);
+ 		List<DiscoveryIssue> discoveryIssues = discoveryResult.getDiscoveryIssues(testEngine);
+ 		return new EngineDiscoveryResults(engineDescriptor, discoveryIssues);
+@@ -337,7 +335,7 @@ public final class EngineTestKit {
+ 
+ 	private static void executeUsingLauncherOrchestration(TestEngine testEngine,
+ 			LauncherDiscoveryRequest discoveryRequest, EngineExecutionListener listener) {
+-		LauncherDiscoveryResult discoveryResult = discover(testEngine, discoveryRequest, EXECUTION);
++		LauncherDiscoveryResult discoveryResult = discoverUsingOrchestrator(testEngine, discoveryRequest);
+ 		TestDescriptor engineTestDescriptor = discoveryResult.getEngineTestDescriptor(testEngine);
+ 		Preconditions.notNull(engineTestDescriptor, "TestEngine did not yield a TestDescriptor");
+ 		withRequestLevelStore(store -> new EngineExecutionOrchestrator().execute(discoveryResult, listener, store));
+@@ -354,10 +352,10 @@ public final class EngineTestKit {
+ 		return new NamespacedHierarchicalStore<>(parentStore, closeAutoCloseables());
+ 	}
+ 
+-	private static LauncherDiscoveryResult discover(TestEngine testEngine, LauncherDiscoveryRequest discoveryRequest,
+-			EngineDiscoveryOrchestrator.Phase phase) {
++	private static LauncherDiscoveryResult discoverUsingOrchestrator(TestEngine testEngine,
++			LauncherDiscoveryRequest discoveryRequest) {
+ 		return new EngineDiscoveryOrchestrator(singleton(testEngine), emptySet()) //
+-				.discover(discoveryRequest, phase);
++				.discover(discoveryRequest);
+ 	}
+ 
+ 	@SuppressWarnings("unchecked")

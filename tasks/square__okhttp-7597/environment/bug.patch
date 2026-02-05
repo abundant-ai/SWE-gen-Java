@@ -1,0 +1,333 @@
+diff --git a/mockwebserver/api/mockwebserver3.api b/mockwebserver/api/mockwebserver3.api
+index a66953d49..ef2f07f75 100644
+--- a/mockwebserver/api/mockwebserver3.api
++++ b/mockwebserver/api/mockwebserver3.api
+@@ -171,7 +171,6 @@ public final class mockwebserver3/RecordedRequest {
+ 	public final fun getChunkSizes ()Ljava/util/List;
+ 	public final fun getFailure ()Ljava/io/IOException;
+ 	public final fun getHandshake ()Lokhttp3/Handshake;
+-	public final fun getHandshakeServerNames ()Ljava/util/List;
+ 	public final fun getHeaders ()Lokhttp3/Headers;
+ 	public final fun getMethod ()Ljava/lang/String;
+ 	public final fun getPath ()Ljava/lang/String;
+diff --git a/mockwebserver/src/main/kotlin/mockwebserver3/RecordedRequest.kt b/mockwebserver/src/main/kotlin/mockwebserver3/RecordedRequest.kt
+index bc50a4273..056c1dd3c 100644
+--- a/mockwebserver/src/main/kotlin/mockwebserver3/RecordedRequest.kt
++++ b/mockwebserver/src/main/kotlin/mockwebserver3/RecordedRequest.kt
+@@ -25,7 +25,6 @@ import okhttp3.Handshake.Companion.handshake
+ import okhttp3.Headers
+ import okhttp3.HttpUrl
+ import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+-import okhttp3.internal.platform.Platform
+ import okio.Buffer
+ 
+ /** An HTTP request that came into the mock web server. */
+@@ -70,24 +69,15 @@ class RecordedRequest(
+   val handshake: Handshake?
+   val requestUrl: HttpUrl?
+ 
+-  /**
+-   * Returns the name of the server the client requested via the SNI (Server Name Indication)
+-   * attribute in the TLS handshake. Unlike the rest of the HTTP exchange, this name is sent in
+-   * cleartext and may be monitored or blocked by a proxy or other middlebox.
+-   */
+-  val handshakeServerNames: List<String>
+-
+   init {
+     if (socket is SSLSocket) {
+       try {
+         this.handshake = socket.session.handshake()
+-        this.handshakeServerNames = Platform.get().getHandshakeServerNames(socket)
+       } catch (e: IOException) {
+         throw IllegalArgumentException(e)
+       }
+     } else {
+       this.handshake = null
+-      this.handshakeServerNames = listOf()
+     }
+ 
+     if (requestLine.isNotEmpty()) {
+diff --git a/mockwebserver/src/test/java/mockwebserver3/MockResponseSniTest.kt b/mockwebserver/src/test/java/mockwebserver3/MockResponseSniTest.kt
+deleted file mode 100644
+index d3049f8e4..000000000
+--- a/mockwebserver/src/test/java/mockwebserver3/MockResponseSniTest.kt
++++ /dev/null
+@@ -1,183 +0,0 @@
+-/*
+- * Copyright (C) 2022 Block, Inc.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-package mockwebserver3
+-
+-import okhttp3.Dns
+-import okhttp3.Headers.Companion.headersOf
+-import okhttp3.HttpUrl.Companion.toHttpUrl
+-import okhttp3.OkHttpClientTestRule
+-import okhttp3.Request
+-import okhttp3.testing.PlatformRule
+-import okhttp3.tls.HandshakeCertificates
+-import okhttp3.tls.HeldCertificate
+-import okhttp3.tls.internal.TlsUtil.localhost
+-import org.assertj.core.api.Assertions.assertThat
+-import org.junit.jupiter.api.BeforeEach
+-import org.junit.jupiter.api.Test
+-import org.junit.jupiter.api.extension.RegisterExtension
+-
+-class MockResponseSniTest {
+-  @RegisterExtension
+-  val clientTestRule = OkHttpClientTestRule()
+-
+-  @RegisterExtension
+-  val platform = PlatformRule()
+-
+-  private lateinit var server: MockWebServer
+-
+-  @BeforeEach
+-  fun setUp(server: MockWebServer) {
+-    this.server = server
+-  }
+-
+-  @Test
+-  fun clientSendsServerNameAndServerReceivesIt() {
+-    // java.net.ConnectException: Connection refused
+-    platform.assumeNotConscrypt()
+-
+-    val handshakeCertificates = localhost()
+-    server.useHttps(handshakeCertificates.sslSocketFactory())
+-
+-    val dns = Dns {
+-      Dns.SYSTEM.lookup(server.hostName)
+-    }
+-
+-    val client = clientTestRule.newClientBuilder()
+-      .sslSocketFactory(
+-        handshakeCertificates.sslSocketFactory(),
+-        handshakeCertificates.trustManager
+-      )
+-      .dns(dns)
+-      .build()
+-
+-    server.enqueue(MockResponse())
+-
+-    val url = server.url("/").newBuilder().host("localhost.localdomain").build()
+-    val call = client.newCall(Request(url = url))
+-    val response = call.execute()
+-    assertThat(response.isSuccessful).isTrue()
+-
+-    val recordedRequest = server.takeRequest()
+-    assertThat(recordedRequest.handshakeServerNames).containsExactly(url.host)
+-  }
+-
+-  /**
+-   * Use different hostnames for the TLS handshake (including SNI) and the HTTP request (in the
+-   * Host header).
+-   */
+-  @Test
+-  fun domainFronting() {
+-    val heldCertificate = HeldCertificate.Builder()
+-      .commonName("server name")
+-      .addSubjectAlternativeName("url-host.com")
+-      .build()
+-    val handshakeCertificates = HandshakeCertificates.Builder()
+-      .heldCertificate(heldCertificate)
+-      .addTrustedCertificate(heldCertificate.certificate)
+-      .build()
+-    server.useHttps(handshakeCertificates.sslSocketFactory())
+-
+-    val dns = Dns {
+-      Dns.SYSTEM.lookup(server.hostName)
+-    }
+-
+-    val client = clientTestRule.newClientBuilder()
+-      .sslSocketFactory(
+-        handshakeCertificates.sslSocketFactory(),
+-        handshakeCertificates.trustManager
+-      )
+-      .dns(dns)
+-      .build()
+-
+-    server.enqueue(MockResponse())
+-
+-    val call = client.newCall(
+-      Request(
+-        url = "https://url-host.com:${server.port}/".toHttpUrl(),
+-        headers = headersOf("Host", "header-host"),
+-      )
+-    )
+-    val response = call.execute()
+-    assertThat(response.isSuccessful).isTrue()
+-
+-    val recordedRequest = server.takeRequest()
+-    assertThat(recordedRequest.requestUrl!!.host).isEqualTo("header-host")
+-    assertThat(recordedRequest.handshakeServerNames).containsExactly("url-host.com")
+-  }
+-
+-  /** No SNI for literal IPv6 addresses. */
+-  @Test
+-  fun ipv6() {
+-    val recordedRequest = requestToHostnameViaProxy("2607:f8b0:400b:804::200e")
+-    assertThat(recordedRequest.requestUrl!!.host).isEqualTo("2607:f8b0:400b:804::200e")
+-    assertThat(recordedRequest.handshakeServerNames).isEmpty()
+-  }
+-
+-  /** No SNI for literal IPv4 addresses. */
+-  @Test
+-  fun ipv4() {
+-    val recordedRequest = requestToHostnameViaProxy("76.223.91.57")
+-    assertThat(recordedRequest.requestUrl!!.host).isEqualTo("76.223.91.57")
+-    assertThat(recordedRequest.handshakeServerNames).isEmpty()
+-  }
+-
+-  @Test
+-  fun regularHostname() {
+-    val recordedRequest = requestToHostnameViaProxy("cash.app")
+-    assertThat(recordedRequest.requestUrl!!.host).isEqualTo("cash.app")
+-    assertThat(recordedRequest.handshakeServerNames).containsExactly("cash.app")
+-  }
+-
+-  /**
+-   * Connect to [hostnameOrIpAddress] and return what was received. To fake an arbitrary hostname we
+-   * tell MockWebServer to act as a proxy.
+-   */
+-  private fun requestToHostnameViaProxy(hostnameOrIpAddress: String): RecordedRequest {
+-    val heldCertificate = HeldCertificate.Builder()
+-      .commonName("server name")
+-      .addSubjectAlternativeName(hostnameOrIpAddress)
+-      .build()
+-    val handshakeCertificates = HandshakeCertificates.Builder()
+-      .heldCertificate(heldCertificate)
+-      .addTrustedCertificate(heldCertificate.certificate)
+-      .build()
+-    server.useHttps(handshakeCertificates.sslSocketFactory())
+-
+-    val client = clientTestRule.newClientBuilder()
+-      .sslSocketFactory(
+-        handshakeCertificates.sslSocketFactory(),
+-        handshakeCertificates.trustManager
+-      )
+-      .proxy(server.toProxyAddress())
+-      .build()
+-
+-    server.enqueue(MockResponse(inTunnel = true))
+-    server.enqueue(MockResponse())
+-
+-    val call = client.newCall(
+-      Request(
+-        url = server.url("/").newBuilder()
+-          .host(hostnameOrIpAddress)
+-          .build()
+-      )
+-    )
+-    val response = call.execute()
+-    assertThat(response.isSuccessful).isTrue()
+-
+-    server.takeRequest() // Discard the CONNECT tunnel.
+-    return server.takeRequest()
+-  }
+-}
+diff --git a/okhttp-tls/src/main/kotlin/okhttp3/tls/internal/TlsUtil.kt b/okhttp-tls/src/main/kotlin/okhttp3/tls/internal/TlsUtil.kt
+index 496d11a33..cd759cfc3 100644
+--- a/okhttp-tls/src/main/kotlin/okhttp3/tls/internal/TlsUtil.kt
++++ b/okhttp-tls/src/main/kotlin/okhttp3/tls/internal/TlsUtil.kt
+@@ -38,7 +38,6 @@ object TlsUtil {
+     val heldCertificate = HeldCertificate.Builder()
+         .commonName("localhost")
+         .addSubjectAlternativeName("localhost")
+-        .addSubjectAlternativeName("localhost.localdomain")
+         .build()
+     return@lazy HandshakeCertificates.Builder()
+         .heldCertificate(heldCertificate)
+diff --git a/okhttp/src/jvmMain/kotlin/okhttp3/internal/platform/Android10Platform.kt b/okhttp/src/jvmMain/kotlin/okhttp3/internal/platform/Android10Platform.kt
+index e887bd733..71b56a86e 100644
+--- a/okhttp/src/jvmMain/kotlin/okhttp3/internal/platform/Android10Platform.kt
++++ b/okhttp/src/jvmMain/kotlin/okhttp3/internal/platform/Android10Platform.kt
+@@ -24,15 +24,15 @@ import javax.net.ssl.SSLSocketFactory
+ import javax.net.ssl.X509TrustManager
+ import okhttp3.Protocol
+ import okhttp3.internal.SuppressSignatureCheck
++import okhttp3.internal.platform.android.AndroidSocketAdapter
+ import okhttp3.internal.platform.android.Android10SocketAdapter
+ import okhttp3.internal.platform.android.AndroidCertificateChainCleaner
+-import okhttp3.internal.platform.android.AndroidSocketAdapter
+ import okhttp3.internal.platform.android.BouncyCastleSocketAdapter
+ import okhttp3.internal.platform.android.ConscryptSocketAdapter
+ import okhttp3.internal.platform.android.DeferredSocketAdapter
+ import okhttp3.internal.tls.CertificateChainCleaner
+ 
+-/** Android 10+ (API 29+). */
++/** Android 29+. */
+ @SuppressSignatureCheck
+ class Android10Platform : Platform() {
+   private val socketAdapters = listOfNotNull(
+diff --git a/okhttp/src/jvmMain/kotlin/okhttp3/internal/platform/AndroidPlatform.kt b/okhttp/src/jvmMain/kotlin/okhttp3/internal/platform/AndroidPlatform.kt
+index 1d11d9037..5c564a5d4 100644
+--- a/okhttp/src/jvmMain/kotlin/okhttp3/internal/platform/AndroidPlatform.kt
++++ b/okhttp/src/jvmMain/kotlin/okhttp3/internal/platform/AndroidPlatform.kt
+@@ -39,7 +39,7 @@ import okhttp3.internal.tls.BasicTrustRootIndex
+ import okhttp3.internal.tls.CertificateChainCleaner
+ import okhttp3.internal.tls.TrustRootIndex
+ 
+-/** Android 5 to 9 (API 21 to 28). */
++/** Android 5+. */
+ @SuppressSignatureCheck
+ class AndroidPlatform : Platform() {
+   private val socketAdapters = listOfNotNull(
+@@ -107,12 +107,6 @@ class AndroidPlatform : Platform() {
+     super.buildTrustRootIndex(trustManager)
+   }
+ 
+-  override fun getHandshakeServerNames(sslSocket: SSLSocket): List<String> {
+-    // The superclass implementation requires APIs not available until API 24+.
+-    if (Build.VERSION.SDK_INT < 24) return listOf()
+-    return super.getHandshakeServerNames(sslSocket)
+-  }
+-
+   /**
+    * A trust manager for Android applications that customize the trust manager.
+    *
+diff --git a/okhttp/src/jvmMain/kotlin/okhttp3/internal/platform/Platform.kt b/okhttp/src/jvmMain/kotlin/okhttp3/internal/platform/Platform.kt
+index 32826be0d..9e0c362d6 100644
+--- a/okhttp/src/jvmMain/kotlin/okhttp3/internal/platform/Platform.kt
++++ b/okhttp/src/jvmMain/kotlin/okhttp3/internal/platform/Platform.kt
+@@ -16,7 +16,6 @@
+  */
+ package okhttp3.internal.platform
+ 
+-import android.annotation.SuppressLint
+ import java.io.IOException
+ import java.net.InetSocketAddress
+ import java.net.Socket
+@@ -25,8 +24,6 @@ import java.security.KeyStore
+ import java.security.Security
+ import java.util.logging.Level
+ import java.util.logging.Logger
+-import javax.net.ssl.ExtendedSSLSession
+-import javax.net.ssl.SNIHostName
+ import javax.net.ssl.SSLContext
+ import javax.net.ssl.SSLSocket
+ import javax.net.ssl.SSLSocketFactory
+@@ -126,13 +123,6 @@ open class Platform {
+   /** Returns the negotiated protocol, or null if no protocol was negotiated. */
+   open fun getSelectedProtocol(sslSocket: SSLSocket): String? = null
+ 
+-  /** For MockWebServer. This returns the inbound SNI names. */
+-  @SuppressLint("NewApi")
+-  open fun getHandshakeServerNames(sslSocket: SSLSocket): List<String> {
+-    val session = sslSocket.session as? ExtendedSSLSession ?: return listOf()
+-    return session.requestedServerNames.mapNotNull { (it as? SNIHostName)?.asciiName }
+-  }
+-
+   @Throws(IOException::class)
+   open fun connectSocket(socket: Socket, address: InetSocketAddress, connectTimeout: Int) {
+     socket.connect(address, connectTimeout)

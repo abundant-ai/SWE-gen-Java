@@ -1,0 +1,419 @@
+diff --git a/devtools/maven/src/main/java/io/quarkus/maven/components/BootstrapSessionListener.java b/devtools/maven/src/main/java/io/quarkus/maven/components/BootstrapSessionListener.java
+index 356b1b81a90..eb1d779576f 100644
+--- a/devtools/maven/src/main/java/io/quarkus/maven/components/BootstrapSessionListener.java
++++ b/devtools/maven/src/main/java/io/quarkus/maven/components/BootstrapSessionListener.java
+@@ -1,6 +1,7 @@
+ package io.quarkus.maven.components;
+ 
+ import java.io.IOException;
++import java.util.List;
+ import java.util.Properties;
+ 
+ import javax.inject.Inject;
+@@ -13,6 +14,7 @@
+ import org.apache.maven.model.Plugin;
+ import org.apache.maven.project.MavenProject;
+ import org.codehaus.plexus.logging.Logger;
++import org.codehaus.plexus.util.xml.Xpp3Dom;
+ 
+ import io.quarkus.maven.BuildAnalyticsProvider;
+ import io.quarkus.maven.QuarkusBootstrapProvider;
+@@ -21,6 +23,11 @@
+ @Named("quarkus-bootstrap")
+ public class BootstrapSessionListener extends AbstractMavenLifecycleParticipant {
+ 
++    private static final List<String> INJECTED_JVM_PROPS = List.of(
++            "--add-opens=java.base/java.lang.invoke=ALL-UNNAMED",
++            "--add-opens=java.base/java.lang=ALL-UNNAMED",
++            "--add-exports=java.base/jdk.internal.module=ALL-UNNAMED");
++
+     private final Logger logger;
+     private final QuarkusBootstrapProvider bootstrapProvider;
+     private final BuildAnalyticsProvider buildAnalyticsProvider;
+@@ -57,7 +64,7 @@ public void afterProjectsRead(MavenSession session) {
+     }
+ 
+     private void injectSurefireTuning(MavenSession session) {
+-        logger.debug("Quarkus Maven extension: inspecting Surefire configuration");
++        logger.debug("Quarkus Maven extension: inspecting Surefire and Failsafe configurations");
+         for (MavenProject project : session.getProjects()) {
+             //Let's not interfere with non-Quarkus modules:
+             if (isQuarkusPluginConfigured(project)) {
+@@ -67,32 +74,98 @@ private void injectSurefireTuning(MavenSession session) {
+     }
+ 
+     private void injectSurefireArgs(MavenProject project) {
+-        Properties props = project.getProperties();
+         if (logger.isDebugEnabled()) {
+             logger.debug(
+-                    "Found quarkus-maven-plugin in " + project.getArtifactId() + ": inspecting for missing Surefire arguments");
+-        }
+-        final String originalArgLine = props.getProperty("argLine", "");
+-        String newArgLine = originalArgLine;
+-        //We need these parameters set in advance; N.B. this approach won't scale efficiently.
+-        newArgLine = possiblyInject(newArgLine, "--add-opens=java.base/java.lang.invoke=ALL-UNNAMED");
+-        newArgLine = possiblyInject(newArgLine, "--add-opens=java.base/java.lang=ALL-UNNAMED");
+-        newArgLine = possiblyInject(newArgLine, "--add-exports=java.base/jdk.internal.module=ALL-UNNAMED");
+-        newArgLine = newArgLine.trim(); // micro cleanup
+-        props.setProperty("argLine", newArgLine);
+-        if (logger.isDebugEnabled()) {
+-            logger.debug("Quarkus Maven extension: injected 'argLine' for Surefire: " + newArgLine);
++                    "Found quarkus-maven-plugin in " + project.getArtifactId()
++                            + ": inspecting for missing Surefire and Failsafe arguments");
+         }
++
++        // Process Surefire and Failsafe plugins, for both of them we want to inject the JVM parameters that Quarkus will need:
++        injectArgsForPlugin(project, "maven-surefire-plugin");
++        injectArgsForPlugin(project, "maven-failsafe-plugin");
+     }
+ 
+-    private String possiblyInject(final String existingArgLine, final String requiredJvmParameter) {
+-        if (!existingArgLine.contains(requiredJvmParameter)) {
++    private void injectArgsForPlugin(MavenProject project, String pluginArtifactId) {
++        Properties props = project.getProperties();
++
++        // Find the plugin and check for explicit argLine configuration
++        Plugin plugin = findPlugin(project, pluginArtifactId);
++        if (plugin == null) {
++            // Plugin not configured in this project
++            return;
++        }
++
++        Object configuration = plugin.getConfiguration();
++        Xpp3Dom configDom = (configuration instanceof Xpp3Dom) ? (Xpp3Dom) configuration : null;
++        Xpp3Dom argLineDom = (configDom != null) ? configDom.getChild("argLine") : null;
++
++        final boolean hasExplicitConfig = (argLineDom != null && argLineDom.getValue() != null);
++        final String userDefinedArgLine = props.getProperty("argLine", "").trim();
++
++        if (hasExplicitConfig) {
++            final String standardMarker = "@{argLine}";
++            // Plugin has explicit argLine in its configuration block
++            String explicitValue = argLineDom.getValue();
++            if (logger.isDebugEnabled()) {
++                logger.debug("Quarkus Maven extension: found explicit argLine configuration in " + pluginArtifactId
++                        + " with value: '"
++                        + explicitValue + "'");
++            }
++            final boolean standardMarkerIsPresent = explicitValue.contains(standardMarker);
++            if (!standardMarkerIsPresent) {
++                //If we have an explicit configuration, and yet the marker is not present, we're stuck and can't
++                //inject anything into Surefire as it will ignore the property.
++                //Suggest the user to insert the marker:
++                logger.warn("Quarkus Maven extension: an explicit 'argLine' is defined in " + pluginArtifactId
++                        + " config, but does not contain '@{argLine}': " +
++                        "we will not be able to inject JVM parameters automatically. Please add '@{argLine}' to the argLine configuration you have defined.");
++            }
++            //N.B. it's tempting here to check if the JVM properties we need have been set already, to omit nagging the user with the warning when
++            // the injection is not necessary, but not having "argLine" injection capabilities has implications on other integrations as well;
++            // for example the jacoco integration will rely on it, and other Quarkus components will rely on it as well.
++            //So: KISS and nudge to user towards this pattern rather than trying to handle too many options and cases dynamically.
++        }
++
++        //Inject the new values we need:
++        final String newValue = generateNewArgLine(userDefinedArgLine);
++        if (!newValue.equals(userDefinedArgLine)) {
++            props.setProperty("argLine", newValue);
++            if (logger.isDebugEnabled()) {
++                logger.debug("Quarkus Maven extension: set project property 'argLine' to: '" + newValue + "'");
++            }
++        } else {
+             if (logger.isDebugEnabled()) {
+-                logger.debug("Quarkus Maven extension: injecting JVM parameter '" + requiredJvmParameter + "' into Surefire");
++                logger.debug("Quarkus Maven extension: not setting 'argLine' as its content doesn't need tuning.");
++            }
++        }
++    }
++
++    private String generateNewArgLine(String userDefinedArgLine) {
++        StringBuilder sb = new StringBuilder();
++
++        // Start with the injected properties, avoiding duplicates if they already exist in userDefinedArgLine:
++        // Duplicates are very likely as this injection process runs twice if both Surefire and Failsafe are configured!
++        for (String prop : INJECTED_JVM_PROPS) {
++            if (!userDefinedArgLine.contains(prop)) {
++                sb.append(prop);
++                sb.append(" ");
++            }
++        }
++        // Finally, append the user defined argLine:
++        sb.append(userDefinedArgLine);
++        return sb.toString().trim();
++    }
++
++    private Plugin findPlugin(MavenProject project, String pluginArtifactId) {
++        if (project.getBuild() == null || project.getBuild().getPlugins() == null) {
++            return null;
++        }
++        for (Plugin plugin : project.getBuild().getPlugins()) {
++            if (pluginArtifactId.equals(plugin.getArtifactId())) {
++                return plugin;
+             }
+-            return existingArgLine + " " + requiredJvmParameter;
+         }
+-        return existingArgLine;
++        return null;
+     }
+ 
+     private boolean isQuarkusPluginConfigured(MavenProject project) {
+diff --git a/docs/src/main/asciidoc/security-openid-connect-client-reference.adoc b/docs/src/main/asciidoc/security-openid-connect-client-reference.adoc
+index 43cf781e891..71f93a930d5 100644
+--- a/docs/src/main/asciidoc/security-openid-connect-client-reference.adoc
++++ b/docs/src/main/asciidoc/security-openid-connect-client-reference.adoc
+@@ -658,7 +658,7 @@ Add the following Maven Dependency:
+ 
+ NOTE: It will also bring `io.quarkus:quarkus-oidc-client`.
+ 
+-`quarkus-resteasy-client-oidc-filter` extension provides `io.quarkus.oidc.client.resteasy.filter.OidcClientRequestFilter` Jakarta REST ClientRequestFilter which uses `OidcClient` to acquire the access token, refresh it if needed, and set it as an HTTP `Authorization Bearer` scheme value.
++`quarkus-resteasy-client-oidc-filter` extension provides `io.quarkus.oidc.client.filter.OidcClientRequestFilter` Jakarta REST ClientRequestFilter which uses `OidcClient` to acquire the access token, refresh it if needed, and set it as an HTTP `Authorization Bearer` scheme value.
+ 
+ By default, this filter will get `OidcClient` to acquire the first pair of access and refresh tokens at its initialization time. If the access tokens are short-lived and refresh tokens are unavailable, then the token acquisition should be delayed with `quarkus.oidc-client.early-tokens-acquisition=false`.
+ 
+@@ -709,7 +709,7 @@ or
+ ----
+ import org.eclipse.microprofile.rest.client.annotation.RegisterProvider;
+ import org.eclipse.microprofile.rest.client.inject.RegisterRestClient;
+-import io.quarkus.oidc.client.resteasy.filter.OidcClientRequestFilter;
++import io.quarkus.oidc.client.filter.OidcClientRequestFilter;
+ import jakarta.ws.rs.GET;
+ import jakarta.ws.rs.Path;
+ 
+diff --git a/extensions/oidc-client-filter/deployment/src/main/java/io/quarkus/oidc/client/filter/deployment/OidcClientFilterBuildStep.java b/extensions/oidc-client-filter/deployment/src/main/java/io/quarkus/oidc/client/filter/deployment/OidcClientFilterBuildStep.java
+index 7923d9d574c..563e240eb18 100644
+--- a/extensions/oidc-client-filter/deployment/src/main/java/io/quarkus/oidc/client/filter/deployment/OidcClientFilterBuildStep.java
++++ b/extensions/oidc-client-filter/deployment/src/main/java/io/quarkus/oidc/client/filter/deployment/OidcClientFilterBuildStep.java
+@@ -23,10 +23,10 @@
+ import io.quarkus.oidc.client.deployment.OidcClientBuildStep.IsEnabled;
+ import io.quarkus.oidc.client.deployment.OidcClientFilterDeploymentHelper;
+ import io.quarkus.oidc.client.filter.OidcClientFilter;
++import io.quarkus.oidc.client.filter.OidcClientRequestFilter;
+ import io.quarkus.oidc.client.filter.runtime.AbstractOidcClientRequestFilter;
+ import io.quarkus.oidc.client.filter.runtime.DetectUnauthorizedClientResponseFilter;
+ import io.quarkus.oidc.client.filter.runtime.OidcClientFilterConfig;
+-import io.quarkus.oidc.client.resteasy.filter.OidcClientRequestFilter;
+ import io.quarkus.restclient.deployment.RestClientPredicateProviderBuildItem;
+ import io.quarkus.resteasy.common.spi.ResteasyJaxrsProviderBuildItem;
+ 
+@@ -49,12 +49,6 @@ void registerProvider(BuildProducer<AdditionalBeanBuildItem> additionalBeans,
+                 .reason(getClass().getName())
+                 .methods().fields().build());
+ 
+-        additionalBeans
+-                .produce(AdditionalBeanBuildItem.unremovableOf(io.quarkus.oidc.client.filter.OidcClientRequestFilter.class));
+-        reflectiveClass.produce(ReflectiveClassBuildItem.builder(io.quarkus.oidc.client.filter.OidcClientRequestFilter.class)
+-                .reason(getClass().getName())
+-                .methods().fields().build());
+-
+         // register default request filter provider against the rest of the clients (client != namedFilterClientClasses)
+         if (config.registerFilter()) {
+             final Set<String> namedFilterClientClasses = namedOidcClientFilterBuildItem.namedFilterClientClasses;
+diff --git a/extensions/oidc-client-filter/deployment/src/test/java/io/quarkus/oidc/client/filter/ExtendedOidcClientRequestFilter.java b/extensions/oidc-client-filter/deployment/src/test/java/io/quarkus/oidc/client/filter/ExtendedOidcClientRequestFilter.java
+index 5853c193a03..c45115b044a 100644
+--- a/extensions/oidc-client-filter/deployment/src/test/java/io/quarkus/oidc/client/filter/ExtendedOidcClientRequestFilter.java
++++ b/extensions/oidc-client-filter/deployment/src/test/java/io/quarkus/oidc/client/filter/ExtendedOidcClientRequestFilter.java
+@@ -3,8 +3,6 @@
+ import jakarta.annotation.Priority;
+ import jakarta.ws.rs.Priorities;
+ 
+-import io.quarkus.oidc.client.resteasy.filter.OidcClientRequestFilter;
+-
+ @Priority(Priorities.AUTHENTICATION)
+ public class ExtendedOidcClientRequestFilter extends OidcClientRequestFilter {
+ }
+diff --git a/extensions/oidc-client-filter/deployment/src/test/java/io/quarkus/oidc/client/filter/ProtectedResourceServiceCustomProviderConfigPropOidcClient.java b/extensions/oidc-client-filter/deployment/src/test/java/io/quarkus/oidc/client/filter/ProtectedResourceServiceCustomProviderConfigPropOidcClient.java
+index f0f059648d5..8aeaa85434f 100644
+--- a/extensions/oidc-client-filter/deployment/src/test/java/io/quarkus/oidc/client/filter/ProtectedResourceServiceCustomProviderConfigPropOidcClient.java
++++ b/extensions/oidc-client-filter/deployment/src/test/java/io/quarkus/oidc/client/filter/ProtectedResourceServiceCustomProviderConfigPropOidcClient.java
+@@ -6,8 +6,6 @@
+ import org.eclipse.microprofile.rest.client.annotation.RegisterProvider;
+ import org.eclipse.microprofile.rest.client.inject.RegisterRestClient;
+ 
+-import io.quarkus.oidc.client.resteasy.filter.OidcClientRequestFilter;
+-
+ @RegisterProvider(OidcClientRequestFilter.class)
+ @RegisterRestClient
+ @Path("/")
+diff --git a/extensions/oidc-client-filter/runtime/src/main/java/io/quarkus/oidc/client/filter/OidcClientRequestFilter.java b/extensions/oidc-client-filter/runtime/src/main/java/io/quarkus/oidc/client/filter/OidcClientRequestFilter.java
+index cbbe66a9a4b..af139bae8db 100644
+--- a/extensions/oidc-client-filter/runtime/src/main/java/io/quarkus/oidc/client/filter/OidcClientRequestFilter.java
++++ b/extensions/oidc-client-filter/runtime/src/main/java/io/quarkus/oidc/client/filter/OidcClientRequestFilter.java
+@@ -11,10 +11,6 @@
+ import io.quarkus.oidc.client.filter.runtime.AbstractOidcClientRequestFilter;
+ import io.quarkus.oidc.client.filter.runtime.OidcClientFilterConfig;
+ 
+-/**
+- * @deprecated use the {@link io.quarkus.oidc.client.resteasy.filter.OidcClientRequestFilter} filter instead
+- */
+-@Deprecated(since = "3.31", forRemoval = true)
+ @Provider
+ @Singleton
+ @Priority(Priorities.AUTHENTICATION)
+diff --git a/extensions/oidc-client-filter/runtime/src/main/java/io/quarkus/oidc/client/resteasy/filter/OidcClientRequestFilter.java b/extensions/oidc-client-filter/runtime/src/main/java/io/quarkus/oidc/client/resteasy/filter/OidcClientRequestFilter.java
+deleted file mode 100644
+index a6ad6b24e54..00000000000
+--- a/extensions/oidc-client-filter/runtime/src/main/java/io/quarkus/oidc/client/resteasy/filter/OidcClientRequestFilter.java
++++ /dev/null
+@@ -1,30 +0,0 @@
+-package io.quarkus.oidc.client.resteasy.filter;
+-
+-import java.util.Optional;
+-
+-import jakarta.annotation.Priority;
+-import jakarta.inject.Inject;
+-import jakarta.inject.Singleton;
+-import jakarta.ws.rs.Priorities;
+-import jakarta.ws.rs.ext.Provider;
+-
+-import io.quarkus.oidc.client.filter.runtime.AbstractOidcClientRequestFilter;
+-import io.quarkus.oidc.client.filter.runtime.OidcClientFilterConfig;
+-
+-@Provider
+-@Singleton
+-@Priority(Priorities.AUTHENTICATION)
+-public class OidcClientRequestFilter extends AbstractOidcClientRequestFilter {
+-
+-    @Inject
+-    public OidcClientFilterConfig oidcClientFilterConfig;
+-
+-    protected Optional<String> clientId() {
+-        return oidcClientFilterConfig.clientName();
+-    }
+-
+-    @Override
+-    protected boolean refreshOnUnauthorized() {
+-        return oidcClientFilterConfig.refreshOnUnauthorized();
+-    }
+-}
+diff --git a/independent-projects/tools/base-codestarts/src/main/resources/codestarts/quarkus-extension/code/extension-base/java/pom.tpl.qute.xml b/independent-projects/tools/base-codestarts/src/main/resources/codestarts/quarkus-extension/code/extension-base/java/pom.tpl.qute.xml
+index b8da17b31a2..b5fd509491d 100644
+--- a/independent-projects/tools/base-codestarts/src/main/resources/codestarts/quarkus-extension/code/extension-base/java/pom.tpl.qute.xml
++++ b/independent-projects/tools/base-codestarts/src/main/resources/codestarts/quarkus-extension/code/extension-base/java/pom.tpl.qute.xml
+@@ -84,6 +84,7 @@
+                     <artifactId>maven-surefire-plugin</artifactId>
+                     <version>$\{surefire-plugin.version}</version>
+                     <configuration>
++                        <argLine>@\{argLine}</argLine>
+                         <systemPropertyVariables>
+                             <java.util.logging.manager>org.jboss.logmanager.LogManager</java.util.logging.manager>
+                             <maven.home>$\{maven.home}</maven.home>
+@@ -96,6 +97,7 @@
+                     <artifactId>maven-failsafe-plugin</artifactId>
+                     <version>$\{failsafe-plugin.version}</version>
+                     <configuration>
++                        <argLine>@\{argLine}</argLine>
+                         <systemPropertyVariables>
+                             <java.util.logging.manager>org.jboss.logmanager.LogManager</java.util.logging.manager>
+                             <maven.home>$\{maven.home}</maven.home>
+diff --git a/independent-projects/tools/base-codestarts/src/main/resources/codestarts/quarkus/buildtool/maven/base/pom.tpl.qute.xml b/independent-projects/tools/base-codestarts/src/main/resources/codestarts/quarkus/buildtool/maven/base/pom.tpl.qute.xml
+index 825313b40f6..d622551385a 100644
+--- a/independent-projects/tools/base-codestarts/src/main/resources/codestarts/quarkus/buildtool/maven/base/pom.tpl.qute.xml
++++ b/independent-projects/tools/base-codestarts/src/main/resources/codestarts/quarkus/buildtool/maven/base/pom.tpl.qute.xml
+@@ -170,6 +170,7 @@
+                 <artifactId>maven-surefire-plugin</artifactId>
+                 <version>$\{surefire-plugin.version}</version>
+                 <configuration>
++                    <argLine>@\{argLine}</argLine>
+                     <systemPropertyVariables>
+                         <java.util.logging.manager>org.jboss.logmanager.LogManager</java.util.logging.manager>
+                         <maven.home>$\{maven.home}</maven.home>
+@@ -190,6 +191,7 @@
+                     </execution>
+                 </executions>
+                 <configuration>
++                    <argLine>@\{argLine}</argLine>
+                     <systemPropertyVariables>
+                         {#if generate-native}
+                         <native.image.path>$\{project.build.directory}/$\{project.build.finalName}-runner</native.image.path>
+diff --git a/independent-projects/tools/devtools-testing/src/test/resources/__snapshots__/QuarkusCodestartGenerationTest/generateDefault/pom.xml b/independent-projects/tools/devtools-testing/src/test/resources/__snapshots__/QuarkusCodestartGenerationTest/generateDefault/pom.xml
+index 36e51522609..17402d6850f 100644
+--- a/independent-projects/tools/devtools-testing/src/test/resources/__snapshots__/QuarkusCodestartGenerationTest/generateDefault/pom.xml
++++ b/independent-projects/tools/devtools-testing/src/test/resources/__snapshots__/QuarkusCodestartGenerationTest/generateDefault/pom.xml
+@@ -61,6 +61,7 @@
+                 <artifactId>maven-surefire-plugin</artifactId>
+                 <version>${surefire-plugin.version}</version>
+                 <configuration>
++                    <argLine>@{argLine}</argLine>
+                     <systemPropertyVariables>
+                         <java.util.logging.manager>org.jboss.logmanager.LogManager</java.util.logging.manager>
+                         <maven.home>${maven.home}</maven.home>
+@@ -79,6 +80,7 @@
+                     </execution>
+                 </executions>
+                 <configuration>
++                    <argLine>@{argLine}</argLine>
+                     <systemPropertyVariables>
+                         <native.image.path>${project.build.directory}/${project.build.finalName}-runner</native.image.path>
+                         <java.util.logging.manager>org.jboss.logmanager.LogManager</java.util.logging.manager>
+diff --git a/independent-projects/tools/devtools-testing/src/test/resources/__snapshots__/QuarkusCodestartGenerationTest/generateMavenWithCustomDep/pom.xml b/independent-projects/tools/devtools-testing/src/test/resources/__snapshots__/QuarkusCodestartGenerationTest/generateMavenWithCustomDep/pom.xml
+index 86190f75eb8..b5846bd0484 100644
+--- a/independent-projects/tools/devtools-testing/src/test/resources/__snapshots__/QuarkusCodestartGenerationTest/generateMavenWithCustomDep/pom.xml
++++ b/independent-projects/tools/devtools-testing/src/test/resources/__snapshots__/QuarkusCodestartGenerationTest/generateMavenWithCustomDep/pom.xml
+@@ -76,6 +76,7 @@
+                 <artifactId>maven-surefire-plugin</artifactId>
+                 <version>${surefire-plugin.version}</version>
+                 <configuration>
++                    <argLine>@{argLine}</argLine>
+                     <systemPropertyVariables>
+                         <java.util.logging.manager>org.jboss.logmanager.LogManager</java.util.logging.manager>
+                         <maven.home>${maven.home}</maven.home>
+@@ -94,6 +95,7 @@
+                     </execution>
+                 </executions>
+                 <configuration>
++                    <argLine>@{argLine}</argLine>
+                     <systemPropertyVariables>
+                         <native.image.path>${project.build.directory}/${project.build.finalName}-runner</native.image.path>
+                         <java.util.logging.manager>org.jboss.logmanager.LogManager</java.util.logging.manager>
+diff --git a/integration-tests/devtools/src/test/resources/__snapshots__/KotlinSerializationCodestartTest/testMavenContent/pom.xml b/integration-tests/devtools/src/test/resources/__snapshots__/KotlinSerializationCodestartTest/testMavenContent/pom.xml
+index 9bb9331bc99..e0ecad44992 100644
+--- a/integration-tests/devtools/src/test/resources/__snapshots__/KotlinSerializationCodestartTest/testMavenContent/pom.xml
++++ b/integration-tests/devtools/src/test/resources/__snapshots__/KotlinSerializationCodestartTest/testMavenContent/pom.xml
+@@ -89,6 +89,7 @@
+                 <artifactId>maven-surefire-plugin</artifactId>
+                 <version>${surefire-plugin.version}</version>
+                 <configuration>
++                    <argLine>@{argLine}</argLine>
+                     <systemPropertyVariables>
+                         <java.util.logging.manager>org.jboss.logmanager.LogManager</java.util.logging.manager>
+                         <maven.home>${maven.home}</maven.home>
+@@ -107,6 +108,7 @@
+                     </execution>
+                 </executions>
+                 <configuration>
++                    <argLine>@{argLine}</argLine>
+                     <systemPropertyVariables>
+                         <native.image.path>${project.build.directory}/${project.build.finalName}-runner</native.image.path>
+                         <java.util.logging.manager>org.jboss.logmanager.LogManager</java.util.logging.manager>
+diff --git a/integration-tests/maven/src/test/resources/__snapshots__/CreateExtensionMojoIT/testCreateStandaloneExtension/my-org-my-own-ext_pom.xml b/integration-tests/maven/src/test/resources/__snapshots__/CreateExtensionMojoIT/testCreateStandaloneExtension/my-org-my-own-ext_pom.xml
+index 5bc15babc63..315bb6db4e2 100644
+--- a/integration-tests/maven/src/test/resources/__snapshots__/CreateExtensionMojoIT/testCreateStandaloneExtension/my-org-my-own-ext_pom.xml
++++ b/integration-tests/maven/src/test/resources/__snapshots__/CreateExtensionMojoIT/testCreateStandaloneExtension/my-org-my-own-ext_pom.xml
+@@ -46,6 +46,7 @@
+                     <artifactId>maven-surefire-plugin</artifactId>
+                     <version>${surefire-plugin.version}</version>
+                     <configuration>
++                        <argLine>@{argLine}</argLine>
+                         <systemPropertyVariables>
+                             <java.util.logging.manager>org.jboss.logmanager.LogManager</java.util.logging.manager>
+                             <maven.home>${maven.home}</maven.home>
+@@ -57,6 +58,7 @@
+                     <artifactId>maven-failsafe-plugin</artifactId>
+                     <version>${failsafe-plugin.version}</version>
+                     <configuration>
++                        <argLine>@{argLine}</argLine>
+                         <systemPropertyVariables>
+                             <java.util.logging.manager>org.jboss.logmanager.LogManager</java.util.logging.manager>
+                             <maven.home>${maven.home}</maven.home>
+diff --git a/integration-tests/oidc-client/src/main/java/io/quarkus/it/keycloak/ProtectedResourceServiceRegisterProvider.java b/integration-tests/oidc-client/src/main/java/io/quarkus/it/keycloak/ProtectedResourceServiceRegisterProvider.java
+index 9a6b73f4ab5..e23cc87d4df 100644
+--- a/integration-tests/oidc-client/src/main/java/io/quarkus/it/keycloak/ProtectedResourceServiceRegisterProvider.java
++++ b/integration-tests/oidc-client/src/main/java/io/quarkus/it/keycloak/ProtectedResourceServiceRegisterProvider.java
+@@ -6,7 +6,7 @@
+ import org.eclipse.microprofile.rest.client.annotation.RegisterProvider;
+ import org.eclipse.microprofile.rest.client.inject.RegisterRestClient;
+ 
+-import io.quarkus.oidc.client.resteasy.filter.OidcClientRequestFilter;
++import io.quarkus.oidc.client.filter.OidcClientRequestFilter;
+ 
+ @RegisterRestClient
+ @RegisterProvider(OidcClientRequestFilter.class)

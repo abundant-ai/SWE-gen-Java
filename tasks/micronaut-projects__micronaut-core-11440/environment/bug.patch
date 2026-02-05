@@ -1,0 +1,2414 @@
+diff --git a/.github/workflows/release.yml b/.github/workflows/release.yml
+index 2dda058489..f0b8ad78a0 100644
+--- a/.github/workflows/release.yml
++++ b/.github/workflows/release.yml
+@@ -160,6 +160,6 @@ jobs:
+       - name: Upload assets
+         # Upload the artifacts to the existing release. Note that the SLSA provenance will
+         # attest to each artifact file and not the aggregated ZIP file.
+-        uses: softprops/action-gh-release@e7a8f85e1c67a31e6ed99a94b41bd0b71bbee6b8 # v2.0.9
++        uses: softprops/action-gh-release@01570a1f39cb168c169c802c3bceb9e93fb10974 # v2.1.0
+         with:
+           files: artifacts.zip
+diff --git a/core-processor/src/main/java/io/micronaut/inject/beans/visitor/BeanIntrospectionWriter.java b/core-processor/src/main/java/io/micronaut/inject/beans/visitor/BeanIntrospectionWriter.java
+index 73190e38fa..6dedd1354a 100644
+--- a/core-processor/src/main/java/io/micronaut/inject/beans/visitor/BeanIntrospectionWriter.java
++++ b/core-processor/src/main/java/io/micronaut/inject/beans/visitor/BeanIntrospectionWriter.java
+@@ -722,7 +722,8 @@ final class BeanIntrospectionWriter extends AbstractClassFileWriter {
+         dispatchWriter.buildGetTargetMethodByIndex(classWriter);
+         buildFindIndexedProperty(classWriter);
+         buildGetIndexedProperties(classWriter);
+-        boolean hasBuilder = annotationMetadata != null && annotationMetadata.isPresent(Introspected.class, "builder");
++        boolean hasBuilder = annotationMetadata != null &&
++            (annotationMetadata.isPresent(Introspected.class, "builder") || annotationMetadata.hasDeclaredAnnotation("lombok.Builder"));
+         if (defaultConstructor != null) {
+             writeInstantiateMethod(classWriter, defaultConstructor, "instantiate");
+             // in case invoked directly or via instantiateUnsafe
+diff --git a/core-processor/src/main/java/io/micronaut/inject/beans/visitor/IntrospectedTypeElementVisitor.java b/core-processor/src/main/java/io/micronaut/inject/beans/visitor/IntrospectedTypeElementVisitor.java
+index 44407f9be0..a7a0ff06c9 100644
+--- a/core-processor/src/main/java/io/micronaut/inject/beans/visitor/IntrospectedTypeElementVisitor.java
++++ b/core-processor/src/main/java/io/micronaut/inject/beans/visitor/IntrospectedTypeElementVisitor.java
+@@ -67,6 +67,7 @@ public class IntrospectedTypeElementVisitor implements TypeElementVisitor<Object
+      * The position of the visitor.
+      */
+     public static final int POSITION = -100;
++    private static final String ANN_LOMBOK_BUILDER = "lombok.Builder";
+ 
+     private final Map<String, BeanIntrospectionWriter> writers = new LinkedHashMap<>(10);
+ 
+@@ -180,62 +181,101 @@ public class IntrospectedTypeElementVisitor implements TypeElementVisitor<Object
+             AnnotationClassValue<?> builderClass = builder.annotationClassValue("builderClass").orElse(null);
+             String[] writePrefixes = builder.getAnnotation("accessorStyle", AccessorsStyle.class)
+                 .map(a -> a.stringValues("writePrefixes")).orElse(new String[]{""});
+-            if (builderMethod != null) {
+-                MethodElement methodElement = element
+-                    .getEnclosedElement(ElementQuery.ALL_METHODS.onlyStatic()
+-                        .filter(m -> m.getName().equals(builderMethod) && !m.getGenericReturnType().isVoid())
+-                        .onlyAccessible(element))
+-                    .orElse(null);
+-                if (methodElement != null) {
+-                    ClassElement returnType = methodElement.getGenericReturnType();
+-                    if (returnType.isPublic() || returnType.getPackageName().equals(element.getPackageName())) {
+-                        AnnotationValueBuilder<Introspected> replaceIntrospected = AnnotationValue.builder(introspected, RetentionPolicy.RUNTIME);
+-                        replaceIntrospected.member("builderClass", new AnnotationClassValue<>(returnType.getName()));
+-                        element.annotate(replaceIntrospected.build());
+-                        AnnotationMetadata methodMetadata = methodElement.getMethodAnnotationMetadata().getTargetAnnotationMetadata();
+-
+-                        handleBuilder(
+-                            element,
+-                            context,
+-                            creatorMethod,
+-                            writePrefixes,
+-                            methodElement,
+-                            null,
+-                            returnType,
+-                            methodMetadata,
+-                            index,
+-                            targetPackage
+-                        );
+-                    } else {
+-                        context.fail("Builder return type is not public. The method must be static and accessible.", methodElement);
+-                    }
+-                } else {
+-                    context.fail("Method specified by builderMethod not found. The method must be static and accessible.", element);
+-                }
+-            } else if (builderClass != null) {
+-                ClassElement builderClassElement = context.getClassElement(builderClass.getName()).orElse(null);
+-                if (builderClassElement != null) {
++            processBuilderDefinition(
++                element,
++                context,
++                introspected,
++                index,
++                targetPackage,
++                builderMethod,
++                creatorMethod,
++                writePrefixes,
++                builderClass
++            );
++        } else if (element.hasDeclaredAnnotation(ANN_LOMBOK_BUILDER)) {
++            AnnotationValue<Annotation> lombokBuilder = element.getAnnotation(ANN_LOMBOK_BUILDER);
++            String builderMethod = lombokBuilder.stringValue("builderMethodName").orElse("builder");
++            MethodElement methodElement = element
++                .getEnclosedElement(ElementQuery.ALL_METHODS.onlyStatic()
++                    .filter(m -> m.getName().equals(builderMethod) && !m.getGenericReturnType().isVoid())
++                    .onlyAccessible(element))
++                .orElse(null);
++            if (methodElement == null) {
++                // Lombok processing not done yet, try again in the next round.
++                throw new ElementPostponedToNextRoundException(element);
++            }
++            String creatorMethod = lombokBuilder.stringValue("buildMethodName").orElse("build");
++            String[] writePrefixes = lombokBuilder.stringValue("setterPrefix").map(sp -> new String[] { sp }).orElse(new String[]{""});
++            processBuilderDefinition(
++                element,
++                context,
++                introspected,
++                index,
++                targetPackage,
++                builderMethod,
++                creatorMethod,
++                writePrefixes,
++                null
++            );
++        }
++    }
++
++    private void processBuilderDefinition(ClassElement element, VisitorContext context, AnnotationValue<Introspected> introspected, int index, String targetPackage, String builderMethod, String creatorMethod, String[] writePrefixes, AnnotationClassValue<?> builderClass) {
++        if (builderMethod != null) {
++            MethodElement methodElement = element
++                .getEnclosedElement(ElementQuery.ALL_METHODS.onlyStatic()
++                    .filter(m -> m.getName().equals(builderMethod) && !m.getGenericReturnType().isVoid())
++                    .onlyAccessible(element))
++                .orElse(null);
++            if (methodElement != null) {
++                ClassElement returnType = methodElement.getGenericReturnType();
++                if (returnType.isPublic() || returnType.getPackageName().equals(element.getPackageName())) {
+                     AnnotationValueBuilder<Introspected> replaceIntrospected = AnnotationValue.builder(introspected, RetentionPolicy.RUNTIME);
+-                    replaceIntrospected.member("builderClass", new AnnotationClassValue<>(builderClassElement.getName()));
++                    replaceIntrospected.member("builderClass", new AnnotationClassValue<>(returnType.getName()));
+                     element.annotate(replaceIntrospected.build());
++                    AnnotationMetadata methodMetadata = methodElement.getMethodAnnotationMetadata().getTargetAnnotationMetadata();
+ 
+                     handleBuilder(
+                         element,
+                         context,
+                         creatorMethod,
+                         writePrefixes,
+-                        builderClassElement.getPrimaryConstructor().orElse(null),
+-                        builderClassElement.getDefaultConstructor().orElse(null),
+-                        builderClassElement,
+-                        builderClassElement.getTargetAnnotationMetadata(),
++                        methodElement,
++                        null,
++                        returnType,
++                        methodMetadata,
+                         index,
+-                        targetPackage);
++                        targetPackage
++                    );
+                 } else {
+-                    context.fail("Builder class not found on compilation classpath: " + builderClass.getName(), element);
++                    context.fail("Builder return type is not public. The method must be static and accessible.", methodElement);
+                 }
+             } else {
+-                context.fail("When specifying the 'builder' member of @Introspected you must supply either a builderClass or builderMethod", element);
++                context.fail("Method " + builderMethod + "() specified by builderMethod not found. The method must be static and accessible.", element);
+             }
++        } else if (builderClass != null) {
++            ClassElement builderClassElement = context.getClassElement(builderClass.getName()).orElse(null);
++            if (builderClassElement != null) {
++                AnnotationValueBuilder<Introspected> replaceIntrospected = AnnotationValue.builder(introspected, RetentionPolicy.RUNTIME);
++                replaceIntrospected.member("builderClass", new AnnotationClassValue<>(builderClassElement.getName()));
++                element.annotate(replaceIntrospected.build());
++
++                handleBuilder(
++                    element,
++                    context,
++                    creatorMethod,
++                    writePrefixes,
++                    builderClassElement.getPrimaryConstructor().orElse(null),
++                    builderClassElement.getDefaultConstructor().orElse(null),
++                    builderClassElement,
++                    builderClassElement.getTargetAnnotationMetadata(),
++                    index,
++                    targetPackage);
++            } else {
++                context.fail("Builder class not found on compilation classpath: " + builderClass.getName(), element);
++            }
++        } else {
++            context.fail("When specifying the 'builder' member of @Introspected you must supply either a builderClass or builderMethod", element);
+         }
+     }
+ 
+@@ -380,13 +420,18 @@ public class IntrospectedTypeElementVisitor implements TypeElementVisitor<Object
+         List<PropertyElement> beanProperties = ce.getBeanProperties(propertyElementQuery).stream()
+             .filter(p -> !p.isExcluded())
+             .toList();
+-        Optional<MethodElement> constructorElement = ce.getPrimaryConstructor();
+-        constructorElement.ifPresent(constructorEl -> {
+-            if (ArrayUtils.isNotEmpty(constructorEl.getParameters())) {
+-                writer.visitConstructor(constructorEl);
+-            }
+-        });
+-        ce.getDefaultConstructor().ifPresent(writer::visitDefaultConstructor);
++        // unfortunately sometimes we don't see the Lombok transformations
++        // so assume if the class is annotated with Lombok builder we cannot
++        // access the constructor.
++        if (!ce.hasDeclaredAnnotation(ANN_LOMBOK_BUILDER)) {
++            Optional<MethodElement> constructorElement = ce.getPrimaryConstructor();
++            constructorElement.ifPresent(constructorEl -> {
++                if (ArrayUtils.isNotEmpty(constructorEl.getParameters())) {
++                    writer.visitConstructor(constructorEl);
++                }
++            });
++            ce.getDefaultConstructor().ifPresent(writer::visitDefaultConstructor);
++        }
+ 
+         for (PropertyElement beanProperty : beanProperties) {
+             if (beanProperty.isExcluded()) {
+diff --git a/core/src/main/java/io/micronaut/core/beans/BeanIntrospection.java b/core/src/main/java/io/micronaut/core/beans/BeanIntrospection.java
+index 55622d4a37..f14fc35467 100644
+--- a/core/src/main/java/io/micronaut/core/beans/BeanIntrospection.java
++++ b/core/src/main/java/io/micronaut/core/beans/BeanIntrospection.java
+@@ -327,7 +327,7 @@ public interface BeanIntrospection<T> extends AnnotationMetadataDelegate, BeanIn
+         final BeanReadProperty<T, ?> prop = getReadProperty(name).orElse(null);
+         if (prop != null && type.isAssignableFrom(prop.getType())) {
+             //noinspection unchecked
+-            return Optional.of((BeanProperty<T, P>) prop);
++            return Optional.of((BeanReadProperty<T, P>) prop);
+         }
+         return Optional.empty();
+     }
+diff --git a/core/src/main/java/io/micronaut/core/io/service/ServiceLoaderFeature.java b/core/src/main/java/io/micronaut/core/io/service/ServiceLoaderFeature.java
+index 6a7f71a9c5..86d2bc6766 100644
+--- a/core/src/main/java/io/micronaut/core/io/service/ServiceLoaderFeature.java
++++ b/core/src/main/java/io/micronaut/core/io/service/ServiceLoaderFeature.java
+@@ -89,6 +89,12 @@ class ServiceLoaderFeature implements Feature {
+                             }
+                             Class<?> beanType = beanInfo.getBeanType();
+                             List<AnnotationValue<Annotation>> values = beanInfo.getAnnotationMetadata().getAnnotationValuesByName("io.micronaut.context.annotation.Requires");
++                            if (values.isEmpty()) {
++                                AnnotationValue<Annotation> requirements = beanInfo.getAnnotationMetadata().getAnnotation("io.micronaut.context.annotation.Requirements");
++                                if (requirements != null) {
++                                    values = requirements.getAnnotations("value");
++                                }
++                            }
+                             if (!values.isEmpty()) {
+                                 for (AnnotationValue<Annotation> value : values) {
+                                     String[] classNames = EMPTY_STRING_ARRAY;
+diff --git a/gradle.properties b/gradle.properties
+index 9c987613c8..4218359204 100644
+--- a/gradle.properties
++++ b/gradle.properties
+@@ -1,4 +1,4 @@
+-projectVersion=4.7.6-SNAPSHOT
++projectVersion=4.7.9-SNAPSHOT
+ projectGroupId=io.micronaut
+ projectDesc=Core components supporting the Micronaut Framework
+ title=Micronaut Core
+diff --git a/gradle/wrapper/gradle-wrapper.properties b/gradle/wrapper/gradle-wrapper.properties
+index df97d72b8b..e2847c8200 100644
+--- a/gradle/wrapper/gradle-wrapper.properties
++++ b/gradle/wrapper/gradle-wrapper.properties
+@@ -1,6 +1,6 @@
+ distributionBase=GRADLE_USER_HOME
+ distributionPath=wrapper/dists
+-distributionUrl=https\://services.gradle.org/distributions/gradle-8.10.2-bin.zip
++distributionUrl=https\://services.gradle.org/distributions/gradle-8.11.1-bin.zip
+ networkTimeout=10000
+ validateDistributionUrl=true
+ zipStoreBase=GRADLE_USER_HOME
+diff --git a/http-client/build.gradle b/http-client/build.gradle
+index 6a9c225a72..c4e14be8d8 100644
+--- a/http-client/build.gradle
++++ b/http-client/build.gradle
+@@ -20,7 +20,6 @@ dependencies {
+     api libs.managed.netty.handler.proxy
+ 
+     compileOnly libs.managed.netty.incubator.codec.http3
+-    testImplementation libs.managed.netty.incubator.codec.http3
+ 
+     testAnnotationProcessor platform(libs.test.boms.micronaut.validation)
+     testAnnotationProcessor (libs.micronaut.validation.processor) {
+@@ -47,8 +46,6 @@ dependencies {
+     testImplementation libs.wiremock
+     testImplementation libs.logback.classic
+     testImplementation libs.bcpkix
+-    testImplementation libs.junit.jupiter.params
+-    testImplementation libs.awaitility
+ 
+     testRuntimeOnly(libs.managed.netty.tcnative.boringssl.static) {
+         artifact {
+diff --git a/http-client/src/main/java/io/micronaut/http/client/netty/ConnectionManager.java b/http-client/src/main/java/io/micronaut/http/client/netty/ConnectionManager.java
+index 4a15ca7b73..a77770d304 100644
+--- a/http-client/src/main/java/io/micronaut/http/client/netty/ConnectionManager.java
++++ b/http-client/src/main/java/io/micronaut/http/client/netty/ConnectionManager.java
+@@ -1369,7 +1369,7 @@ public class ConnectionManager {
+             }
+ 
+             @Override
+-            public final boolean dispatch(PoolSink<PoolHandle> sink) {
++            public boolean dispatch(PoolSink<PoolHandle> sink) {
+                 if (!tryEarmarkForRequest()) {
+                     return false;
+                 }
+@@ -1602,7 +1602,7 @@ public class ConnectionManager {
+             }
+ 
+             @Override
+-            final void dispatch0(PoolSink<PoolHandle> sink) {
++            void dispatch0(PoolSink<PoolHandle> sink) {
+                 if (!channel.isActive() || windDownConnection) {
+                     // make sure the request isn't dispatched to this connection again
+                     windDownConnection();
+diff --git a/http-client/src/main/java/io/micronaut/http/client/netty/DefaultHttpClient.java b/http-client/src/main/java/io/micronaut/http/client/netty/DefaultHttpClient.java
+index 6595b5ea5b..9093107247 100644
+--- a/http-client/src/main/java/io/micronaut/http/client/netty/DefaultHttpClient.java
++++ b/http-client/src/main/java/io/micronaut/http/client/netty/DefaultHttpClient.java
+@@ -2187,7 +2187,7 @@ public class DefaultHttpClient implements
+     /**
+      * Used as a holder for the current SSE event.
+      */
+-    private static final class CurrentEvent {
++    private static class CurrentEvent {
+         byte[] data;
+         String id;
+         String name;
+diff --git a/http-client/src/main/java/io/micronaut/http/client/netty/FullNettyClientHttpResponse.java b/http-client/src/main/java/io/micronaut/http/client/netty/FullNettyClientHttpResponse.java
+index d5756b8427..78121bcd09 100644
+--- a/http-client/src/main/java/io/micronaut/http/client/netty/FullNettyClientHttpResponse.java
++++ b/http-client/src/main/java/io/micronaut/http/client/netty/FullNettyClientHttpResponse.java
+@@ -45,6 +45,7 @@ import java.util.HashMap;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Optional;
++import java.util.concurrent.ConcurrentHashMap;
+ 
+ /**
+  * Wraps a Netty {@link FullHttpResponse} for consumption by the {@link io.micronaut.http.client.HttpClient}.
+@@ -63,7 +64,7 @@ public class FullNettyClientHttpResponse<B> implements HttpResponse<B>, NettyHtt
+     private final MutableConvertibleValues<Object> attributes;
+     private final io.netty.handler.codec.http.HttpResponse nettyHttpResponse;
+     private final ByteBuf unpooledContent;
+-    private final Map<Argument, Optional> convertedBodies = new HashMap<>();
++    private final Map<Argument, Optional> convertedBodies = new ConcurrentHashMap<>();
+     private final MessageBodyHandlerRegistry handlerRegistry;
+     private final B body;
+     private final ConversionService conversionService;
+@@ -76,11 +77,12 @@ public class FullNettyClientHttpResponse<B> implements HttpResponse<B>, NettyHtt
+      * @param conversionService      The conversion service
+      */
+     FullNettyClientHttpResponse(
+-            FullHttpResponse fullHttpResponse,
+-            MessageBodyHandlerRegistry handlerRegistry,
+-            Argument<B> bodyType,
+-            boolean convertBody,
+-            ConversionService conversionService) {
++        FullHttpResponse fullHttpResponse,
++        MessageBodyHandlerRegistry handlerRegistry,
++        Argument<B> bodyType,
++        boolean convertBody,
++        ConversionService conversionService
++    ) {
+         this.conversionService = conversionService;
+         this.headers = new NettyHttpHeaders(fullHttpResponse.headers(), conversionService);
+         this.attributes = new MutableConvertibleValuesMap<>();
+@@ -95,7 +97,7 @@ public class FullNettyClientHttpResponse<B> implements HttpResponse<B>, NettyHtt
+             if (HttpResponse.class.isAssignableFrom(bodyType.getType())) {
+                 Optional<Argument<?>> responseBodyType = bodyType.getFirstTypeVariable();
+                 if (responseBodyType.isPresent()) {
+-                    Argument<B> finalResponseBodyType = (Argument<B>) responseBodyType.get();
++                    var finalResponseBodyType = (Argument<B>) responseBodyType.get();
+                     this.body = convertBody || isParseableBodyType(finalResponseBodyType.getType()) ? getBody(finalResponseBodyType).orElse(null) : null;
+                 } else {
+                     this.body = null;
+@@ -118,6 +120,7 @@ public class FullNettyClientHttpResponse<B> implements HttpResponse<B>, NettyHtt
+         return this.nettyHttpResponse.status().code();
+     }
+ 
++    @NonNull
+     @Override
+     public HttpHeaders getHeaders() {
+         return headers;
+@@ -133,18 +136,21 @@ public class FullNettyClientHttpResponse<B> implements HttpResponse<B>, NettyHtt
+         return nettyCookies.findCookie(name);
+     }
+ 
++    @NonNull
+     @Override
+     public MutableConvertibleValues<Object> getAttributes() {
+         return attributes;
+     }
+ 
++    @NonNull
+     @Override
+     public Optional<B> getBody() {
+         return Optional.ofNullable(body);
+     }
+ 
++    @NonNull
+     @Override
+-    public <T> Optional<T> getBody(Class<T> type) {
++    public <T> Optional<T> getBody(@NonNull Class<T> type) {
+         if (type == null) {
+             return Optional.empty();
+         }
+@@ -152,8 +158,9 @@ public class FullNettyClientHttpResponse<B> implements HttpResponse<B>, NettyHtt
+     }
+ 
+     @SuppressWarnings("unchecked")
++    @NonNull
+     @Override
+-    public <T> Optional<T> getBody(Argument<T> type) {
++    public <T> Optional<T> getBody(@NonNull Argument<T> type) {
+         if (type == null) {
+             return Optional.empty();
+         }
+@@ -171,21 +178,19 @@ public class FullNettyClientHttpResponse<B> implements HttpResponse<B>, NettyHtt
+             } catch (RuntimeException e) {
+                 if (code() < 400) {
+                     throw e;
+-                } else {
+-                    if (LOG.isDebugEnabled()) {
+-                        LOG.debug("Error decoding HTTP error response body: {}", e.getMessage(), e);
+-                    }
+-                    converted = Optional.empty();
+                 }
++                if (LOG.isDebugEnabled()) {
++                    LOG.debug("Error decoding HTTP error response body: {}", e.getMessage(), e);
++                }
++                converted = Optional.empty();
+             }
+             if (isOptional) {
+                 return Optional.of(converted);
+             } else {
+                 return converted;
+             }
+-        }
++        });
+ 
+-        );
+         if (LOG.isTraceEnabled() && result.isEmpty()) {
+             LOG.trace("Unable to convert response body to target type {}", type.getType());
+         }
+@@ -232,7 +237,7 @@ public class FullNettyClientHttpResponse<B> implements HttpResponse<B>, NettyHtt
+     @NonNull
+     @Override
+     public FullHttpResponse toFullHttpResponse() {
+-        DefaultFullHttpResponse copy = new DefaultFullHttpResponse(
++        var copy = new DefaultFullHttpResponse(
+             nettyHttpResponse.protocolVersion(),
+             nettyHttpResponse.status(),
+             unpooledContent,
+diff --git a/http-client/src/main/java/io/micronaut/http/client/netty/Http1ResponseHandler.java b/http-client/src/main/java/io/micronaut/http/client/netty/Http1ResponseHandler.java
+index 3c7cdede95..7af3435a7d 100644
+--- a/http-client/src/main/java/io/micronaut/http/client/netty/Http1ResponseHandler.java
++++ b/http-client/src/main/java/io/micronaut/http/client/netty/Http1ResponseHandler.java
+@@ -95,7 +95,6 @@ final class Http1ResponseHandler extends SimpleChannelInboundHandlerInstrumented
+         if (state != fromState) {
+             throw new IllegalStateException("Wrong source state");
+         }
+-        fromState.leave(ctx);
+         state = nextState;
+     }
+ 
+@@ -111,9 +110,6 @@ final class Http1ResponseHandler extends SimpleChannelInboundHandlerInstrumented
+         void channelInactive(ChannelHandlerContext ctx) {
+             exceptionCaught(ctx, new ResponseClosedException("Connection closed before response was received"));
+         }
+-
+-        void leave(ChannelHandlerContext ctx) {
+-        }
+     }
+ 
+     /**
+@@ -230,7 +226,6 @@ final class Http1ResponseHandler extends SimpleChannelInboundHandlerInstrumented
+         private final ResponseListener listener;
+         private final ChannelHandlerContext streamingContext;
+         private final StreamingNettyByteBody.SharedBuffer streaming;
+-        private final boolean wasAutoRead;
+         private long demand;
+ 
+         UnbufferedContent(ResponseListener listener, ChannelHandlerContext ctx, HttpResponse response) {
+@@ -240,13 +235,6 @@ final class Http1ResponseHandler extends SimpleChannelInboundHandlerInstrumented
+                 streaming.setExpectedLengthFrom(response.headers());
+             }
+             streamingContext = ctx;
+-            wasAutoRead = ctx.channel().config().isAutoRead();
+-            ctx.channel().config().setAutoRead(false);
+-        }
+-
+-        @Override
+-        void leave(ChannelHandlerContext ctx) {
+-            ctx.channel().config().setAutoRead(wasAutoRead);
+         }
+ 
+         void add(ByteBuf buf) {
+@@ -290,7 +278,14 @@ final class Http1ResponseHandler extends SimpleChannelInboundHandlerInstrumented
+         }
+ 
+         private void start0() {
+-            onBytesConsumed0(1);
++            if (state != this) {
++                return;
++            }
++
++            demand++;
++            if (demand == 1) {
++                streamingContext.read();
++            }
+         }
+ 
+         @Override
+@@ -311,7 +306,7 @@ final class Http1ResponseHandler extends SimpleChannelInboundHandlerInstrumented
+             long newDemand = oldDemand + bytesConsumed;
+             if (newDemand < oldDemand) {
+                 // overflow
+-                newDemand = Long.MAX_VALUE;
++                newDemand = oldDemand;
+             }
+             this.demand = newDemand;
+             if (oldDemand <= 0 && newDemand > 0) {
+diff --git a/http-client/src/main/java/io/micronaut/http/client/netty/ReactiveClientReader.java b/http-client/src/main/java/io/micronaut/http/client/netty/ReactiveClientReader.java
+new file mode 100644
+index 0000000000..d59cc65cf6
+--- /dev/null
++++ b/http-client/src/main/java/io/micronaut/http/client/netty/ReactiveClientReader.java
+@@ -0,0 +1,172 @@
++/*
++ * Copyright 2017-2023 original authors
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * https://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package io.micronaut.http.client.netty;
++
++import io.micronaut.core.annotation.Internal;
++import io.micronaut.core.annotation.Nullable;
++import io.micronaut.http.client.exceptions.ResponseClosedException;
++import io.micronaut.http.netty.reactive.HotObservable;
++import io.netty.channel.ChannelHandlerContext;
++import io.netty.channel.ChannelInboundHandlerAdapter;
++import io.netty.channel.EventLoop;
++import io.netty.handler.codec.http.HttpContent;
++import io.netty.handler.codec.http.LastHttpContent;
++import org.reactivestreams.Publisher;
++import org.reactivestreams.Subscriber;
++import org.reactivestreams.Subscription;
++
++/**
++ * Provides incoming {@link HttpContent} as a {@link Publisher}. Note: This handler <b>requires</b>
++ * a {@link io.netty.handler.flow.FlowControlHandler}.
++ *
++ * @since 4.1.0
++ * @author Jonas Konrad
++ */
++@Internal
++abstract class ReactiveClientReader extends ChannelInboundHandlerAdapter implements HotObservable<HttpContent>, Subscription {
++    private EventLoop eventLoop;
++    private ChannelHandlerContext ctx;
++    @Nullable
++    private Subscriber<? super HttpContent> subscriber;
++    private Throwable heldBackException;
++    private long demand;
++    private boolean cancelled = false;
++
++    @Override
++    public final void handlerAdded(ChannelHandlerContext ctx) throws Exception {
++        this.ctx = ctx;
++        eventLoop = ctx.channel().eventLoop();
++    }
++
++    private void forwardException(Throwable t) {
++        if (subscriber == null) {
++            // no subscriber yet
++            heldBackException = t;
++        } else {
++            subscriber.onError(t);
++        }
++    }
++
++    @Override
++    public final void channelInactive(ChannelHandlerContext ctx) throws Exception {
++        super.channelInactive(ctx);
++        if (!cancelled) {
++            cancelled = true;
++            forwardException(new ResponseClosedException("Connection closed before full response body was transferred"));
++        }
++    }
++
++    @Override
++    public final void subscribe(Subscriber<? super HttpContent> s) {
++        if (subscriber != null) {
++            throw new IllegalStateException("Already subscribed");
++        }
++        if (!eventLoop.inEventLoop()) {
++            eventLoop.execute(() -> subscribe(s));
++            return;
++        }
++
++        subscriber = s;
++        s.onSubscribe(this);
++        if (heldBackException != null) {
++            // already got an error
++            s.onError(heldBackException);
++            heldBackException = null;
++        }
++    }
++
++    @Override
++    public final void request(long n) {
++        if (!eventLoop.inEventLoop()) {
++            eventLoop.execute(() -> request(n));
++            return;
++        }
++
++        long oldDemand = demand;
++        long newDemand = oldDemand + n;
++        if (newDemand < 0) {
++            newDemand = Long.MAX_VALUE;
++        }
++        demand = newDemand;
++        // this read call can lead to a channelRead and thus an onNext. If we are already in an
++        // onNext, we need to make sure this doesn't happen (onNext must not be nested). For this
++        // reason, in channelRead, the demand is decremented *after* the onNext call, so that
++        // if we are already in onNext, oldDemand is never 0 here.
++        if (oldDemand == 0) {
++            ctx.read();
++        }
++    }
++
++    @Override
++    public final void cancel() {
++        if (!eventLoop.inEventLoop()) {
++            eventLoop.execute(this::cancel);
++            return;
++        }
++        cancelled = true;
++        if (demand == 0) {
++            // eat remaining content
++            ctx.read();
++        }
++    }
++
++    @Override
++    public final void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
++        boolean last = msg instanceof LastHttpContent;
++        if (cancelled) {
++            ((HttpContent) msg).release();
++            if (last) {
++                remove(ctx);
++            } else {
++                ctx.read();
++            }
++        } else {
++            assert demand > 0 : "should be ensured by FlowControlHandler";
++            // demand > 0 => subscriber != null, so this is safe
++            subscriber.onNext((HttpContent) msg);
++            if (last) {
++                cancelled = true;
++                remove(ctx);
++                subscriber.onComplete();
++            } else if (--demand > 0) {
++                ctx.read();
++            }
++        }
++    }
++
++    @Override
++    public final void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception {
++        if (cancelled) {
++            ctx.fireExceptionCaught(cause);
++        } else {
++            cancelled = true;
++            remove(ctx);
++            forwardException(cause);
++        }
++    }
++
++    @Override
++    public final void closeIfNoSubscriber() {
++        cancel();
++    }
++
++    /**
++     * Remove this handler.
++     *
++     * @param ctx The context of this handler
++     */
++    protected abstract void remove(ChannelHandlerContext ctx);
++}
+diff --git a/http-client/src/main/java/io/micronaut/http/client/netty/ReactiveClientWriter.java b/http-client/src/main/java/io/micronaut/http/client/netty/ReactiveClientWriter.java
+new file mode 100644
+index 0000000000..24551f9d7d
+--- /dev/null
++++ b/http-client/src/main/java/io/micronaut/http/client/netty/ReactiveClientWriter.java
+@@ -0,0 +1,138 @@
++/*
++ * Copyright 2017-2023 original authors
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * https://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package io.micronaut.http.client.netty;
++
++import io.micronaut.core.annotation.Internal;
++import io.micronaut.http.netty.EventLoopFlow;
++import io.netty.channel.ChannelHandlerContext;
++import io.netty.channel.ChannelInboundHandlerAdapter;
++import io.netty.handler.codec.http.HttpContent;
++import io.netty.handler.codec.http.LastHttpContent;
++import org.reactivestreams.Publisher;
++import org.reactivestreams.Subscriber;
++import org.reactivestreams.Subscription;
++
++/**
++ * Writes data from a publisher to a channel.
++ *
++ * @since 4.1.0
++ * @author Jonas Konrad
++ */
++@Internal
++final class ReactiveClientWriter extends ChannelInboundHandlerAdapter implements Subscriber<HttpContent> {
++    private final Publisher<HttpContent> source;
++    private EventLoopFlow flow;
++    private ChannelHandlerContext ctx;
++    private Subscription subscription;
++    private boolean writtenLast;
++
++    ReactiveClientWriter(Publisher<HttpContent> source) {
++        this.source = source;
++    }
++
++    @Override
++    public void handlerAdded(ChannelHandlerContext ctx) throws Exception {
++        this.flow = new EventLoopFlow(ctx.channel().eventLoop());
++        this.ctx = ctx;
++        source.subscribe(this);
++    }
++
++    @Override
++    public void handlerRemoved(ChannelHandlerContext ctx) throws Exception {
++        this.ctx = null;
++        if (subscription != null) {
++            subscription.cancel();
++        }
++    }
++
++    @Override
++    public void channelWritabilityChanged(ChannelHandlerContext ctx) throws Exception {
++        super.channelWritabilityChanged(ctx);
++        if (ctx.channel().isWritable()) {
++            subscription.request(1);
++        }
++    }
++
++    @Override
++    public void onSubscribe(Subscription s) {
++        if (flow.executeNow(() -> onSubscribe0(s))) {
++            onSubscribe0(s);
++        }
++    }
++
++    private void onSubscribe0(Subscription s) {
++        if (ctx == null) {
++            s.cancel();
++        } else {
++            subscription = s;
++            if (ctx.channel().isWritable()) {
++                subscription.request(1);
++            }
++        }
++    }
++
++    @Override
++    public void onNext(HttpContent httpContent) {
++        if (flow.executeNow(() -> onNext0(httpContent))) {
++            onNext0(httpContent);
++        }
++    }
++
++    private void onNext0(HttpContent httpContent) {
++        if (writtenLast) {
++            throw new IllegalStateException("Already written a LastHttpContent");
++        }
++
++        if (ctx == null) {
++            httpContent.release();
++            return;
++        }
++
++        if (httpContent instanceof LastHttpContent) {
++            writtenLast = true;
++        }
++        ctx.writeAndFlush(httpContent, ctx.voidPromise());
++        if (ctx.channel().isWritable()) {
++            subscription.request(1);
++        }
++    }
++
++    @Override
++    public void onError(Throwable t) {
++        if (flow.executeNow(() -> onError0(t))) {
++            onError0(t);
++        }
++    }
++
++    private void onError0(Throwable t) {
++        ctx.fireExceptionCaught(t);
++        ctx.pipeline().remove(ctx.name());
++    }
++
++    @Override
++    public void onComplete() {
++        if (flow.executeNow(this::onComplete0)) {
++            onComplete0();
++        }
++    }
++
++    private void onComplete0() {
++        if (!writtenLast) {
++            ctx.writeAndFlush(LastHttpContent.EMPTY_LAST_CONTENT, ctx.voidPromise());
++        }
++        ctx.pipeline().remove(ctx.name());
++    }
++}
+diff --git a/http-client/src/main/java/io/micronaut/http/client/netty/StreamWriter.java b/http-client/src/main/java/io/micronaut/http/client/netty/StreamWriter.java
+index 1ea457aa49..c0f6559f5f 100644
+--- a/http-client/src/main/java/io/micronaut/http/client/netty/StreamWriter.java
++++ b/http-client/src/main/java/io/micronaut/http/client/netty/StreamWriter.java
+@@ -37,10 +37,11 @@ import java.util.function.Consumer;
+  */
+ @Internal
+ final class StreamWriter extends ChannelInboundHandlerAdapter implements BufferConsumer {
++    private final StreamingNettyByteBody body;
+     private final Consumer<Throwable> errorHandler;
+     private ChannelHandlerContext ctx;
+     private EventLoopFlow flow;
+-    private final Upstream upstream;
++    private Upstream upstream;
+     private long unwritten = 0;
+     private boolean completed = false;
+ 
+@@ -49,8 +50,8 @@ final class StreamWriter extends ChannelInboundHandlerAdapter implements BufferC
+      * @param errorHandler Handler to call when the streaming body emits an error
+      */
+     StreamWriter(StreamingNettyByteBody body, Consumer<Throwable> errorHandler) {
++        this.body = body;
+         this.errorHandler = errorHandler;
+-        this.upstream = body.primary(this);
+     }
+ 
+     /**
+@@ -60,6 +61,7 @@ final class StreamWriter extends ChannelInboundHandlerAdapter implements BufferC
+         if (ctx == null) {
+             throw new IllegalStateException("Not added to a channel yet");
+         }
++        upstream = body.primary(this);
+         try {
+             upstream.start();
+         } catch (Exception e) {
+@@ -71,8 +73,11 @@ final class StreamWriter extends ChannelInboundHandlerAdapter implements BufferC
+      * Cancel writing the body (e.g. because a {@code CONTINUE} response was never received).
+      */
+     void cancel() {
+-        upstream.allowDiscard();
+-        upstream.disregardBackpressure();
++        if (upstream != null) {
++            upstream.allowDiscard();
++            upstream.disregardBackpressure();
++        }
++        body.close();
+     }
+ 
+     boolean isCompleted() {
+diff --git a/http-client/src/test/groovy/io/micronaut/http/client/netty/ConnectionManagerSpec.groovy b/http-client/src/test/groovy/io/micronaut/http/client/netty/ConnectionManagerSpec.groovy
+index b8a8c0f84a..1c6364193c 100644
+--- a/http-client/src/test/groovy/io/micronaut/http/client/netty/ConnectionManagerSpec.groovy
++++ b/http-client/src/test/groovy/io/micronaut/http/client/netty/ConnectionManagerSpec.groovy
+@@ -1,6 +1,7 @@
+ package io.micronaut.http.client.netty
+ 
+ import io.micronaut.context.ApplicationContext
++import io.micronaut.context.annotation.Requires
+ import io.micronaut.context.event.BeanCreatedEvent
+ import io.micronaut.context.event.BeanCreatedEventListener
+ import io.micronaut.http.HttpRequest
+@@ -129,6 +130,7 @@ class ConnectionManagerSpec extends Specification {
+     def 'simple http2 get'() {
+         def ctx = ApplicationContext.run([
+                 'micronaut.http.client.ssl.insecure-trust-all-certificates': true,
++                'spec.name': ConnectionManagerSpec.simpleName,
+         ])
+         def client = ctx.getBean(DefaultHttpClient)
+ 
+@@ -150,6 +152,7 @@ class ConnectionManagerSpec extends Specification {
+     def 'http2 streaming get'() {
+         def ctx = ApplicationContext.run([
+                 'micronaut.http.client.ssl.insecure-trust-all-certificates': true,
++                'spec.name': ConnectionManagerSpec.simpleName,
+         ])
+         def client = ctx.getBean(DefaultHttpClient)
+ 
+@@ -186,7 +189,7 @@ class ConnectionManagerSpec extends Specification {
+     }
+ 
+     def 'http1 get with compression'() {
+-        def ctx = ApplicationContext.run()
++        def ctx = ApplicationContext.run(['spec.name': ConnectionManagerSpec.simpleName])
+         def client = ctx.getBean(DefaultHttpClient)
+ 
+         def conn = new EmbeddedTestConnectionHttp1()
+@@ -217,6 +220,7 @@ class ConnectionManagerSpec extends Specification {
+     def 'http2 get with compression'() {
+         def ctx = ApplicationContext.run([
+                 'micronaut.http.client.ssl.insecure-trust-all-certificates': true,
++                'spec.name': ConnectionManagerSpec.simpleName
+         ])
+         def client = ctx.getBean(DefaultHttpClient)
+ 
+@@ -252,6 +256,7 @@ class ConnectionManagerSpec extends Specification {
+     def 'simple http1 tls get'() {
+         def ctx = ApplicationContext.run([
+                 'micronaut.http.client.ssl.insecure-trust-all-certificates': true,
++                'spec.name': ConnectionManagerSpec.simpleName,
+         ])
+         def client = ctx.getBean(DefaultHttpClient)
+ 
+@@ -269,6 +274,7 @@ class ConnectionManagerSpec extends Specification {
+     def 'simple h2c get'() {
+         def ctx = ApplicationContext.run([
+                 'micronaut.http.client.plaintext-mode': 'h2c',
++                'spec.name': ConnectionManagerSpec.simpleName,
+         ])
+         def client = ctx.getBean(DefaultHttpClient)
+ 
+@@ -286,7 +292,7 @@ class ConnectionManagerSpec extends Specification {
+     }
+ 
+     def 'http1 streaming get'() {
+-        def ctx = ApplicationContext.run()
++        def ctx = ApplicationContext.run(['spec.name': ConnectionManagerSpec.simpleName])
+         def client = ctx.getBean(DefaultHttpClient)
+ 
+         def conn = new EmbeddedTestConnectionHttp1()
+@@ -304,6 +310,7 @@ class ConnectionManagerSpec extends Specification {
+         given:
+         def ctx = ApplicationContext.run([
+                 'micronaut.http.client.ssl.insecure-trust-all-certificates': true,
++                'spec.name': ConnectionManagerSpec.simpleName,
+         ])
+         def client = ctx.getBean(DefaultHttpClient)
+ 
+@@ -371,7 +378,7 @@ class ConnectionManagerSpec extends Specification {
+     }
+ 
+     def 'http1 reuse'() {
+-        def ctx = ApplicationContext.run()
++        def ctx = ApplicationContext.run(['spec.name': ConnectionManagerSpec.simpleName])
+         def client = ctx.getBean(DefaultHttpClient)
+ 
+         def conn = new EmbeddedTestConnectionHttp1()
+@@ -394,7 +401,7 @@ class ConnectionManagerSpec extends Specification {
+     }
+ 
+     def 'http1 not reused after refresh'() {
+-        def ctx = ApplicationContext.run()
++        def ctx = ApplicationContext.run(['spec.name': ConnectionManagerSpec.simpleName])
+         def client = ctx.getBean(DefaultHttpClient)
+ 
+         def conn1 = new EmbeddedTestConnectionHttp1()
+@@ -416,7 +423,7 @@ class ConnectionManagerSpec extends Specification {
+ 
+     def 'http1 plain text customization'() {
+         given:
+-        def ctx = ApplicationContext.run()
++        def ctx = ApplicationContext.run(['spec.name': ConnectionManagerSpec.simpleName])
+         def client = ctx.getBean(DefaultHttpClient)
+         def tracker = ctx.getBean(CustomizerTracker)
+ 
+@@ -464,6 +471,7 @@ class ConnectionManagerSpec extends Specification {
+         def ctx = ApplicationContext.run([
+                 'micronaut.http.client.ssl.insecure-trust-all-certificates': true,
+                 'micronaut.http.client.plaintext-mode': 'h2c',
++                'spec.name': ConnectionManagerSpec.simpleName,
+         ])
+         def client = ctx.getBean(DefaultHttpClient)
+         def tracker = ctx.getBean(CustomizerTracker)
+@@ -523,6 +531,7 @@ class ConnectionManagerSpec extends Specification {
+     def 'http1 exchange read timeout'() {
+         def ctx = ApplicationContext.run([
+                 'micronaut.http.client.read-timeout': '5s',
++                'spec.name': ConnectionManagerSpec.simpleName,
+         ])
+         def client = ctx.getBean(DefaultHttpClient)
+ 
+@@ -563,6 +572,7 @@ class ConnectionManagerSpec extends Specification {
+         def ctx = ApplicationContext.run([
+                 'micronaut.http.client.ssl.insecure-trust-all-certificates': true,
+                 'micronaut.http.client.read-timeout': '5s',
++                'spec.name': ConnectionManagerSpec.simpleName,
+         ])
+         def client = ctx.getBean(DefaultHttpClient)
+ 
+@@ -605,6 +615,7 @@ class ConnectionManagerSpec extends Specification {
+     def 'http1 read timeout during dispatch'() {
+         def ctx = ApplicationContext.run([
+                 'micronaut.http.client.read-timeout': '5s',
++                'spec.name': ConnectionManagerSpec.simpleName,
+         ])
+         def client = ctx.getBean(DefaultHttpClient)
+ 
+@@ -641,6 +652,7 @@ class ConnectionManagerSpec extends Specification {
+     def 'http1 ttl'() {
+         def ctx = ApplicationContext.run([
+                 'micronaut.http.client.connect-ttl': '100s',
++                'spec.name': ConnectionManagerSpec.simpleName,
+         ])
+         def client = ctx.getBean(DefaultHttpClient)
+ 
+@@ -668,6 +680,7 @@ class ConnectionManagerSpec extends Specification {
+         def ctx = ApplicationContext.run([
+                 'micronaut.http.client.ssl.insecure-trust-all-certificates': true,
+                 'micronaut.http.client.connect-ttl': '100s',
++                'spec.name': ConnectionManagerSpec.simpleName,
+         ])
+         def client = ctx.getBean(DefaultHttpClient)
+ 
+@@ -697,6 +710,7 @@ class ConnectionManagerSpec extends Specification {
+     def 'http1 pool timeout'() {
+         def ctx = ApplicationContext.run([
+                 'micronaut.http.client.connection-pool-idle-timeout': '5s',
++                'spec.name': ConnectionManagerSpec.simpleName,
+         ])
+         def client = ctx.getBean(DefaultHttpClient)
+ 
+@@ -726,6 +740,7 @@ class ConnectionManagerSpec extends Specification {
+         def ctx = ApplicationContext.run([
+                 'micronaut.http.client.ssl.insecure-trust-all-certificates': true,
+                 'micronaut.http.client.connect-ttl': '100s',
++                'spec.name': ConnectionManagerSpec.simpleName,
+         ])
+         def client = ctx.getBean(DefaultHttpClient)
+ 
+@@ -772,7 +787,7 @@ class ConnectionManagerSpec extends Specification {
+     }
+ 
+     def 'cancel pool acquisition'() {
+-        def ctx = ApplicationContext.run()
++        def ctx = ApplicationContext.run('spec.name': ConnectionManagerSpec.simpleName)
+         def client = ctx.getBean(DefaultHttpClient)
+ 
+         def conn = new EmbeddedTestConnectionHttp1()
+@@ -820,6 +835,7 @@ class ConnectionManagerSpec extends Specification {
+         def ctx = ApplicationContext.run([
+                 'micronaut.http.client.pool.max-pending-acquires': 5,
+                 'micronaut.http.client.pool.max-pending-connections': 1,
++                'spec.name': ConnectionManagerSpec.simpleName,
+         ])
+         def client = ctx.getBean(DefaultHttpClient)
+ 
+@@ -871,6 +887,7 @@ class ConnectionManagerSpec extends Specification {
+         def ctx = ApplicationContext.run([
+                 'micronaut.http.client.pool.max-pending-connections': 1,
+                 'micronaut.http.client.pool.max-concurrent-http1-connections': 2,
++                'spec.name': ConnectionManagerSpec.simpleName,
+         ])
+         def client = ctx.getBean(DefaultHttpClient)
+ 
+@@ -900,7 +917,7 @@ class ConnectionManagerSpec extends Specification {
+     }
+ 
+     def 'multipart request'() {
+-        def ctx = ApplicationContext.run()
++        def ctx = ApplicationContext.run('spec.name': ConnectionManagerSpec.simpleName)
+         def client = ctx.getBean(DefaultHttpClient)
+ 
+         def conn = new EmbeddedTestConnectionHttp1()
+@@ -934,7 +951,7 @@ class ConnectionManagerSpec extends Specification {
+     }
+ 
+     def 'publisher request'() {
+-        def ctx = ApplicationContext.run()
++        def ctx = ApplicationContext.run('spec.name': ConnectionManagerSpec.simpleName)
+         def client = ctx.getBean(DefaultHttpClient)
+ 
+         def conn = new EmbeddedTestConnectionHttp1()
+@@ -968,6 +985,7 @@ class ConnectionManagerSpec extends Specification {
+     def 'connection pool disabled http1'() {
+         def ctx = ApplicationContext.run([
+                 'micronaut.http.client.pool.enabled': false,
++                'spec.name': ConnectionManagerSpec.simpleName,
+         ])
+         def client = ctx.getBean(DefaultHttpClient)
+ 
+@@ -994,6 +1012,7 @@ class ConnectionManagerSpec extends Specification {
+         def ctx = ApplicationContext.run([
+                 'micronaut.http.client.pool.enabled': false,
+                 'micronaut.http.client.ssl.insecure-trust-all-certificates': true,
++                'spec.name': ConnectionManagerSpec.simpleName,
+         ])
+         def client = ctx.getBean(DefaultHttpClient)
+ 
+@@ -1020,7 +1039,8 @@ class ConnectionManagerSpec extends Specification {
+ 
+     def 'http2 goaway'() {
+         def ctx = ApplicationContext.run([
+-                'micronaut.http.client.ssl.insecure-trust-all-certificates'  : true
++                'micronaut.http.client.ssl.insecure-trust-all-certificates'  : true,
++                'spec.name': ConnectionManagerSpec.simpleName,
+         ])
+         def client = ctx.getBean(DefaultHttpClient)
+ 
+@@ -1053,7 +1073,8 @@ class ConnectionManagerSpec extends Specification {
+     def 'http2 channel inactive but fire inactive channel scheduled after acquire'() {
+         def ctx = ApplicationContext.run([
+                 'micronaut.http.client.ssl.insecure-trust-all-certificates': true,
+-                'micronaut.http.client.read-timeout': '5s'
++                'micronaut.http.client.read-timeout': '5s',
++                'spec.name': ConnectionManagerSpec.simpleName,
+         ])
+         def client = ctx.getBean(DefaultHttpClient)
+ 
+@@ -1102,6 +1123,7 @@ class ConnectionManagerSpec extends Specification {
+         def ctx = ApplicationContext.run([
+                 'micronaut.http.client.ssl.insecure-trust-all-certificates': true,
+                 'micronaut.http.client.read-timeout': '1s',
++                'spec.name': ConnectionManagerSpec.simpleName,
+         ])
+         def client = ctx.getBean(DefaultHttpClient)
+ 
+@@ -1145,7 +1167,10 @@ class ConnectionManagerSpec extends Specification {
+ 
+     def 'automated ping, writes only'(String prop, boolean ping) {
+         given:
+-        def props = ['micronaut.http.client.ssl.insecure-trust-all-certificates': true]
++        def props = [
++                'micronaut.http.client.ssl.insecure-trust-all-certificates': true,
++                'spec.name': ConnectionManagerSpec.simpleName,
++        ]
+         props.put(prop, '1s')
+         def ctx = ApplicationContext.run(props)
+         def client = ctx.getBean(DefaultHttpClient)
+@@ -1185,7 +1210,10 @@ class ConnectionManagerSpec extends Specification {
+ 
+     def 'automated ping, no traffic'(String prop, boolean ping) {
+         given:
+-        def props = ['micronaut.http.client.ssl.insecure-trust-all-certificates': true]
++        def props = [
++                'micronaut.http.client.ssl.insecure-trust-all-certificates': true,
++                'spec.name': ConnectionManagerSpec.simpleName,
++        ]
+         props.put(prop, '1s')
+         def ctx = ApplicationContext.run(props)
+         def client = ctx.getBean(DefaultHttpClient)
+@@ -1477,6 +1505,7 @@ class ConnectionManagerSpec extends Specification {
+         }
+     }
+ 
++    @Requires(property = "spec.name", value = "ConnectionManagerSpec")
+     @Singleton
+     static class CustomizerTracker implements NettyClientCustomizer, BeanCreatedEventListener<Registry> {
+         final Queue<Snapshot> initialPipelineBuilt = new ArrayDeque<>()
+diff --git a/http-client/src/test/groovy/io/micronaut/http/client/netty/FullNettyClientHttpResponseSpec.groovy b/http-client/src/test/groovy/io/micronaut/http/client/netty/FullNettyClientHttpResponseSpec.groovy
+index 22a5f25fb7..502d0226f6 100644
+--- a/http-client/src/test/groovy/io/micronaut/http/client/netty/FullNettyClientHttpResponseSpec.groovy
++++ b/http-client/src/test/groovy/io/micronaut/http/client/netty/FullNettyClientHttpResponseSpec.groovy
+@@ -1,8 +1,17 @@
+ package io.micronaut.http.client.netty
+ 
++import io.micronaut.context.ApplicationContext
++import io.micronaut.context.annotation.Requires
+ import io.micronaut.core.convert.ConversionService
++import io.micronaut.http.HttpRequest
++import io.micronaut.http.HttpResponse
++import io.micronaut.http.annotation.Controller
++import io.micronaut.http.annotation.Get
++import io.micronaut.http.client.BlockingHttpClient
++import io.micronaut.http.client.HttpClient
+ import io.micronaut.http.cookie.Cookie
+ import io.micronaut.http.cookie.Cookies
++import io.micronaut.runtime.server.EmbeddedServer
+ import io.netty.buffer.ByteBuf
+ import io.netty.buffer.Unpooled
+ import io.netty.handler.codec.http.DefaultFullHttpResponse
+@@ -12,21 +21,26 @@ import io.netty.handler.codec.http.HttpHeaderNames
+ import io.netty.handler.codec.http.HttpHeaders
+ import io.netty.handler.codec.http.HttpResponseStatus
+ import io.netty.handler.codec.http.HttpVersion
+-import spock.lang.Specification
+-
++import jakarta.inject.Singleton
+ import java.nio.charset.Charset
++import java.util.concurrent.Callable
++import java.util.concurrent.ExecutorService
++import java.util.concurrent.Executors
++import java.util.concurrent.TimeUnit
++import spock.lang.Specification
+ 
+ class FullNettyClientHttpResponseSpec extends Specification {
+ 
+     void "test cookies"() {
+         given:
+           String cookieDef = "simple-cookie=avalue; max-age=60; path=/; domain=.micronaut.io"
+-          HttpHeaders httpHeaders = new DefaultHttpHeaders(false).add(HttpHeaderNames.SET_COOKIE, cookieDef)
++          HttpHeaders httpHeaders = new DefaultHttpHeaders(false)
++                  .add(HttpHeaderNames.SET_COOKIE, cookieDef)
+           FullHttpResponse fullHttpResponse = new DefaultFullHttpResponse(HttpVersion.HTTP_1_1, HttpResponseStatus.OK)
+           fullHttpResponse.headers().set(httpHeaders)
+ 
+         when:
+-          FullNettyClientHttpResponse response = new FullNettyClientHttpResponse(fullHttpResponse, null, null, false, ConversionService.SHARED)
++          var response = new FullNettyClientHttpResponse(fullHttpResponse, null, null, false, ConversionService.SHARED)
+ 
+         then:
+             Cookies cookies = response.getCookies()
+@@ -35,21 +49,21 @@ class FullNettyClientHttpResponseSpec extends Specification {
+             cookies.contains("simple-cookie")
+             Optional<Cookie> oCookie = response.getCookie("simple-cookie")
+             oCookie.isPresent()
+-            oCookie.get().getValue().equals("avalue")
++            oCookie.get().getValue() == "avalue"
+     }
+ 
+     void "test multiple cookie headers"() {
+-        HttpHeaders httpHeaders = new DefaultHttpHeaders(false)
+         FullHttpResponse fullHttpResponse = new DefaultFullHttpResponse(HttpVersion.HTTP_1_1, HttpResponseStatus.OK)
+-        httpHeaders.add(HttpHeaderNames.SET_COOKIE, "enctp=1;Domain=.xxx.xxx.com;Expires=Sat, 09-Jan-2021 17:32:47 GMT;Max-Age=7776000")
+-        httpHeaders.add(HttpHeaderNames.SET_COOKIE, "inf=123456; path=/; domain=.xxx.com;")
+-        httpHeaders.add(HttpHeaderNames.SET_COOKIE, "AUT=aaaabbbbcccc; path=/; domain=.xxx.com; HttpOnly")
+-        httpHeaders.add(HttpHeaderNames.SET_COOKIE, "SES=abcdabcd; path=/; domain=.xxx.com;")
+-        httpHeaders.add(HttpHeaderNames.SET_COOKIE, "JKL=abcdaaaa=; path=/; domain=.xxx.com; Secure;")
++        HttpHeaders httpHeaders = new DefaultHttpHeaders(false)
++            .add(HttpHeaderNames.SET_COOKIE, "enctp=1;Domain=.xxx.xxx.com;Expires=Sat, 09-Jan-2021 17:32:47 GMT;Max-Age=7776000")
++            .add(HttpHeaderNames.SET_COOKIE, "inf=123456; path=/; domain=.xxx.com;")
++            .add(HttpHeaderNames.SET_COOKIE, "AUT=aaaabbbbcccc; path=/; domain=.xxx.com; HttpOnly")
++            .add(HttpHeaderNames.SET_COOKIE, "SES=abcdabcd; path=/; domain=.xxx.com;")
++            .add(HttpHeaderNames.SET_COOKIE, "JKL=abcdaaaa=; path=/; domain=.xxx.com; Secure;")
+         fullHttpResponse.headers().set(httpHeaders)
+ 
+         when:
+-        FullNettyClientHttpResponse response = new FullNettyClientHttpResponse(fullHttpResponse, null, null, false, ConversionService.SHARED)
++        var response = new FullNettyClientHttpResponse(fullHttpResponse, null, null, false, ConversionService.SHARED)
+ 
+         then:
+         Cookies cookies = response.getCookies()
+@@ -72,13 +86,360 @@ class FullNettyClientHttpResponseSpec extends Specification {
+         FullHttpResponse fullHttpResponse = new DefaultFullHttpResponse(HttpVersion.HTTP_1_1, HttpResponseStatus.OK, content)
+ 
+         when:
+-        FullNettyClientHttpResponse response1 = new FullNettyClientHttpResponse(fullHttpResponse, null, null, false, ConversionService.SHARED)
+-        FullNettyClientHttpResponse response2 = new FullNettyClientHttpResponse(fullHttpResponse, null, null, false, ConversionService.SHARED)
++        var response1 = new FullNettyClientHttpResponse(fullHttpResponse, null, null, false, ConversionService.SHARED)
++        var response2 = new FullNettyClientHttpResponse(fullHttpResponse, null, null, false, ConversionService.SHARED)
+ 
+         then:
+         response1.getBody(String.class).get() == "foo bar"
+         response2.getBody(String.class).get() == "foo bar"
+     }
+ 
++    void "test concurrency FullNettyClientHttpResponse"() {
++
++        given:
++        EmbeddedServer server = ApplicationContext.run(EmbeddedServer, ['spec.name': FullNettyClientHttpResponseSpec.simpleName])
++        ApplicationContext ctx = server.applicationContext
++        BlockingHttpClient client = ctx.createBean(HttpClient, server.URL).toBlocking()
++
++        when:
++
++        var threadsCount = 10
++        ExecutorService executor = Executors.newFixedThreadPool(threadsCount)
++        ExecutorService executor2 = Executors.newScheduledThreadPool(threadsCount)
++
++        var concurrentExceptionWasThrown = false
++        var tasks = new ArrayList<Callable<?>>()
++
++        for (var i = 0; i < 100; i++) {
++            tasks.add(Executors.callable {
++                if (concurrentExceptionWasThrown) {
++                    return null
++                }
++                var requestTasks = new ArrayList<Callable<?>>()
++                var response = client.exchange(HttpRequest.GET("/someGet"), byte[].class) as FullNettyClientHttpResponse<byte[]>
++                for (var j = 0; j < 100; j++) {
++                    requestTasks.add(Executors.callable {
++                        if (concurrentExceptionWasThrown) {
++                            return null
++                        }
++                        response.getBody(String.class).orElse(null)
++                    })
++                    requestTasks.add(Executors.callable {
++                        if (concurrentExceptionWasThrown) {
++                            return null
++                        }
++                        response.getBody(byte[].class).orElse(null)
++                    })
++                }
++
++                try {
++                    var futures = executor2.invokeAll(requestTasks);
++                    for (var future : futures) {
++                        future.get();
++                    }
++                } catch (Exception e) {
++                    println("Something is wrong: ${e.message}, ${e.class.simpleName}")
++                    concurrentExceptionWasThrown = true
++                }
++            })
++        }
++        executor.invokeAll(tasks)
++        executor.shutdown()
++        try {
++            if (!executor.awaitTermination(800, TimeUnit.MILLISECONDS)) {
++                executor.shutdownNow()
++            }
++        } catch (InterruptedException e) {
++            executor.shutdownNow()
++        }
++
++        then:
++        !concurrentExceptionWasThrown
++    }
++
++    @Requires(property = "spec.name", value = "FullNettyClientHttpResponseSpec")
++    @Controller
++    @Singleton
++    static class ExampleController {
++
++        @Get("/someGet")
++        HttpResponse<String> exampleGet() {
++            // autogenerated json
++            return HttpResponse.ok("""
++            [
++              {
++                "_id": "673df45fc80f6ab432122195",
++                "index": 0,
++                "guid": "b7cbafe6-a620-4e72-8f52-275bbd51a1b6",
++                "isActive": false,
++                "balance": "${'$'}2,889.56",
++                "picture": "http://placehold.it/32x32",
++                "age": 27,
++                "eyeColor": "blue",
++                "name": "Cote Weiss",
++                "gender": "male",
++                "company": "PHARMEX",
++                "email": "coteweiss@pharmex.com",
++                "phone": "+1 (921) 443-2881",
++                "address": "225 Losee Terrace, Tryon, Missouri, 2789",
++                "about": "Cillum consequat amet non ipsum nostrud est eu dolor voluptate minim. Enim velit sint exercitation labore do incididunt anim aute dolor quis consectetur tempor ex est. Irure nostrud cupidatat sint duis excepteur aliqua eiusmod cillum laboris eiusmod mollit deserunt elit. Tempor voluptate duis ex esse eu veniam et deserunt in amet id cupidatat do laboris. Duis quis ullamco quis voluptate duis in in exercitation. Cupidatat sunt aliqua in consectetur sint minim anim ut.\r\n",
++                "registered": "2014-08-26T05:18:29 -02:00",
++                "latitude": -65.593812,
++                "longitude": 123.085155,
++                "tags": [
++                  "non",
++                  "duis",
++                  "ipsum",
++                  "id",
++                  "ea",
++                  "anim",
++                  "officia"
++                ],
++                "friends": [
++                  {
++                    "id": 0,
++                    "name": "Janie Gross"
++                  },
++                  {
++                    "id": 1,
++                    "name": "Latasha Sykes"
++                  },
++                  {
++                    "id": 2,
++                    "name": "Summer Pruitt"
++                  }
++                ],
++                "greeting": "Hello, Cote Weiss! You have 6 unread messages.",
++                "favoriteFruit": "strawberry"
++              },
++              {
++                "_id": "673df45fd0cd418c67455600",
++                "index": 1,
++                "guid": "639c4cfa-7875-4170-9045-1391ddeed7ca",
++                "isActive": false,
++                "balance": "${'$'}1,429.26",
++                "picture": "http://placehold.it/32x32",
++                "age": 40,
++                "eyeColor": "green",
++                "name": "Ebony Mcknight",
++                "gender": "female",
++                "company": "OPTICALL",
++                "email": "ebonymcknight@opticall.com",
++                "phone": "+1 (902) 484-2716",
++                "address": "617 Bayview Place, Sterling, North Carolina, 7858",
++                "about": "Non eiusmod ullamco minim et eu eiusmod ut duis laborum laborum. Pariatur eu exercitation est voluptate eu enim in sit aliquip ad deserunt. Cillum officia mollit incididunt labore irure tempor officia eiusmod duis ex ullamco est culpa. Nostrud culpa veniam ipsum pariatur nostrud occaecat ipsum anim deserunt amet adipisicing duis elit fugiat. Pariatur aliquip eiusmod dolor dolore est ad qui eu incididunt excepteur laborum. Aliquip elit tempor enim laborum qui mollit velit qui sit quis veniam. Magna laboris quis sint amet fugiat.\r\n",
++                "registered": "2014-06-15T10:16:47 -02:00",
++                "latitude": -15.512737,
++                "longitude": -111.397878,
++                "tags": [
++                  "commodo",
++                  "Lorem",
++                  "dolore",
++                  "dolore",
++                  "exercitation",
++                  "amet",
++                  "irure"
++                ],
++                "friends": [
++                  {
++                    "id": 0,
++                    "name": "Alicia Johnston"
++                  },
++                  {
++                    "id": 1,
++                    "name": "Blanche Gilliam"
++                  },
++                  {
++                    "id": 2,
++                    "name": "Jessica Fry"
++                  }
++                ],
++                "greeting": "Hello, Ebony Mcknight! You have 10 unread messages.",
++                "favoriteFruit": "banana"
++              },
++              {
++                "_id": "673df45f18a35a5f44b04309",
++                "index": 2,
++                "guid": "614168a3-4586-4d90-be8f-8be6d6448ba3",
++                "isActive": false,
++                "balance": "${'$'}1,690.57",
++                "picture": "http://placehold.it/32x32",
++                "age": 38,
++                "eyeColor": "blue",
++                "name": "Florine Patton",
++                "gender": "female",
++                "company": "QOT",
++                "email": "florinepatton@qot.com",
++                "phone": "+1 (954) 450-3766",
++                "address": "536 Charles Place, Franklin, California, 7005",
++                "about": "Duis laboris ex aute ipsum laborum amet ad elit irure mollit aliqua eiusmod duis elit. Reprehenderit duis veniam ullamco Lorem culpa sit labore excepteur elit occaecat eiusmod est culpa incididunt. Pariatur sint mollit voluptate amet magna do reprehenderit consectetur eiusmod. Anim velit aliquip do ut aliquip ipsum deserunt et. Pariatur reprehenderit excepteur cupidatat quis et duis aliquip ipsum laboris anim aliquip anim magna eiusmod.\r\n",
++                "registered": "2016-02-02T01:58:35 -01:00",
++                "latitude": 29.255451,
++                "longitude": -104.598785,
++                "tags": [
++                  "magna",
++                  "pariatur",
++                  "Lorem",
++                  "consectetur",
++                  "sunt",
++                  "est",
++                  "nulla"
++                ],
++                "friends": [
++                  {
++                    "id": 0,
++                    "name": "Carver Harmon"
++                  },
++                  {
++                    "id": 1,
++                    "name": "Rollins Wong"
++                  },
++                  {
++                    "id": 2,
++                    "name": "Shelby Livingston"
++                  }
++                ],
++                "greeting": "Hello, Florine Patton! You have 5 unread messages.",
++                "favoriteFruit": "apple"
++              },
++              {
++                "_id": "673df45fa3dfad9948af8878",
++                "index": 3,
++                "guid": "d9a0f891-c442-4f56-ad21-aeeae43dd040",
++                "isActive": false,
++                "balance": "${'$'}1,340.69",
++                "picture": "http://placehold.it/32x32",
++                "age": 30,
++                "eyeColor": "green",
++                "name": "Madeleine Moran",
++                "gender": "female",
++                "company": "ILLUMITY",
++                "email": "madeleinemoran@illumity.com",
++                "phone": "+1 (818) 408-2235",
++                "address": "494 Powers Street, Williston, Mississippi, 5041",
++                "about": "Esse sunt sit deserunt magna anim amet. Anim ut elit sint fugiat quis ad. Et dolore tempor laboris ad ad fugiat elit.\r\n",
++                "registered": "2020-03-07T10:07:24 -01:00",
++                "latitude": 89.045778,
++                "longitude": 17.840976,
++                "tags": [
++                  "consectetur",
++                  "adipisicing",
++                  "enim",
++                  "mollit",
++                  "do",
++                  "dolor",
++                  "irure"
++                ],
++                "friends": [
++                  {
++                    "id": 0,
++                    "name": "Thornton Brady"
++                  },
++                  {
++                    "id": 1,
++                    "name": "Ashley Newman"
++                  },
++                  {
++                    "id": 2,
++                    "name": "Terra Downs"
++                  }
++                ],
++                "greeting": "Hello, Madeleine Moran! You have 8 unread messages.",
++                "favoriteFruit": "banana"
++              },
++              {
++                "_id": "673df45ff83ad1120ffa1a83",
++                "index": 4,
++                "guid": "20935d40-8069-464d-8497-5a69b72451ae",
++                "isActive": false,
++                "balance": "${'$'}1,154.89",
++                "picture": "http://placehold.it/32x32",
++                "age": 33,
++                "eyeColor": "brown",
++                "name": "Sanchez Mullins",
++                "gender": "male",
++                "company": "XLEEN",
++                "email": "sanchezmullins@xleen.com",
++                "phone": "+1 (891) 502-2082",
++                "address": "963 Pierrepont Street, Bangor, Minnesota, 4386",
++                "about": "Adipisicing magna amet eiusmod veniam amet laboris excepteur. Deserunt amet consectetur deserunt irure culpa. Occaecat nostrud labore excepteur sint sint. Nulla quis ut cillum consectetur eu et consectetur duis.\r\n",
++                "registered": "2014-01-26T09:17:34 -01:00",
++                "latitude": 45.081551,
++                "longitude": -21.080718,
++                "tags": [
++                  "magna",
++                  "non",
++                  "id",
++                  "nisi",
++                  "eu",
++                  "labore",
++                  "cupidatat"
++                ],
++                "friends": [
++                  {
++                    "id": 0,
++                    "name": "Billie Parrish"
++                  },
++                  {
++                    "id": 1,
++                    "name": "Ortiz Lester"
++                  },
++                  {
++                    "id": 2,
++                    "name": "Stacy Sargent"
++                  }
++                ],
++                "greeting": "Hello, Sanchez Mullins! You have 9 unread messages.",
++                "favoriteFruit": "banana"
++              },
++              {
++                "_id": "673df45f661c0664c5c7cc25",
++                "index": 5,
++                "guid": "35a84917-3421-4c7d-b350-87adebb1d2ee",
++                "isActive": true,
++                "balance": "${'$'}1,414.77",
++                "picture": "http://placehold.it/32x32",
++                "age": 33,
++                "eyeColor": "green",
++                "name": "Preston Lowe",
++                "gender": "male",
++                "company": "UBERLUX",
++                "email": "prestonlowe@uberlux.com",
++                "phone": "+1 (965) 526-2168",
++                "address": "442 Beach Place, Bluffview, Idaho, 2698",
++                "about": "Laboris tempor non ullamco sit sit voluptate eu deserunt id nostrud ad velit occaecat sit. Laboris fugiat eu veniam duis dolor do excepteur. Aliquip sunt id laborum do.\r\n",
++                "registered": "2019-12-28T08:36:12 -01:00",
++                "latitude": 30.586004,
++                "longitude": 76.748238,
++                "tags": [
++                  "cupidatat",
++                  "qui",
++                  "laborum",
++                  "et",
++                  "et",
++                  "ut",
++                  "tempor"
++                ],
++                "friends": [
++                  {
++                    "id": 0,
++                    "name": "Greene Mcfadden"
++                  },
++                  {
++                    "id": 1,
++                    "name": "Tate Schneider"
++                  },
++                  {
++                    "id": 2,
++                    "name": "Nola Baxter"
++                  }
++                ],
++                "greeting": "Hello, Preston Lowe! You have 4 unread messages.",
++                "favoriteFruit": "apple"
++              }
++            ]
++        """.stripIndent())
++        }
++    }
+ }
+ 
+diff --git a/http-client/src/test/groovy/io/micronaut/http/client/netty/ReactiveClientReaderSpec.groovy b/http-client/src/test/groovy/io/micronaut/http/client/netty/ReactiveClientReaderSpec.groovy
+new file mode 100644
+index 0000000000..e67ad7cb8d
+--- /dev/null
++++ b/http-client/src/test/groovy/io/micronaut/http/client/netty/ReactiveClientReaderSpec.groovy
+@@ -0,0 +1,128 @@
++package io.micronaut.http.client.netty
++
++import io.micronaut.http.client.exceptions.ResponseClosedException
++import io.netty.buffer.Unpooled
++import io.netty.channel.ChannelHandlerContext
++import io.netty.channel.embedded.EmbeddedChannel
++import io.netty.handler.codec.http.DefaultHttpContent
++import io.netty.handler.codec.http.HttpContent
++import io.netty.handler.flow.FlowControlHandler
++import org.reactivestreams.Subscriber
++import org.reactivestreams.Subscription
++import reactor.core.publisher.Flux
++import spock.lang.Specification
++
++class ReactiveClientReaderSpec extends Specification {
++    def 'avoid nested onNext'() {
++        def reader = new ReactiveClientReader() {
++            @Override
++            protected void remove(ChannelHandlerContext ctx) {
++            }
++        }
++        def channel = new EmbeddedChannel()
++        channel.config().setAutoRead(false)
++        channel.pipeline().addLast(new FlowControlHandler(), reader)
++        boolean nested = false
++        Subscription sub = null
++        HttpContent item = null
++        reader.subscribe(new Subscriber<HttpContent>() {
++            boolean inNext
++
++            @Override
++            void onSubscribe(Subscription s) {
++                sub = s
++            }
++
++            @Override
++            void onNext(HttpContent httpContent) {
++                if (inNext) {
++                    nested = true
++                    throw new IllegalStateException()
++                }
++                inNext = true
++                item = httpContent
++                sub.request(1)
++                inNext = false
++            }
++
++            @Override
++            void onError(Throwable t) {
++                if (inNext) {
++                    nested = true
++                    throw new IllegalStateException()
++                }
++            }
++
++            @Override
++            void onComplete() {
++                if (inNext) {
++                    nested = true
++                    throw new IllegalStateException()
++                }
++            }
++        })
++
++        when:
++        def c1 = new DefaultHttpContent(Unpooled.EMPTY_BUFFER)
++        channel.writeInbound(c1)
++        then:
++        item == null
++
++        when:
++        sub.request(1)
++        then:
++        item == c1
++
++        when:
++        def c2 = new DefaultHttpContent(Unpooled.EMPTY_BUFFER)
++        def c3 = new DefaultHttpContent(Unpooled.EMPTY_BUFFER)
++        channel.writeInbound(c2, c3)
++        then:
++        item == c3
++        !nested
++    }
++
++    def 'error before subscribe'() {
++        given:
++        def reader = new ReactiveClientReader() {
++            @Override
++            protected void remove(ChannelHandlerContext ctx) {
++            }
++        }
++        def channel = new EmbeddedChannel(reader)
++        def err = new RuntimeException()
++
++        when:
++        channel.pipeline().fireExceptionCaught(err)
++        channel.checkException()
++        then:
++        noExceptionThrown()
++
++        when:
++        Flux.from(reader).blockLast()
++        then:
++        def e = thrown RuntimeException
++        e == err
++    }
++
++    def 'inactive before subscribe'() {
++        given:
++        def reader = new ReactiveClientReader() {
++            @Override
++            protected void remove(ChannelHandlerContext ctx) {
++            }
++        }
++        def channel = new EmbeddedChannel(reader)
++
++        when:
++        channel.pipeline().fireChannelInactive()
++        channel.checkException()
++        then:
++        noExceptionThrown()
++
++        when:
++        Flux.from(reader).blockLast()
++        then:
++        thrown ResponseClosedException
++    }
++}
+diff --git a/http-client/src/test/groovy/io/micronaut/http/client/netty/ReactiveClientWriterSpec.groovy b/http-client/src/test/groovy/io/micronaut/http/client/netty/ReactiveClientWriterSpec.groovy
+new file mode 100644
+index 0000000000..b534281d91
+--- /dev/null
++++ b/http-client/src/test/groovy/io/micronaut/http/client/netty/ReactiveClientWriterSpec.groovy
+@@ -0,0 +1,61 @@
++package io.micronaut.http.client.netty
++
++import io.netty.buffer.Unpooled
++import io.netty.channel.embedded.EmbeddedChannel
++import io.netty.handler.codec.http.DefaultHttpContent
++import io.netty.handler.codec.http.DefaultLastHttpContent
++import io.netty.handler.codec.http.HttpContent
++import io.netty.handler.codec.http.LastHttpContent
++import reactor.core.publisher.Sinks
++import spock.lang.Specification
++
++import java.nio.charset.StandardCharsets
++
++class ReactiveClientWriterSpec extends Specification {
++    def 'last content as part of publisher'() {
++        given:
++        Sinks.Many<HttpContent> sink = Sinks.many().unicast().onBackpressureBuffer()
++        def writer = new ReactiveClientWriter(sink.asFlux())
++        def channel = new EmbeddedChannel(writer)
++
++        when:
++        def c1 = new DefaultHttpContent(Unpooled.wrappedBuffer("foo".getBytes(StandardCharsets.UTF_8)))
++        sink.tryEmitNext(c1)
++        then:
++        channel.readOutbound() == c1
++
++        when:
++        def c2 = new DefaultLastHttpContent(Unpooled.wrappedBuffer("foo".getBytes(StandardCharsets.UTF_8)))
++        sink.tryEmitNext(c2)
++        then:
++        channel.readOutbound() == c2
++
++        when:
++        sink.tryEmitComplete()
++        then:
++        channel.readOutbound() == null
++    }
++
++    def 'last content from onComplete'() {
++        given:
++        Sinks.Many<HttpContent> sink = Sinks.many().unicast().onBackpressureBuffer()
++        def writer = new ReactiveClientWriter(sink.asFlux())
++        def channel = new EmbeddedChannel(writer)
++
++        when:
++        def c1 = new DefaultHttpContent(Unpooled.wrappedBuffer("foo".getBytes(StandardCharsets.UTF_8)))
++        sink.tryEmitNext(c1)
++        then:
++        channel.readOutbound() == c1
++
++        when:
++        sink.tryEmitComplete()
++        then:
++        channel.readOutbound() == LastHttpContent.EMPTY_LAST_CONTENT
++
++        when:
++        sink.tryEmitComplete()
++        then:
++        channel.readOutbound() == null
++    }
++}
+diff --git a/http-client/src/test/java/io/micronaut/http/client/ProxyBackpressureTest.java b/http-client/src/test/java/io/micronaut/http/client/ProxyBackpressureTest.java
+deleted file mode 100644
+index b366dd2745..0000000000
+--- a/http-client/src/test/java/io/micronaut/http/client/ProxyBackpressureTest.java
++++ /dev/null
+@@ -1,137 +0,0 @@
+-package io.micronaut.http.client;
+-
+-import io.micronaut.context.ApplicationContext;
+-import io.micronaut.context.annotation.Requires;
+-import io.micronaut.core.io.buffer.ByteBuffer;
+-import io.micronaut.http.HttpRequest;
+-import io.micronaut.http.MutableHttpResponse;
+-import io.micronaut.http.annotation.Controller;
+-import io.micronaut.http.annotation.Get;
+-import io.micronaut.http.annotation.RequestFilter;
+-import io.micronaut.http.annotation.ServerFilter;
+-import io.micronaut.runtime.server.EmbeddedServer;
+-import jakarta.inject.Inject;
+-import org.awaitility.Awaitility;
+-import org.junit.jupiter.api.Assertions;
+-import org.junit.jupiter.api.parallel.Execution;
+-import org.junit.jupiter.api.parallel.ExecutionMode;
+-import org.junit.jupiter.params.ParameterizedTest;
+-import org.junit.jupiter.params.provider.CsvSource;
+-import org.reactivestreams.Publisher;
+-import org.reactivestreams.Subscriber;
+-import org.reactivestreams.Subscription;
+-import reactor.core.publisher.Flux;
+-
+-import java.util.Map;
+-import java.util.concurrent.ThreadLocalRandom;
+-import java.util.concurrent.TimeUnit;
+-
+-public class ProxyBackpressureTest {
+-    private static final int CHUNK_SIZE = 1024 * 1024;
+-    private static final int TOTAL_CHUNKS = 128;
+-
+-    @ParameterizedTest
+-    @CsvSource({
+-        "false,1,/large",
+-        "true,1,/large",
+-        "true,2,/large",
+-        "true,3,/large",
+-        "false,1,/proxy",
+-        "true,1,/proxy",
+-        "true,2,/proxy",
+-        "true,3,/proxy",
+-    })
+-    @Execution(ExecutionMode.CONCURRENT)
+-    public void backpressure(boolean ssl, int version, String endpoint) throws InterruptedException {
+-        try (ApplicationContext ctx = ApplicationContext.run(Map.of(
+-            "spec.name", "ProxyBackpressureTest",
+-            "micronaut.http.client.ssl.insecure-trust-all-certificates", ssl,
+-            "micronaut.http.client.alpn-modes", version == 2 ? "h2" : version == 3 ? "h3" : "http/1.1",
+-            "micronaut.http.client.read-timeout", "120",
+-            "micronaut.server.http-version", ssl ? "2.0" : "1.1",
+-            "micronaut.server.ssl.enabled", ssl,
+-            "micronaut.server.ssl.build-self-signed", true,
+-            "micronaut.server.netty.listeners.main.family", version == 3 ? "quic" : "tcp",
+-            "micronaut.server.netty.listeners.main.ssl", ssl,
+-            "micronaut.server.netty.listeners.main.port", 0
+-        ));
+-             EmbeddedServer server = ctx.getBean(EmbeddedServer.class).start();
+-             StreamingHttpClient client = ctx.createBean(StreamingHttpClient.class, server.getURI())) {
+-
+-            Ctrl ctrl = ctx.getBean(Ctrl.class);
+-            var subscriber = new Subscriber<ByteBuffer<?>>() {
+-                volatile Subscription subscription;
+-                volatile long received = 0;
+-                volatile boolean complete = false;
+-                Throwable error;
+-
+-                @Override
+-                public void onSubscribe(Subscription s) {
+-                    subscription = s;
+-                }
+-
+-                @Override
+-                public void onNext(ByteBuffer<?> byteBuffer) {
+-                    received += byteBuffer.readableBytes();
+-                }
+-
+-                @Override
+-                public void onError(Throwable t) {
+-                    error = t;
+-                    complete = true;
+-                }
+-
+-                @Override
+-                public void onComplete() {
+-                    complete = true;
+-                }
+-            };
+-            Flux.from(client.dataStream(HttpRequest.GET(endpoint))).subscribe(subscriber);
+-
+-            Awaitility.await().atMost(60, TimeUnit.SECONDS).until(() -> subscriber.subscription != null);
+-            subscriber.subscription.request(1);
+-            Awaitility.await().atMost(60, TimeUnit.SECONDS).until(() -> subscriber.received > 1024);
+-            TimeUnit.SECONDS.sleep(5);
+-            Assertions.assertTrue(ctrl.emitted < 32 * CHUNK_SIZE);
+-
+-            subscriber.subscription.request(Long.MAX_VALUE);
+-            Awaitility.await().atMost(60, TimeUnit.SECONDS).until(() -> subscriber.complete);
+-            if (subscriber.error != null) {
+-                Assertions.fail(subscriber.error);
+-            }
+-            Assertions.assertEquals(TOTAL_CHUNKS * CHUNK_SIZE, subscriber.received);
+-            Assertions.assertEquals(TOTAL_CHUNKS * CHUNK_SIZE, ctrl.emitted);
+-        }
+-    }
+-
+-    @Controller
+-    @Requires(property = "spec.name", value = "ProxyBackpressureTest")
+-    static class Ctrl {
+-        volatile long emitted = 0;
+-
+-        @Get("/large")
+-        Publisher<byte[]> large() {
+-            return Flux.range(0, TOTAL_CHUNKS)
+-                .map(i -> {
+-                    var arr = new byte[CHUNK_SIZE];
+-                    ThreadLocalRandom.current().nextBytes(arr);
+-                    return arr;
+-                })
+-                .doOnNext(it -> emitted += it.length);
+-        }
+-    }
+-
+-    @ServerFilter("/proxy")
+-    @Requires(property = "spec.name", value = "ProxyBackpressureTest")
+-    static class Filt {
+-        @Inject
+-        ProxyHttpClient proxy;
+-        @Inject
+-        EmbeddedServer server;
+-
+-        @RequestFilter
+-        Publisher<MutableHttpResponse<?>> proxy() {
+-            return proxy.proxy(HttpRequest.GET(server.getURI() + "/large"));
+-        }
+-    }
+-}
+diff --git a/http-client/src/test/resources/junit-platform.properties b/http-client/src/test/resources/junit-platform.properties
+deleted file mode 100644
+index 2115a2f133..0000000000
+--- a/http-client/src/test/resources/junit-platform.properties
++++ /dev/null
+@@ -1 +0,0 @@
+-junit.jupiter.execution.parallel.enabled = true
+diff --git a/http-server-netty/src/main/java/io/micronaut/http/server/netty/DefaultHttpCompressionStrategy.java b/http-server-netty/src/main/java/io/micronaut/http/server/netty/DefaultHttpCompressionStrategy.java
+index a06975d582..20ecbbecac 100644
+--- a/http-server-netty/src/main/java/io/micronaut/http/server/netty/DefaultHttpCompressionStrategy.java
++++ b/http-server-netty/src/main/java/io/micronaut/http/server/netty/DefaultHttpCompressionStrategy.java
+@@ -36,6 +36,7 @@ final class DefaultHttpCompressionStrategy implements HttpCompressionStrategy {
+ 
+     private final int compressionThreshold;
+     private final int compressionLevel;
++    private final int maxZstdEncodeSize;
+ 
+     /**
+      * @param serverConfiguration The netty server configuration
+@@ -44,15 +45,17 @@ final class DefaultHttpCompressionStrategy implements HttpCompressionStrategy {
+     DefaultHttpCompressionStrategy(NettyHttpServerConfiguration serverConfiguration) {
+         this.compressionThreshold = serverConfiguration.getCompressionThreshold();
+         this.compressionLevel = serverConfiguration.getCompressionLevel();
++        this.maxZstdEncodeSize = serverConfiguration.getMaxZstdEncodeSize();
+     }
+ 
+     /**
+      * @param compressionThreshold The compression threshold
+      * @param compressionLevel The compression level (0-9)
+      */
+-    DefaultHttpCompressionStrategy(int compressionThreshold, int compressionLevel) {
++    DefaultHttpCompressionStrategy(int compressionThreshold, int compressionLevel, int maxZstdEncodeSize) {
+         this.compressionThreshold = compressionThreshold;
+         this.compressionLevel = compressionLevel;
++        this.maxZstdEncodeSize = maxZstdEncodeSize;
+     }
+ 
+     @Override
+@@ -79,4 +82,9 @@ final class DefaultHttpCompressionStrategy implements HttpCompressionStrategy {
+     public int getCompressionLevel() {
+         return compressionLevel;
+     }
++
++    @Override
++    public int getMaxZstdEncodeSize() {
++        return maxZstdEncodeSize;
++    }
+ }
+diff --git a/http-server-netty/src/main/java/io/micronaut/http/server/netty/HttpCompressionStrategy.java b/http-server-netty/src/main/java/io/micronaut/http/server/netty/HttpCompressionStrategy.java
+index 29edddefd9..2746fc5b67 100644
+--- a/http-server-netty/src/main/java/io/micronaut/http/server/netty/HttpCompressionStrategy.java
++++ b/http-server-netty/src/main/java/io/micronaut/http/server/netty/HttpCompressionStrategy.java
+@@ -39,4 +39,9 @@ public interface HttpCompressionStrategy extends Toggleable {
+     default int getCompressionLevel() {
+         return StandardCompressionOptions.gzip().compressionLevel();
+     }
++
++    /**
++     * @return The maximum size of data that can be encoded using the zstd algorithm.
++     */
++    int getMaxZstdEncodeSize();
+ }
+diff --git a/http-server-netty/src/main/java/io/micronaut/http/server/netty/HttpPipelineBuilder.java b/http-server-netty/src/main/java/io/micronaut/http/server/netty/HttpPipelineBuilder.java
+index 07813f8c03..ad5544ca4d 100644
+--- a/http-server-netty/src/main/java/io/micronaut/http/server/netty/HttpPipelineBuilder.java
++++ b/http-server-netty/src/main/java/io/micronaut/http/server/netty/HttpPipelineBuilder.java
+@@ -20,8 +20,8 @@ import io.micronaut.core.annotation.Nullable;
+ import io.micronaut.core.naming.Named;
+ import io.micronaut.core.util.SupplierUtil;
+ import io.micronaut.http.HttpVersion;
+-import io.micronaut.http.netty.body.BodySizeLimits;
+ import io.micronaut.http.netty.channel.ChannelPipelineCustomizer;
++import io.micronaut.http.netty.body.BodySizeLimits;
+ import io.micronaut.http.server.netty.configuration.NettyHttpServerConfiguration;
+ import io.micronaut.http.server.netty.handler.Http2ServerHandler;
+ import io.micronaut.http.server.netty.handler.PipeliningServerHandler;
+@@ -155,7 +155,7 @@ final class HttpPipelineBuilder implements Closeable {
+     }
+ 
+     boolean supportsSsl() {
+-        return sslContext != null || quicSslContext != null;
++        return sslContext != null;
+     }
+ 
+     @Override
+@@ -340,7 +340,6 @@ final class HttpPipelineBuilder implements Closeable {
+                         ch.pipeline().addLast(new Http3ServerConnectionHandler(new ChannelInitializer<QuicStreamChannel>() {
+                             @Override
+                             protected void initChannel(@NonNull QuicStreamChannel ch) throws Exception {
+-                                ch.config().setAutoRead(false);
+                                 StreamPipeline streamPipeline = new StreamPipeline(ch, sslHandler, connectionCustomizer.specializeForChannel(ch, NettyServerCustomizer.ChannelRole.REQUEST_STREAM));
+                                 streamPipeline.insertHttp3FrameHandlers();
+                                 streamPipeline.streamCustomizer.onStreamPipelineBuilt();
+diff --git a/http-server-netty/src/main/java/io/micronaut/http/server/netty/configuration/NettyHttpServerConfiguration.java b/http-server-netty/src/main/java/io/micronaut/http/server/netty/configuration/NettyHttpServerConfiguration.java
+index d26b2ff1f6..0d5c9b7f60 100644
+--- a/http-server-netty/src/main/java/io/micronaut/http/server/netty/configuration/NettyHttpServerConfiguration.java
++++ b/http-server-netty/src/main/java/io/micronaut/http/server/netty/configuration/NettyHttpServerConfiguration.java
+@@ -109,6 +109,12 @@ public class NettyHttpServerConfiguration extends HttpServerConfiguration {
+     @SuppressWarnings("WeakerAccess")
+     public static final int DEFAULT_COMPRESSIONLEVEL = 6;
+ 
++    /**
++     * The default size of the largest data that can be encoded using the zstd algorithm.
++     */
++    @SuppressWarnings("WeakerAccess")
++    public static final int DEFAULT_MAX_ZSTD_ENCODE_SIZE = 1024 * 1024 * 32;
++
+     /**
+      * The default configuration for boolean flag indicating whether to add connection header `keep-alive` to responses with HttpStatus > 499.
+      */
+@@ -200,6 +206,7 @@ public class NettyHttpServerConfiguration extends HttpServerConfiguration {
+     private LogLevel logLevel;
+     private int compressionThreshold = DEFAULT_COMPRESSIONTHRESHOLD;
+     private int compressionLevel = DEFAULT_COMPRESSIONLEVEL;
++    private int maxZstdEncodeSize = DEFAULT_MAX_ZSTD_ENCODE_SIZE;
+     private boolean useNativeTransport = DEFAULT_USE_NATIVE_TRANSPORT;
+     private String fallbackProtocol = ApplicationProtocolNames.HTTP_1_1;
+     private AccessLogger accessLogger;
+@@ -472,6 +479,16 @@ public class NettyHttpServerConfiguration extends HttpServerConfiguration {
+         return compressionLevel;
+     }
+ 
++    /**
++     * The default maximum size of data that can be encoded using the zstd algorithm.
++     * Default value ({@value #DEFAULT_MAX_ZSTD_ENCODE_SIZE}).
++     *
++     * @return The maximum size of data that can be encoded using the zstd algorithm.
++     */
++    public int getMaxZstdEncodeSize() {
++        return maxZstdEncodeSize;
++    }
++
+     /**
+      * @return The Netty child channel options.
+      * @see io.netty.bootstrap.ServerBootstrap#childOption(io.netty.channel.ChannelOption, Object)
+@@ -657,6 +674,15 @@ public class NettyHttpServerConfiguration extends HttpServerConfiguration {
+         this.compressionLevel = compressionLevel;
+     }
+ 
++    /**
++     * Sets the maximum size of data that can be encoded using the zstd algorithm. Default value ({@value #DEFAULT_MAX_ZSTD_ENCODE_SIZE}).
++     *
++     * @param maxZstdEncodeSize The maximum size of block.
++     */
++    public void setMaxZstdEncodeSize(int maxZstdEncodeSize) {
++        this.maxZstdEncodeSize = maxZstdEncodeSize;
++    }
++
+     /**
+      * Whether to send connection keep alive on internal server errors. Default value ({@value DEFAULT_KEEP_ALIVE_ON_SERVER_ERROR}).
+      * @param keepAliveOnServerError The keep alive on server error flag
+diff --git a/http-server-netty/src/main/java/io/micronaut/http/server/netty/handler/Compressor.java b/http-server-netty/src/main/java/io/micronaut/http/server/netty/handler/Compressor.java
+index dd5a88ca2a..9c28d2294e 100644
+--- a/http-server-netty/src/main/java/io/micronaut/http/server/netty/handler/Compressor.java
++++ b/http-server-netty/src/main/java/io/micronaut/http/server/netty/handler/Compressor.java
+@@ -65,7 +65,11 @@ final class Compressor {
+         this.gzipOptions = StandardCompressionOptions.gzip(strategy.getCompressionLevel(), stdGzip.windowBits(), stdGzip.memLevel());
+         DeflateOptions stdDeflate = StandardCompressionOptions.deflate();
+         this.deflateOptions = StandardCompressionOptions.deflate(strategy.getCompressionLevel(), stdDeflate.windowBits(), stdDeflate.memLevel());
+-        this.zstdOptions = Zstd.isAvailable() ? StandardCompressionOptions.zstd() : null;
++        this.zstdOptions = Zstd.isAvailable()
++            ? StandardCompressionOptions.zstd(strategy.getCompressionLevel(),
++            StandardCompressionOptions.zstd().blockSize(),
++            strategy.getMaxZstdEncodeSize())
++            : null;
+         this.snappyOptions = StandardCompressionOptions.snappy();
+     }
+ 
+@@ -96,7 +100,7 @@ final class Compressor {
+         response.headers().add(HttpHeaderNames.CONTENT_ENCODING, encoding.contentEncoding);
+         ChannelHandler handler = switch (encoding) {
+             case BR -> makeBrotliEncoder();
+-            case ZSTD -> new ZstdEncoder(zstdOptions.compressionLevel(), zstdOptions.blockSize(), zstdOptions.maxEncodeSize());
++            case ZSTD -> new ZstdEncoder(zstdOptions.compressionLevel(), zstdOptions.blockSize(), strategy.getMaxZstdEncodeSize());
+             case SNAPPY -> new SnappyFrameEncoder();
+             case GZIP -> ZlibCodecFactory.newZlibEncoder(ZlibWrapper.GZIP, gzipOptions.compressionLevel(), gzipOptions.windowBits(), gzipOptions.memLevel());
+             case DEFLATE -> ZlibCodecFactory.newZlibEncoder(ZlibWrapper.ZLIB, deflateOptions.compressionLevel(), deflateOptions.windowBits(), deflateOptions.memLevel());
+diff --git a/http-server-netty/src/main/java/io/micronaut/http/server/netty/handler/PipeliningServerHandler.java b/http-server-netty/src/main/java/io/micronaut/http/server/netty/handler/PipeliningServerHandler.java
+index a1592cbc91..813ac99365 100644
+--- a/http-server-netty/src/main/java/io/micronaut/http/server/netty/handler/PipeliningServerHandler.java
++++ b/http-server-netty/src/main/java/io/micronaut/http/server/netty/handler/PipeliningServerHandler.java
+@@ -1141,7 +1141,6 @@ public final class PipeliningServerHandler extends ChannelInboundHandlerAdapter
+ 
+                 if (!writtenLast) {
+                     writeCompressing(LastHttpContent.EMPTY_LAST_CONTENT, true, outboundAccess.closeAfterWrite);
+-                    writtenLast = true;
+                 }
+                 requestHandler.responseWritten(outboundAccess.attachment);
+                 PipeliningServerHandler.this.writeSome();
+diff --git a/inject-java-test/src/test/groovy/io/micronaut/inject/visitor/beans/BeanIntrospectionSpec.groovy b/inject-java-test/src/test/groovy/io/micronaut/inject/visitor/beans/BeanIntrospectionSpec.groovy
+index 7c7c1a58ad..4b334a1fea 100644
+--- a/inject-java-test/src/test/groovy/io/micronaut/inject/visitor/beans/BeanIntrospectionSpec.groovy
++++ b/inject-java-test/src/test/groovy/io/micronaut/inject/visitor/beans/BeanIntrospectionSpec.groovy
+@@ -801,6 +801,59 @@ class Test {
+         introspection.getProperty("foo").get().type == String.class
+     }
+ 
++    void "test read property by type is defined by its reader field"() {
++        given:
++        def introspection = buildBeanIntrospection('test.Test', '''
++package test;
++
++import io.micronaut.core.annotation.Introspected;
++import io.micronaut.context.annotation.Executable;
++import io.micronaut.core.annotation.Nullable;
++import java.util.Optional;
++
++@Introspected(accessKind = {Introspected.AccessKind.METHOD, Introspected.AccessKind.FIELD})
++class Test {
++    @Nullable
++    String foo;
++
++    public Optional<String> getFoo() {
++        return Optional.ofNullable(foo);
++    }
++
++}
++''')
++        expect:
++        introspection.getReadProperty("foo", String.class).isEmpty()
++        introspection.getReadProperty("foo", Optional.class).get().type == Optional.class
++
++    }
++
++    void "test read property type is defined by its field"() {
++        given:
++        def introspection = buildBeanIntrospection('test.Test', '''
++package test;
++
++import io.micronaut.core.annotation.Introspected;
++import io.micronaut.context.annotation.Executable;
++import io.micronaut.core.annotation.Nullable;
++import java.util.Optional;
++
++@Introspected(accessKind = {Introspected.AccessKind.METHOD, Introspected.AccessKind.FIELD})
++class Test {
++    @Nullable
++    String foo;
++
++    public void setFoo(Optional<String> foo) {
++        this.foo = foo.orElse(null);
++    }
++
++}
++''')
++        expect:
++        introspection.getReadProperty("foo", String.class).get().type == String.class
++        introspection.getReadProperty("foo", Optional.class).isEmpty()
++    }
++
+     void "test optional property type is defined by its setter"() {
+         given:
+         def introspection = buildBeanIntrospection('test.Test', '''
+diff --git a/inject-java/src/main/java/io/micronaut/annotation/processing/TypeElementVisitorProcessor.java b/inject-java/src/main/java/io/micronaut/annotation/processing/TypeElementVisitorProcessor.java
+index 2d26416e05..e68fac8b28 100644
+--- a/inject-java/src/main/java/io/micronaut/annotation/processing/TypeElementVisitorProcessor.java
++++ b/inject-java/src/main/java/io/micronaut/annotation/processing/TypeElementVisitorProcessor.java
+@@ -35,6 +35,7 @@ import io.micronaut.inject.ast.FieldElement;
+ import io.micronaut.inject.ast.MemberElement;
+ import io.micronaut.inject.ast.MethodElement;
+ import io.micronaut.inject.processing.ProcessingException;
++import io.micronaut.inject.visitor.ElementPostponedToNextRoundException;
+ import io.micronaut.inject.visitor.TypeElementVisitor;
+ import io.micronaut.inject.visitor.VisitorContext;
+ import io.micronaut.inject.writer.AbstractBeanDefinitionBuilder;
+@@ -42,6 +43,7 @@ import io.micronaut.inject.writer.AbstractBeanDefinitionBuilder;
+ import javax.annotation.processing.ProcessingEnvironment;
+ import javax.annotation.processing.RoundEnvironment;
+ import javax.annotation.processing.SupportedOptions;
++import javax.lang.model.element.Element;
+ import javax.lang.model.element.TypeElement;
+ import javax.lang.model.type.TypeMirror;
+ import java.io.IOException;
+@@ -276,6 +278,15 @@ public class TypeElementVisitorProcessor extends AbstractInjectAnnotationProcess
+                             error(originatingElement.element(), e.getMessage());
+                         } catch (PostponeToNextRoundException e) {
+                             postponedTypes.put(javaClassElement.getCanonicalName(), e.getErrorElement());
++                        } catch (ElementPostponedToNextRoundException e) {
++                            Object nativeType = e.getOriginatingElement().getNativeType();
++                            if (nativeType instanceof JavaNativeElement jne) {
++                                Element element = jne.element();
++                                postponedTypes.put(javaClassElement.getCanonicalName(), element);
++                            } else {
++                                // should never happen.
++                                throw e;
++                            }
+                         }
+                     }
+                 }
+diff --git a/inject-kotlin/src/main/kotlin/io/micronaut/kotlin/processing/annotation/KotlinAnnotationMetadataBuilder.kt b/inject-kotlin/src/main/kotlin/io/micronaut/kotlin/processing/annotation/KotlinAnnotationMetadataBuilder.kt
+index 6bd7ce1ccf..742fe92c87 100644
+--- a/inject-kotlin/src/main/kotlin/io/micronaut/kotlin/processing/annotation/KotlinAnnotationMetadataBuilder.kt
++++ b/inject-kotlin/src/main/kotlin/io/micronaut/kotlin/processing/annotation/KotlinAnnotationMetadataBuilder.kt
+@@ -79,6 +79,7 @@ internal class KotlinAnnotationMetadataBuilder(
+         val annotationMirror = getAnnotationMirror(value.annotationName).orElse(null)
+         if (annotationMirror == null) {
+             return ClassUtils.forName(value.annotationName, null)
++                .or { ClassUtils.forName(value.annotationName, visitorContext::class.java.classLoader) }
+                 .map { it -> it.annotations.any { it.annotationClass.java == Repeatable::class.java } }
+                 .orElse(false)
+         }
+diff --git a/inject/src/main/java/io/micronaut/inject/beans/AbstractInitializableBeanIntrospection.java b/inject/src/main/java/io/micronaut/inject/beans/AbstractInitializableBeanIntrospection.java
+index 05fad119a7..cab98699d4 100644
+--- a/inject/src/main/java/io/micronaut/inject/beans/AbstractInitializableBeanIntrospection.java
++++ b/inject/src/main/java/io/micronaut/inject/beans/AbstractInitializableBeanIntrospection.java
+@@ -472,9 +472,11 @@ public abstract class AbstractInitializableBeanIntrospection<B> implements Unsaf
+ 
+             AnnotationValue<Introspected.IntrospectionBuilder> builderAnn = getAnnotationMetadata().findAnnotation(Introspected.class)
+                 .flatMap(a -> a.getAnnotation("builder", Introspected.IntrospectionBuilder.class)).orElse(null);
+-            if (builderAnn != null) {
+-                Class<?> builderClass = getAnnotationMetadata().classValue(Introspected.class, "builderClass").orElse(null);
+-                if (builderClass != null) {
++            Class<?> builderClass = getAnnotationMetadata().classValue(Introspected.class, "builderClass").orElse(null);
++            if (builderAnn != null || builderClass != null) {
++                if (builderClass == null) {
++                    throw new IntrospectionException("Introspection defines invalid builder member for type: " + getBeanType());
++                } else {
+                     BeanIntrospection<Object> builderIntrospection = (BeanIntrospection<Object>) BeanIntrospection.getIntrospection(builderClass);
+                     Collection<BeanMethod<Object, Object>> beanMethods = builderIntrospection.getBeanMethods();
+ 
+@@ -520,8 +522,6 @@ public abstract class AbstractInitializableBeanIntrospection<B> implements Unsaf
+                             arguments.toArray(Argument.ZERO_ARGUMENTS)
+                         );
+                     }
+-                } else {
+-                    throw new IntrospectionException("Introspection defines invalid builder member for type: " + getBeanType());
+                 }
+             } else {
+                 int constructorLength = constructorArguments.length;
+diff --git a/settings.gradle b/settings.gradle
+index 2b6bb9d198..f3acdf625a 100644
+--- a/settings.gradle
++++ b/settings.gradle
+@@ -6,7 +6,7 @@ pluginManagement {
+ }
+ 
+ plugins {
+-    id 'io.micronaut.build.shared.settings' version '7.2.3'
++    id 'io.micronaut.build.shared.settings' version '7.3.0'
+ }
+ enableFeaturePreview("TYPESAFE_PROJECT_ACCESSORS")
+ 
+diff --git a/src/main/docs/guide/config.adoc b/src/main/docs/guide/config.adoc
+index cb7c3ebf90..5d3b92313f 100644
+--- a/src/main/docs/guide/config.adoc
++++ b/src/main/docs/guide/config.adoc
+@@ -1,6 +1,6 @@
+ Micronaut features a flexible configuration mechanism that allows reading configuration from a variety of sources into a unified model that can be bound to Java types annotated with <<configurationProperties, @ConfigurationProperties>>.
+ 
+-Configuration can by default be provided in Java properties files or https://www.json.org/json-en.html[JSON] with the ability to add support for more formats (such as YAML or Groovy configuration) by adding addition third-party libraries to your classpath. The convention is to search for a file named `application.properties` or `application.json` with support for other formats requiring additional dependencies as described by the following table:
++Configuration can by default be provided in Java properties files or https://www.json.org/json-en.html[JSON] with the ability to add support for more formats (such as YAML or Groovy configuration) by adding additional third-party libraries to your classpath. The convention is to search for a file named `application.properties` or `application.json` with support for other formats requiring additional dependencies as described by the following table:
+ 
+ .Supported Configuration Formats
+ |===
+diff --git a/src/main/docs/guide/httpServer/serverConfiguration/https.adoc b/src/main/docs/guide/httpServer/serverConfiguration/https.adoc
+index 4d1ce10669..04fd50bff3 100644
+--- a/src/main/docs/guide/httpServer/serverConfiguration/https.adoc
++++ b/src/main/docs/guide/httpServer/serverConfiguration/https.adoc
+@@ -20,7 +20,7 @@ If you use a pre-generated certificate (as you should, for security), these step
+ - Netty can use the JDK-internal `sun.security.x509` package. On newer JDK versions, this package is restricted and may not work. You may need to add `--add-exports=java.base/sun.security.x509=ALL-UNNAMED` as a VM parameter.
+ - Alternatively, netty will use the Bouncy Castle BCPKIX API. This needs an additional dependency:
+ 
+-dependency:org.bouncycastle:bcpkix-jdk15on[scope="implementation"]
++dependency:org.bouncycastle:bcpkix-jdk18on[scope="implementation"]
+ 
+ WARNING: This configuration will generate a warning in the browser.
+ 
+diff --git a/test-suite/build.gradle b/test-suite/build.gradle
+index 29c6095ecb..690bf5429b 100644
+--- a/test-suite/build.gradle
++++ b/test-suite/build.gradle
+@@ -118,3 +118,4 @@ test {
+     // Prevent scanning classes with missing classes
+     exclude '**/classnotfound/**'
+ }
++
+diff --git a/test-suite/src/test/java/io/micronaut/test/lombok/LombokIntrospectedBuilderTest.java b/test-suite/src/test/java/io/micronaut/test/lombok/LombokIntrospectedBuilderTest.java
+index 7424b20a45..76f1f54290 100644
+--- a/test-suite/src/test/java/io/micronaut/test/lombok/LombokIntrospectedBuilderTest.java
++++ b/test-suite/src/test/java/io/micronaut/test/lombok/LombokIntrospectedBuilderTest.java
+@@ -1,5 +1,7 @@
+ package io.micronaut.test.lombok;
+ 
++import static org.junit.jupiter.api.Assertions.assertEquals;
++
+ import io.micronaut.core.beans.BeanIntrospection;
+ import org.junit.jupiter.api.Assertions;
+ import org.junit.jupiter.api.Test;
+@@ -17,7 +19,19 @@ public class LombokIntrospectedBuilderTest {
+         RobotEntity robotEntity = builder.with("name", "foo")
+             .build();
+ 
+-        Assertions.assertEquals("foo", robotEntity.getName());
++        assertEquals("foo", robotEntity.getName());
++    }
++
++    @Test
++    void testLombokBuilder2() {
++        BeanIntrospection.Builder<MyEntity> builder = BeanIntrospection.getIntrospection(MyEntity.class)
++            .builder();
++        MyEntity.MyEntityBuilder builder1 = MyEntity.builder();
++        builder.with("name", "foo");
++        builder.with("id", "123");
++        MyEntity myEntity = builder.build();
++        assertEquals("foo", myEntity.getName());
++        assertEquals("123", myEntity.getId());
+     }
+ 
+     @Test
+@@ -29,7 +43,7 @@ public class LombokIntrospectedBuilderTest {
+         SimpleEntity simpleEntity = builder.with("id", id)
+             .build();
+ 
+-        Assertions.assertEquals(id, simpleEntity.getId());
++        assertEquals(id, simpleEntity.getId());
+ 
+         BeanIntrospection<SimpleEntity.CompartmentCreationTimeIndexPrefix> innerClassIntrospection =
+             BeanIntrospection.getIntrospection(SimpleEntity.CompartmentCreationTimeIndexPrefix.class);
+@@ -42,7 +56,7 @@ public class LombokIntrospectedBuilderTest {
+         SimpleEntity.CompartmentCreationTimeIndexPrefix innerClassEntity =
+             innerClassBuilder.with("compartmentId", "c1").with("timeCreated", current).build();
+ 
+-        Assertions.assertEquals("c1", innerClassEntity.getCompartmentId());
+-        Assertions.assertEquals(current, innerClassEntity.getTimeCreated());
++        assertEquals("c1", innerClassEntity.getCompartmentId());
++        assertEquals(current, innerClassEntity.getTimeCreated());
+     }
+ }
+diff --git a/test-suite/src/test/java/io/micronaut/test/lombok/MyEntity.java b/test-suite/src/test/java/io/micronaut/test/lombok/MyEntity.java
+new file mode 100644
+index 0000000000..a91af297fc
+--- /dev/null
++++ b/test-suite/src/test/java/io/micronaut/test/lombok/MyEntity.java
+@@ -0,0 +1,19 @@
++package io.micronaut.test.lombok;
++
++
++import io.micronaut.core.annotation.Introspected;
++import lombok.Builder;
++import lombok.Value;
++
++@Introspected
++@Value
++@Builder
++public class MyEntity {
++    public static final String NAME_INDEX = "name";
++
++    @lombok.NonNull
++    String id;
++
++    @lombok.NonNull
++    String name;
++}

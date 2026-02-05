@@ -1,0 +1,459 @@
+diff --git a/okhttp/src/jvmMain/kotlin/okhttp3/internal/connection/Exchange.kt b/okhttp/src/jvmMain/kotlin/okhttp3/internal/connection/Exchange.kt
+index cee773ec7..c00f71a2f 100644
+--- a/okhttp/src/jvmMain/kotlin/okhttp3/internal/connection/Exchange.kt
++++ b/okhttp/src/jvmMain/kotlin/okhttp3/internal/connection/Exchange.kt
+@@ -40,7 +40,7 @@ import okio.buffer
+ class Exchange(
+   internal val call: RealCall,
+   internal val eventListener: EventListener,
+-  internal val finder: RoutePlanner,
++  internal val finder: ExchangeFinder,
+   private val codec: ExchangeCodec
+ ) {
+   /** True if the request body need not complete before the response body starts. */
+@@ -55,7 +55,7 @@ class Exchange(
+     get() = codec.carrier as? RealConnection ?: error("no connection for CONNECT tunnels")
+ 
+   internal val isCoalescedConnection: Boolean
+-    get() = finder.address.url.host != codec.carrier.route.address.url.host
++    get() = finder.routePlanner.address.url.host != codec.carrier.route.address.url.host
+ 
+   @Throws(IOException::class)
+   fun writeRequestHeaders(request: Request) {
+@@ -169,7 +169,6 @@ class Exchange(
+ 
+   private fun trackFailure(e: IOException) {
+     hasFailure = true
+-    finder.trackFailure(e)
+     codec.carrier.trackFailure(call, e)
+   }
+ 
+diff --git a/okhttp/src/jvmMain/kotlin/okhttp3/internal/connection/ExchangeFinder.kt b/okhttp/src/jvmMain/kotlin/okhttp3/internal/connection/ExchangeFinder.kt
+index 73444f9e6..740297e31 100644
+--- a/okhttp/src/jvmMain/kotlin/okhttp3/internal/connection/ExchangeFinder.kt
++++ b/okhttp/src/jvmMain/kotlin/okhttp3/internal/connection/ExchangeFinder.kt
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (C) 2015 Square, Inc.
++ * Copyright (C) 2022 Square, Inc.
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -15,53 +15,8 @@
+  */
+ package okhttp3.internal.connection
+ 
+-import java.io.IOException
++interface ExchangeFinder {
++  val routePlanner: RoutePlanner
+ 
+-internal class ExchangeFinder(
+-  private val routePlanner: RoutePlanner
+-) {
+-  fun find(): RealConnection {
+-    var firstException: IOException? = null
+-    var queuedPlan: RoutePlanner.Plan? = null
+-    while (true) {
+-      if (routePlanner.isCanceled()) throw IOException("Canceled")
+-
+-      try {
+-        val plan = when {
+-          queuedPlan != null -> {
+-            val result = queuedPlan
+-            queuedPlan = null
+-            result
+-          }
+-          else -> routePlanner.plan()
+-        }
+-
+-        if (!plan.isReady) {
+-          val tcpConnectResult = plan.connectTcp()
+-          val connectResult = when {
+-            tcpConnectResult.isSuccess -> plan.connectTlsEtc()
+-            else -> tcpConnectResult
+-          }
+-
+-          val (_, nextPlan, failure) = connectResult
+-
+-          queuedPlan = nextPlan
+-          if (failure != null) throw failure
+-          if (nextPlan != null) continue
+-        }
+-        return plan.handleSuccess()
+-      } catch (e: IOException) {
+-        routePlanner.trackFailure(e)
+-
+-        if (firstException == null) {
+-          firstException = e
+-        } else {
+-          firstException.addSuppressed(e)
+-        }
+-        if (queuedPlan == null && !routePlanner.hasMoreRoutes()) {
+-          throw firstException
+-        }
+-      }
+-    }
+-  }
++  fun find(): RealConnection
+ }
+diff --git a/okhttp/src/jvmMain/kotlin/okhttp3/internal/connection/FastFallbackExchangeFinder.kt b/okhttp/src/jvmMain/kotlin/okhttp3/internal/connection/FastFallbackExchangeFinder.kt
+index 9970a5cc2..4faf55559 100644
+--- a/okhttp/src/jvmMain/kotlin/okhttp3/internal/connection/FastFallbackExchangeFinder.kt
++++ b/okhttp/src/jvmMain/kotlin/okhttp3/internal/connection/FastFallbackExchangeFinder.kt
+@@ -30,9 +30,9 @@ import okhttp3.internal.okHttpName
+  * connects successfully. This kicks off new attempts every 250 ms until a connect succeeds.
+  */
+ internal class FastFallbackExchangeFinder(
+-  private val routePlanner: RoutePlanner,
++  override val routePlanner: RoutePlanner,
+   private val taskRunner: TaskRunner,
+-) {
++) : ExchangeFinder {
+   private val connectDelayNanos = TimeUnit.MILLISECONDS.toNanos(250L)
+   private var nextTcpConnectAtNanos = Long.MIN_VALUE
+ 
+@@ -54,15 +54,12 @@ internal class FastFallbackExchangeFinder(
+    */
+   private val connectResults = taskRunner.backend.decorate(LinkedBlockingDeque<ConnectResult>())
+ 
+-  /** True until we've launched all the connects we'll ever launch. */
+-  private var routePlannerHasMoreRoutes = true
+-
+-  fun find(): RealConnection {
++  override fun find(): RealConnection {
+     var firstException: IOException? = null
+     try {
+-      while (routePlannerHasMoreRoutes ||
+-        tcpConnectsInFlight.isNotEmpty() ||
+-        deferredPlans.isNotEmpty()
++      while (tcpConnectsInFlight.isNotEmpty() ||
++        deferredPlans.isNotEmpty() ||
++        routePlanner.hasNext()
+       ) {
+         if (routePlanner.isCanceled()) throw IOException("Canceled")
+ 
+@@ -95,7 +92,6 @@ internal class FastFallbackExchangeFinder(
+         val throwable = connectResult.throwable
+         if (throwable != null) {
+           if (throwable !is IOException) throw throwable
+-          routePlanner.trackFailure(throwable)
+           if (firstException == null) {
+             firstException = throwable
+           } else {
+@@ -121,13 +117,11 @@ internal class FastFallbackExchangeFinder(
+       deferredPlans.isNotEmpty() -> {
+         deferredPlans.removeFirst()
+       }
+-      routePlannerHasMoreRoutes -> {
++      routePlanner.hasNext() -> {
+         try {
+           routePlanner.plan()
+         } catch (e: Throwable) {
+           FailedPlan(e)
+-        } finally {
+-          routePlannerHasMoreRoutes = routePlanner.hasMoreRoutes()
+         }
+       }
+       else -> return // Nothing further to try.
+diff --git a/okhttp/src/jvmMain/kotlin/okhttp3/internal/connection/RealCall.kt b/okhttp/src/jvmMain/kotlin/okhttp3/internal/connection/RealCall.kt
+index ca99132cf..d1784fd99 100644
+--- a/okhttp/src/jvmMain/kotlin/okhttp3/internal/connection/RealCall.kt
++++ b/okhttp/src/jvmMain/kotlin/okhttp3/internal/connection/RealCall.kt
+@@ -85,7 +85,7 @@ class RealCall(
+   private var callStackTrace: Any? = null
+ 
+   /** Finds an exchange to send the next request and receive the next response. */
+-  private var routePlanner: RoutePlanner? = null
++  private var exchangeFinder: ExchangeFinder? = null
+ 
+   var connection: RealConnection? = null
+     private set
+@@ -242,12 +242,16 @@ class RealCall(
+     }
+ 
+     if (newRoutePlanner) {
+-      this.routePlanner = RealRoutePlanner(
++      val routePlanner = RealRoutePlanner(
+         client,
+         createAddress(request.url),
+         this,
+         chain,
+       )
++      this.exchangeFinder = when {
++        client.fastFallback -> FastFallbackExchangeFinder(routePlanner, client.taskRunner)
++        else -> SequentialExchangeFinder(routePlanner)
++      }
+     }
+   }
+ 
+@@ -259,13 +263,10 @@ class RealCall(
+       check(!requestBodyOpen)
+     }
+ 
+-    val routePlanner = this.routePlanner!!
+-    val connection = when {
+-      client.fastFallback -> FastFallbackExchangeFinder(routePlanner, client.taskRunner).find()
+-      else -> ExchangeFinder(routePlanner).find()
+-    }
++    val exchangeFinder = this.exchangeFinder!!
++    val connection = exchangeFinder.find()
+     val codec = connection.newCodec(client, chain)
+-    val result = Exchange(this, eventListener, routePlanner, codec)
++    val result = Exchange(this, eventListener, exchangeFinder, codec)
+     this.interceptorScopedExchange = result
+     this.exchange = result
+     synchronized(this) {
+@@ -465,7 +466,10 @@ class RealCall(
+     )
+   }
+ 
+-  fun retryAfterFailure(): Boolean = routePlanner!!.hasFailure() && routePlanner!!.hasMoreRoutes()
++  fun retryAfterFailure(): Boolean {
++    return exchange?.hasFailure == true &&
++      exchangeFinder!!.routePlanner.hasNext(exchange?.connection)
++  }
+ 
+   /**
+    * Returns a string that describes this call. Doesn't include a full URL as that might contain
+diff --git a/okhttp/src/jvmMain/kotlin/okhttp3/internal/connection/RealRoutePlanner.kt b/okhttp/src/jvmMain/kotlin/okhttp3/internal/connection/RealRoutePlanner.kt
+index 2abb5cb3a..fb081a233 100644
+--- a/okhttp/src/jvmMain/kotlin/okhttp3/internal/connection/RealRoutePlanner.kt
++++ b/okhttp/src/jvmMain/kotlin/okhttp3/internal/connection/RealRoutePlanner.kt
+@@ -32,9 +32,6 @@ import okhttp3.internal.canReuseConnectionFor
+ import okhttp3.internal.closeQuietly
+ import okhttp3.internal.connection.RoutePlanner.Plan
+ import okhttp3.internal.http.RealInterceptorChain
+-import okhttp3.internal.http2.ConnectionShutdownException
+-import okhttp3.internal.http2.ErrorCode
+-import okhttp3.internal.http2.StreamResetException
+ import okhttp3.internal.platform.Platform
+ import okhttp3.internal.toHostHeader
+ import okhttp3.internal.userAgent
+@@ -49,9 +46,6 @@ class RealRoutePlanner(
+ 
+   private var routeSelection: RouteSelector.Selection? = null
+   private var routeSelector: RouteSelector? = null
+-  private var refusedStreamCount = 0
+-  private var connectionShutdownCount = 0
+-  private var otherFailureCount = 0
+   private var nextRouteToTry: Route? = null
+ 
+   override fun isCanceled(): Boolean = call.isCanceled()
+@@ -61,11 +55,6 @@ class RealRoutePlanner(
+     val reuseCallConnection = planReuseCallConnection()
+     if (reuseCallConnection != null) return reuseCallConnection
+ 
+-    // We need a new connection. Give it fresh stats.
+-    refusedStreamCount = 0
+-    connectionShutdownCount = 0
+-    otherFailureCount = 0
+-
+     // Attempt to get a connection from the pool.
+     val pooled1 = planReusePooledConnection()
+     if (pooled1 != null) return pooled1
+@@ -263,30 +252,18 @@ class RealRoutePlanner(
+     return authenticatedRequest ?: proxyConnectRequest
+   }
+ 
+-  override fun trackFailure(e: IOException) {
+-    if (e is StreamResetException && e.errorCode == ErrorCode.REFUSED_STREAM) {
+-      refusedStreamCount++
+-    } else if (e is ConnectionShutdownException) {
+-      connectionShutdownCount++
+-    } else {
+-      otherFailureCount++
+-    }
+-  }
+-
+-  override fun hasFailure(): Boolean {
+-    return refusedStreamCount > 0 || connectionShutdownCount > 0 || otherFailureCount > 0
+-  }
+-
+-  override fun hasMoreRoutes(): Boolean {
++  override fun hasNext(failedConnection: RealConnection?): Boolean {
+     if (nextRouteToTry != null) {
+       return true
+     }
+ 
+-    val retryRoute = retryRoute()
+-    if (retryRoute != null) {
+-      // Lock in the route because retryRoute() is racy and we don't want to call it twice.
+-      nextRouteToTry = retryRoute
+-      return true
++    if (failedConnection != null) {
++      val retryRoute = retryRoute(failedConnection)
++      if (retryRoute != null) {
++        // Lock in the route because retryRoute() is racy and we don't want to call it twice.
++        nextRouteToTry = retryRoute
++        return true
++      }
+     }
+ 
+     // If we have a routes left, use 'em.
+@@ -300,17 +277,11 @@ class RealRoutePlanner(
+   }
+ 
+   /**
+-   * Return the route from the current connection if it should be retried, even if the connection
+-   * itself is unhealthy. The biggest gotcha here is that we shouldn't reuse routes from coalesced
++   * Return the route from [connection] if it should be retried, even if the connection itself is
++   * unhealthy. The biggest gotcha here is that we shouldn't reuse routes from coalesced
+    * connections.
+    */
+-  private fun retryRoute(): Route? {
+-    if (refusedStreamCount > 1 || connectionShutdownCount > 1 || otherFailureCount > 0) {
+-      return null // This route has too many problems to retry.
+-    }
+-
+-    val connection = call.connection ?: return null
+-
++  private fun retryRoute(connection: RealConnection): Route? {
+     synchronized(connection) {
+       if (connection.routeFailureCount != 0) return null
+       if (!connection.noNewExchanges) return null // This route is still in use.
+diff --git a/okhttp/src/jvmMain/kotlin/okhttp3/internal/connection/RoutePlanner.kt b/okhttp/src/jvmMain/kotlin/okhttp3/internal/connection/RoutePlanner.kt
+index b3f07b7a3..dcc522449 100644
+--- a/okhttp/src/jvmMain/kotlin/okhttp3/internal/connection/RoutePlanner.kt
++++ b/okhttp/src/jvmMain/kotlin/okhttp3/internal/connection/RoutePlanner.kt
+@@ -51,13 +51,13 @@ interface RoutePlanner {
+   @Throws(IOException::class)
+   fun plan(): Plan
+ 
+-  fun trackFailure(e: IOException)
+-
+-  /** Returns true if this planner has received any failures. */
+-  fun hasFailure(): Boolean
+-
+-  /** Returns true if this planner has more routes to try. */
+-  fun hasMoreRoutes(): Boolean
++  /**
++   * Returns true if there's more route plans to try.
++   *
++   * @param failedConnection an optional connection that was resulted in a failure. If the failure
++   *     is recoverable, the connection's route may be recovered for the retry.
++   */
++  fun hasNext(failedConnection: RealConnection? = null): Boolean
+ 
+   /**
+    * Returns true if the host and port are unchanged from when this was created. This is used to
+diff --git a/okhttp/src/jvmMain/kotlin/okhttp3/internal/connection/SequentialExchangeFinder.kt b/okhttp/src/jvmMain/kotlin/okhttp3/internal/connection/SequentialExchangeFinder.kt
+new file mode 100644
+index 000000000..73df0781b
+--- /dev/null
++++ b/okhttp/src/jvmMain/kotlin/okhttp3/internal/connection/SequentialExchangeFinder.kt
+@@ -0,0 +1,66 @@
++/*
++ * Copyright (C) 2015 Square, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package okhttp3.internal.connection
++
++import java.io.IOException
++
++/** Attempt routes one at a time until one connects. */
++internal class SequentialExchangeFinder(
++  override val routePlanner: RoutePlanner
++) : ExchangeFinder {
++  override fun find(): RealConnection {
++    var firstException: IOException? = null
++    var queuedPlan: RoutePlanner.Plan? = null
++    while (true) {
++      if (routePlanner.isCanceled()) throw IOException("Canceled")
++
++      try {
++        val plan = when {
++          queuedPlan != null -> {
++            val result = queuedPlan
++            queuedPlan = null
++            result
++          }
++          else -> routePlanner.plan()
++        }
++
++        if (!plan.isReady) {
++          val tcpConnectResult = plan.connectTcp()
++          val connectResult = when {
++            tcpConnectResult.isSuccess -> plan.connectTlsEtc()
++            else -> tcpConnectResult
++          }
++
++          val (_, nextPlan, failure) = connectResult
++
++          queuedPlan = nextPlan
++          if (failure != null) throw failure
++          if (nextPlan != null) continue
++        }
++        return plan.handleSuccess()
++      } catch (e: IOException) {
++        if (firstException == null) {
++          firstException = e
++        } else {
++          firstException.addSuppressed(e)
++        }
++        if (queuedPlan == null && !routePlanner.hasNext()) {
++          throw firstException
++        }
++      }
++    }
++  }
++}
+diff --git a/okhttp/src/jvmMain/kotlin/okhttp3/internal/http/RealInterceptorChain.kt b/okhttp/src/jvmMain/kotlin/okhttp3/internal/http/RealInterceptorChain.kt
+index e41a7d742..3df3b2f8f 100644
+--- a/okhttp/src/jvmMain/kotlin/okhttp3/internal/http/RealInterceptorChain.kt
++++ b/okhttp/src/jvmMain/kotlin/okhttp3/internal/http/RealInterceptorChain.kt
+@@ -93,7 +93,7 @@ class RealInterceptorChain(
+     calls++
+ 
+     if (exchange != null) {
+-      check(exchange.finder.sameHostAndPort(request.url)) {
++      check(exchange.finder.routePlanner.sameHostAndPort(request.url)) {
+         "network interceptor ${interceptors[index - 1]} must retain the same host and port"
+       }
+       check(calls == 1) {
+diff --git a/okhttp/src/jvmTest/java/okhttp3/FakeRoutePlanner.kt b/okhttp/src/jvmTest/java/okhttp3/FakeRoutePlanner.kt
+index bd3d18ef8..0b56359ea 100644
+--- a/okhttp/src/jvmTest/java/okhttp3/FakeRoutePlanner.kt
++++ b/okhttp/src/jvmTest/java/okhttp3/FakeRoutePlanner.kt
+@@ -19,6 +19,7 @@ import java.io.Closeable
+ import java.io.IOException
+ import java.util.concurrent.LinkedBlockingDeque
+ import okhttp3.internal.concurrent.TaskFaker
++import okhttp3.internal.connection.RealConnection
+ import okhttp3.internal.connection.RoutePlanner
+ import okhttp3.internal.connection.RoutePlanner.ConnectResult
+ 
+@@ -35,7 +36,6 @@ class FakeRoutePlanner(
+ 
+   val events = LinkedBlockingDeque<String>()
+   var canceled = false
+-  var hasFailure = false
+   private var nextPlanId = 0
+   private var nextPlanIndex = 0
+   private val plans = mutableListOf<FakePlan>()
+@@ -63,14 +63,7 @@ class FakeRoutePlanner(
+     return result
+   }
+ 
+-  override fun trackFailure(e: IOException) {
+-    events += "tracking failure: $e"
+-    hasFailure = true
+-  }
+-
+-  override fun hasFailure() = hasFailure
+-
+-  override fun hasMoreRoutes(): Boolean {
++  override fun hasNext(failedConnection: RealConnection?): Boolean {
+     return nextPlanIndex < plans.size
+   }
+ 

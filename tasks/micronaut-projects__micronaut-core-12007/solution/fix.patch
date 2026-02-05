@@ -1,0 +1,109 @@
+diff --git a/http-server-netty/build.gradle.kts b/http-server-netty/build.gradle.kts
+index eb1a066db3..d1df4a845e 100644
+--- a/http-server-netty/build.gradle.kts
++++ b/http-server-netty/build.gradle.kts
+@@ -14,8 +14,8 @@ import org . apache . tools . ant . taskdefs . condition . Os
+ tasks {
+     test {
+         systemProperty("io.netty.leakDetection.level", "paranoid")
+-        systemProperty("io.netty.customResourceLeakDetector", "io.micronaut.http.server.netty.fuzzing.BufferLeakDetection")
+         systemProperty("io.netty.leakDetection.targetRecords", "100")
++        systemProperty("junit.jupiter.extensions.autodetection.enabled", "true")
+         jvmArgs("--add-opens=java.base/java.lang=ALL-UNNAMED")
+         maxHeapSize = "1G"
+     }
+diff --git a/http-server/src/main/java/io/micronaut/http/server/RouteExecutor.java b/http-server/src/main/java/io/micronaut/http/server/RouteExecutor.java
+index 50c248889b..d6666e40ca 100644
+--- a/http-server/src/main/java/io/micronaut/http/server/RouteExecutor.java
++++ b/http-server/src/main/java/io/micronaut/http/server/RouteExecutor.java
+@@ -41,6 +41,7 @@ import io.micronaut.http.MutableHttpHeaders;
+ import io.micronaut.http.MutableHttpResponse;
+ import io.micronaut.http.bind.binders.ContinuationArgumentBinder;
+ import io.micronaut.http.body.MessageBodyWriter;
++import io.micronaut.http.body.stream.BaseSharedBuffer;
+ import io.micronaut.http.codec.CodecException;
+ import io.micronaut.http.context.ServerHttpRequestContext;
+ import io.micronaut.http.context.ServerRequestContext;
+@@ -275,7 +276,7 @@ public final class RouteExecutor {
+     }
+ 
+     static boolean isIgnorable(Throwable cause) {
+-        if (cause instanceof ClosedChannelException) {
++        if (cause instanceof ClosedChannelException || cause instanceof BaseSharedBuffer.IncorrectContentLengthException) {
+             return true;
+         }
+         String message = cause.getMessage();
+diff --git a/http-tck/src/main/java/io/micronaut/http/tck/netty/TestLeakDetector.java b/http-tck/src/main/java/io/micronaut/http/tck/netty/TestLeakDetector.java
+index 236ebccb6f..f50cbefcf9 100644
+--- a/http-tck/src/main/java/io/micronaut/http/tck/netty/TestLeakDetector.java
++++ b/http-tck/src/main/java/io/micronaut/http/tck/netty/TestLeakDetector.java
+@@ -23,7 +23,9 @@ import io.netty.util.ResourceLeakTracker;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
++import java.lang.reflect.Field;
+ import java.util.List;
++import java.util.Set;
+ import java.util.UUID;
+ import java.util.concurrent.CopyOnWriteArrayList;
+ 
+@@ -144,6 +146,21 @@ public final class TestLeakDetector {
+         } while (!canaryDetected && !Thread.interrupted());
+     }
+ 
++    public static void reportStillOpen() throws Exception {
++        triggerGc();
++        Field allLeaksField = ResourceLeakDetector.class.getDeclaredField("allLeaks");
++        allLeaksField.trySetAccessible();
++        for (ResourceLeakDetector<?> detector : ALL_DETECTORS) {
++            Set<?> allLeaks = (Set<?>) allLeaksField.get(detector);
++            for (Object leak : allLeaks) {
++                String stack = leak.toString();
++                if (!stack.contains("<clinit>")) {
++                    throw new IllegalStateException("Still open: " + stack);
++                }
++            }
++        }
++    }
++
+     private static final class TestResourceLeakDetector<T> extends ResourceLeakDetector<T> {
+         public TestResourceLeakDetector(Class<?> resourceType, int samplingInterval) {
+             super(resourceType, samplingInterval);
+diff --git a/http/src/main/java/io/micronaut/http/body/stream/BaseSharedBuffer.java b/http/src/main/java/io/micronaut/http/body/stream/BaseSharedBuffer.java
+index e666aa3744..30d659c322 100644
+--- a/http/src/main/java/io/micronaut/http/body/stream/BaseSharedBuffer.java
++++ b/http/src/main/java/io/micronaut/http/body/stream/BaseSharedBuffer.java
+@@ -353,7 +353,8 @@ public abstract class BaseSharedBuffer<C extends BufferConsumer, F> {
+         long newLength = lengthSoFar + n;
+         long expectedLength = this.expectedLength;
+         if (expectedLength != -1 && newLength > expectedLength) {
+-            throw new IllegalStateException("Received more bytes than specified by Content-Length");
++            addDoNotBuffer();
++            throw new IncorrectContentLengthException("Received more bytes than specified by Content-Length");
+         }
+         lengthSoFar = newLength;
+ 
+@@ -401,7 +402,7 @@ public abstract class BaseSharedBuffer<C extends BufferConsumer, F> {
+      */
+     public void complete() {
+         if (expectedLength > lengthSoFar) {
+-            throw new IllegalStateException("Received fewer bytes than specified by Content-Length");
++            throw new IncorrectContentLengthException("Received fewer bytes than specified by Content-Length");
+         }
+         complete = true;
+         expectedLength = lengthSoFar;
+@@ -499,4 +500,14 @@ public abstract class BaseSharedBuffer<C extends BufferConsumer, F> {
+                 });
+         }
+     }
++
++    /**
++     * Thrown when {@link #complete()} is called before {@link #getExpectedLength()} bytes are
++     * received.
++     */
++    public static final class IncorrectContentLengthException extends IllegalStateException {
++        IncorrectContentLengthException(String msg) {
++            super(msg);
++        }
++    }
+ }

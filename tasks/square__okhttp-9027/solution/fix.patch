@@ -1,0 +1,232 @@
+diff --git a/okhttp/src/commonJvmAndroid/kotlin/okhttp3/Cache.kt b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/Cache.kt
+index 6768e4bf9..34b00bd72 100644
+--- a/okhttp/src/commonJvmAndroid/kotlin/okhttp3/Cache.kt
++++ b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/Cache.kt
+@@ -26,6 +26,7 @@ import java.security.cert.CertificateFactory
+ import java.util.TreeSet
+ import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+ import okhttp3.MediaType.Companion.toMediaTypeOrNull
++import okhttp3.internal.UnreadableRequestBody
+ import okhttp3.internal.cache.CacheRequest
+ import okhttp3.internal.cache.CacheStrategy
+ import okhttp3.internal.cache.DiskLruCache
+@@ -45,10 +46,12 @@ import okio.ByteString.Companion.toByteString
+ import okio.FileSystem
+ import okio.ForwardingSink
+ import okio.ForwardingSource
++import okio.HashingSink
+ import okio.Path
+ import okio.Path.Companion.toOkioPath
+ import okio.Sink
+ import okio.Source
++import okio.blackholeSink
+ import okio.buffer
+ 
+ /**
+@@ -191,7 +194,12 @@ class Cache internal constructor(
+     get() = cache.isClosed()
+ 
+   internal fun get(request: Request): Response? {
+-    val key = key(request.url)
++    if (request.body != null && request.body.isOneShot()) {
++      // Don't cache one-shot QUERY requests, since we need to cache by using the body,
++      // and we can't consume the body twice
++      return null
++    }
++    val key = key(request)
+     val snapshot: DiskLruCache.Snapshot =
+       try {
+         cache[key] ?: return null
+@@ -228,13 +236,19 @@ class Cache internal constructor(
+       return null
+     }
+ 
+-    if (requestMethod != "GET" && requestMethod != "QUERY") {
++    if (!HttpMethod.isCacheable(requestMethod)) {
+       // Don't cache non-GET and non-QUERY responses. We're technically allowed to cache HEAD
+       // requests and some POST requests, but the complexity of doing so is high and the benefit
+       // is low.
+       return null
+     }
+ 
++    if (response.request.body != null && response.request.body.isOneShot()) {
++      // Don't cache one-shot QUERY requests, since we need to cache by using the body,
++      // and we can't consume the body twice
++      return null
++    }
++
+     if (response.hasVaryAll()) {
+       return null
+     }
+@@ -242,7 +256,7 @@ class Cache internal constructor(
+     val entry = Entry(response)
+     var editor: DiskLruCache.Editor? = null
+     try {
+-      editor = cache.edit(key(response.request.url)) ?: return null
++      editor = cache.edit(key(response.request)) ?: return null
+       entry.writeTo(editor)
+       return RealCacheRequest(editor)
+     } catch (_: IOException) {
+@@ -253,7 +267,7 @@ class Cache internal constructor(
+ 
+   @Throws(IOException::class)
+   internal fun remove(request: Request) {
+-    cache.remove(key(request.url))
++    cache.remove(key(request))
+   }
+ 
+   internal fun update(
+@@ -688,7 +702,13 @@ class Cache internal constructor(
+     fun response(snapshot: DiskLruCache.Snapshot): Response {
+       val contentType = responseHeaders["Content-Type"]
+       val contentLength = responseHeaders["Content-Length"]
+-      val cacheRequest = Request(url, varyHeaders, requestMethod)
++      val cacheRequest =
++        Request(
++          url = url,
++          headers = varyHeaders,
++          method = requestMethod,
++          body = if (HttpMethod.requiresRequestBody(requestMethod)) UnreadableRequestBody() else null,
++        )
+       return Response
+         .Builder()
+         .request(cacheRequest)
+@@ -752,6 +772,35 @@ class Cache internal constructor(
+         .md5()
+         .hex()
+ 
++    /** Returns the cache key for a request */
++    internal fun key(request: Request): String {
++      if (
++        // Request such as PUT, DELETE that invalidates a GET
++        !HttpMethod.invalidatesCache(request.method) &&
++
++        // QUERY request that considers the request body in the cache key
++        HttpMethod.isCacheable(request.method) &&
++        HttpMethod.permitsRequestBody(request.method) &&
++        request.body != null
++      ) {
++        val hashingSink = HashingSink.md5(blackholeSink())
++        hashingSink.buffer().use {
++          it.writeUtf8(request.method)
++          it.writeByte(0)
++          it.writeUtf8(request.url.toString())
++          it.writeByte(0)
++          request.body.writeTo(it)
++        }
++        return hashingSink.hash.hex()
++      }
++
++      return request.url
++        .toString()
++        .encodeUtf8()
++        .md5()
++        .hex()
++    }
++
+     @Throws(IOException::class)
+     internal fun readInt(source: BufferedSource): Int {
+       try {
+diff --git a/okhttp/src/commonJvmAndroid/kotlin/okhttp3/Request.kt b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/Request.kt
+index 071490bec..b37b212a9 100644
+--- a/okhttp/src/commonJvmAndroid/kotlin/okhttp3/Request.kt
++++ b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/Request.kt
+@@ -317,6 +317,9 @@ class Request internal constructor(
+ 
+     open fun patch(body: RequestBody): Builder = method("PATCH", body)
+ 
++    /**
++     * A QUERY request with a body. If `body.isOneShot()` is true, then caching will be disabled.
++     */
+     open fun query(body: RequestBody): Builder = method("QUERY", body)
+ 
+     open fun method(
+diff --git a/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/UnreadableRequestBody.kt b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/UnreadableRequestBody.kt
+new file mode 100644
+index 000000000..c0531b9a1
+--- /dev/null
++++ b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/UnreadableRequestBody.kt
+@@ -0,0 +1,50 @@
++/*
++ * Copyright (C) 2025 Block, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package okhttp3.internal
++
++import okhttp3.RequestBody
++import okio.Buffer
++import okio.BufferedSink
++import okio.Source
++import okio.Timeout
++
++internal class UnreadableRequestBody :
++  RequestBody(),
++  Source {
++  override fun contentType() = failUnsupported()
++
++  override fun contentLength() = failUnsupported()
++
++  override fun writeTo(sink: BufferedSink) = failUnsupported()
++
++  override fun read(
++    sink: Buffer,
++    byteCount: Long,
++  ): Long = failUnsupported()
++
++  private fun failUnsupported(): Nothing =
++    throw IllegalStateException(
++      """
++        |Unreadable RequestBody! These Request objects have bodies that are stripped:
++        | * Response.cacheResponse.request
++      """.trimMargin(),
++    )
++
++  override fun timeout() = Timeout.NONE
++
++  override fun close() {
++  }
++}
+diff --git a/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/cache/CacheInterceptor.kt b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/cache/CacheInterceptor.kt
+index 8e6581bdc..1a66c2d4c 100644
+--- a/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/cache/CacheInterceptor.kt
++++ b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/cache/CacheInterceptor.kt
+@@ -299,7 +299,8 @@ class CacheInterceptor(
+ private fun Request.requestForCache(): Request {
+   val cacheUrlOverride = cacheUrlOverride
+ 
+-  return if (cacheUrlOverride != null && (method == "GET" || method == "POST")) {
++  // Allow POST caching only when there is a cacheUrlOverride
++  return if (cacheUrlOverride != null && (HttpMethod.isCacheable(method) || method == "POST")) {
+     newBuilder()
+       .get()
+       .url(cacheUrlOverride)
+diff --git a/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/http/HttpMethod.kt b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/http/HttpMethod.kt
+index 0d3df7510..77d2d9da5 100644
+--- a/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/http/HttpMethod.kt
++++ b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/http/HttpMethod.kt
+@@ -35,6 +35,7 @@ object HttpMethod {
+         method == "PUT" ||
+         method == "PATCH" ||
+         method == "PROPPATCH" ||
++        method == "QUERY" ||
+         // WebDAV
+         method == "REPORT"
+     )
+@@ -45,4 +46,6 @@ object HttpMethod {
+   fun redirectsWithBody(method: String): Boolean = method == "PROPFIND"
+ 
+   fun redirectsToGet(method: String): Boolean = method != "PROPFIND"
++
++  fun isCacheable(requestMethod: String): Boolean = requestMethod == "GET" || requestMethod == "QUERY"
+ }

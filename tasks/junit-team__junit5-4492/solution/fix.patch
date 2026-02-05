@@ -1,0 +1,197 @@
+diff --git a/documentation/src/docs/asciidoc/release-notes/release-notes-5.13.0-M3.adoc b/documentation/src/docs/asciidoc/release-notes/release-notes-5.13.0-M3.adoc
+index 0c9907c52..f67c3702c 100644
+--- a/documentation/src/docs/asciidoc/release-notes/release-notes-5.13.0-M3.adoc
++++ b/documentation/src/docs/asciidoc/release-notes/release-notes-5.13.0-M3.adoc
+@@ -98,7 +98,10 @@ to start reporting discovery issues.
+     - Blank `@SentenceFragment` declarations
+     - `@BeforeParameterizedClassInvocation` and `@AfterParameterizedClassInvocation`
+       methods declared in non-parameterized test classes
+-
++* `java.util.Locale` arguments are now converted according to the IETF BCP 47 language tag
++  format. See the
++  <<../user-guide/index.adoc#writing-tests-parameterized-tests-argument-conversion-implicit, User Guide>>
++  for details.
+ 
+ [[release-notes-5.13.0-M3-junit-vintage]]
+ === JUnit Vintage
+diff --git a/documentation/src/docs/asciidoc/user-guide/writing-tests.adoc b/documentation/src/docs/asciidoc/user-guide/writing-tests.adoc
+index f413644bf..e84ed85c5 100644
+--- a/documentation/src/docs/asciidoc/user-guide/writing-tests.adoc
++++ b/documentation/src/docs/asciidoc/user-guide/writing-tests.adoc
+@@ -2483,10 +2483,16 @@ integral types: `byte`, `short`, `int`, `long`, and their boxed counterparts.
+ | `java.time.ZoneId`         | `"Europe/Berlin"`                        -> `ZoneId.of("Europe/Berlin")`
+ | `java.time.ZoneOffset`     | `"+02:30"`                               -> `ZoneOffset.ofHoursMinutes(2, 30)`
+ | `java.util.Currency`       | `"JPY"`                                  -> `Currency.getInstance("JPY")`
+-| `java.util.Locale`         | `"en"`                                   -> `new Locale("en")`
++| `java.util.Locale`         | `"en-US"`                                -> `Locale.forLanguageTag("en-US")`
+ | `java.util.UUID`           | `"d043e930-7b3b-48e3-bdbe-5a3ccfb833db"` -> `UUID.fromString("d043e930-7b3b-48e3-bdbe-5a3ccfb833db")`
+ |===
+ 
++WARNING: To revert to the old `java.util.Locale` conversion behavior of version 5.12 and
++earlier (which called the deprecated `Locale(String)` constructor), you can set the
++`junit.jupiter.params.arguments.conversion.locale.format`
++<<running-tests-config-params, configuration parameter>> to `iso_639`. However, please
++note that this parameter is deprecated and will be removed in a future release.
++
+ [[writing-tests-parameterized-tests-argument-conversion-implicit-fallback]]
+ ====== Fallback String-to-Object Conversion
+ 
+@@ -2523,7 +2529,7 @@ include::{testDir}/example/ParameterizedTestDemo.java[tags=implicit_fallback_con
+ [[writing-tests-parameterized-tests-argument-conversion-explicit]]
+ ===== Explicit Conversion
+ 
+-Instead of relying on implicit argument conversion you may explicitly specify an
++Instead of relying on implicit argument conversion, you may explicitly specify an
+ `ArgumentConverter` to use for a certain parameter using the `@ConvertWith` annotation
+ like in the following example. Note that an implementation of `ArgumentConverter` must be
+ declared as either a top-level class or as a `static` nested class.
+diff --git a/junit-jupiter-params/src/main/java/org/junit/jupiter/params/ParameterizedInvocationContext.java b/junit-jupiter-params/src/main/java/org/junit/jupiter/params/ParameterizedInvocationContext.java
+index 207817c69..33964ced7 100644
+--- a/junit-jupiter-params/src/main/java/org/junit/jupiter/params/ParameterizedInvocationContext.java
++++ b/junit-jupiter-params/src/main/java/org/junit/jupiter/params/ParameterizedInvocationContext.java
+@@ -72,7 +72,7 @@ class ParameterizedInvocationContext<T extends ParameterizedDeclarationContext<?
+ 		ParameterDeclarations declarations = this.declarationContext.getResolverFacade().getIndexedParameterDeclarations();
+ 		ClassLoader classLoader = getClassLoader(this.declarationContext.getTestClass());
+ 		Object[] arguments = this.arguments.getConsumedPayloads();
+-		ArgumentsAccessor accessor = DefaultArgumentsAccessor.create(invocationIndex, classLoader, arguments);
++		ArgumentsAccessor accessor = DefaultArgumentsAccessor.create(context, invocationIndex, classLoader, arguments);
+ 		new DefaultParameterInfo(declarations, accessor).store(context);
+ 	}
+ 
+diff --git a/junit-jupiter-params/src/main/java/org/junit/jupiter/params/ResolverFacade.java b/junit-jupiter-params/src/main/java/org/junit/jupiter/params/ResolverFacade.java
+index 28eda4b81..a1cad8e98 100644
+--- a/junit-jupiter-params/src/main/java/org/junit/jupiter/params/ResolverFacade.java
++++ b/junit-jupiter-params/src/main/java/org/junit/jupiter/params/ResolverFacade.java
+@@ -425,7 +425,7 @@ class ResolverFacade {
+ 					.map(clazz -> ParameterizedTestSpiInstantiator.instantiate(ArgumentConverter.class, clazz, extensionContext))
+ 					.map(converter -> AnnotationConsumerInitializer.initialize(declaration.getAnnotatedElement(), converter))
+ 					.map(Converter::new)
+-					.orElse(Converter.DEFAULT);
++					.orElseGet(() -> Converter.createDefault(extensionContext));
+ 		} // @formatter:on
+ 		catch (Exception ex) {
+ 			throw parameterResolutionException("Error creating ArgumentConverter", ex, declaration.getParameterIndex());
+@@ -467,10 +467,12 @@ class ResolverFacade {
+ 
+ 	private static class Converter implements Resolver {
+ 
+-		private static final Converter DEFAULT = new Converter(DefaultArgumentConverter.INSTANCE);
+-
+ 		private final ArgumentConverter argumentConverter;
+ 
++		private static Converter createDefault(ExtensionContext context) {
++			return new Converter(new DefaultArgumentConverter(context));
++		}
++
+ 		Converter(ArgumentConverter argumentConverter) {
+ 			this.argumentConverter = argumentConverter;
+ 		}
+diff --git a/junit-jupiter-params/src/main/java/org/junit/jupiter/params/aggregator/DefaultArgumentsAccessor.java b/junit-jupiter-params/src/main/java/org/junit/jupiter/params/aggregator/DefaultArgumentsAccessor.java
+index 811a8abd0..40bf7213e 100644
+--- a/junit-jupiter-params/src/main/java/org/junit/jupiter/params/aggregator/DefaultArgumentsAccessor.java
++++ b/junit-jupiter-params/src/main/java/org/junit/jupiter/params/aggregator/DefaultArgumentsAccessor.java
+@@ -19,6 +19,7 @@ import java.util.List;
+ import java.util.function.BiFunction;
+ 
+ import org.apiguardian.api.API;
++import org.junit.jupiter.api.extension.ExtensionContext;
+ import org.junit.jupiter.params.converter.DefaultArgumentConverter;
+ import org.junit.platform.commons.util.ClassUtils;
+ import org.junit.platform.commons.util.Preconditions;
+@@ -40,10 +41,11 @@ public class DefaultArgumentsAccessor implements ArgumentsAccessor {
+ 	private final Object[] arguments;
+ 	private final BiFunction<Object, Class<?>, Object> converter;
+ 
+-	public static DefaultArgumentsAccessor create(int invocationIndex, ClassLoader classLoader, Object[] arguments) {
++	public static DefaultArgumentsAccessor create(ExtensionContext context, int invocationIndex,
++			ClassLoader classLoader, Object[] arguments) {
+ 		Preconditions.notNull(classLoader, "ClassLoader must not be null");
+ 
+-		BiFunction<Object, Class<?>, Object> converter = (source, targetType) -> DefaultArgumentConverter.INSTANCE //
++		BiFunction<Object, Class<?>, Object> converter = (source, targetType) -> new DefaultArgumentConverter(context) //
+ 				.convert(source, targetType, classLoader);
+ 		return new DefaultArgumentsAccessor(converter, invocationIndex, arguments);
+ 	}
+diff --git a/junit-jupiter-params/src/main/java/org/junit/jupiter/params/converter/DefaultArgumentConverter.java b/junit-jupiter-params/src/main/java/org/junit/jupiter/params/converter/DefaultArgumentConverter.java
+index 8544019c1..eea0e7345 100644
+--- a/junit-jupiter-params/src/main/java/org/junit/jupiter/params/converter/DefaultArgumentConverter.java
++++ b/junit-jupiter-params/src/main/java/org/junit/jupiter/params/converter/DefaultArgumentConverter.java
+@@ -21,8 +21,10 @@ import java.net.URL;
+ import java.util.Currency;
+ import java.util.Locale;
+ import java.util.UUID;
++import java.util.function.Function;
+ 
+ import org.apiguardian.api.API;
++import org.junit.jupiter.api.extension.ExtensionContext;
+ import org.junit.jupiter.api.extension.ParameterContext;
+ import org.junit.jupiter.params.support.FieldContext;
+ import org.junit.platform.commons.support.conversion.ConversionException;
+@@ -50,10 +52,31 @@ import org.junit.platform.commons.util.ReflectionUtils;
+ @API(status = INTERNAL, since = "5.0")
+ public class DefaultArgumentConverter implements ArgumentConverter {
+ 
+-	public static final DefaultArgumentConverter INSTANCE = new DefaultArgumentConverter();
++	/**
++	 * Property name used to set the format for the conversion of {@link Locale}
++	 * arguments: {@value}
++	 *
++	 * <h4>Supported Values</h4>
++	 * <ul>
++	 * <li>{@code bcp_47}: uses the IETF BCP 47 language tag format, delegating
++	 * the conversion to {@link Locale#forLanguageTag(String)}</li>
++	 * <li>{@code iso_639}: uses the ISO 639 alpha-2 or alpha-3 language code
++	 * format, delegating the conversion to {@link Locale#Locale(String)}</li>
++	 * </ul>
++	 *
++	 * <p>If not specified, the default is {@code bcp_47}.
++	 *
++	 * @since 5.13
++	 */
++	public static final String DEFAULT_LOCALE_CONVERSION_FORMAT_PROPERTY_NAME = "junit.jupiter.params.arguments.conversion.locale.format";
+ 
+-	private DefaultArgumentConverter() {
+-		// nothing to initialize
++	private static final Function<String, LocaleConversionFormat> TRANSFORMER = value -> LocaleConversionFormat.valueOf(
++		value.trim().toUpperCase(Locale.ROOT));
++
++	private final ExtensionContext context;
++
++	public DefaultArgumentConverter(ExtensionContext context) {
++		this.context = context;
+ 	}
+ 
+ 	@Override
+@@ -84,6 +107,10 @@ public class DefaultArgumentConverter implements ArgumentConverter {
+ 		}
+ 
+ 		if (source instanceof String) {
++			if (targetType == Locale.class && getLocaleConversionFormat() == LocaleConversionFormat.BCP_47) {
++				return Locale.forLanguageTag((String) source);
++			}
++
+ 			try {
+ 				return convert((String) source, targetType, classLoader);
+ 			}
+@@ -97,8 +124,21 @@ public class DefaultArgumentConverter implements ArgumentConverter {
+ 				source.getClass().getTypeName(), targetType.getTypeName()));
+ 	}
+ 
++	private LocaleConversionFormat getLocaleConversionFormat() {
++		return context.getConfigurationParameter(DEFAULT_LOCALE_CONVERSION_FORMAT_PROPERTY_NAME, TRANSFORMER) //
++				.orElse(LocaleConversionFormat.BCP_47);
++	}
++
+ 	Object convert(String source, Class<?> targetType, ClassLoader classLoader) {
+ 		return ConversionSupport.convert(source, targetType, classLoader);
+ 	}
+ 
++	enum LocaleConversionFormat {
++
++		BCP_47,
++
++		ISO_639
++
++	}
++
+ }

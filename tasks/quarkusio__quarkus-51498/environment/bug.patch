@@ -1,0 +1,851 @@
+diff --git a/independent-projects/tools/registry-client/src/main/java/io/quarkus/registry/client/maven/MavenRegistryClientFactory.java b/independent-projects/tools/registry-client/src/main/java/io/quarkus/registry/client/maven/MavenRegistryClientFactory.java
+index d071cce6b38..1a8d775c7e9 100644
+--- a/independent-projects/tools/registry-client/src/main/java/io/quarkus/registry/client/maven/MavenRegistryClientFactory.java
++++ b/independent-projects/tools/registry-client/src/main/java/io/quarkus/registry/client/maven/MavenRegistryClientFactory.java
+@@ -17,6 +17,9 @@
+ import org.eclipse.aether.repository.RemoteRepository;
+ import org.eclipse.aether.repository.RepositoryPolicy;
+ import org.eclipse.aether.resolution.ArtifactResult;
++import org.eclipse.aether.transfer.TransferCancelledException;
++import org.eclipse.aether.transfer.TransferEvent;
++import org.eclipse.aether.transfer.TransferListener;
+ 
+ import io.quarkus.bootstrap.resolver.maven.BootstrapMavenContext;
+ import io.quarkus.bootstrap.resolver.maven.BootstrapMavenException;
+@@ -68,7 +71,9 @@ public RegistryClient buildRegistryClient(RegistryConfig config) throws Registry
+         ArtifactResult result;
+         if (!registryRepos.isEmpty()) {
+             // first, we try applying the mirrors and proxies found in the user settings
+-            final List<RemoteRepository> aggregatedRepos = applyMirrorsAndProxies(registryRepos);
++            final List<RemoteRepository> aggregatedRepos = originalResolver.getRemoteRepositoryManager().aggregateRepositories(
++                    originalResolver.getSession(),
++                    Collections.emptyList(), registryRepos, true);
+             resolver = newResolver(originalResolver, aggregatedRepos, config, log);
+             try {
+                 result = MavenRegistryArtifactResolverWithCleanup.resolveAndCleanupOldTimestampedVersions(resolver,
+@@ -133,63 +138,31 @@ public RegistryClient buildRegistryClient(RegistryConfig config) throws Registry
+             config = completeRegistryConfig(config, descriptor);
+         }
+ 
+-        final MavenRegistryArtifactResolver registryArtifactResolver = newRegistryArtifactResolver(resolver,
+-                cleanupTimestampedArtifacts);
+-
+-        return new RegistryClientDispatcher(config,
+-                getPlatformsResolver(config, registryArtifactResolver),
+-                getPlatformExtensionsResolver(config, registryArtifactResolver, cleanupTimestampedArtifacts),
+-                getNonPlatformExtensionsResolver(config, registryArtifactResolver),
+-                new MavenRegistryCache(config, registryArtifactResolver, log));
+-    }
+-
+-    private List<RemoteRepository> applyMirrorsAndProxies(List<RemoteRepository> registryRepos) {
+-        return originalResolver.getRemoteRepositoryManager().aggregateRepositories(
+-                originalResolver.getSession(), List.of(), registryRepos, true);
+-    }
+-
+-    private MavenPlatformExtensionsResolver getPlatformExtensionsResolver(RegistryConfig config,
+-            MavenRegistryArtifactResolver registryArtifactResolver, boolean cleanupTimestampedArtifacts) {
+-        var platformsConfig = config.getPlatforms();
+-        if (platformsConfig != null && platformsConfig.getExtensionCatalogsIncluded() != null
+-                && platformsConfig.getExtensionCatalogsIncluded()) {
+-            // re-use the registry artifact resolver
+-            return new MavenPlatformExtensionsResolver(registryArtifactResolver, log);
+-        }
+-        final RegistryMavenRepoConfig repoConfig = platformsConfig == null ? null
+-                : (platformsConfig.getMaven() == null ? null
+-                        : (platformsConfig.getMaven().getRepository() == null ? null
+-                                : platformsConfig.getMaven().getRepository()));
+-        if (repoConfig != null) {
+-            // initialize a resolver with the repository configured by the registry
+-            final List<RemoteRepository> resolverRepos = applyMirrorsAndProxies(List.of(
+-                    new RemoteRepository.Builder(repoConfig.getId(), "default", repoConfig.getUrl()).build()));
+-            return new MavenPlatformExtensionsResolver(newRegistryArtifactResolver(
+-                    newResolver(originalResolver, resolverRepos, config, log), cleanupTimestampedArtifacts), log);
+-        }
+-        // use the original user Maven resolver
+-        return new MavenPlatformExtensionsResolver(newRegistryArtifactResolver(originalResolver, cleanupTimestampedArtifacts),
+-                log);
+-    }
+-
+-    private RegistryPlatformsResolver getPlatformsResolver(RegistryConfig config,
+-            MavenRegistryArtifactResolver registryArtifactResolver) {
+-        final RegistryPlatformsConfig platformsConfig = config.getPlatforms();
+-        if (platformsConfig == null || platformsConfig.isDisabled()) {
+-            log.debug("Platform catalogs were disabled for registry %s", config.getId());
+-            return null;
+-        }
+-        return new MavenPlatformsResolver(platformsConfig, registryArtifactResolver, log);
+-    }
+-
+-    private RegistryNonPlatformExtensionsResolver getNonPlatformExtensionsResolver(RegistryConfig config,
+-            MavenRegistryArtifactResolver registryArtifactResolver) {
++        final MavenRegistryArtifactResolver defaultResolver = defaultResolver(resolver, cleanupTimestampedArtifacts);
++        final RegistryNonPlatformExtensionsResolver nonPlatformExtensionsResolver;
+         final RegistryNonPlatformExtensionsConfig nonPlatformExtensions = config.getNonPlatformExtensions();
+         if (nonPlatformExtensions == null || nonPlatformExtensions.isDisabled()) {
+             log.debug("Non-platform extension catalogs were disabled for registry %s", config.getId());
+-            return null;
++            nonPlatformExtensionsResolver = null;
++        } else {
++            nonPlatformExtensionsResolver = new MavenNonPlatformExtensionsResolver(nonPlatformExtensions, defaultResolver, log);
+         }
+-        return new MavenNonPlatformExtensionsResolver(nonPlatformExtensions, registryArtifactResolver, log);
++
++        final RegistryPlatformsResolver platformsResolver;
++        final RegistryPlatformsConfig platformsConfig = config.getPlatforms();
++        if (platformsConfig == null || platformsConfig.isDisabled()) {
++            log.debug("Platform catalogs were disabled for registry %s", config.getId());
++            platformsResolver = null;
++        } else {
++            platformsResolver = new MavenPlatformsResolver(platformsConfig, defaultResolver, log);
++        }
++        return new RegistryClientDispatcher(config, platformsResolver,
++                Boolean.TRUE.equals(platformsConfig == null ? Boolean.FALSE : platformsConfig.getExtensionCatalogsIncluded())
++                        ? new MavenPlatformExtensionsResolver(defaultResolver, log)
++                        : new MavenPlatformExtensionsResolver(defaultResolver(originalResolver, cleanupTimestampedArtifacts),
++                                log),
++                nonPlatformExtensionsResolver,
++                new MavenRegistryCache(config, defaultResolver, log));
+     }
+ 
+     private static Artifact getDescriptorCoords(RegistryConfig config) {
+@@ -208,7 +181,7 @@ private static boolean isCleanupTimestampedArtifacts(RegistryConfig config) {
+         return o == null || Boolean.parseBoolean(o.toString());
+     }
+ 
+-    private static MavenRegistryArtifactResolver newRegistryArtifactResolver(MavenArtifactResolver resolver,
++    private static MavenRegistryArtifactResolver defaultResolver(MavenArtifactResolver resolver,
+             boolean cleanupTimestampedArtifacts) {
+         return new MavenRegistryArtifactResolverWithCleanup(resolver, cleanupTimestampedArtifacts);
+     }
+@@ -248,12 +221,11 @@ static RegistryConfig.Mutable completeRegistryConfig(RegistryConfig local, Regis
+ 
+         if (local.getMaven() == null) {
+             complete.setMaven(remote.getMaven());
+-        } else if (isMavenConfigComplete(local.getMaven())) {
++        } else if (isComplete(local.getMaven())) {
+             complete.setMaven(local.getMaven());
+         } else {
+             complete.setMaven(RegistryMavenConfig.builder()
+-                    .setRepository(
+-                            completeMavenRepoConfig(local.getMaven().getRepository(), remote.getMaven().getRepository())));
++                    .setRepository(completeMavenRepoConfig(local.getMaven(), remote.getMaven())));
+         }
+ 
+         complete.setQuarkusVersions(complete(local.getQuarkusVersions(), remote.getQuarkusVersions()));
+@@ -296,57 +268,37 @@ private static RegistryQuarkusVersionsConfig complete(RegistryQuarkusVersionsCon
+         return complete;
+     }
+ 
+-    private static RegistryPlatformsConfig completeRegistryPlatformConfig(RegistryPlatformsConfig local,
+-            RegistryPlatformsConfig remote) {
+-        if (local == null) {
+-            return remote;
++    private static RegistryPlatformsConfig completeRegistryPlatformConfig(RegistryPlatformsConfig client,
++            RegistryPlatformsConfig descriptor) {
++        if (client == null) {
++            return descriptor;
+         }
+-        if (isPlatformsConfigComplete(local, remote)) {
+-            return local;
+-        }
+-
+-        Boolean extensionCatalogsIncluded = local.getExtensionCatalogsIncluded();
+-        RegistryMavenConfig mavenConfig = null;
+-        if (local.getMaven() != null && local.getMaven().getRepository() != null) {
+-            if (extensionCatalogsIncluded != null && extensionCatalogsIncluded) {
+-                throw new IllegalArgumentException(
+-                        "Either extension-catalogs-included or mavenConfig/repository configuration can be enabled at the same time");
+-            }
+-            mavenConfig = local.getMaven();
+-        }
+-
+-        if (mavenConfig == null) {
+-            if (extensionCatalogsIncluded == null || !extensionCatalogsIncluded) {
+-                if (extensionCatalogsIncluded == null) {
+-                    extensionCatalogsIncluded = remote.getExtensionCatalogsIncluded();
+-                    if (extensionCatalogsIncluded == null || !extensionCatalogsIncluded) {
+-                        mavenConfig = remote.getMaven();
+-                    }
+-                }
+-            }
+-        } else if (remote.getMaven() != null && !isMavenConfigComplete(mavenConfig)) {
+-            mavenConfig = RegistryMavenConfig.builder()
+-                    .setRepository(completeMavenRepoConfig(mavenConfig.getRepository(), remote.getMaven().getRepository()));
++        if (isComplete(client, descriptor)) {
++            return client;
+         }
+ 
+         return RegistryPlatformsConfig.builder()
+-                .setArtifact(local.getArtifact() == null ? remote.getArtifact() : local.getArtifact())
+-                .setDisabled(local.isDisabled())
+-                .setExtensionCatalogsIncluded(extensionCatalogsIncluded)
+-                .setMaven(mavenConfig);
++                .setArtifact(client.getArtifact() == null ? descriptor.getArtifact() : client.getArtifact())
++                .setDisabled(client.isDisabled())
++                .setExtensionCatalogsIncluded(
++                        client.getExtensionCatalogsIncluded() == null
++                                ? descriptor.getExtensionCatalogsIncluded()
++                                : client.getExtensionCatalogsIncluded());
+     }
+ 
+-    private static RegistryMavenRepoConfig completeMavenRepoConfig(RegistryMavenRepoConfig local,
+-            RegistryMavenRepoConfig remote) {
+-        if (local == null) {
+-            return remote;
+-        }
+-        if (isMavenRepoComplete(local) || remote == null) {
+-            return local;
++    private static RegistryMavenRepoConfig completeMavenRepoConfig(RegistryMavenConfig original,
++            RegistryMavenConfig descriptor) {
++        RegistryMavenRepoConfig originalRepo = original.getRepository();
++        RegistryMavenRepoConfig descriptorRepo = descriptor.getRepository();
++        if (originalRepo == null) {
++            return descriptorRepo;
++        } else if (isComplete(originalRepo) || descriptorRepo == null) {
++            return originalRepo;
+         }
++
+         return RegistryMavenRepoConfig.builder()
+-                .setId(local.getId() != null ? local.getId() : remote.getId())
+-                .setUrl(local.getUrl() != null ? local.getUrl() : remote.getUrl());
++                .setId(originalRepo.getId() == null ? descriptorRepo.getId() : originalRepo.getId())
++                .setUrl(originalRepo.getUrl() == null ? descriptorRepo.getUrl() : originalRepo.getUrl());
+     }
+ 
+     private static boolean isComplete(RegistryConfig client, RegistryConfig descriptor) {
+@@ -356,13 +308,13 @@ private static boolean isComplete(RegistryConfig client, RegistryConfig descript
+         if (client.getDescriptor() == null) {
+             return false;
+         }
+-        if (!isPlatformsConfigComplete(client.getPlatforms(), descriptor.getPlatforms())) {
++        if (!isComplete(client.getPlatforms(), descriptor.getPlatforms())) {
+             return false;
+         }
+-        if (!isArtifactConfigComplete(client.getNonPlatformExtensions())) {
++        if (!isComplete(client.getNonPlatformExtensions())) {
+             return false;
+         }
+-        if (!isMavenConfigComplete(client.getMaven())) {
++        if (!isComplete(client.getMaven())) {
+             return false;
+         }
+         if (client.getQuarkusVersions() == null && descriptor.getQuarkusVersions() != null) {
+@@ -374,31 +326,48 @@ private static boolean isComplete(RegistryConfig client, RegistryConfig descript
+         return true;
+     }
+ 
+-    private static boolean isMavenConfigComplete(RegistryMavenConfig config) {
+-        return config != null && isMavenRepoComplete(config.getRepository());
++    private static boolean isComplete(RegistryMavenConfig config) {
++        if (config == null) {
++            return false;
++        }
++        if (!isComplete(config.getRepository())) {
++            return false;
++        }
++        return true;
+     }
+ 
+-    private static boolean isPlatformsConfigComplete(RegistryPlatformsConfig client, RegistryPlatformsConfig descriptor) {
+-        if (!isArtifactConfigComplete(client)) {
++    private static boolean isComplete(RegistryPlatformsConfig client, RegistryPlatformsConfig descriptor) {
++        if (!isComplete(client)) {
+             return false;
+         }
+-        if (client.getMaven() != null && client.getMaven().getRepository() != null
+-                && client.getMaven().getRepository().getUrl() != null
+-                || client.getExtensionCatalogsIncluded() != null) {
+-            return true;
+-        }
+-        if (descriptor != null) {
+-            return !Boolean.TRUE.equals(descriptor.getExtensionCatalogsIncluded()) && descriptor.getMaven() == null;
++        if (descriptor != null && Boolean.TRUE.equals(descriptor.getExtensionCatalogsIncluded())
++                && client.getExtensionCatalogsIncluded() == null) {
++            return false;
+         }
+         return true;
+     }
+ 
+-    private static boolean isArtifactConfigComplete(RegistryArtifactConfig config) {
+-        return config != null && (config.isDisabled() || config.getArtifact() != null);
++    private static boolean isComplete(RegistryArtifactConfig config) {
++        if (config == null) {
++            return false;
++        }
++        if (!config.isDisabled() && config.getArtifact() == null) {
++            return false;
++        }
++        return true;
+     }
+ 
+-    private static boolean isMavenRepoComplete(RegistryMavenRepoConfig config) {
+-        return config != null && config.getId() != null && config.getUrl() != null;
++    private static boolean isComplete(RegistryMavenRepoConfig config) {
++        if (config == null) {
++            return false;
++        }
++        if (config.getId() == null) {
++            return false;
++        }
++        if (config.getUrl() == null) {
++            return false;
++        }
++        return true;
+     }
+ 
+     private static MavenArtifactResolver newResolver(MavenArtifactResolver resolver, List<RemoteRepository> aggregatedRepos,
+@@ -424,7 +393,58 @@ private static MavenArtifactResolver newResolver(MavenArtifactResolver resolver,
+     private static DefaultRepositorySystemSession setRegistryTransferListener(RegistryConfig config, MessageWriter log,
+             RepositorySystemSession session) {
+         final DefaultRepositorySystemSession newSession = new DefaultRepositorySystemSession(session);
+-        newSession.setTransferListener(new RegistryCacheRefreshLogger(config, log, newSession.getTransferListener()));
++        final TransferListener tl = newSession.getTransferListener();
++        newSession.setTransferListener(new TransferListener() {
++
++            boolean loggedCatalogRefreshMsg;
++
++            @Override
++            public void transferInitiated(TransferEvent event) throws TransferCancelledException {
++                if (!loggedCatalogRefreshMsg && !event.getResource().getResourceName()
++                        .contains(config.getDescriptor().getArtifact().getArtifactId())) {
++                    loggedCatalogRefreshMsg = true;
++                    log.info("Looking for the newly published extensions in " + config.getId());
++                }
++                if (tl != null) {
++                    tl.transferInitiated(event);
++                }
++            }
++
++            @Override
++            public void transferStarted(TransferEvent event) throws TransferCancelledException {
++                if (tl != null) {
++                    tl.transferStarted(event);
++                }
++            }
++
++            @Override
++            public void transferProgressed(TransferEvent event) throws TransferCancelledException {
++                if (tl != null) {
++                    tl.transferProgressed(event);
++                }
++            }
++
++            @Override
++            public void transferCorrupted(TransferEvent event) throws TransferCancelledException {
++                if (tl != null) {
++                    tl.transferCorrupted(event);
++                }
++            }
++
++            @Override
++            public void transferSucceeded(TransferEvent event) {
++                if (tl != null) {
++                    tl.transferSucceeded(event);
++                }
++            }
++
++            @Override
++            public void transferFailed(TransferEvent event) {
++                if (tl != null) {
++                    tl.transferFailed(event);
++                }
++            }
++        });
+         return newSession;
+     }
+ 
+@@ -471,7 +491,7 @@ private List<RemoteRepository> determineRegistryRepos(RegistryConfig config, Lis
+             }
+         }
+ 
+-        return List.of(repoBuilder.build());
++        return Collections.singletonList(repoBuilder.build());
+     }
+ 
+     private static String getDescriptorResolutionFailureFromMirrorMessage(RegistryConfig config,
+diff --git a/independent-projects/tools/registry-client/src/main/java/io/quarkus/registry/client/maven/RegistryCacheRefreshLogger.java b/independent-projects/tools/registry-client/src/main/java/io/quarkus/registry/client/maven/RegistryCacheRefreshLogger.java
+deleted file mode 100644
+index d66649562fd..00000000000
+--- a/independent-projects/tools/registry-client/src/main/java/io/quarkus/registry/client/maven/RegistryCacheRefreshLogger.java
++++ /dev/null
+@@ -1,69 +0,0 @@
+-package io.quarkus.registry.client.maven;
+-
+-import org.eclipse.aether.transfer.TransferCancelledException;
+-import org.eclipse.aether.transfer.TransferEvent;
+-import org.eclipse.aether.transfer.TransferListener;
+-
+-import io.quarkus.devtools.messagewriter.MessageWriter;
+-import io.quarkus.registry.config.RegistryConfig;
+-
+-class RegistryCacheRefreshLogger implements TransferListener {
+-
+-    private final RegistryConfig config;
+-    private final MessageWriter log;
+-    private final TransferListener delegate;
+-    boolean loggedCatalogRefreshMsg;
+-
+-    public RegistryCacheRefreshLogger(RegistryConfig config, MessageWriter log, TransferListener delegate) {
+-        this.config = config;
+-        this.log = log;
+-        this.delegate = delegate;
+-    }
+-
+-    @Override
+-    public void transferInitiated(TransferEvent event) throws TransferCancelledException {
+-        if (!loggedCatalogRefreshMsg && !event.getResource().getResourceName()
+-                .contains(config.getDescriptor().getArtifact().getArtifactId())) {
+-            loggedCatalogRefreshMsg = true;
+-            log.info("Looking for the newly published extensions in " + config.getId());
+-        }
+-        if (delegate != null) {
+-            delegate.transferInitiated(event);
+-        }
+-    }
+-
+-    @Override
+-    public void transferStarted(TransferEvent event) throws TransferCancelledException {
+-        if (delegate != null) {
+-            delegate.transferStarted(event);
+-        }
+-    }
+-
+-    @Override
+-    public void transferProgressed(TransferEvent event) throws TransferCancelledException {
+-        if (delegate != null) {
+-            delegate.transferProgressed(event);
+-        }
+-    }
+-
+-    @Override
+-    public void transferCorrupted(TransferEvent event) throws TransferCancelledException {
+-        if (delegate != null) {
+-            delegate.transferCorrupted(event);
+-        }
+-    }
+-
+-    @Override
+-    public void transferSucceeded(TransferEvent event) {
+-        if (delegate != null) {
+-            delegate.transferSucceeded(event);
+-        }
+-    }
+-
+-    @Override
+-    public void transferFailed(TransferEvent event) {
+-        if (delegate != null) {
+-            delegate.transferFailed(event);
+-        }
+-    }
+-}
+diff --git a/independent-projects/tools/registry-client/src/main/java/io/quarkus/registry/config/RegistryMavenRepoConfigImpl.java b/independent-projects/tools/registry-client/src/main/java/io/quarkus/registry/config/RegistryMavenRepoConfigImpl.java
+index 8690da4187f..5425b17255e 100644
+--- a/independent-projects/tools/registry-client/src/main/java/io/quarkus/registry/config/RegistryMavenRepoConfigImpl.java
++++ b/independent-projects/tools/registry-client/src/main/java/io/quarkus/registry/config/RegistryMavenRepoConfigImpl.java
+@@ -56,7 +56,10 @@ public int hashCode() {
+ 
+     @Override
+     public String toString() {
+-        return "Maven repo " + id + " " + " " + url;
++        return "BaseRegistryMavenRepoConfig{" +
++                "id='" + id + '\'' +
++                ", url='" + url + '\'' +
++                '}';
+     }
+ 
+     /**
+diff --git a/independent-projects/tools/registry-client/src/main/java/io/quarkus/registry/config/RegistryPlatformsConfig.java b/independent-projects/tools/registry-client/src/main/java/io/quarkus/registry/config/RegistryPlatformsConfig.java
+index 8dcc12ce4c3..abcdddb716c 100644
+--- a/independent-projects/tools/registry-client/src/main/java/io/quarkus/registry/config/RegistryPlatformsConfig.java
++++ b/independent-projects/tools/registry-client/src/main/java/io/quarkus/registry/config/RegistryPlatformsConfig.java
+@@ -17,13 +17,6 @@ public interface RegistryPlatformsConfig extends RegistryArtifactConfig {
+      */
+     Boolean getExtensionCatalogsIncluded();
+ 
+-    /**
+-     * Allows configuring a Maven repository to resolve platform extension catalogs from.
+-     *
+-     * @return Maven repository configuration or null
+-     */
+-    RegistryMavenConfig getMaven();
+-
+     default Mutable mutable() {
+         return new RegistryPlatformsConfigImpl.Builder(this);
+     }
+@@ -38,8 +31,6 @@ interface Mutable extends RegistryPlatformsConfig, RegistryArtifactConfig.Mutabl
+ 
+         RegistryPlatformsConfig.Mutable setExtensionCatalogsIncluded(Boolean extensionCatalogsIncluded);
+ 
+-        RegistryPlatformsConfig.Mutable setMaven(RegistryMavenConfig mavenConfig);
+-
+         /** @return an immutable copy of this config */
+         @Override
+         RegistryPlatformsConfig build();
+diff --git a/independent-projects/tools/registry-client/src/main/java/io/quarkus/registry/config/RegistryPlatformsConfigImpl.java b/independent-projects/tools/registry-client/src/main/java/io/quarkus/registry/config/RegistryPlatformsConfigImpl.java
+index dd0cb46dd3d..079091d6a41 100644
+--- a/independent-projects/tools/registry-client/src/main/java/io/quarkus/registry/config/RegistryPlatformsConfigImpl.java
++++ b/independent-projects/tools/registry-client/src/main/java/io/quarkus/registry/config/RegistryPlatformsConfigImpl.java
+@@ -4,7 +4,6 @@
+ 
+ import com.fasterxml.jackson.annotation.JsonIgnore;
+ import com.fasterxml.jackson.annotation.JsonInclude;
+-import com.fasterxml.jackson.databind.annotation.JsonDeserialize;
+ 
+ import io.quarkus.maven.dependency.ArtifactCoords;
+ import io.quarkus.registry.json.JsonBuilder;
+@@ -22,12 +21,10 @@
+ public class RegistryPlatformsConfigImpl extends RegistryArtifactConfigImpl implements RegistryPlatformsConfig {
+ 
+     protected final Boolean extensionCatalogsIncluded;
+-    protected final RegistryMavenConfig mavenConfig;
+ 
+     private RegistryPlatformsConfigImpl(Builder builder) {
+         super(builder.disabled, builder.artifact);
+         this.extensionCatalogsIncluded = builder.extensionCatalogsIncluded;
+-        this.mavenConfig = builder.mavenConfig;
+     }
+ 
+     @Override
+@@ -35,11 +32,6 @@ public Boolean getExtensionCatalogsIncluded() {
+         return extensionCatalogsIncluded;
+     }
+ 
+-    @Override
+-    public RegistryMavenConfig getMaven() {
+-        return mavenConfig;
+-    }
+-
+     @Override
+     public boolean equals(Object o) {
+         if (this == o)
+@@ -75,7 +67,6 @@ public RegistryPlatformsConfig.Mutable mutable() {
+      */
+     public static class Builder extends RegistryArtifactConfigImpl.Builder implements RegistryPlatformsConfig.Mutable {
+         protected Boolean extensionCatalogsIncluded;
+-        protected RegistryMavenConfig mavenConfig;
+ 
+         public Builder() {
+         }
+@@ -109,18 +100,6 @@ public RegistryPlatformsConfig.Mutable setExtensionCatalogsIncluded(Boolean exte
+             return this;
+         }
+ 
+-        @Override
+-        @JsonDeserialize(as = RegistryMavenConfigImpl.Builder.class)
+-        public RegistryMavenConfig getMaven() {
+-            return mavenConfig;
+-        }
+-
+-        @Override
+-        public RegistryPlatformsConfig.Mutable setMaven(RegistryMavenConfig mavenConfig) {
+-            this.mavenConfig = mavenConfig;
+-            return this;
+-        }
+-
+         @Override
+         public RegistryPlatformsConfigImpl build() {
+             return new RegistryPlatformsConfigImpl(this);
+diff --git a/independent-projects/tools/registry-client/src/test/java/io/quarkus/registry/client/maven/MavenRegistryClientCompleteConfigTest.java b/independent-projects/tools/registry-client/src/test/java/io/quarkus/registry/client/maven/MavenRegistryClientCompleteConfigTest.java
+index 8e17a0a4288..f8bce022e4f 100644
+--- a/independent-projects/tools/registry-client/src/test/java/io/quarkus/registry/client/maven/MavenRegistryClientCompleteConfigTest.java
++++ b/independent-projects/tools/registry-client/src/test/java/io/quarkus/registry/client/maven/MavenRegistryClientCompleteConfigTest.java
+@@ -10,8 +10,6 @@
+ import io.quarkus.maven.dependency.ArtifactCoords;
+ import io.quarkus.registry.config.RegistryConfig;
+ import io.quarkus.registry.config.RegistryDescriptorConfig;
+-import io.quarkus.registry.config.RegistryMavenConfig;
+-import io.quarkus.registry.config.RegistryMavenRepoConfig;
+ import io.quarkus.registry.config.RegistryPlatformsConfig;
+ import io.quarkus.registry.config.RegistryQuarkusVersionsConfig;
+ 
+@@ -54,225 +52,6 @@ public void testCompletePlatformsConfig() {
+         assertThat(completePlatforms.getExtensionCatalogsIncluded()).isTrue();
+     }
+ 
+-    @Test
+-    public void testPlatformExtensionsMavenConfigProvidedByRegistry() {
+-
+-        final RegistryDescriptorConfig descriptorConfig = RegistryDescriptorConfig.builder()
+-                .setArtifact(ArtifactCoords.fromString("org.acme.registry:acme-registry-descriptor::json:1.0-SNAPSHOT"))
+-                .build();
+-
+-        final RegistryConfig.Mutable localClientConfig = RegistryConfig.builder();
+-        localClientConfig.setId("acme-registry")
+-                .setDescriptor(descriptorConfig)
+-                .setPlatforms(RegistryPlatformsConfig.builder()
+-                        .setArtifact(ArtifactCoords.fromString("org.acme.registry:acme-platforms::json:1.0-SNAPSHOT"))
+-                        .build());
+-
+-        final RegistryConfig.Mutable registryDescriptor = RegistryConfig.builder();
+-        registryDescriptor.setId("acme-registry")
+-                .setDescriptor(descriptorConfig)
+-                .setPlatforms(RegistryPlatformsConfig.builder()
+-                        .setArtifact(ArtifactCoords.fromString("org.acme.registry:acme-platforms::json:1.0-SNAPSHOT"))
+-                        .setMaven(RegistryMavenConfig.builder()
+-                                .setRepository(RegistryMavenRepoConfig.builder()
+-                                        .setId("repo-id")
+-                                        .setUrl("repo-url")
+-                                        .build())
+-                                .build())
+-                        .build());
+-
+-        final RegistryConfig.Mutable completeConfig = MavenRegistryClientFactory.completeRegistryConfig(localClientConfig,
+-                registryDescriptor);
+-        assertThat(completeConfig.getId()).isEqualTo("acme-registry");
+-        assertThat(completeConfig.getDescriptor().getArtifact())
+-                .isEqualTo(ArtifactCoords.fromString("org.acme.registry:acme-registry-descriptor::json:1.0-SNAPSHOT"));
+-        final RegistryPlatformsConfig completePlatforms = completeConfig.getPlatforms();
+-        assertThat(completePlatforms).isNotNull();
+-        assertThat(completePlatforms.getArtifact())
+-                .isEqualTo(ArtifactCoords.fromString("org.acme.registry:acme-platforms::json:1.0-SNAPSHOT"));
+-        assertThat(completePlatforms.getExtensionCatalogsIncluded()).isNull();
+-        assertThat(completePlatforms.getMaven()).isNotNull();
+-        assertThat(completePlatforms.getMaven().getRepository()).isNotNull();
+-        assertThat(completePlatforms.getMaven().getRepository().getId()).isEqualTo("repo-id");
+-        assertThat(completePlatforms.getMaven().getRepository().getUrl()).isEqualTo("repo-url");
+-    }
+-
+-    @Test
+-    public void testClientOverridingPlatformExtensionsMavenConfigProvidedByRegistry() {
+-
+-        final RegistryDescriptorConfig descriptorConfig = RegistryDescriptorConfig.builder()
+-                .setArtifact(ArtifactCoords.fromString("org.acme.registry:acme-registry-descriptor::json:1.0-SNAPSHOT"))
+-                .build();
+-
+-        final RegistryConfig.Mutable localClientConfig = RegistryConfig.builder();
+-        localClientConfig.setId("acme-registry")
+-                .setDescriptor(descriptorConfig)
+-                .setPlatforms(RegistryPlatformsConfig.builder()
+-                        .setArtifact(ArtifactCoords.fromString("org.acme.registry:acme-platforms::json:1.0-SNAPSHOT"))
+-                        .setMaven(RegistryMavenConfig.builder()
+-                                .setRepository(RegistryMavenRepoConfig.builder()
+-                                        .setId("client-repo-id")
+-                                        .build())
+-                                .build())
+-                        .build());
+-
+-        final RegistryConfig.Mutable registryDescriptor = RegistryConfig.builder();
+-        registryDescriptor.setId("acme-registry")
+-                .setDescriptor(descriptorConfig)
+-                .setPlatforms(RegistryPlatformsConfig.builder()
+-                        .setArtifact(ArtifactCoords.fromString("org.acme.registry:acme-platforms::json:1.0-SNAPSHOT"))
+-                        .setMaven(RegistryMavenConfig.builder()
+-                                .setRepository(RegistryMavenRepoConfig.builder()
+-                                        .setId("repo-id")
+-                                        .setUrl("repo-url")
+-                                        .build())
+-                                .build())
+-                        .build());
+-
+-        final RegistryConfig.Mutable completeConfig = MavenRegistryClientFactory.completeRegistryConfig(localClientConfig,
+-                registryDescriptor);
+-        assertThat(completeConfig.getId()).isEqualTo("acme-registry");
+-        assertThat(completeConfig.getDescriptor().getArtifact())
+-                .isEqualTo(ArtifactCoords.fromString("org.acme.registry:acme-registry-descriptor::json:1.0-SNAPSHOT"));
+-        final RegistryPlatformsConfig completePlatforms = completeConfig.getPlatforms();
+-        assertThat(completePlatforms).isNotNull();
+-        assertThat(completePlatforms.getArtifact())
+-                .isEqualTo(ArtifactCoords.fromString("org.acme.registry:acme-platforms::json:1.0-SNAPSHOT"));
+-        assertThat(completePlatforms.getExtensionCatalogsIncluded()).isNull();
+-        assertThat(completePlatforms.getMaven()).isNotNull();
+-        assertThat(completePlatforms.getMaven().getRepository()).isNotNull();
+-        assertThat(completePlatforms.getMaven().getRepository().getId()).isEqualTo("client-repo-id");
+-        assertThat(completePlatforms.getMaven().getRepository().getUrl()).isEqualTo("repo-url");
+-    }
+-
+-    @Test
+-    public void testPlatformExtensionsMavenConfigProvidedByClient() {
+-
+-        final RegistryDescriptorConfig descriptorConfig = RegistryDescriptorConfig.builder()
+-                .setArtifact(ArtifactCoords.fromString("org.acme.registry:acme-registry-descriptor::json:1.0-SNAPSHOT"))
+-                .build();
+-
+-        final RegistryConfig.Mutable localClientConfig = RegistryConfig.builder();
+-        localClientConfig.setId("acme-registry")
+-                .setDescriptor(descriptorConfig)
+-                .setPlatforms(RegistryPlatformsConfig.builder()
+-                        .setArtifact(ArtifactCoords.fromString("org.acme.registry:acme-platforms::json:1.0-SNAPSHOT"))
+-                        .setMaven(RegistryMavenConfig.builder()
+-                                .setRepository(RegistryMavenRepoConfig.builder()
+-                                        .setId("repo-id")
+-                                        .setUrl("repo-url")
+-                                        .build())
+-                                .build())
+-                        .build());
+-
+-        final RegistryConfig.Mutable registryDescriptor = RegistryConfig.builder();
+-        registryDescriptor.setId("acme-registry")
+-                .setDescriptor(descriptorConfig)
+-                .setPlatforms(RegistryPlatformsConfig.builder()
+-                        .setArtifact(ArtifactCoords.fromString("org.acme.registry:acme-platforms::json:1.0-SNAPSHOT"))
+-                        .build());
+-
+-        final RegistryConfig.Mutable completeConfig = MavenRegistryClientFactory.completeRegistryConfig(localClientConfig,
+-                registryDescriptor);
+-        assertThat(completeConfig.getId()).isEqualTo("acme-registry");
+-        assertThat(completeConfig.getDescriptor().getArtifact())
+-                .isEqualTo(ArtifactCoords.fromString("org.acme.registry:acme-registry-descriptor::json:1.0-SNAPSHOT"));
+-        final RegistryPlatformsConfig completePlatforms = completeConfig.getPlatforms();
+-        assertThat(completePlatforms).isNotNull();
+-        assertThat(completePlatforms.getArtifact())
+-                .isEqualTo(ArtifactCoords.fromString("org.acme.registry:acme-platforms::json:1.0-SNAPSHOT"));
+-        assertThat(completePlatforms.getExtensionCatalogsIncluded()).isNull();
+-        assertThat(completePlatforms.getMaven()).isNotNull();
+-        assertThat(completePlatforms.getMaven().getRepository()).isNotNull();
+-        assertThat(completePlatforms.getMaven().getRepository().getId()).isEqualTo("repo-id");
+-        assertThat(completePlatforms.getMaven().getRepository().getUrl()).isEqualTo("repo-url");
+-    }
+-
+-    @Test
+-    public void testPlatformExtensionsMavenConfigProvidedByClientOverridesRegistryIncludedCatalogs() {
+-
+-        final RegistryDescriptorConfig descriptorConfig = RegistryDescriptorConfig.builder()
+-                .setArtifact(ArtifactCoords.fromString("org.acme.registry:acme-registry-descriptor::json:1.0-SNAPSHOT"))
+-                .build();
+-
+-        final RegistryConfig.Mutable localClientConfig = RegistryConfig.builder();
+-        localClientConfig.setId("acme-registry")
+-                .setDescriptor(descriptorConfig)
+-                .setPlatforms(RegistryPlatformsConfig.builder()
+-                        .setArtifact(ArtifactCoords.fromString("org.acme.registry:acme-platforms::json:1.0-SNAPSHOT"))
+-                        .setMaven(RegistryMavenConfig.builder()
+-                                .setRepository(RegistryMavenRepoConfig.builder()
+-                                        .setId("repo-id")
+-                                        .setUrl("repo-url")
+-                                        .build())
+-                                .build())
+-                        .build());
+-
+-        final RegistryConfig.Mutable registryDescriptor = RegistryConfig.builder();
+-        registryDescriptor.setId("acme-registry")
+-                .setDescriptor(descriptorConfig)
+-                .setPlatforms(RegistryPlatformsConfig.builder()
+-                        .setArtifact(ArtifactCoords.fromString("org.acme.registry:acme-platforms::json:1.0-SNAPSHOT"))
+-                        .setExtensionCatalogsIncluded(true)
+-                        .build());
+-
+-        final RegistryConfig.Mutable completeConfig = MavenRegistryClientFactory.completeRegistryConfig(localClientConfig,
+-                registryDescriptor);
+-        assertThat(completeConfig.getId()).isEqualTo("acme-registry");
+-        assertThat(completeConfig.getDescriptor().getArtifact())
+-                .isEqualTo(ArtifactCoords.fromString("org.acme.registry:acme-registry-descriptor::json:1.0-SNAPSHOT"));
+-        final RegistryPlatformsConfig completePlatforms = completeConfig.getPlatforms();
+-        assertThat(completePlatforms).isNotNull();
+-        assertThat(completePlatforms.getArtifact())
+-                .isEqualTo(ArtifactCoords.fromString("org.acme.registry:acme-platforms::json:1.0-SNAPSHOT"));
+-        assertThat(completePlatforms.getExtensionCatalogsIncluded()).isNull();
+-        assertThat(completePlatforms.getMaven()).isNotNull();
+-        assertThat(completePlatforms.getMaven().getRepository()).isNotNull();
+-        assertThat(completePlatforms.getMaven().getRepository().getId()).isEqualTo("repo-id");
+-        assertThat(completePlatforms.getMaven().getRepository().getUrl()).isEqualTo("repo-url");
+-    }
+-
+-    @Test
+-    public void testClientPlatformExtensionIncludedCatalogsOverridesRegistryMavenConfig() {
+-
+-        final RegistryDescriptorConfig descriptorConfig = RegistryDescriptorConfig.builder()
+-                .setArtifact(ArtifactCoords.fromString("org.acme.registry:acme-registry-descriptor::json:1.0-SNAPSHOT"))
+-                .build();
+-
+-        final RegistryConfig.Mutable localClientConfig = RegistryConfig.builder();
+-        localClientConfig.setId("acme-registry")
+-                .setDescriptor(descriptorConfig)
+-                .setPlatforms(RegistryPlatformsConfig.builder()
+-                        .setArtifact(ArtifactCoords.fromString("org.acme.registry:acme-platforms::json:1.0-SNAPSHOT"))
+-                        .setExtensionCatalogsIncluded(true)
+-                        .build());
+-
+-        final RegistryConfig.Mutable registryDescriptor = RegistryConfig.builder();
+-        registryDescriptor.setId("acme-registry")
+-                .setDescriptor(descriptorConfig)
+-                .setPlatforms(RegistryPlatformsConfig.builder()
+-                        .setArtifact(ArtifactCoords.fromString("org.acme.registry:acme-platforms::json:1.0-SNAPSHOT"))
+-                        .setMaven(RegistryMavenConfig.builder()
+-                                .setRepository(RegistryMavenRepoConfig.builder()
+-                                        .setId("repo-id")
+-                                        .setUrl("repo-url")
+-                                        .build())
+-                                .build())
+-                        .build());
+-
+-        final RegistryConfig.Mutable completeConfig = MavenRegistryClientFactory.completeRegistryConfig(localClientConfig,
+-                registryDescriptor);
+-        assertThat(completeConfig.getId()).isEqualTo("acme-registry");
+-        assertThat(completeConfig.getDescriptor().getArtifact())
+-                .isEqualTo(ArtifactCoords.fromString("org.acme.registry:acme-registry-descriptor::json:1.0-SNAPSHOT"));
+-        final RegistryPlatformsConfig completePlatforms = completeConfig.getPlatforms();
+-        assertThat(completePlatforms).isNotNull();
+-        assertThat(completePlatforms.getArtifact())
+-                .isEqualTo(ArtifactCoords.fromString("org.acme.registry:acme-platforms::json:1.0-SNAPSHOT"));
+-        assertThat(completePlatforms.getExtensionCatalogsIncluded()).isTrue();
+-        assertThat(completePlatforms.getMaven()).isNull();
+-    }
+-
+     @Test
+     public void testRecognizedVersionOverride() {
+ 
+diff --git a/independent-projects/tools/registry-client/src/test/java/io/quarkus/registry/config/DevToolsConfigSerializationTest.java b/independent-projects/tools/registry-client/src/test/java/io/quarkus/registry/config/DevToolsConfigSerializationTest.java
+index d78187dca96..f542167f506 100644
+--- a/independent-projects/tools/registry-client/src/test/java/io/quarkus/registry/config/DevToolsConfigSerializationTest.java
++++ b/independent-projects/tools/registry-client/src/test/java/io/quarkus/registry/config/DevToolsConfigSerializationTest.java
+@@ -349,35 +349,6 @@ void testRegistryClientJsonConfig() throws IOException {
+         assertThat(actualContents).isEqualTo(expectedContents);
+     }
+ 
+-    @Test
+-    void testRegistryClientMavenPlatformExtensionJsonConfig() throws IOException {
+-        String configName = "registry-client-platform-extension-maven-config.json";
+-        Path expectedFile = baseDir.resolve(configName);
+-        Path actualFile = writeDir.resolve(configName);
+-
+-        RegistryConfig expected = RegistryConfig.builder()
+-                .setId("registry.acme.org")
+-                .setDescriptor(RegistryDescriptorConfig.builder()
+-                        .setArtifact(
+-                                ArtifactCoords
+-                                        .fromString("registry.quarkus.test:quarkus-registry-descriptor::json:1.0-SNAPSHOT")))
+-                .setPlatforms(RegistryPlatformsConfig.builder()
+-                        .setArtifact(ArtifactCoords.fromString("registry.quarkus.test:quarkus-platforms::json:1.0-SNAPSHOT"))
+-                        .setMaven(RegistryMavenConfig.builder().setRepository(
+-                                RegistryMavenRepoConfig.builder().setId("repo-id").setUrl("repo-url"))))
+-                .setNonPlatformExtensions(RegistryNonPlatformExtensionsConfig.builder()
+-                        .setDisabled(true)
+-                        .setArtifact(ArtifactCoords
+-                                .fromString("registry.quarkus.test:quarkus-non-platform-extensions::json:1.0-SNAPSHOT")));
+-
+-        expected.persist(actualFile);
+-
+-        String expectedContents = Files.readString(expectedFile);
+-        String actualContents = Files.readString(actualFile);
+-
+-        assertThat(actualContents).isEqualTo(expectedContents);
+-    }
+-
+     @Test
+     void testReadJsonRegistryDescriptor() throws IOException {
+         String configName = "registry-descriptor-1.0-SNAPSHOT.json";
+diff --git a/independent-projects/tools/registry-client/src/test/resources/devtools-config/registry-client-platform-extension-maven-config.json b/independent-projects/tools/registry-client/src/test/resources/devtools-config/registry-client-platform-extension-maven-config.json
+deleted file mode 100644
+index b945148bddc..00000000000
+--- a/independent-projects/tools/registry-client/src/test/resources/devtools-config/registry-client-platform-extension-maven-config.json
++++ /dev/null
+@@ -1,18 +0,0 @@
+-{
+-  "descriptor" : {
+-    "artifact" : "registry.quarkus.test:quarkus-registry-descriptor::json:1.0-SNAPSHOT"
+-  },
+-  "platforms" : {
+-    "artifact" : "registry.quarkus.test:quarkus-platforms::json:1.0-SNAPSHOT",
+-    "maven" : {
+-      "repository" : {
+-        "id" : "repo-id",
+-        "url" : "repo-url"
+-      }
+-    }
+-  },
+-  "non-platform-extensions" : {
+-    "disabled" : true,
+-    "artifact" : "registry.quarkus.test:quarkus-non-platform-extensions::json:1.0-SNAPSHOT"
+-  }
+-}
+\ No newline at end of file

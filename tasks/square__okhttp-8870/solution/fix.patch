@@ -1,0 +1,1087 @@
+diff --git a/mockwebserver-deprecated/src/main/kotlin/okhttp3/mockwebserver/DeprecationBridge.kt b/mockwebserver-deprecated/src/main/kotlin/okhttp3/mockwebserver/DeprecationBridge.kt
+index 9fea41599..f3dfa512d 100644
+--- a/mockwebserver-deprecated/src/main/kotlin/okhttp3/mockwebserver/DeprecationBridge.kt
++++ b/mockwebserver-deprecated/src/main/kotlin/okhttp3/mockwebserver/DeprecationBridge.kt
+@@ -16,20 +16,10 @@
+ package okhttp3.mockwebserver
+ 
+ import java.util.concurrent.TimeUnit.MILLISECONDS
+-import mockwebserver3.SocketPolicy.DisconnectAfterRequest
+-import mockwebserver3.SocketPolicy.DisconnectAtEnd
+-import mockwebserver3.SocketPolicy.DisconnectAtStart
+-import mockwebserver3.SocketPolicy.DisconnectDuringRequestBody
+-import mockwebserver3.SocketPolicy.DisconnectDuringResponseBody
+-import mockwebserver3.SocketPolicy.DoNotReadRequestBody
+-import mockwebserver3.SocketPolicy.FailHandshake
+-import mockwebserver3.SocketPolicy.KeepOpen
+-import mockwebserver3.SocketPolicy.NoResponse
+-import mockwebserver3.SocketPolicy.ResetStreamAtStart
+-import mockwebserver3.SocketPolicy.ShutdownInputAtEnd
+-import mockwebserver3.SocketPolicy.ShutdownOutputAtEnd
+-import mockwebserver3.SocketPolicy.ShutdownServerAfterResponse
+-import mockwebserver3.SocketPolicy.StallSocketAtStart
++import mockwebserver3.SocketEffect
++import mockwebserver3.SocketEffect.CloseSocket
++import mockwebserver3.SocketEffect.CloseStream
++import mockwebserver3.SocketEffect.ShutdownConnection
+ import okio.Buffer
+ import okio.ByteString
+ 
+@@ -66,19 +56,38 @@ internal fun MockResponse.wrap(): mockwebserver3.MockResponse {
+   result.status(status)
+   result.headers(headers)
+   result.trailers(trailers)
+-  result.socketPolicy(
+-    when (socketPolicy) {
+-      SocketPolicy.EXPECT_CONTINUE, SocketPolicy.CONTINUE_ALWAYS -> {
+-        result.add100Continue()
+-        KeepOpen
+-      }
+-      SocketPolicy.UPGRADE_TO_SSL_AT_END -> {
+-        result.inTunnel()
+-        KeepOpen
+-      }
+-      else -> wrapSocketPolicy()
+-    },
+-  )
++
++  when (socketPolicy) {
++    SocketPolicy.EXPECT_CONTINUE, SocketPolicy.CONTINUE_ALWAYS -> result.add100Continue()
++    SocketPolicy.UPGRADE_TO_SSL_AT_END -> result.inTunnel()
++    SocketPolicy.SHUTDOWN_SERVER_AFTER_RESPONSE -> result.shutdownServer(true)
++    SocketPolicy.KEEP_OPEN -> Unit
++    SocketPolicy.DISCONNECT_AT_END -> result.onResponseEnd(ShutdownConnection)
++    SocketPolicy.DISCONNECT_AT_START -> result.onRequestStart(CloseSocket())
++    SocketPolicy.DISCONNECT_AFTER_REQUEST -> result.onResponseStart(CloseSocket())
++    SocketPolicy.DISCONNECT_DURING_REQUEST_BODY -> result.onRequestBody(CloseSocket())
++    SocketPolicy.DISCONNECT_DURING_RESPONSE_BODY -> result.onResponseBody(CloseSocket())
++    SocketPolicy.DO_NOT_READ_REQUEST_BODY -> result.doNotReadRequestBody()
++    SocketPolicy.FAIL_HANDSHAKE -> result.failHandshake()
++    SocketPolicy.SHUTDOWN_INPUT_AT_END ->
++      result.onResponseEnd(
++        CloseSocket(
++          closeSocket = false,
++          shutdownInput = true,
++        ),
++      )
++    SocketPolicy.SHUTDOWN_OUTPUT_AT_END ->
++      result.onResponseEnd(
++        CloseSocket(
++          closeSocket = false,
++          shutdownOutput = true,
++        ),
++      )
++    SocketPolicy.STALL_SOCKET_AT_START -> result.onRequestStart(SocketEffect.Stall)
++    SocketPolicy.NO_RESPONSE -> result.onResponseStart(SocketEffect.Stall)
++    SocketPolicy.RESET_STREAM_AT_START -> result.onRequestStart(CloseStream(http2ErrorCode))
++  }
++
+   result.throttleBody(throttleBytesPerPeriod, getThrottlePeriod(MILLISECONDS), MILLISECONDS)
+   result.bodyDelay(getBodyDelay(MILLISECONDS), MILLISECONDS)
+   result.headersDelay(getHeadersDelay(MILLISECONDS), MILLISECONDS)
+@@ -107,22 +116,3 @@ internal fun mockwebserver3.RecordedRequest.unwrap(): RecordedRequest =
+     handshake = handshake,
+     requestUrl = url,
+   )
+-
+-private fun MockResponse.wrapSocketPolicy(): mockwebserver3.SocketPolicy =
+-  when (val socketPolicy = socketPolicy) {
+-    SocketPolicy.SHUTDOWN_SERVER_AFTER_RESPONSE -> ShutdownServerAfterResponse
+-    SocketPolicy.KEEP_OPEN -> KeepOpen
+-    SocketPolicy.DISCONNECT_AT_END -> DisconnectAtEnd
+-    SocketPolicy.DISCONNECT_AT_START -> DisconnectAtStart
+-    SocketPolicy.DISCONNECT_AFTER_REQUEST -> DisconnectAfterRequest
+-    SocketPolicy.DISCONNECT_DURING_REQUEST_BODY -> DisconnectDuringRequestBody
+-    SocketPolicy.DISCONNECT_DURING_RESPONSE_BODY -> DisconnectDuringResponseBody
+-    SocketPolicy.DO_NOT_READ_REQUEST_BODY -> DoNotReadRequestBody(http2ErrorCode)
+-    SocketPolicy.FAIL_HANDSHAKE -> FailHandshake
+-    SocketPolicy.SHUTDOWN_INPUT_AT_END -> ShutdownInputAtEnd
+-    SocketPolicy.SHUTDOWN_OUTPUT_AT_END -> ShutdownOutputAtEnd
+-    SocketPolicy.STALL_SOCKET_AT_START -> StallSocketAtStart
+-    SocketPolicy.NO_RESPONSE -> NoResponse
+-    SocketPolicy.RESET_STREAM_AT_START -> ResetStreamAtStart(http2ErrorCode)
+-    else -> error("Unexpected SocketPolicy: $socketPolicy")
+-  }
+diff --git a/mockwebserver/api/mockwebserver3.api b/mockwebserver/api/mockwebserver3.api
+index 24d8a0d64..980b7b03c 100644
+--- a/mockwebserver/api/mockwebserver3.api
++++ b/mockwebserver/api/mockwebserver3.api
+@@ -6,21 +6,28 @@ public abstract class mockwebserver3/Dispatcher : java/io/Closeable {
+ }
+ 
+ public final class mockwebserver3/MockResponse {
+-	public fun <init> (ILokhttp3/Headers;Ljava/lang/String;Lmockwebserver3/SocketPolicy;)V
+-	public synthetic fun <init> (ILokhttp3/Headers;Ljava/lang/String;Lmockwebserver3/SocketPolicy;ILkotlin/jvm/internal/DefaultConstructorMarker;)V
++	public fun <init> (ILokhttp3/Headers;Ljava/lang/String;)V
++	public synthetic fun <init> (ILokhttp3/Headers;Ljava/lang/String;ILkotlin/jvm/internal/DefaultConstructorMarker;)V
+ 	public synthetic fun <init> (Lmockwebserver3/MockResponse$Builder;Lkotlin/jvm/internal/DefaultConstructorMarker;)V
+ 	public final fun getBody ()Lmockwebserver3/MockResponseBody;
+ 	public final fun getBodyDelayNanos ()J
+ 	public final fun getCode ()I
++	public final fun getDoNotReadRequestBody ()Z
++	public final fun getFailHandshake ()Z
+ 	public final fun getHeaders ()Lokhttp3/Headers;
+ 	public final fun getHeadersDelayNanos ()J
+ 	public final fun getInTunnel ()Z
+ 	public final fun getInformationalResponses ()Ljava/util/List;
+ 	public final fun getMessage ()Ljava/lang/String;
++	public final fun getOnRequestBody ()Lmockwebserver3/SocketEffect;
++	public final fun getOnRequestStart ()Lmockwebserver3/SocketEffect;
++	public final fun getOnResponseBody ()Lmockwebserver3/SocketEffect;
++	public final fun getOnResponseEnd ()Lmockwebserver3/SocketEffect;
++	public final fun getOnResponseStart ()Lmockwebserver3/SocketEffect;
+ 	public final fun getPushPromises ()Ljava/util/List;
+ 	public final fun getSettings ()Lokhttp3/internal/http2/Settings;
++	public final fun getShutdownServer ()Z
+ 	public final fun getSocketHandler ()Lmockwebserver3/SocketHandler;
+-	public final fun getSocketPolicy ()Lmockwebserver3/SocketPolicy;
+ 	public final fun getStatus ()Ljava/lang/String;
+ 	public final fun getThrottleBytesPerPeriod ()J
+ 	public final fun getThrottlePeriodNanos ()J
+@@ -52,17 +59,26 @@ public final class mockwebserver3/MockResponse$Builder : java/lang/Cloneable {
+ 	public synthetic fun clone ()Ljava/lang/Object;
+ 	public fun clone ()Lmockwebserver3/MockResponse$Builder;
+ 	public final fun code (I)Lmockwebserver3/MockResponse$Builder;
++	public final fun doNotReadRequestBody ()Lmockwebserver3/MockResponse$Builder;
++	public final fun failHandshake ()Lmockwebserver3/MockResponse$Builder;
+ 	public final fun getBody ()Lmockwebserver3/MockResponseBody;
+ 	public final fun getBodyDelayNanos ()J
+ 	public final fun getCode ()I
++	public final fun getDoNotReadRequestBody ()Z
++	public final fun getFailHandshake ()Z
+ 	public final fun getHeaders ()Lokhttp3/Headers;
+ 	public final fun getHeadersDelayNanos ()J
+ 	public final fun getInTunnel ()Z
+ 	public final fun getInformationalResponses ()Ljava/util/List;
++	public final fun getOnRequestBody ()Lmockwebserver3/SocketEffect;
++	public final fun getOnRequestStart ()Lmockwebserver3/SocketEffect;
++	public final fun getOnResponseBody ()Lmockwebserver3/SocketEffect;
++	public final fun getOnResponseEnd ()Lmockwebserver3/SocketEffect;
++	public final fun getOnResponseStart ()Lmockwebserver3/SocketEffect;
+ 	public final fun getPushPromises ()Ljava/util/List;
+ 	public final fun getSettings ()Lokhttp3/internal/http2/Settings;
++	public final fun getShutdownServer ()Z
+ 	public final fun getSocketHandler ()Lmockwebserver3/SocketHandler;
+-	public final fun getSocketPolicy ()Lmockwebserver3/SocketPolicy;
+ 	public final fun getStatus ()Ljava/lang/String;
+ 	public final fun getThrottleBytesPerPeriod ()J
+ 	public final fun getThrottlePeriodNanos ()J
+@@ -72,11 +88,16 @@ public final class mockwebserver3/MockResponse$Builder : java/lang/Cloneable {
+ 	public final fun headers (Lokhttp3/Headers;)Lmockwebserver3/MockResponse$Builder;
+ 	public final fun headersDelay (JLjava/util/concurrent/TimeUnit;)Lmockwebserver3/MockResponse$Builder;
+ 	public final fun inTunnel ()Lmockwebserver3/MockResponse$Builder;
++	public final fun onRequestBody (Lmockwebserver3/SocketEffect;)Lmockwebserver3/MockResponse$Builder;
++	public final fun onRequestStart (Lmockwebserver3/SocketEffect;)Lmockwebserver3/MockResponse$Builder;
++	public final fun onResponseBody (Lmockwebserver3/SocketEffect;)Lmockwebserver3/MockResponse$Builder;
++	public final fun onResponseEnd (Lmockwebserver3/SocketEffect;)Lmockwebserver3/MockResponse$Builder;
++	public final fun onResponseStart (Lmockwebserver3/SocketEffect;)Lmockwebserver3/MockResponse$Builder;
+ 	public final fun removeHeader (Ljava/lang/String;)Lmockwebserver3/MockResponse$Builder;
+ 	public final fun setHeader (Ljava/lang/String;Ljava/lang/Object;)Lmockwebserver3/MockResponse$Builder;
+ 	public final fun settings (Lokhttp3/internal/http2/Settings;)Lmockwebserver3/MockResponse$Builder;
++	public final fun shutdownServer (Z)Lmockwebserver3/MockResponse$Builder;
+ 	public final fun socketHandler (Lmockwebserver3/SocketHandler;)Lmockwebserver3/MockResponse$Builder;
+-	public final fun socketPolicy (Lmockwebserver3/SocketPolicy;)Lmockwebserver3/MockResponse$Builder;
+ 	public final fun status (Ljava/lang/String;)Lmockwebserver3/MockResponse$Builder;
+ 	public final fun throttleBody (JJLjava/util/concurrent/TimeUnit;)Lmockwebserver3/MockResponse$Builder;
+ 	public final fun trailers (Lokhttp3/Headers;)Lmockwebserver3/MockResponse$Builder;
+@@ -163,76 +184,34 @@ public final class mockwebserver3/RecordedRequest {
+ 	public fun toString ()Ljava/lang/String;
+ }
+ 
+-public abstract interface class mockwebserver3/SocketHandler {
+-	public abstract fun handle (Lokio/Socket;)V
+-}
+-
+-public abstract interface class mockwebserver3/SocketPolicy {
+-}
+-
+-public final class mockwebserver3/SocketPolicy$DisconnectAfterRequest : mockwebserver3/SocketPolicy {
+-	public static final field INSTANCE Lmockwebserver3/SocketPolicy$DisconnectAfterRequest;
+-}
+-
+-public final class mockwebserver3/SocketPolicy$DisconnectAtEnd : mockwebserver3/SocketPolicy {
+-	public static final field INSTANCE Lmockwebserver3/SocketPolicy$DisconnectAtEnd;
++public abstract interface class mockwebserver3/SocketEffect {
+ }
+ 
+-public final class mockwebserver3/SocketPolicy$DisconnectAtStart : mockwebserver3/SocketPolicy {
+-	public static final field INSTANCE Lmockwebserver3/SocketPolicy$DisconnectAtStart;
+-}
+-
+-public final class mockwebserver3/SocketPolicy$DisconnectDuringRequestBody : mockwebserver3/SocketPolicy {
+-	public static final field INSTANCE Lmockwebserver3/SocketPolicy$DisconnectDuringRequestBody;
+-}
+-
+-public final class mockwebserver3/SocketPolicy$DisconnectDuringResponseBody : mockwebserver3/SocketPolicy {
+-	public static final field INSTANCE Lmockwebserver3/SocketPolicy$DisconnectDuringResponseBody;
+-}
+-
+-public final class mockwebserver3/SocketPolicy$DoNotReadRequestBody : mockwebserver3/SocketPolicy {
++public final class mockwebserver3/SocketEffect$CloseSocket : mockwebserver3/SocketEffect {
+ 	public fun <init> ()V
+-	public fun <init> (I)V
+-	public synthetic fun <init> (IILkotlin/jvm/internal/DefaultConstructorMarker;)V
+-	public final fun getHttp2ErrorCode ()I
+-}
+-
+-public final class mockwebserver3/SocketPolicy$FailHandshake : mockwebserver3/SocketPolicy {
+-	public static final field INSTANCE Lmockwebserver3/SocketPolicy$FailHandshake;
+-}
+-
+-public final class mockwebserver3/SocketPolicy$HalfCloseAfterRequest : mockwebserver3/SocketPolicy {
+-	public static final field INSTANCE Lmockwebserver3/SocketPolicy$HalfCloseAfterRequest;
+-}
+-
+-public final class mockwebserver3/SocketPolicy$KeepOpen : mockwebserver3/SocketPolicy {
+-	public static final field INSTANCE Lmockwebserver3/SocketPolicy$KeepOpen;
+-}
+-
+-public final class mockwebserver3/SocketPolicy$NoResponse : mockwebserver3/SocketPolicy {
+-	public static final field INSTANCE Lmockwebserver3/SocketPolicy$NoResponse;
++	public fun <init> (ZZZ)V
++	public synthetic fun <init> (ZZZILkotlin/jvm/internal/DefaultConstructorMarker;)V
++	public final fun getCloseSocket ()Z
++	public final fun getShutdownInput ()Z
++	public final fun getShutdownOutput ()Z
+ }
+ 
+-public final class mockwebserver3/SocketPolicy$ResetStreamAtStart : mockwebserver3/SocketPolicy {
++public final class mockwebserver3/SocketEffect$CloseStream : mockwebserver3/SocketEffect {
+ 	public fun <init> ()V
+ 	public fun <init> (I)V
+ 	public synthetic fun <init> (IILkotlin/jvm/internal/DefaultConstructorMarker;)V
+ 	public final fun getHttp2ErrorCode ()I
+ }
+ 
+-public final class mockwebserver3/SocketPolicy$ShutdownInputAtEnd : mockwebserver3/SocketPolicy {
+-	public static final field INSTANCE Lmockwebserver3/SocketPolicy$ShutdownInputAtEnd;
++public final class mockwebserver3/SocketEffect$ShutdownConnection : mockwebserver3/SocketEffect {
++	public static final field INSTANCE Lmockwebserver3/SocketEffect$ShutdownConnection;
+ }
+ 
+-public final class mockwebserver3/SocketPolicy$ShutdownOutputAtEnd : mockwebserver3/SocketPolicy {
+-	public static final field INSTANCE Lmockwebserver3/SocketPolicy$ShutdownOutputAtEnd;
++public final class mockwebserver3/SocketEffect$Stall : mockwebserver3/SocketEffect {
++	public static final field INSTANCE Lmockwebserver3/SocketEffect$Stall;
+ }
+ 
+-public final class mockwebserver3/SocketPolicy$ShutdownServerAfterResponse : mockwebserver3/SocketPolicy {
+-	public static final field INSTANCE Lmockwebserver3/SocketPolicy$ShutdownServerAfterResponse;
+-}
+-
+-public final class mockwebserver3/SocketPolicy$StallSocketAtStart : mockwebserver3/SocketPolicy {
+-	public static final field INSTANCE Lmockwebserver3/SocketPolicy$StallSocketAtStart;
++public abstract interface class mockwebserver3/SocketHandler {
++	public abstract fun handle (Lokio/Socket;)V
+ }
+ 
+diff --git a/mockwebserver/src/main/kotlin/mockwebserver3/Dispatcher.kt b/mockwebserver/src/main/kotlin/mockwebserver3/Dispatcher.kt
+index c92ccb1fd..e8de08e27 100644
+--- a/mockwebserver/src/main/kotlin/mockwebserver3/Dispatcher.kt
++++ b/mockwebserver/src/main/kotlin/mockwebserver3/Dispatcher.kt
+@@ -16,7 +16,6 @@
+ package mockwebserver3
+ 
+ import java.io.Closeable
+-import mockwebserver3.SocketPolicy.KeepOpen
+ 
+ /** Handler for mock server requests. */
+ public abstract class Dispatcher : Closeable {
+@@ -33,7 +32,7 @@ public abstract class Dispatcher : Closeable {
+    * can return other values to test HTTP edge cases, such as unhappy socket policies or throttled
+    * request bodies.
+    */
+-  public open fun peek(): MockResponse = MockResponse(socketPolicy = KeepOpen)
++  public open fun peek(): MockResponse = MockResponse()
+ 
+   /**
+    * Release any resources held by this dispatcher. Any requests that are currently being dispatched
+diff --git a/mockwebserver/src/main/kotlin/mockwebserver3/MockResponse.kt b/mockwebserver/src/main/kotlin/mockwebserver3/MockResponse.kt
+index f6e863d6e..7056271ce 100644
+--- a/mockwebserver/src/main/kotlin/mockwebserver3/MockResponse.kt
++++ b/mockwebserver/src/main/kotlin/mockwebserver3/MockResponse.kt
+@@ -23,12 +23,13 @@
+ package mockwebserver3
+ 
+ import java.util.concurrent.TimeUnit
+-import mockwebserver3.SocketPolicy.KeepOpen
++import mockwebserver3.SocketEffect.CloseStream
+ import mockwebserver3.internal.toMockResponseBody
+ import okhttp3.Headers
+ import okhttp3.Headers.Companion.headersOf
+ import okhttp3.WebSocketListener
+ import okhttp3.internal.addHeaderLenient
++import okhttp3.internal.http2.ErrorCode
+ import okhttp3.internal.http2.Settings
+ import okio.Buffer
+ 
+@@ -65,7 +66,14 @@ public class MockResponse {
+   public val throttleBytesPerPeriod: Long
+   public val throttlePeriodNanos: Long
+ 
+-  public val socketPolicy: SocketPolicy
++  public val failHandshake: Boolean
++  public val onRequestStart: SocketEffect?
++  public val doNotReadRequestBody: Boolean
++  public val onRequestBody: SocketEffect?
++  public val onResponseStart: SocketEffect?
++  public val onResponseBody: SocketEffect?
++  public val onResponseEnd: SocketEffect?
++  public val shutdownServer: Boolean
+ 
+   public val headersDelayNanos: Long
+   public val bodyDelayNanos: Long
+@@ -80,13 +88,11 @@ public class MockResponse {
+     code: Int = 200,
+     headers: Headers = headersOf(),
+     body: String = "",
+-    socketPolicy: SocketPolicy = KeepOpen,
+   ) : this(
+     Builder()
+       .code(code)
+       .headers(headers)
+-      .body(body)
+-      .socketPolicy(socketPolicy),
++      .body(body),
+   )
+ 
+   private constructor(builder: Builder) {
+@@ -100,7 +106,14 @@ public class MockResponse {
+     this.informationalResponses = builder.informationalResponses
+     this.throttleBytesPerPeriod = builder.throttleBytesPerPeriod
+     this.throttlePeriodNanos = builder.throttlePeriodNanos
+-    this.socketPolicy = builder.socketPolicy
++    this.failHandshake = builder.failHandshake
++    this.onRequestStart = builder.onRequestStart
++    this.doNotReadRequestBody = builder.doNotReadRequestBody
++    this.onRequestBody = builder.onRequestBody
++    this.onResponseStart = builder.onResponseStart
++    this.onResponseBody = builder.onResponseBody
++    this.onResponseEnd = builder.onResponseEnd
++    this.shutdownServer = builder.shutdownServer
+     this.headersDelayNanos = builder.headersDelayNanos
+     this.bodyDelayNanos = builder.bodyDelayNanos
+     this.trailersDelayNanos = builder.trailersDelayNanos
+@@ -182,7 +195,21 @@ public class MockResponse {
+     public var throttlePeriodNanos: Long
+       private set
+ 
+-    public var socketPolicy: SocketPolicy
++    public var failHandshake: Boolean
++      private set
++    public var onRequestStart: SocketEffect?
++      private set
++    public var doNotReadRequestBody: Boolean
++      private set
++    public var onRequestBody: SocketEffect?
++      private set
++    public var onResponseStart: SocketEffect?
++      private set
++    public var onResponseBody: SocketEffect?
++      private set
++    public var onResponseEnd: SocketEffect?
++      private set
++    public var shutdownServer: Boolean
+       private set
+ 
+     public var headersDelayNanos: Long
+@@ -214,7 +241,14 @@ public class MockResponse {
+       this.trailers_ = Headers.Builder()
+       this.throttleBytesPerPeriod = Long.MAX_VALUE
+       this.throttlePeriodNanos = 0L
+-      this.socketPolicy = KeepOpen
++      this.failHandshake = false
++      this.onRequestStart = null
++      this.doNotReadRequestBody = false
++      this.onRequestBody = null
++      this.onResponseStart = null
++      this.onResponseBody = null
++      this.onResponseEnd = null
++      this.shutdownServer = false
+       this.headersDelayNanos = 0L
+       this.bodyDelayNanos = 0L
+       this.trailersDelayNanos = 0L
+@@ -233,7 +267,14 @@ public class MockResponse {
+       this.webSocketListenerVar = mockResponse.webSocketListener
+       this.throttleBytesPerPeriod = mockResponse.throttleBytesPerPeriod
+       this.throttlePeriodNanos = mockResponse.throttlePeriodNanos
+-      this.socketPolicy = mockResponse.socketPolicy
++      this.failHandshake = mockResponse.failHandshake
++      this.onRequestStart = mockResponse.onRequestStart
++      this.doNotReadRequestBody = mockResponse.doNotReadRequestBody
++      this.onRequestBody = mockResponse.onRequestBody
++      this.onResponseStart = mockResponse.onResponseStart
++      this.onResponseBody = mockResponse.onResponseBody
++      this.onResponseEnd = mockResponse.onResponseEnd
++      this.shutdownServer = mockResponse.shutdownServer
+       this.headersDelayNanos = mockResponse.headersDelayNanos
+       this.bodyDelayNanos = mockResponse.bodyDelayNanos
+       this.trailersDelayNanos = mockResponse.trailersDelayNanos
+@@ -374,10 +415,56 @@ public class MockResponse {
+         this.trailers_ = trailers.newBuilder()
+       }
+ 
+-    /** Sets the socket policy and returns this. */
+-    public fun socketPolicy(socketPolicy: SocketPolicy): Builder =
++    /** Don't trust the client during the SSL handshake. */
++    public fun failHandshake(): Builder =
++      apply {
++        failHandshake = true
++      }
++
++    /** Trigger [socketEffect] before the request headers are read. */
++    public fun onRequestStart(socketEffect: SocketEffect?): Builder =
++      apply {
++        this.onRequestStart = socketEffect
++      }
++
++    /**
++     * Process the response without even attempting to reading the request body. For HTTP/2 this
++     * will close the response stream after the response body or trailers. For HTTP/1 this will
++     * close the socket after the response body or trailers.
++     */
++    public fun doNotReadRequestBody(): Builder =
++      apply {
++        doNotReadRequestBody = true
++        onResponseEnd = CloseStream(ErrorCode.NO_ERROR.httpCode)
++      }
++
++    /** Trigger [socketEffect] while reading the request body. */
++    public fun onRequestBody(socketEffect: SocketEffect?): Builder =
++      apply {
++        this.onRequestBody = socketEffect
++      }
++
++    /** Trigger [socketEffect] before the response headers are sent. */
++    public fun onResponseStart(socketEffect: SocketEffect?): Builder =
++      apply {
++        this.onResponseStart = socketEffect
++      }
++
++    /** Trigger [socketEffect] while writing the response body. */
++    public fun onResponseBody(socketEffect: SocketEffect?): Builder =
++      apply {
++        this.onResponseBody = socketEffect
++      }
++
++    /** Trigger [socketEffect] after writing the response body. */
++    public fun onResponseEnd(socketEffect: SocketEffect?): Builder =
++      apply {
++        this.onResponseEnd = socketEffect
++      }
++
++    public fun shutdownServer(shutdownServer: Boolean): Builder =
+       apply {
+-        this.socketPolicy = socketPolicy
++        this.shutdownServer = shutdownServer
+       }
+ 
+     /**
+diff --git a/mockwebserver/src/main/kotlin/mockwebserver3/MockWebServer.kt b/mockwebserver/src/main/kotlin/mockwebserver3/MockWebServer.kt
+index a77001e9c..bf6b9295b 100644
+--- a/mockwebserver/src/main/kotlin/mockwebserver3/MockWebServer.kt
++++ b/mockwebserver/src/main/kotlin/mockwebserver3/MockWebServer.kt
+@@ -50,20 +50,10 @@ import javax.net.ssl.SSLSocket
+ import javax.net.ssl.SSLSocketFactory
+ import javax.net.ssl.TrustManager
+ import javax.net.ssl.X509TrustManager
+-import mockwebserver3.SocketPolicy.DisconnectAfterRequest
+-import mockwebserver3.SocketPolicy.DisconnectAtEnd
+-import mockwebserver3.SocketPolicy.DisconnectAtStart
+-import mockwebserver3.SocketPolicy.DisconnectDuringRequestBody
+-import mockwebserver3.SocketPolicy.DisconnectDuringResponseBody
+-import mockwebserver3.SocketPolicy.DoNotReadRequestBody
+-import mockwebserver3.SocketPolicy.FailHandshake
+-import mockwebserver3.SocketPolicy.HalfCloseAfterRequest
+-import mockwebserver3.SocketPolicy.NoResponse
+-import mockwebserver3.SocketPolicy.ResetStreamAtStart
+-import mockwebserver3.SocketPolicy.ShutdownInputAtEnd
+-import mockwebserver3.SocketPolicy.ShutdownOutputAtEnd
+-import mockwebserver3.SocketPolicy.ShutdownServerAfterResponse
+-import mockwebserver3.SocketPolicy.StallSocketAtStart
++import mockwebserver3.SocketEffect.CloseSocket
++import mockwebserver3.SocketEffect.CloseStream
++import mockwebserver3.SocketEffect.ShutdownConnection
++import mockwebserver3.SocketEffect.Stall
+ import mockwebserver3.internal.DEFAULT_REQUEST_LINE_HTTP_1
+ import mockwebserver3.internal.DEFAULT_REQUEST_LINE_HTTP_2
+ import mockwebserver3.internal.RecordedRequest
+@@ -396,8 +386,8 @@ public class MockWebServer : Closeable {
+         return
+       }
+ 
+-      val socketPolicy = dispatcher.peek().socketPolicy
+-      if (socketPolicy === DisconnectAtStart) {
++      val peek = dispatcher.peek()
++      if (peek.onRequestStart is CloseSocket) {
+         dispatchBookkeepingRequest(
+           connectionIndex = nextConnectionIndex++,
+           exchangeIndex = 0,
+@@ -406,7 +396,7 @@ public class MockWebServer : Closeable {
+         socket.close()
+       } else {
+         openClientSockets.add(socket)
+-        serveConnection(nextConnectionIndex++, socket)
++        serveConnection(nextConnectionIndex++, socket, peek)
+       }
+     }
+   }
+@@ -433,10 +423,11 @@ public class MockWebServer : Closeable {
+   private fun serveConnection(
+     connectionIndex: Int,
+     raw: Socket,
++    firstExchangePeek: MockResponse,
+   ) {
+     taskRunner.newQueue().execute("MockWebServer ${raw.remoteSocketAddress}", cancelable = false) {
+       try {
+-        SocketHandler(connectionIndex, raw).handle()
++        SocketHandler(connectionIndex, raw, firstExchangePeek).handle()
+       } catch (e: IOException) {
+         logger.fine("$this connection from ${raw.inetAddress} failed: $e")
+       } catch (e: Exception) {
+@@ -448,6 +439,7 @@ public class MockWebServer : Closeable {
+   internal inner class SocketHandler(
+     private val connectionIndex: Int,
+     private val raw: Socket,
++    private val firstExchangePeek: MockResponse,
+   ) {
+     private var nextExchangeIndex = 0
+ 
+@@ -455,12 +447,11 @@ public class MockWebServer : Closeable {
+     fun handle() {
+       if (!processTunnelRequests()) return
+ 
+-      val socketPolicy = dispatcher.peek().socketPolicy
+       val protocol: Protocol
+       val socket: Socket
+       when {
+         sslSocketFactory != null -> {
+-          if (socketPolicy === FailHandshake) {
++          if (firstExchangePeek.failHandshake) {
+             dispatchBookkeepingRequest(
+               connectionIndex = connectionIndex,
+               exchangeIndex = nextExchangeIndex++,
+@@ -514,7 +505,7 @@ public class MockWebServer : Closeable {
+         }
+       }
+ 
+-      if (socketPolicy === StallSocketAtStart) {
++      if (firstExchangePeek.onRequestStart == Stall) {
+         dispatchBookkeepingRequest(
+           connectionIndex = connectionIndex,
+           exchangeIndex = nextExchangeIndex++,
+@@ -593,7 +584,7 @@ public class MockWebServer : Closeable {
+         return false // No more requests on this socket.
+       }
+ 
+-      val request = readRequest(socket, source, sink, connectionIndex, nextExchangeIndex)
++      val request = readRequest(socket, source, sink, connectionIndex, nextExchangeIndex++)
+       atomicRequestCount.incrementAndGet()
+       requestQueue.add(request)
+ 
+@@ -602,52 +593,41 @@ public class MockWebServer : Closeable {
+       }
+ 
+       val response = dispatcher.dispatch(request)
+-      if (response.socketPolicy === DisconnectAfterRequest) {
+-        socket.close()
+-        return false
+-      }
+-      if (response.socketPolicy === HalfCloseAfterRequest) {
+-        socket.shutdownOutput()
+-        return false
+-      }
+-      if (response.socketPolicy === NoResponse) {
+-        // This read should block until the socket is closed. (Because nobody is writing.)
+-        if (source.exhausted()) return false
+-        throw ProtocolException("unexpected data")
+-      }
+ 
+-      var reuseSocket = true
+-      val requestWantsWebSockets =
+-        "Upgrade".equals(request.headers["Connection"], ignoreCase = true) &&
+-          "websocket".equals(request.headers["Upgrade"], ignoreCase = true)
+-      val responseWantsWebSockets = response.webSocketListener != null
+-      if (requestWantsWebSockets && responseWantsWebSockets) {
+-        handleWebSocketUpgrade(socket, source, sink, request, response)
+-        reuseSocket = false
+-      } else {
+-        writeHttpResponse(socket, sink, response)
+-      }
++      try {
++        if (handleSocketEffect(response.onResponseStart, socket)) {
++          return false
++        }
+ 
+-      if (logger.isLoggable(Level.FINE)) {
+-        logger.fine(
+-          "${this@MockWebServer} received request: $request and responded: $response",
+-        )
+-      }
++        var reuseSocket = true
++        val requestWantsWebSockets =
++          "Upgrade".equals(request.headers["Connection"], ignoreCase = true) &&
++            "websocket".equals(request.headers["Upgrade"], ignoreCase = true)
++        val responseWantsWebSockets = response.webSocketListener != null
++        if (requestWantsWebSockets && responseWantsWebSockets) {
++          handleWebSocketUpgrade(socket, source, sink, request, response)
++          reuseSocket = false
++        } else {
++          writeHttpResponse(socket, sink, response)
++        }
+ 
+-      // See warnings associated with these socket policies in SocketPolicy.
+-      when (response.socketPolicy) {
+-        DisconnectAtEnd, is DoNotReadRequestBody -> {
+-          socket.close()
++        if (logger.isLoggable(Level.FINE)) {
++          logger.fine(
++            "${this@MockWebServer} received request: $request and responded: $response",
++          )
++        }
++
++        // See warnings associated with these socket policies in SocketPolicy.
++        if (handleSocketEffect(response.onResponseEnd, socket)) {
+           return false
+         }
+-        ShutdownInputAtEnd -> socket.shutdownInput()
+-        ShutdownOutputAtEnd -> socket.shutdownOutput()
+-        ShutdownServerAfterResponse -> close()
+-        else -> {
++
++        return reuseSocket
++      } finally {
++        if (response.shutdownServer) {
++          close()
+         }
+       }
+-      nextExchangeIndex++
+-      return reuseSocket
+     }
+   }
+ 
+@@ -666,7 +646,7 @@ public class MockWebServer : Closeable {
+     try {
+       socket.startHandshake() // we're testing a handshake failure
+       throw AssertionError()
+-    } catch (expected: IOException) {
++    } catch (_: IOException) {
+     }
+     socket.close()
+   }
+@@ -741,18 +721,17 @@ public class MockWebServer : Closeable {
+         writeHttpResponse(socket, sink, response)
+       }
+ 
+-      val policy = dispatcher.peek()
+       val requestBodySink =
+         requestBody
+-          .withThrottlingAndSocketPolicy(
+-            policy = policy,
+-            disconnectHalfway = policy.socketPolicy == DisconnectDuringRequestBody,
++          .withThrottlingAndSocketEffect(
++            policy = peek,
++            socketEffect = peek.onRequestBody,
+             expectedByteCount = contentLength,
+             socket = socket,
+           ).buffer()
+       requestBodySink.use {
+         when {
+-          policy.socketPolicy is DoNotReadRequestBody -> {
++          peek.doNotReadRequestBody -> {
+             hasBody = false // Ignore the body completely.
+           }
+ 
+@@ -889,9 +868,9 @@ public class MockWebServer : Closeable {
+     socket.sleepWhileOpen(response.bodyDelayNanos)
+     val responseBodySink =
+       sink
+-        .withThrottlingAndSocketPolicy(
++        .withThrottlingAndSocketEffect(
+           policy = response,
+-          disconnectHalfway = response.socketPolicy == DisconnectDuringResponseBody,
++          socketEffect = response.onResponseBody,
+           expectedByteCount = body.contentLength,
+           socket = socket,
+         ).buffer()
+@@ -920,11 +899,12 @@ public class MockWebServer : Closeable {
+   }
+ 
+   /** Returns a sink that applies throttling and disconnecting. */
+-  private fun Sink.withThrottlingAndSocketPolicy(
++  private fun Sink.withThrottlingAndSocketEffect(
+     policy: MockResponse,
+-    disconnectHalfway: Boolean,
++    socketEffect: SocketEffect?,
+     expectedByteCount: Long,
+     socket: Socket,
++    stream: Http2Stream? = null,
+   ): Sink {
+     var result: Sink = this
+ 
+@@ -938,7 +918,7 @@ public class MockWebServer : Closeable {
+         )
+     }
+ 
+-    if (disconnectHalfway) {
++    if (socketEffect != null) {
+       val halfwayByteCount =
+         when {
+           expectedByteCount != -1L -> expectedByteCount / 2
+@@ -950,13 +930,54 @@ public class MockWebServer : Closeable {
+           triggerByteCount = halfwayByteCount,
+         ) {
+           result.flush()
+-          socket.close()
++          handleSocketEffect(socketEffect, socket, stream)
+         }
+     }
+ 
+     return result
+   }
+ 
++  /** Returns true if processing this exchange is complete. */
++  private fun handleSocketEffect(
++    effect: SocketEffect?,
++    socket: Socket,
++    stream: Http2Stream? = null,
++  ): Boolean {
++    if (effect == null) return false
++
++    when (effect) {
++      is CloseStream -> {
++        if (stream != null) {
++          stream.close(ErrorCode.fromHttp2(effect.http2ErrorCode)!!, null)
++        } else {
++          socket.close()
++        }
++      }
++
++      ShutdownConnection -> {
++        if (stream != null) {
++          stream.connection.shutdown(ErrorCode.NO_ERROR)
++        } else {
++          socket.close()
++        }
++      }
++
++      is CloseSocket -> {
++        if (effect.shutdownInput) socket.shutdownInput()
++        if (effect.shutdownOutput) socket.shutdownOutput()
++        if (effect.closeSocket) socket.close()
++      }
++
++      Stall -> {
++        // Sleep until the socket is closed.
++        socket.sleepWhileOpen(TimeUnit.MINUTES.toNanos(60))
++        error("expected timeout")
++      }
++    }
++
++    return true
++  }
++
+   @Throws(IOException::class)
+   private fun readEmptyLine(source: BufferedSource) {
+     val line = source.readUtf8LineStrict()
+@@ -1017,15 +1038,14 @@ public class MockWebServer : Closeable {
+ 
+     @Throws(IOException::class)
+     override fun onStream(stream: Http2Stream) {
+-      val peekedResponse = dispatcher.peek()
+-      if (peekedResponse.socketPolicy is ResetStreamAtStart) {
++      val peek = dispatcher.peek()
++      if (handleSocketEffect(peek.onRequestStart, socket, stream)) {
+         dispatchBookkeepingRequest(
+           connectionIndex = connectionIndex,
+           exchangeIndex = nextExchangeIndex.getAndIncrement(),
+           socket = socket,
+           requestLine = DEFAULT_REQUEST_LINE_HTTP_2,
+         )
+-        stream.close(ErrorCode.fromHttp2(peekedResponse.socketPolicy.http2ErrorCode)!!, null)
+         return
+       }
+ 
+@@ -1036,29 +1056,25 @@ public class MockWebServer : Closeable {
+         return // Nothing to respond to.
+       }
+ 
+-      val response: MockResponse = dispatcher.dispatch(request)
+-
+-      val socketPolicy = response.socketPolicy
+-      if (socketPolicy === DisconnectAfterRequest) {
+-        socket.close()
+-        return
+-      }
+-      writeResponse(stream, request, response)
+-      if (logger.isLoggable(Level.FINE)) {
+-        logger.fine(
+-          "${this@MockWebServer} received request: $request " +
+-            "and responded: $response protocol is $protocol",
+-        )
+-      }
++      val response = dispatcher.dispatch(request)
+ 
+-      when (socketPolicy) {
+-        DisconnectAtEnd -> {
+-          stream.connection.shutdown(ErrorCode.NO_ERROR)
++      try {
++        if (handleSocketEffect(peek.onResponseStart, socket, stream)) {
++          return
+         }
+-        is DoNotReadRequestBody -> {
+-          stream.close(ErrorCode.fromHttp2(socketPolicy.http2ErrorCode)!!, null)
++
++        writeResponse(stream, request, response)
++        if (logger.isLoggable(Level.FINE)) {
++          logger.fine(
++            "${this@MockWebServer} received request: $request " +
++              "and responded: $response protocol is $protocol",
++          )
+         }
+-        else -> {
++
++        handleSocketEffect(peek.onResponseEnd, socket, stream)
++      } finally {
++        if (response.shutdownServer) {
++          close()
+         }
+       }
+     }
+@@ -1104,17 +1120,18 @@ public class MockWebServer : Closeable {
+         )
+       var exception: IOException? = null
+       var bodyByteString: ByteString? = null
+-      if (readBody && peek.socketHandler == null && peek.socketPolicy !is DoNotReadRequestBody) {
++      if (readBody && peek.socketHandler == null && !peek.doNotReadRequestBody) {
+         val body = Buffer()
+         try {
+           val contentLengthString = headers["content-length"]
+           val requestBodySink =
+             body
+-              .withThrottlingAndSocketPolicy(
++              .withThrottlingAndSocketEffect(
+                 policy = peek,
+-                disconnectHalfway = peek.socketPolicy == DisconnectDuringRequestBody,
++                socketEffect = peek.onRequestBody,
+                 expectedByteCount = contentLengthString?.toLong() ?: Long.MAX_VALUE,
+                 socket = socket,
++                stream = stream,
+               ).buffer()
+           requestBodySink.use {
+             it.writeAll(stream.source)
+@@ -1161,10 +1178,6 @@ public class MockWebServer : Closeable {
+       val settings = response.settings
+       stream.connection.setSettings(settings)
+ 
+-      if (response.socketPolicy === NoResponse) {
+-        return
+-      }
+-
+       val bodyDelayNanos = response.bodyDelayNanos
+       val trailers = response.trailers
+       val body = response.body
+@@ -1191,11 +1204,12 @@ public class MockWebServer : Closeable {
+         val responseBodySink =
+           stream
+             .sink
+-            .withThrottlingAndSocketPolicy(
++            .withThrottlingAndSocketEffect(
+               policy = response,
+-              disconnectHalfway = response.socketPolicy == DisconnectDuringResponseBody,
++              socketEffect = response.onResponseBody,
+               expectedByteCount = body.contentLength,
+               socket = socket,
++              stream = stream,
+             ).buffer()
+         responseBodySink.use {
+           body.writeTo(it)
+diff --git a/mockwebserver/src/main/kotlin/mockwebserver3/SocketEffect.kt b/mockwebserver/src/main/kotlin/mockwebserver3/SocketEffect.kt
+new file mode 100644
+index 000000000..c04cf3a0c
+--- /dev/null
++++ b/mockwebserver/src/main/kotlin/mockwebserver3/SocketEffect.kt
+@@ -0,0 +1,52 @@
++/*
++ * Copyright (C) 2025 Square, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package mockwebserver3
++
++/**
++ * An adverse action to take on a socket, intended to exercise failure modes in the calling code.
++ */
++public sealed interface SocketEffect {
++  /**
++   * Close the TCP socket that carries this request.
++   *
++   * Using this as [MockResponse.onResponseEnd] is the default for HTTP/1.0.
++   */
++  public class CloseSocket(
++    public val closeSocket: Boolean = true,
++    public val shutdownInput: Boolean = false,
++    public val shutdownOutput: Boolean = false,
++  ) : SocketEffect
++
++  /**
++   * On HTTP/2, send a [GOAWAY frame](https://tools.ietf.org/html/rfc7540#section-6.8) immediately
++   * after the response and will close the connection when the client's socket is exhausted.
++   *
++   * On HTTP/1 this closes the socket.
++   */
++  public object ShutdownConnection : SocketEffect
++
++  /**
++   * On HTTP/2 this will send the error code on the stream.
++   *
++   * On HTTP/1 this closes the socket.
++   */
++  public class CloseStream(
++    public val http2ErrorCode: Int = 0,
++  ) : SocketEffect
++
++  /** Stop processing this. */
++  public object Stall : SocketEffect
++}
+diff --git a/mockwebserver/src/main/kotlin/mockwebserver3/SocketPolicy.kt b/mockwebserver/src/main/kotlin/mockwebserver3/SocketPolicy.kt
+deleted file mode 100644
+index 5449c7df3..000000000
+--- a/mockwebserver/src/main/kotlin/mockwebserver3/SocketPolicy.kt
++++ /dev/null
+@@ -1,125 +0,0 @@
+-/*
+- * Copyright (C) 2011 Google Inc.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-package mockwebserver3
+-
+-import okhttp3.ExperimentalOkHttpApi
+-
+-/**
+- * What should be done with the incoming socket.
+- *
+- * Be careful when using values like [DisconnectAtEnd], [ShutdownInputAtEnd]
+- * and [ShutdownOutputAtEnd] that close a socket after a response, and where there are
+- * follow-up requests. The client is unblocked and free to continue as soon as it has received the
+- * entire response body. If and when the client makes a subsequent request using a pooled socket the
+- * server may not have had time to close the socket. The socket will be closed at an indeterminate
+- * point before or during the second request. It may be closed after client has started sending the
+- * request body. If a request body is not retryable then the client may fail the request, making
+- * client behavior non-deterministic. Add delays in the client to improve the chances that the
+- * server has closed the socket before follow up requests are made.
+- */
+-@ExperimentalOkHttpApi
+-public sealed interface SocketPolicy {
+-  /**
+-   * Shutdown [MockWebServer] after writing response.
+-   */
+-  public object ShutdownServerAfterResponse : SocketPolicy
+-
+-  /**
+-   * Keep the socket open after the response. This is the default HTTP/1.1 behavior.
+-   */
+-  public object KeepOpen : SocketPolicy
+-
+-  /**
+-   * Close the socket after the response. This is the default HTTP/1.0 behavior. For HTTP/2
+-   * connections, this sends a [GOAWAYframe](https://tools.ietf.org/html/rfc7540#section-6.8)
+-   * immediately after the response and will close the connection when the client's socket
+-   * is exhausted.
+-   *
+-   * See [SocketPolicy] for reasons why this can cause test flakiness and how to avoid it.
+-   */
+-  public object DisconnectAtEnd : SocketPolicy
+-
+-  /**
+-   * Request immediate close of connection without even reading the request. Use to simulate buggy
+-   * SSL servers closing connections in response to unrecognized TLS extensions.
+-   */
+-  public object DisconnectAtStart : SocketPolicy
+-
+-  /**
+-   * Close connection after reading the request but before writing the response. Use this to
+-   * simulate late connection pool failures.
+-   */
+-  public object DisconnectAfterRequest : SocketPolicy
+-
+-  /**
+-   * Half close connection (InputStream for client) after reading the request but before
+-   * writing the response. Use this to simulate late connection pool failures.
+-   */
+-  public object HalfCloseAfterRequest : SocketPolicy
+-
+-  /** Close connection after reading half of the request body (if present). */
+-  public object DisconnectDuringRequestBody : SocketPolicy
+-
+-  /** Close connection after writing half of the response body (if present). */
+-  public object DisconnectDuringResponseBody : SocketPolicy
+-
+-  /**
+-   * Process the response without even attempting to reading the request body. For HTTP/2 this will
+-   * send [http2ErrorCode] after the response body or trailers. For HTTP/1 this will close the
+-   * socket after the response body or trailers.
+-   */
+-  public class DoNotReadRequestBody(
+-    public val http2ErrorCode: Int = 0,
+-  ) : SocketPolicy
+-
+-  /** Don't trust the client during the SSL handshake. */
+-  public object FailHandshake : SocketPolicy
+-
+-  /**
+-   * Shutdown the socket input after sending the response. For testing bad behavior.
+-   *
+-   * See [SocketPolicy] for reasons why this can cause test flakiness and how to avoid it.
+-   */
+-  public object ShutdownInputAtEnd : SocketPolicy
+-
+-  /**
+-   * Shutdown the socket output after sending the response. For testing bad behavior.
+-   *
+-   * See [SocketPolicy] for reasons why this can cause test flakiness and how to avoid it.
+-   */
+-  public object ShutdownOutputAtEnd : SocketPolicy
+-
+-  /**
+-   * After accepting the connection and doing TLS (if configured) don't do HTTP/1.1 or HTTP/2
+-   * framing. Ignore the socket completely until the server is shut down.
+-   */
+-  public object StallSocketAtStart : SocketPolicy
+-
+-  /**
+-   * Read the request but don't respond to it. Just keep the socket open. For testing read response
+-   * header timeout issue.
+-   */
+-  public object NoResponse : SocketPolicy
+-
+-  /**
+-   * Fail HTTP/2 requests without processing them by sending [http2ErrorCode].
+-   */
+-  @ExperimentalOkHttpApi
+-  public class ResetStreamAtStart(
+-    public val http2ErrorCode: Int = 0,
+-  ) : SocketPolicy
+-}

@@ -1,0 +1,145 @@
+diff --git a/extensions/jackson/deployment/src/main/java/io/quarkus/jackson/deployment/JacksonProcessor.java b/extensions/jackson/deployment/src/main/java/io/quarkus/jackson/deployment/JacksonProcessor.java
+index cacde752569..728a7af62d9 100644
+--- a/extensions/jackson/deployment/src/main/java/io/quarkus/jackson/deployment/JacksonProcessor.java
++++ b/extensions/jackson/deployment/src/main/java/io/quarkus/jackson/deployment/JacksonProcessor.java
+@@ -56,7 +56,7 @@
+ import io.quarkus.deployment.annotations.ExecutionTime;
+ import io.quarkus.deployment.annotations.Record;
+ import io.quarkus.deployment.builditem.CombinedIndexBuildItem;
+-import io.quarkus.deployment.builditem.ShutdownListenerBuildItem;
++import io.quarkus.deployment.builditem.ShutdownContextBuildItem;
+ import io.quarkus.deployment.builditem.nativeimage.ReflectiveClassBuildItem;
+ import io.quarkus.deployment.builditem.nativeimage.ReflectiveHierarchyBuildItem;
+ import io.quarkus.deployment.builditem.nativeimage.ReflectiveMethodBuildItem;
+@@ -534,8 +534,8 @@ public SyntheticBeanBuildItem jacksonSupport(JacksonRecorder recorder,
+ 
+     @Record(ExecutionTime.RUNTIME_INIT)
+     @BuildStep
+-    public ShutdownListenerBuildItem clearCachesOnShutdown(JacksonRecorder recorder) {
+-        return new ShutdownListenerBuildItem(recorder.clearCachesOnShutdown());
++    public void clearCachesOnShutdown(JacksonRecorder recorder, ShutdownContextBuildItem shutdown) {
++        recorder.clearCachesOnShutdown(shutdown);
+     }
+ 
+     private Optional<String> determinePropertyNamingStrategyClassName(JacksonBuildTimeConfig jacksonBuildTimeConfig) {
+diff --git a/extensions/jackson/runtime/src/main/java/io/quarkus/jackson/runtime/JacksonRecorder.java b/extensions/jackson/runtime/src/main/java/io/quarkus/jackson/runtime/JacksonRecorder.java
+index 2a73f295741..1ff838e9ed3 100644
+--- a/extensions/jackson/runtime/src/main/java/io/quarkus/jackson/runtime/JacksonRecorder.java
++++ b/extensions/jackson/runtime/src/main/java/io/quarkus/jackson/runtime/JacksonRecorder.java
+@@ -9,10 +9,10 @@
+ import com.fasterxml.jackson.databind.type.TypeFactory;
+ 
+ import io.quarkus.jackson.ObjectMapperCustomizer;
++import io.quarkus.runtime.ShutdownContext;
+ import io.quarkus.runtime.annotations.Recorder;
+ import io.quarkus.runtime.annotations.RuntimeInit;
+ import io.quarkus.runtime.annotations.StaticInit;
+-import io.quarkus.runtime.shutdown.ShutdownListener;
+ 
+ @Recorder
+ public class JacksonRecorder {
+@@ -68,12 +68,12 @@ public int priority() {
+     }
+ 
+     @RuntimeInit
+-    public ShutdownListener clearCachesOnShutdown() {
+-        return new ShutdownListener() {
++    public void clearCachesOnShutdown(ShutdownContext shutdownContext) {
++        shutdownContext.addShutdownTask(new Runnable() {
+             @Override
+-            public void shutdown(ShutdownNotification notification) {
++            public void run() {
+                 TypeFactory.defaultInstance().clearCache();
+             }
+-        };
++        });
+     }
+ }
+diff --git a/integration-tests/jackson/pom.xml b/integration-tests/jackson/pom.xml
+index 414a348832b..fb1bbe0adc2 100644
+--- a/integration-tests/jackson/pom.xml
++++ b/integration-tests/jackson/pom.xml
+@@ -14,6 +14,10 @@
+     <name>Quarkus - Integration Tests - Jackson</name>
+     <description>Jackson integration tests module</description>
+ 
++    <properties>
++        <skipPMTests>${skipTests}</skipPMTests>
++    </properties>
++
+     <dependencies>
+         <dependency>
+             <groupId>io.quarkus</groupId>
+@@ -29,6 +33,11 @@
+             <artifactId>quarkus-junit</artifactId>
+             <scope>test</scope>
+         </dependency>
++        <dependency>
++            <groupId>io.quarkus</groupId>
++            <artifactId>quarkus-junit-internal</artifactId>
++            <scope>test</scope>
++        </dependency>
+         <dependency>
+             <groupId>io.rest-assured</groupId>
+             <artifactId>rest-assured</artifactId>
+@@ -39,6 +48,11 @@
+             <artifactId>assertj-core</artifactId>
+             <scope>test</scope>
+         </dependency>
++        <dependency>
++            <groupId>org.awaitility</groupId>
++            <artifactId>awaitility</artifactId>
++            <scope>test</scope>
++        </dependency>
+ 
+         <!-- Minimal test dependencies to *-deployment artifacts for consistent build order -->
+         <dependency>
+@@ -103,9 +117,24 @@
+                 <plugins>
+                     <plugin>
+                         <artifactId>maven-surefire-plugin</artifactId>
+-                        <configuration>
+-                            <skip>true</skip>
+-                        </configuration>
++                        <executions>
++                            <!--
++                            The prod mode tests need to be part of a different execution to ensure that they don't mess with the standard tests.
++                            By adding this configuration we ensure that the maven surefire plugin will execute twice, one for the regular **/*Test.java
++                            tests (using the 'default-test' execution), and one for the prod mode tests (this 'prod-mode' execution)
++                            -->
++                            <execution>
++                                <id>prod-mode</id>
++                                <phase>test</phase>
++                                <goals>
++                                    <goal>test</goal>
++                                </goals>
++                                <configuration>
++                                    <includes>**/*PMT.java</includes>
++                                    <skip>${skipPMTests}</skip>
++                                </configuration>
++                            </execution>
++                        </executions>
+                     </plugin>
+                 </plugins>
+             </build>
+diff --git a/integration-tests/jackson/src/main/java/io/quarkus/it/jackson/ExitResource.java b/integration-tests/jackson/src/main/java/io/quarkus/it/jackson/ExitResource.java
+new file mode 100644
+index 00000000000..0ebe8556772
+--- /dev/null
++++ b/integration-tests/jackson/src/main/java/io/quarkus/it/jackson/ExitResource.java
+@@ -0,0 +1,15 @@
++package io.quarkus.it.jackson;
++
++import jakarta.ws.rs.POST;
++import jakarta.ws.rs.Path;
++
++import io.quarkus.runtime.Quarkus;
++
++@Path("exit")
++public class ExitResource {
++
++    @POST
++    public void exit() {
++        Quarkus.asyncExit();
++    }
++}

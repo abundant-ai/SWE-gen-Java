@@ -1,0 +1,322 @@
+diff --git a/extensions/vertx-http/runtime/src/main/java/io/quarkus/vertx/http/runtime/FormAuthConfig.java b/extensions/vertx-http/runtime/src/main/java/io/quarkus/vertx/http/runtime/FormAuthConfig.java
+index 597ade33ae7..9326664d8e8 100644
+--- a/extensions/vertx-http/runtime/src/main/java/io/quarkus/vertx/http/runtime/FormAuthConfig.java
++++ b/extensions/vertx-http/runtime/src/main/java/io/quarkus/vertx/http/runtime/FormAuthConfig.java
+@@ -2,7 +2,10 @@
+ 
+ import java.time.Duration;
+ import java.util.Optional;
++import java.util.Set;
+ 
++import io.quarkus.runtime.configuration.TrimmedStringConverter;
++import io.smallrye.config.WithConverter;
+ import io.smallrye.config.WithDefault;
+ 
+ /**
+@@ -24,6 +27,15 @@ enum CookieSameSite {
+     @WithDefault("/login.html")
+     Optional<String> loginPage();
+ 
++    /**
++     * List of query parameters that should be passed through when Quarkus redirects requests to the login page.
++     * For example, if a request to the `/secured-path?query_param=1&other_query_param=2` is redirected
++     * on the authentication failure to the login page and this property is set to the `other_query_param`,
++     * then the resulting redirect path will be `/login.html?other_query_param=2`.
++     * By default, no request query parameters are passed through.
++     */
++    Optional<Set<@WithConverter(TrimmedStringConverter.class) String>> loginPageQueryParams();
++
+     /**
+      * The username field name.
+      */
+@@ -42,6 +54,17 @@ enum CookieSameSite {
+     @WithDefault("/error.html")
+     Optional<String> errorPage();
+ 
++    /**
++     * List of query parameters that should be passed through when Quarkus redirects requests to the error page.
++     * For example, if the POST request to the `/j_security_check?query_param=1&other_query_param=2` is redirected
++     * on the authentication failure to the error page and this property is set to the `other_query_param`,
++     * then the resulting redirect path will be `/error.html?other_query_param=2`.
++     * By default, only query parameters configured with the `quarkus.http.auth.form.login-page-query-params` property are
++     * passed through.
++     */
++    @WithDefault("${quarkus.http.auth.form.login-page-query-params:}")
++    Optional<Set<@WithConverter(TrimmedStringConverter.class) String>> errorPageQueryParams();
++
+     /**
+      * The landing page to redirect to if there is no saved page to redirect back to.
+      * Redirect to landing page can be disabled by setting `quarkus.http.auth.form.landing-page=`.
+@@ -49,6 +72,17 @@ enum CookieSameSite {
+     @WithDefault("/index.html")
+     Optional<String> landingPage();
+ 
++    /**
++     * List of query parameters that should be passed through when Quarkus redirects requests to the landing page.
++     * For example, if the POST request to the `/j_security_check?query_param=1&other_query_param=2` is redirected
++     * on the authentication success to the landing page and this property is set to the `other_query_param`,
++     * then the resulting redirect path will be `/index.html?other_query_param=2`.
++     * By default, only query parameters configured with the `quarkus.http.auth.form.login-page-query-params` property are
++     * passed through.
++     */
++    @WithDefault("${quarkus.http.auth.form.login-page-query-params:}")
++    Optional<Set<@WithConverter(TrimmedStringConverter.class) String>> landingPageQueryParams();
++
+     /**
+      * Option to disable redirect to landingPage if there is no saved page to redirect back to. Form Auth POST is followed
+      * by redirect to landingPage by default.
+diff --git a/extensions/vertx-http/runtime/src/main/java/io/quarkus/vertx/http/runtime/security/FormAuthenticationMechanism.java b/extensions/vertx-http/runtime/src/main/java/io/quarkus/vertx/http/runtime/security/FormAuthenticationMechanism.java
+index b28e6ba849c..005cc4ba528 100644
+--- a/extensions/vertx-http/runtime/src/main/java/io/quarkus/vertx/http/runtime/security/FormAuthenticationMechanism.java
++++ b/extensions/vertx-http/runtime/src/main/java/io/quarkus/vertx/http/runtime/security/FormAuthenticationMechanism.java
+@@ -5,6 +5,8 @@
+ import static io.quarkus.vertx.http.runtime.security.RoutingContextAwareSecurityIdentity.addRoutingCtxToIdentityIfMissing;
+ 
+ import java.net.URI;
++import java.net.URLEncoder;
++import java.nio.charset.StandardCharsets;
+ import java.security.SecureRandom;
+ import java.time.Duration;
+ import java.util.Arrays;
+@@ -15,6 +17,7 @@
+ import java.util.Set;
+ import java.util.function.Consumer;
+ import java.util.function.Function;
++import java.util.stream.Collectors;
+ 
+ import jakarta.enterprise.event.Event;
+ 
+@@ -65,6 +68,9 @@ public class FormAuthenticationMechanism implements HttpAuthenticationMechanism
+     private final boolean isFormAuthEventObserver;
+     private final PersistentLoginManager loginManager;
+     private final Event<FormAuthenticationEvent> formAuthEvent;
++    private final Set<String> landingPageQueryParams;
++    private final Set<String> errorPageQueryParams;
++    private final Set<String> loginPageQueryParams;
+ 
+     //the temp encryption key, persistent across dev mode restarts
+     static volatile String encryptionKey;
+@@ -107,6 +113,9 @@ public FormAuthenticationMechanism(FormAuthConfig runtimeForm, Optional<String>
+         this.formAuthEvent = this.isFormAuthEventObserver
+                 ? Arc.container().beanManager().getEvent().select(FormAuthenticationEvent.class)
+                 : null;
++        this.landingPageQueryParams = runtimeForm.landingPageQueryParams().filter(p -> !p.isEmpty()).orElse(null);
++        this.loginPageQueryParams = runtimeForm.loginPageQueryParams().filter(p -> !p.isEmpty()).orElse(null);
++        this.errorPageQueryParams = runtimeForm.errorPageQueryParams().filter(p -> !p.isEmpty()).orElse(null);
+     }
+ 
+     /**
+@@ -133,6 +142,9 @@ public FormAuthenticationMechanism(String loginPage, String postLocation,
+         this.loginManager = loginManager;
+         this.isFormAuthEventObserver = false;
+         this.formAuthEvent = null;
++        this.landingPageQueryParams = null;
++        this.loginPageQueryParams = null;
++        this.errorPageQueryParams = null;
+     }
+ 
+     public Uni<SecurityIdentity> runFormAuth(final RoutingContext exchange,
+@@ -217,7 +229,7 @@ protected void handleRedirectBack(final RoutingContext exchange) {
+                 throw new IllegalStateException(
+                         "Landing page is no set, please make sure 'quarkus.http.auth.form.landing-page' is configured properly.");
+             }
+-            location = exchange.request().scheme() + "://" + exchange.request().authority() + landingPage;
++            location = assembleRedirectLocation(exchange, landingPage, landingPageQueryParams);
+         }
+         exchange.response().setStatusCode(302);
+         exchange.response().headers().add(HttpHeaderNames.LOCATION, location);
+@@ -245,22 +257,60 @@ protected void storeInitialLocation(final RoutingContext exchange) {
+         exchange.response().addCookie(cookie);
+     }
+ 
++    /**
++     * @deprecated this method hasn't been used by this class for some time now; if you implement this mechanism
++     *             and have a use case with this method, please let us no so that we can document and test it
++     */
++    @Deprecated(since = "3.31", forRemoval = true)
+     protected void servePage(final RoutingContext exchange, final String location) {
+         sendRedirect(exchange, location);
+     }
+ 
+     static void sendRedirect(final RoutingContext exchange, final String location) {
+-        String loc = exchange.request().scheme() + "://" + exchange.request().authority() + location;
++        String loc = assembleRedirectLocation(exchange, location, null);
+         exchange.response().headers().add(HttpHeaderNames.LOCATION, loc);
+         exchange.response().setStatusCode(302);
+         exchange.response().end();
+     }
+ 
+-    static Uni<ChallengeData> getRedirect(final RoutingContext exchange, final String location) {
+-        String loc = exchange.request().scheme() + "://" + exchange.request().authority() + location;
++    static Uni<ChallengeData> getRedirect(final RoutingContext exchange, final String location,
++            Set<String> redirectQueryParams) {
++        String loc = assembleRedirectLocation(exchange, location, redirectQueryParams);
+         return Uni.createFrom().item(new ChallengeData(302, "Location", loc));
+     }
+ 
++    private static String assembleRedirectLocation(RoutingContext exchange, String path, Set<String> redirectQueryParams) {
++        var location = exchange.request().scheme() + "://" + exchange.request().authority() + path;
++        if (redirectQueryParams != null) {
++            // add certain query params from the active HTTP request to the redirect location
++            String queryString = exchange.queryParams().names().stream()
++                    .filter(redirectQueryParams::contains)
++                    .flatMap(queryName -> exchange.queryParam(queryName).stream()
++                            .map(queryValue -> queryName + "=" + urlEncode(queryValue)))
++                    .collect(Collectors.joining("&"));
++
++            if (!queryString.isEmpty()) {
++                if (path.contains("?")) {
++                    location += "&" + queryString;
++                } else {
++                    location += "?" + queryString;
++                }
++            }
++        }
++        return location;
++    }
++
++    private static String urlEncode(String value) {
++        try {
++            return URLEncoder.encode(value, StandardCharsets.UTF_8)
++                    // force stricter encoding (RFC 3986 uses %20) to have cookie 'quarkus-redirect-location'
++                    // and the header location encoded similarly
++                    .replace("+", "%20");
++        } catch (Exception ex) {
++            throw new RuntimeException(ex);
++        }
++    }
++
+     @Override
+     public Uni<SecurityIdentity> authenticate(RoutingContext context,
+             IdentityProviderManager identityProviderManager) {
+@@ -310,14 +360,14 @@ public Uni<ChallengeData> getChallenge(RoutingContext context) {
+             if (redirectToErrorPage) {
+                 log.debugf("Serving form auth error page %s for %s", errorPage, context);
+                 // This method would no longer be called if authentication had already occurred.
+-                return getRedirect(context, errorPage);
++                return getRedirect(context, errorPage, errorPageQueryParams);
+             }
+         } else {
+             if (redirectToLoginPage) {
+                 log.debugf("Serving login form %s for %s", loginPage, context);
+                 // we need to store the URL
+                 storeInitialLocation(context);
+-                return getRedirect(context, loginPage);
++                return getRedirect(context, loginPage, loginPageQueryParams);
+             }
+         }
+ 
+diff --git a/extensions/vertx-http/runtime/src/main/java/io/quarkus/vertx/http/security/Form.java b/extensions/vertx-http/runtime/src/main/java/io/quarkus/vertx/http/security/Form.java
+index c5ef491f959..43311ebe76d 100644
+--- a/extensions/vertx-http/runtime/src/main/java/io/quarkus/vertx/http/security/Form.java
++++ b/extensions/vertx-http/runtime/src/main/java/io/quarkus/vertx/http/security/Form.java
+@@ -3,6 +3,7 @@
+ import java.time.Duration;
+ import java.util.Objects;
+ import java.util.Optional;
++import java.util.Set;
+ 
+ import org.eclipse.microprofile.config.ConfigProvider;
+ 
+@@ -58,6 +59,9 @@ final class Builder {
+         private FormAuthConfig.CookieSameSite cookieSameSite;
+         private Optional<Duration> cookieMaxAge;
+         private Optional<String> encryptionKey;
++        private Optional<Set<String>> landingPageQueryParams;
++        private Optional<Set<String>> errorPageQueryParams;
++        private Optional<Set<String>> loginPageQueryParams;
+ 
+         public Builder() {
+             this(ConfigProvider.getConfig().unwrap(SmallRyeConfig.class).getConfigMapping(VertxHttpConfig.class));
+@@ -82,6 +86,9 @@ private Builder(VertxHttpConfig vertxHttpConfig) {
+             this.cookieSameSite = formAuthConfig.cookieSameSite();
+             this.cookieMaxAge = formAuthConfig.cookieMaxAge();
+             this.encryptionKey = vertxHttpConfig.encryptionKey();
++            this.landingPageQueryParams = formAuthConfig.landingPageQueryParams();
++            this.errorPageQueryParams = formAuthConfig.errorPageQueryParams();
++            this.loginPageQueryParams = formAuthConfig.loginPageQueryParams();
+         }
+ 
+         /**
+@@ -109,6 +116,20 @@ public Builder loginPage(String loginPage) {
+             return this;
+         }
+ 
++        /**
++         * Configures query parameters Quarkus passes through when redirecting requests to the login page.
++         *
++         * @param queryParameters query parameters; must not be null
++         * @return Builder
++         * @see FormAuthConfig#loginPageQueryParams()
++         */
++        public Builder loginPageQueryParameters(String... queryParameters) {
++            if (queryParameters != null) {
++                this.loginPageQueryParams = Optional.of(Set.of(queryParameters));
++            }
++            return this;
++        }
++
+         /**
+          * Configures the username field name.
+          *
+@@ -147,6 +168,20 @@ public Builder errorPage(String errorPage) {
+             return this;
+         }
+ 
++        /**
++         * Configures query parameters Quarkus passes through when redirecting requests to the error page.
++         *
++         * @param queryParameters query parameters; must not be null
++         * @return Builder
++         * @see FormAuthConfig#errorPageQueryParams()
++         */
++        public Builder errorPageQueryParameters(String... queryParameters) {
++            if (queryParameters != null) {
++                this.errorPageQueryParams = Optional.of(Set.of(queryParameters));
++            }
++            return this;
++        }
++
+         /**
+          * Configures the landing page to redirect to if there is no saved page to redirect back to.
+          *
+@@ -159,6 +194,20 @@ public Builder landingPage(String landingPage) {
+             return this;
+         }
+ 
++        /**
++         * Configures query parameters Quarkus passes through when redirecting requests to the landing page.
++         *
++         * @param queryParameters query parameters; must not be null
++         * @return Builder
++         * @see FormAuthConfig#landingPageQueryParams()
++         */
++        public Builder landingPageQueryParameters(String... queryParameters) {
++            if (queryParameters != null) {
++                this.landingPageQueryParams = Optional.of(Set.of(queryParameters));
++            }
++            return this;
++        }
++
+         /**
+          * Configures a name for the cookie that is used to redirect the user back to the location they want to access.
+          *
+@@ -303,13 +352,14 @@ record FormConfigImpl(Optional<String> loginPage, String usernameParameter, Stri
+                     Optional<String> errorPage, Optional<String> landingPage, boolean redirectAfterLogin,
+                     String locationCookie, Duration timeout, Duration newCookieInterval, String cookieName,
+                     Optional<String> cookiePath, Optional<String> cookieDomain, boolean httpOnlyCookie,
+-                    CookieSameSite cookieSameSite, Optional<Duration> cookieMaxAge, String postLocation)
+-                    implements
+-                        FormAuthConfig {
++                    CookieSameSite cookieSameSite, Optional<Duration> cookieMaxAge, String postLocation,
++                    Optional<Set<String>> landingPageQueryParams, Optional<Set<String>> errorPageQueryParams,
++                    Optional<Set<String>> loginPageQueryParams) implements FormAuthConfig {
+             }
+             return new FormConfigImpl(loginPage, usernameParameter, passwordParameter, errorPage,
+                     landingPage, redirectAfterLogin, locationCookie, timeout, newCookieInterval, cookieName, cookiePath,
+-                    cookieDomain, httpOnlyCookie, cookieSameSite, cookieMaxAge, postLocation);
++                    cookieDomain, httpOnlyCookie, cookieSameSite, cookieMaxAge, postLocation, landingPageQueryParams,
++                    errorPageQueryParams, loginPageQueryParams);
+         }
+     }
+ }

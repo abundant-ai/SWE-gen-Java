@@ -1,0 +1,204 @@
+diff --git a/mockwebserver-deprecated/src/main/kotlin/okhttp3/mockwebserver/DeprecationBridge.kt b/mockwebserver-deprecated/src/main/kotlin/okhttp3/mockwebserver/DeprecationBridge.kt
+index d6813ff4b..337fc26fe 100644
+--- a/mockwebserver-deprecated/src/main/kotlin/okhttp3/mockwebserver/DeprecationBridge.kt
++++ b/mockwebserver-deprecated/src/main/kotlin/okhttp3/mockwebserver/DeprecationBridge.kt
+@@ -31,6 +31,7 @@ import mockwebserver3.SocketPolicy.ShutdownOutputAtEnd
+ import mockwebserver3.SocketPolicy.ShutdownServerAfterResponse
+ import mockwebserver3.SocketPolicy.StallSocketAtStart
+ import okio.Buffer
++import okio.ByteString
+ 
+ internal fun Dispatcher.wrap(): mockwebserver3.Dispatcher {
+   if (this is QueueDispatcher) return this.delegate
+@@ -98,7 +99,7 @@ internal fun mockwebserver3.RecordedRequest.unwrap(): RecordedRequest =
+     headers = headers,
+     chunkSizes = chunkSizes,
+     bodySize = bodySize,
+-    body = Buffer().write(body),
++    body = Buffer().write(body ?: ByteString.EMPTY),
+     sequenceNumber = sequenceNumber,
+     failure = failure,
+     method = method,
+diff --git a/mockwebserver/src/main/kotlin/mockwebserver3/MockWebServer.kt b/mockwebserver/src/main/kotlin/mockwebserver3/MockWebServer.kt
+index c63d01e2f..4e637e076 100644
+--- a/mockwebserver/src/main/kotlin/mockwebserver3/MockWebServer.kt
++++ b/mockwebserver/src/main/kotlin/mockwebserver3/MockWebServer.kt
+@@ -95,6 +95,7 @@ import okhttp3.internal.ws.WebSocketProtocol
+ import okio.Buffer
+ import okio.BufferedSink
+ import okio.BufferedSource
++import okio.ByteString
+ import okio.Sink
+ import okio.Timeout
+ import okio.buffer
+@@ -659,13 +660,13 @@ public class MockWebServer : Closeable {
+   ) {
+     val request =
+       RecordedRequest(
+-        DEFAULT_REQUEST_LINE,
+-        headersOf(),
+-        emptyList(),
+-        0L,
+-        Buffer(),
+-        sequenceNumber,
+-        socket,
++        requestLine = DEFAULT_REQUEST_LINE,
++        headers = headersOf(),
++        chunkSizes = emptyList(),
++        bodySize = 0L,
++        body = null,
++        sequenceNumber = sequenceNumber,
++        socket = socket,
+       )
+     atomicRequestCount.incrementAndGet()
+     requestQueue.add(request)
+@@ -684,6 +685,7 @@ public class MockWebServer : Closeable {
+     val headers = Headers.Builder()
+     var contentLength = -1L
+     var chunked = false
++    var hasBody = false
+     val requestBody = TruncatingBuffer(bodyLimit)
+     val chunkSizes = mutableListOf<Int>()
+     var failure: IOException? = null
+@@ -717,7 +719,6 @@ public class MockWebServer : Closeable {
+         writeHttpResponse(socket, sink, response)
+       }
+ 
+-      var hasBody = false
+       val policy = dispatcher.peek()
+       val requestBodySink =
+         requestBody
+@@ -730,11 +731,11 @@ public class MockWebServer : Closeable {
+       requestBodySink.use {
+         when {
+           policy.socketPolicy is DoNotReadRequestBody -> {
+-            // Ignore the body completely.
++            hasBody = false // Ignore the body completely.
+           }
+ 
+           contentLength != -1L -> {
+-            hasBody = contentLength > 0L
++            hasBody = contentLength > 0L || HttpMethod.permitsRequestBody(request.method)
+             requestBodySink.write(source, contentLength)
+           }
+ 
+@@ -752,7 +753,9 @@ public class MockWebServer : Closeable {
+             }
+           }
+ 
+-          else -> Unit // No request body.
++          else -> {
++            hasBody = false // No request body.
++          }
+         }
+       }
+ 
+@@ -768,7 +771,11 @@ public class MockWebServer : Closeable {
+       headers = headers.build(),
+       chunkSizes = chunkSizes,
+       bodySize = requestBody.receivedByteCount,
+-      body = requestBody.buffer,
++      body =
++        when {
++          hasBody -> requestBody.buffer.readByteString()
++          else -> null
++        },
+       sequenceNumber = sequenceNumber,
+       socket = socket,
+       failure = failure,
+@@ -1060,7 +1067,6 @@ public class MockWebServer : Closeable {
+         }
+       }
+ 
+-      val body = Buffer()
+       val requestLine =
+         RequestLine(
+           method = method,
+@@ -1068,7 +1074,9 @@ public class MockWebServer : Closeable {
+           version = "HTTP/1.1",
+         )
+       var exception: IOException? = null
++      var bodyByteString: ByteString? = null
+       if (readBody && peek.socketHandler == null && peek.socketPolicy !is DoNotReadRequestBody) {
++        val body = Buffer()
+         try {
+           val contentLengthString = headers["content-length"]
+           val requestBodySink =
+@@ -1084,6 +1092,8 @@ public class MockWebServer : Closeable {
+           }
+         } catch (e: IOException) {
+           exception = e
++        } finally {
++          bodyByteString = body.readByteString()
+         }
+       }
+ 
+@@ -1091,8 +1101,12 @@ public class MockWebServer : Closeable {
+         requestLine = requestLine,
+         headers = headers,
+         chunkSizes = emptyList(),
+-        bodySize = body.size,
+-        body = body,
++        bodySize = bodyByteString?.size?.toLong() ?: 0,
++        body =
++          when {
++            HttpMethod.permitsRequestBody(method) -> bodyByteString
++            else -> null
++          },
+         sequenceNumber = sequenceNumber.getAndIncrement(),
+         socket = socket,
+         failure = exception,
+@@ -1198,7 +1212,7 @@ public class MockWebServer : Closeable {
+             headers = pushPromise.headers,
+             chunkSizes = chunkSizes,
+             bodySize = 0,
+-            body = Buffer(),
++            body = null,
+             sequenceNumber = sequenceNumber.getAndIncrement(),
+             socket = socket,
+           ),
+diff --git a/mockwebserver/src/main/kotlin/mockwebserver3/RecordedRequest.kt b/mockwebserver/src/main/kotlin/mockwebserver3/RecordedRequest.kt
+index a9ebc77a2..e98b45554 100644
+--- a/mockwebserver/src/main/kotlin/mockwebserver3/RecordedRequest.kt
++++ b/mockwebserver/src/main/kotlin/mockwebserver3/RecordedRequest.kt
+@@ -62,8 +62,8 @@ public class RecordedRequest(
+   public val url: HttpUrl,
+   /** All headers. */
+   public val headers: Headers,
+-  /** The body of this request, or [ByteString.EMPTY] if it has none. This may be truncated. */
+-  public val body: ByteString,
++  /** The body of this request, or null if it has none. This may be truncated. */
++  public val body: ByteString?,
+   /** The total size of the body of this request (before truncation).*/
+   public val bodySize: Long,
+   /**
+diff --git a/mockwebserver/src/main/kotlin/mockwebserver3/internal/RecordedRequestFactory.kt b/mockwebserver/src/main/kotlin/mockwebserver3/internal/RecordedRequestFactory.kt
+index 000de9712..8869e4267 100644
+--- a/mockwebserver/src/main/kotlin/mockwebserver3/internal/RecordedRequestFactory.kt
++++ b/mockwebserver/src/main/kotlin/mockwebserver3/internal/RecordedRequestFactory.kt
+@@ -28,14 +28,14 @@ import okhttp3.HttpUrl
+ import okhttp3.HttpUrl.Companion.toHttpUrl
+ import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+ import okhttp3.internal.platform.Platform
+-import okio.Buffer
++import okio.ByteString
+ 
+ internal fun RecordedRequest(
+   requestLine: RequestLine,
+   headers: Headers,
+   chunkSizes: List<Int>,
+   bodySize: Long,
+-  body: Buffer,
++  body: ByteString?,
+   sequenceNumber: Int,
+   socket: Socket,
+   failure: IOException? = null,
+@@ -71,7 +71,7 @@ internal fun RecordedRequest(
+     version = requestLine.version,
+     url = requestUrl,
+     headers = headers,
+-    body = body.readByteString(),
++    body = body,
+     bodySize = bodySize,
+     chunkSizes = chunkSizes,
+     failure = failure,

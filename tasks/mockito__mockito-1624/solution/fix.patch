@@ -1,0 +1,432 @@
+diff --git a/src/main/java/org/mockito/Mockito.java b/src/main/java/org/mockito/Mockito.java
+index e2a0ade37..0d85e672c 100644
+--- a/src/main/java/org/mockito/Mockito.java
++++ b/src/main/java/org/mockito/Mockito.java
+@@ -1685,6 +1685,7 @@ public class Mockito extends ArgumentMatchers {
+ 
+     /**
+      * Optional <code>Answer</code> to be used with {@link Mockito#mock(Class, Answer)}
++     *
+      * <p>
+      * {@link Answer} can be used to define the return values of unstubbed invocations.
+      * <p>
+@@ -1716,8 +1717,11 @@ public class Mockito extends ArgumentMatchers {
+      * </code></pre>
+      *
+      * <p>
+-     * <u>Note:</u> Stubbing partial mocks using <code>when(mock.getSomething()).thenReturn(fakeValue)</code>
++     * <u>Note 1:</u> Stubbing partial mocks using <code>when(mock.getSomething()).thenReturn(fakeValue)</code>
+      * syntax will call the real method. For partial mock it's recommended to use <code>doReturn</code> syntax.
++     * <p>
++     * <u>Note 2:</u> If the mock is serialized then deserialized, then this answer will not be able to understand
++     * generics metadata.
+      */
+     public static final Answer<Object> CALLS_REAL_METHODS = Answers.CALLS_REAL_METHODS;
+ 
+diff --git a/src/main/java/org/mockito/internal/creation/bytebuddy/MockMethodInterceptor.java b/src/main/java/org/mockito/internal/creation/bytebuddy/MockMethodInterceptor.java
+index 906692768..e57a82e73 100644
+--- a/src/main/java/org/mockito/internal/creation/bytebuddy/MockMethodInterceptor.java
++++ b/src/main/java/org/mockito/internal/creation/bytebuddy/MockMethodInterceptor.java
+@@ -46,13 +46,11 @@ public class MockMethodInterceptor implements Serializable {
+                        Method invokedMethod,
+                        Object[] arguments,
+                        RealMethod realMethod) throws Throwable {
+-        return doIntercept(
+-                mock,
+-                invokedMethod,
+-                arguments,
+-            realMethod,
+-                new LocationImpl()
+-        );
++        return doIntercept(mock,
++                           invokedMethod,
++                           arguments,
++                           realMethod,
++                           new LocationImpl());
+     }
+ 
+     Object doIntercept(Object mock,
+@@ -108,11 +106,11 @@ public class MockMethodInterceptor implements Serializable {
+                 return superCall.call();
+             }
+             return interceptor.doIntercept(
+-                    mock,
+-                    invokedMethod,
+-                    arguments,
+-                    new RealMethod.FromCallable(superCall)
+-            );
++                mock,
++                invokedMethod,
++                arguments,
++                new RealMethod.FromCallable(superCall)
++                                          );
+         }
+ 
+         @SuppressWarnings("unused")
+@@ -126,11 +124,11 @@ public class MockMethodInterceptor implements Serializable {
+                 return stubValue;
+             }
+             return interceptor.doIntercept(
+-                    mock,
+-                    invokedMethod,
+-                    arguments,
+-                    RealMethod.IsIllegal.INSTANCE
+-            );
++                mock,
++                invokedMethod,
++                arguments,
++                RealMethod.IsIllegal.INSTANCE
++                                          );
+         }
+     }
+ }
+diff --git a/src/main/java/org/mockito/internal/stubbing/defaultanswers/ReturnsDeepStubs.java b/src/main/java/org/mockito/internal/stubbing/defaultanswers/ReturnsDeepStubs.java
+index 872917125..356b2e629 100644
+--- a/src/main/java/org/mockito/internal/stubbing/defaultanswers/ReturnsDeepStubs.java
++++ b/src/main/java/org/mockito/internal/stubbing/defaultanswers/ReturnsDeepStubs.java
+@@ -25,7 +25,7 @@ import static org.mockito.Mockito.withSettings;
+ /**
+  * Returning deep stub implementation.
+  *
+- * Will return previously created mock if the invocation matches.
++ * <p>Will return previously created mock if the invocation matches.
+  *
+  * <p>Supports nested generic information, with this answer you can write code like this :
+  *
+@@ -37,6 +37,8 @@ import static org.mockito.Mockito.withSettings;
+  * </code></pre>
+  * </p>
+  *
++ * <p>However this answer does not support generics information when the mock has been deserialized.
++ *
+  * @see org.mockito.Mockito#RETURNS_DEEP_STUBS
+  * @see org.mockito.Answers#RETURNS_DEEP_STUBS
+  */
+@@ -46,19 +48,19 @@ public class ReturnsDeepStubs implements Answer<Object>, Serializable {
+ 
+     public Object answer(InvocationOnMock invocation) throws Throwable {
+         GenericMetadataSupport returnTypeGenericMetadata =
+-                actualParameterizedType(invocation.getMock()).resolveGenericReturnType(invocation.getMethod());
++            actualParameterizedType(invocation.getMock()).resolveGenericReturnType(invocation.getMethod());
+ 
+         Class<?> rawType = returnTypeGenericMetadata.rawType();
+         if (!mockitoCore().isTypeMockable(rawType)) {
+             return delegate().returnValueFor(rawType);
+         }
+ 
+-        // When dealing with erasured generics, we only receive the Object type as rawType. At this
++        // When dealing with erased generics, we only receive the Object type as rawType. At this
+         // point, there is nothing to salvage for Mockito. Instead of trying to be smart and generate
+         // a mock that would potentially match the return signature, instead return `null`. This
+         // is valid per the CheckCast JVM instruction and is better than causing a ClassCastException
+         // on runtime.
+-        if (rawType.equals(Object.class)) {
++        if (rawType.equals(Object.class) && !returnTypeGenericMetadata.hasRawExtraInterfaces()) {
+             return null;
+         }
+ 
+@@ -78,9 +80,9 @@ public class ReturnsDeepStubs implements Answer<Object>, Serializable {
+ 
+         // record deep stub answer
+         StubbedInvocationMatcher stubbing = recordDeepStubAnswer(
+-                newDeepStubMock(returnTypeGenericMetadata, invocation.getMock()),
+-                container
+-        );
++            newDeepStubMock(returnTypeGenericMetadata, invocation.getMock()),
++            container
++                                                                );
+ 
+         // deep stubbing creates a stubbing and immediately uses it
+         // so the stubbing is actually used by the same invocation
+@@ -97,24 +99,24 @@ public class ReturnsDeepStubs implements Answer<Object>, Serializable {
+      * {@link ReturnsDeepStubs} answer in which we will store the returned type generic metadata.
+      *
+      * @param returnTypeGenericMetadata The metadata to use to create the new mock.
+-     * @param parentMock The parent of the current deep stub mock.
++     * @param parentMock                The parent of the current deep stub mock.
+      * @return The mock
+      */
+     private Object newDeepStubMock(GenericMetadataSupport returnTypeGenericMetadata, Object parentMock) {
+         MockCreationSettings parentMockSettings = MockUtil.getMockSettings(parentMock);
+         return mockitoCore().mock(
+-                returnTypeGenericMetadata.rawType(),
+-                withSettingsUsing(returnTypeGenericMetadata, parentMockSettings)
+-        );
++            returnTypeGenericMetadata.rawType(),
++            withSettingsUsing(returnTypeGenericMetadata, parentMockSettings)
++                                 );
+     }
+ 
+     private MockSettings withSettingsUsing(GenericMetadataSupport returnTypeGenericMetadata, MockCreationSettings parentMockSettings) {
+         MockSettings mockSettings = returnTypeGenericMetadata.hasRawExtraInterfaces() ?
+-                withSettings().extraInterfaces(returnTypeGenericMetadata.rawExtraInterfaces())
+-                : withSettings();
++                                    withSettings().extraInterfaces(returnTypeGenericMetadata.rawExtraInterfaces())
++                                                                                      : withSettings();
+ 
+         return propagateSerializationSettings(mockSettings, parentMockSettings)
+-                .defaultAnswer(returnsDeepStubsAnswerUsing(returnTypeGenericMetadata));
++            .defaultAnswer(returnsDeepStubsAnswerUsing(returnTypeGenericMetadata));
+     }
+ 
+     private MockSettings propagateSerializationSettings(MockSettings mockSettings, MockCreationSettings parentMockSettings) {
+@@ -148,6 +150,15 @@ public class ReturnsDeepStubs implements Answer<Object>, Serializable {
+         protected GenericMetadataSupport actualParameterizedType(Object mock) {
+             return returnTypeGenericMetadata;
+         }
++
++        /**
++         * Generics support and serialization with deep stubs don't work together.
++         * <p>
++         * The issue is that GenericMetadataSupport is not serializable because
++         * the type elements inferred via reflection are not serializable. Supporting
++         * serialization would require to replace all types coming from the Java reflection
++         * with our own and still managing type equality with the JDK ones.
++         */
+         private Object writeReplace() throws IOException {
+             return Mockito.RETURNS_DEEP_STUBS;
+         }
+@@ -161,6 +172,7 @@ public class ReturnsDeepStubs implements Answer<Object>, Serializable {
+         DeeplyStubbedAnswer(Object mock) {
+             this.mock = mock;
+         }
++
+         public Object answer(InvocationOnMock invocation) throws Throwable {
+             return mock;
+         }
+diff --git a/src/main/java/org/mockito/internal/util/reflection/GenericMetadataSupport.java b/src/main/java/org/mockito/internal/util/reflection/GenericMetadataSupport.java
+index 596827c64..80cbf65be 100644
+--- a/src/main/java/org/mockito/internal/util/reflection/GenericMetadataSupport.java
++++ b/src/main/java/org/mockito/internal/util/reflection/GenericMetadataSupport.java
+@@ -8,8 +8,23 @@ package org.mockito.internal.util.reflection;
+ import org.mockito.exceptions.base.MockitoException;
+ import org.mockito.internal.util.Checks;
+ 
+-import java.lang.reflect.*;
+-import java.util.*;
++import java.lang.reflect.GenericArrayType;
++import java.lang.reflect.Method;
++import java.lang.reflect.ParameterizedType;
++import java.lang.reflect.Type;
++import java.lang.reflect.TypeVariable;
++import java.lang.reflect.WildcardType;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.Collections;
++import java.util.HashMap;
++import java.util.HashSet;
++import java.util.LinkedHashMap;
++import java.util.LinkedList;
++import java.util.List;
++import java.util.Map;
++import java.util.Queue;
++import java.util.Set;
+ 
+ 
+ /**
+@@ -17,20 +32,20 @@ import java.util.*;
+  * and accessible members.
+  *
+  * <p>
+- *     The main idea of this code is to create a Map that will help to resolve return types.
+- *     In order to actually work with nested generics, this map will have to be passed along new instances
+- *     as a type context.
++ * The main idea of this code is to create a Map that will help to resolve return types.
++ * In order to actually work with nested generics, this map will have to be passed along new instances
++ * as a type context.
+  * </p>
+  *
+  * <p>
+- *     Hence :
+- *     <ul>
+- *         <li>A new instance representing the metadata is created using the {@link #inferFrom(Type)} method from a real
+- *         <code>Class</code> or from a <code>ParameterizedType</code>, other types are not yet supported.</li>
++ * Hence :
++ * <ul>
++ * <li>A new instance representing the metadata is created using the {@link #inferFrom(Type)} method from a real
++ * <code>Class</code> or from a <code>ParameterizedType</code>, other types are not yet supported.</li>
+  *
+- *         <li>Then from this metadata, we can extract meta-data for a generic return type of a method, using
+- *         {@link #resolveGenericReturnType(Method)}.</li>
+- *     </ul>
++ * <li>Then from this metadata, we can extract meta-data for a generic return type of a method, using
++ * {@link #resolveGenericReturnType(Method)}.</li>
++ * </ul>
+  * </p>
+  *
+  * <p>
+@@ -97,8 +112,9 @@ public abstract class GenericMetadataSupport {
+         }
+         if (type instanceof TypeVariable) {
+             /*
+-             * If type is a TypeVariable, then it is needed to gather data elsewhere. Usually TypeVariables are declared
+-             * on the class definition, such as such as List<E>.
++             * If type is a TypeVariable, then it is needed to gather data elsewhere.
++             * Usually TypeVariables are declared on the class definition, such as such
++             * as List<E>.
+              */
+             return extractRawTypeOf(contextualActualTypeParameters.get(type));
+         }
+@@ -116,10 +132,21 @@ public abstract class GenericMetadataSupport {
+             TypeVariable<?> typeParameter = typeParameters[i];
+             Type actualTypeArgument = actualTypeArguments[i];
+ 
+-            // Prevent registration of a cycle of TypeVariables. This can happen when we are processing
+-            // type parameters in a Method, while we already processed the type parameters of a class.
+-            if (actualTypeArgument instanceof TypeVariable && contextualActualTypeParameters.containsKey(typeParameter)) {
+-                continue;
++            if (actualTypeArgument instanceof TypeVariable) {
++                /*
++                 * If actualTypeArgument is a TypeVariable, and it is not present in
++                 * the context map then it is needed to try harder to gather more data
++                 * from the type argument itself. In some case the type argument do
++                 * define upper bounds, this allow to look for them if not in the
++                 * context map.
++                 */
++                registerTypeVariableIfNotPresent((TypeVariable<?>) actualTypeArgument);
++
++                // Prevent registration of a cycle of TypeVariables. This can happen when we are processing
++                // type parameters in a Method, while we already processed the type parameters of a class.
++                if (contextualActualTypeParameters.containsKey(typeParameter)) {
++                    continue;
++                }
+             }
+ 
+             if (actualTypeArgument instanceof WildcardType) {
+@@ -147,7 +174,7 @@ public abstract class GenericMetadataSupport {
+     /**
+      * @param typeParameter The TypeVariable parameter
+      * @return A {@link BoundedType} for easy bound information, if first bound is a TypeVariable
+-     *         then retrieve BoundedType of this TypeVariable
++     * then retrieve BoundedType of this TypeVariable
+      */
+     private BoundedType boundsOf(TypeVariable<?> typeParameter) {
+         if (typeParameter.getBounds()[0] instanceof TypeVariable) {
+@@ -159,13 +186,17 @@ public abstract class GenericMetadataSupport {
+     /**
+      * @param wildCard The WildCard type
+      * @return A {@link BoundedType} for easy bound information, if first bound is a TypeVariable
+-     *         then retrieve BoundedType of this TypeVariable
++     * then retrieve BoundedType of this TypeVariable
+      */
+     private BoundedType boundsOf(WildcardType wildCard) {
+         /*
+          *  According to JLS(http://docs.oracle.com/javase/specs/jls/se5.0/html/typesValues.html#4.5.1):
+-         *  - Lower and upper can't coexist: (for instance, this is not allowed: <? extends List<String> & super MyInterface>)
+-         *  - Multiple bounds are not supported (for instance, this is not allowed: <? extends List<String> & MyInterface>)
++         *  - Lower and upper can't coexist: (for instance, this is not allowed:
++         *    <? extends List<String> & super MyInterface>)
++         *  - Multiple concrete type bounds are not supported (for instance, this is not allowed:
++         *    <? extends ArrayList<String> & MyInterface>)
++         *    But the following form is possible where there is a single concrete tyep bound followed by interface type bounds
++         *    <T extends List<String> & Comparable>
+          */
+ 
+         WildCardBoundedType wildCardBoundedType = new WildCardBoundedType(wildCard);
+@@ -241,7 +272,7 @@ public abstract class GenericMetadataSupport {
+         // logger.log("Method '" + method.toGenericString() + "' has return type : " + genericReturnType.getClass().getInterfaces()[0].getSimpleName() + " : " + genericReturnType);
+ 
+         int arity = 0;
+-        while(genericReturnType instanceof GenericArrayType) {
++        while (genericReturnType instanceof GenericArrayType) {
+             arity++;
+             genericReturnType = ((GenericArrayType) genericReturnType).getGenericComponentType();
+         }
+@@ -273,8 +304,8 @@ public abstract class GenericMetadataSupport {
+      * Create an new instance of {@link GenericMetadataSupport} inferred from a {@link Type}.
+      *
+      * <p>
+-     *     At the moment <code>type</code> can only be a {@link Class} or a {@link ParameterizedType}, otherwise
+-     *     it'll throw a {@link MockitoException}.
++     * At the moment <code>type</code> can only be a {@link Class} or a {@link ParameterizedType}, otherwise
++     * it'll throw a {@link MockitoException}.
+      * </p>
+      *
+      * @param type The class from which the {@link GenericMetadataSupport} should be built.
+@@ -300,7 +331,7 @@ public abstract class GenericMetadataSupport {
+ 
+     /**
+      * Generic metadata implementation for {@link Class}.
+-     *
++     * <p>
+      * Offer support to retrieve generic metadata on a {@link Class} by reading type parameters and type variables on
+      * the class and its ancestors and interfaces.
+      */
+@@ -322,10 +353,10 @@ public abstract class GenericMetadataSupport {
+ 
+     /**
+      * Generic metadata implementation for "standalone" {@link ParameterizedType}.
+-     *
++     * <p>
+      * Offer support to retrieve generic metadata on a {@link ParameterizedType} by reading type variables of
+      * the related raw type and declared type variable of this parameterized type.
+-     *
++     * <p>
+      * This class is not designed to work on ParameterizedType returned by {@link Method#getGenericReturnType()}, as
+      * the ParameterizedType instance return in these cases could have Type Variables that refer to type declaration(s).
+      * That's what meant the "standalone" word at the beginning of the Javadoc.
+@@ -387,6 +418,7 @@ public abstract class GenericMetadataSupport {
+         private final TypeVariable<?> typeVariable;
+         private final TypeVariable<?>[] typeParameters;
+         private Class<?> rawType;
++        private List<Type> extraInterfaces;
+ 
+         public TypeVariableReturnType(GenericMetadataSupport source, TypeVariable<?>[] typeParameters, TypeVariable<?> typeVariable) {
+             this.typeParameters = typeParameters;
+@@ -405,7 +437,7 @@ public abstract class GenericMetadataSupport {
+             for (Type type : typeVariable.getBounds()) {
+                 registerTypeVariablesOn(type);
+             }
+-            registerTypeParametersOn(new TypeVariable[] { typeVariable });
++            registerTypeParametersOn(new TypeVariable[]{typeVariable});
+             registerTypeVariablesOn(getActualTypeArgumentFor(typeVariable));
+         }
+ 
+@@ -419,15 +451,18 @@ public abstract class GenericMetadataSupport {
+ 
+         @Override
+         public List<Type> extraInterfaces() {
++            if (extraInterfaces != null) {
++                return extraInterfaces;
++            }
+             Type type = extractActualBoundedTypeOf(typeVariable);
+             if (type instanceof BoundedType) {
+-                return Arrays.asList(((BoundedType) type).interfaceBounds());
++                return extraInterfaces = Arrays.asList(((BoundedType) type).interfaceBounds());
+             }
+             if (type instanceof ParameterizedType) {
+-                return Collections.singletonList(type);
++                return extraInterfaces = Collections.singletonList(type);
+             }
+             if (type instanceof Class) {
+-                return Collections.emptyList();
++                return extraInterfaces = Collections.emptyList();
+             }
+             throw new MockitoException("Cannot extract extra-interfaces from '" + typeVariable + "' : '" + type + "'");
+         }
+@@ -442,7 +477,7 @@ public abstract class GenericMetadataSupport {
+             for (Type extraInterface : extraInterfaces) {
+                 Class<?> rawInterface = extractRawTypeOf(extraInterface);
+                 // avoid interface collision with actual raw type (with typevariables, resolution ca be quite aggressive)
+-                if(!rawType().equals(rawInterface)) {
++                if (!rawType().equals(rawInterface)) {
+                     rawExtraInterfaces.add(rawInterface);
+                 }
+             }
+@@ -514,7 +549,6 @@ public abstract class GenericMetadataSupport {
+     }
+ 
+ 
+-
+     /**
+      * Type representing bounds of a type
+      *
+@@ -537,7 +571,7 @@ public abstract class GenericMetadataSupport {
+      *
+      * <p>If upper bounds are declared with SomeClass and additional interfaces, then firstBound will be SomeClass and
+      * interfacesBound will be an array of the additional interfaces.
+-     *
++     * <p>
+      * i.e. <code>SomeClass</code>.
+      * <pre class="code"><code class="java">
+      *     interface UpperBoundedTypeWithClass<E extends Comparable<E> & Cloneable> {

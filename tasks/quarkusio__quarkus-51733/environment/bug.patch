@@ -1,0 +1,667 @@
+diff --git a/core/deployment/src/main/java/io/quarkus/deployment/configuration/BuildTimeConfigurationReader.java b/core/deployment/src/main/java/io/quarkus/deployment/configuration/BuildTimeConfigurationReader.java
+index 37828c32df7..3c2469fe033 100644
+--- a/core/deployment/src/main/java/io/quarkus/deployment/configuration/BuildTimeConfigurationReader.java
++++ b/core/deployment/src/main/java/io/quarkus/deployment/configuration/BuildTimeConfigurationReader.java
+@@ -217,6 +217,7 @@ final class ReadOperation {
+         final ConfigTrackingInterceptor buildConfigTracker;
+         final Map<String, ConfigValue> allBuildTimeValues = new TreeMap<>();
+         final Map<String, ConfigValue> buildTimeRunTimeValues = new TreeMap<>();
++        final Map<String, ConfigValue> runTimeDefaultValues = new TreeMap<>();
+         final Map<String, ConfigValue> runTimeValues = new TreeMap<>();
+ 
+         ReadOperation(final SmallRyeConfig config, ConfigTrackingInterceptor buildConfigTracker) {
+@@ -333,6 +334,7 @@ public void accept(final ConfigSource buildSystem) {
+             return new ReadResult.Builder()
+                     .setAllBuildTimeValues(allBuildTimeValues)
+                     .setBuildTimeRunTimeValues(filterActiveProfileProperties(buildTimeRunTimeValues))
++                    .setRunTimeDefaultValues(filterActiveProfileProperties(runTimeDefaultValues))
+                     .setRuntimeValues(runTimeValues)
+                     .setBuildTimeMappings(buildTimeMappings)
+                     .setBuildTimeRunTimeMappings(buildTimeRunTimeMappings)
+@@ -538,6 +540,7 @@ private static Map<PropertyName, String> mappingsToNames(final List<ConfigClass>
+     public static final class ReadResult {
+         final Map<String, ConfigValue> allBuildTimeValues;
+         final Map<String, ConfigValue> buildTimeRunTimeValues;
++        final Map<String, ConfigValue> runTimeDefaultValues;
+         final Map<String, ConfigValue> runTimeValues;
+ 
+         final List<ConfigClass> buildTimeMappings;
+@@ -553,6 +556,7 @@ public static final class ReadResult {
+         public ReadResult(final Builder builder) {
+             this.allBuildTimeValues = builder.getAllBuildTimeValues();
+             this.buildTimeRunTimeValues = builder.getBuildTimeRunTimeValues();
++            this.runTimeDefaultValues = builder.getRunTimeDefaultValues();
+             this.runTimeValues = builder.getRuntimeValues();
+ 
+             this.buildTimeMappings = builder.getBuildTimeMappings();
+@@ -589,6 +593,10 @@ public Map<String, ConfigValue> getBuildTimeRunTimeValues() {
+             return buildTimeRunTimeValues;
+         }
+ 
++        public Map<String, ConfigValue> getRunTimeDefaultValues() {
++            return runTimeDefaultValues;
++        }
++
+         public Map<String, ConfigValue> getRunTimeValues() {
+             return runTimeValues;
+         }
+@@ -628,6 +636,7 @@ public ConfigTrackingInterceptor.ReadOptionsProvider getReadOptionsProvider() {
+         static class Builder {
+             private Map<String, ConfigValue> allBuildTimeValues;
+             private Map<String, ConfigValue> buildTimeRunTimeValues;
++            private Map<String, ConfigValue> runTimeDefaultValues;
+             private Map<String, ConfigValue> runtimeValues;
+             private List<ConfigClass> buildTimeMappings;
+             private List<ConfigClass> buildTimeRunTimeMappings;
+@@ -654,6 +663,15 @@ Builder setBuildTimeRunTimeValues(final Map<String, ConfigValue> buildTimeRunTim
+                 return this;
+             }
+ 
++            Map<String, ConfigValue> getRunTimeDefaultValues() {
++                return runTimeDefaultValues;
++            }
++
++            Builder setRunTimeDefaultValues(final Map<String, ConfigValue> runTimeDefaultValues) {
++                this.runTimeDefaultValues = runTimeDefaultValues;
++                return this;
++            }
++
+             Map<String, ConfigValue> getRuntimeValues() {
+                 return runtimeValues;
+             }
+diff --git a/core/deployment/src/main/java/io/quarkus/deployment/steps/ConfigGenerationBuildStep.java b/core/deployment/src/main/java/io/quarkus/deployment/steps/ConfigGenerationBuildStep.java
+index 0019103aaf5..8bfa63e3bc8 100644
+--- a/core/deployment/src/main/java/io/quarkus/deployment/steps/ConfigGenerationBuildStep.java
++++ b/core/deployment/src/main/java/io/quarkus/deployment/steps/ConfigGenerationBuildStep.java
+@@ -9,7 +9,6 @@
+ import static io.quarkus.deployment.util.ServiceUtil.classNamesNamedIn;
+ import static io.smallrye.config.SmallRyeConfig.SMALLRYE_CONFIG_LOCATIONS;
+ import static java.util.stream.Collectors.toSet;
+-import static org.objectweb.asm.Opcodes.ACC_STATIC;
+ 
+ import java.io.Closeable;
+ import java.io.IOException;
+@@ -25,7 +24,6 @@
+ import java.util.LinkedHashSet;
+ import java.util.List;
+ import java.util.Map;
+-import java.util.Map.Entry;
+ import java.util.Objects;
+ import java.util.Optional;
+ import java.util.Set;
+@@ -112,6 +110,7 @@
+ import io.smallrye.config.ConfigSourceInterceptorFactory;
+ import io.smallrye.config.ConfigValue;
+ import io.smallrye.config.DefaultValuesConfigSource;
++import io.smallrye.config.ProfileConfigSourceInterceptor;
+ import io.smallrye.config.SecretKeysHandler;
+ import io.smallrye.config.SecretKeysHandlerFactory;
+ import io.smallrye.config.SmallRyeConfig;
+@@ -149,10 +148,10 @@ void buildTimeRunTimeConfig(
+                 .build()) {
+ 
+             FieldDescriptor source = FieldDescriptor.of(classCreator.getClassName(), "source", ConfigSource.class);
+-            classCreator.getFieldCreator(source).setModifiers(ACC_STATIC | Opcodes.ACC_FINAL);
++            classCreator.getFieldCreator(source).setModifiers(Opcodes.ACC_STATIC | Opcodes.ACC_FINAL);
+ 
+             MethodCreator clinit = classCreator.getMethodCreator("<clinit>", void.class);
+-            clinit.setModifiers(ACC_STATIC);
++            clinit.setModifiers(Opcodes.ACC_STATIC);
+ 
+             ResultHandle map = clinit.newInstance(MethodDescriptor.ofConstructor(HashMap.class));
+             MethodDescriptor put = MethodDescriptor.ofMethod(Map.class, "put", Object.class, Object.class, Object.class);
+@@ -233,9 +232,30 @@ void generateBuilders(
+             BuildProducer<ReflectiveClassBuildItem> reflectiveClass) throws Exception {
+ 
+         Map<String, String> defaultValues = new HashMap<>();
++        // Default values from @ConfigRoot
++        for (Map.Entry<String, ConfigValue> entry : configItem.getReadResult().getRunTimeDefaultValues().entrySet()) {
++            defaultValues.put(entry.getKey(), entry.getValue().getRawValue());
++        }
++        // Default values from build item RunTimeConfigurationDefaultBuildItem override
+         for (RunTimeConfigurationDefaultBuildItem e : runTimeDefaults) {
+             defaultValues.put(e.getKey(), e.getValue());
+         }
++        // Recorded values from build time from any other source (higher ordinal then defaults, so override)
++        SmallRyeConfig config = ConfigProvider.getConfig().unwrap(SmallRyeConfig.class);
++        List<String> profiles = config.getProfiles();
++        for (Map.Entry<String, ConfigValue> entry : configItem.getReadResult().getRunTimeValues().entrySet()) {
++            if (DefaultValuesConfigSource.NAME.equals(entry.getValue().getConfigSourceName())) {
++                continue;
++            }
++            // Runtime values may contain active profiled names that override sames names in defaults
++            // We need to keep the original name definition in case a different profile is used to run the app
++            String activeName = ProfileConfigSourceInterceptor.activeName(entry.getKey(), profiles);
++            // But keep the default
++            if (!configItem.getReadResult().getRunTimeDefaultValues().containsKey(activeName)) {
++                defaultValues.remove(activeName);
++            }
++            defaultValues.put(entry.getKey(), entry.getValue().getRawValue());
++        }
+ 
+         Set<String> converters = discoverService(Converter.class, reflectiveClass);
+         Set<String> interceptors = discoverService(ConfigSourceInterceptor.class, reflectiveClass);
+@@ -276,7 +296,6 @@ void generateBuilders(
+                 combinedIndex,
+                 sharedFields,
+                 defaultValues,
+-                Map.of(),
+                 converters,
+                 interceptors,
+                 staticSafeServices(interceptorFactories),
+@@ -293,10 +312,6 @@ void generateBuilders(
+         reflectiveClass.produce(ReflectiveClassBuildItem.builder(CONFIG_STATIC_NAME).build());
+ 
+         // For RunTime Config
+-        Map<String, String> runtimeValues = new HashMap<>();
+-        for (Entry<String, ConfigValue> entry : configItem.getReadResult().getRunTimeValues().entrySet()) {
+-            runtimeValues.put(entry.getKey(), entry.getValue().getRawValue());
+-        }
+         Set<ConfigClass> runTimeMappings = new LinkedHashSet<>();
+         runTimeMappings.addAll(runtimeConfigMappings(configMappings));
+         runTimeMappings.addAll(configItem.getReadResult().getBuildTimeRunTimeMappings());
+@@ -309,7 +324,6 @@ void generateBuilders(
+                 combinedIndex,
+                 sharedFields,
+                 defaultValues,
+-                runtimeValues,
+                 converters,
+                 interceptors,
+                 interceptorFactories,
+@@ -582,9 +596,6 @@ private static String getPathWithoutExtension(Path path) {
+     private static final MethodDescriptor WITH_DEFAULTS = MethodDescriptor.ofMethod(AbstractConfigBuilder.class,
+             "withDefaultValues",
+             void.class, SmallRyeConfigBuilder.class, Map.class);
+-    private static final MethodDescriptor WITH_RUNTIME_VALUES = MethodDescriptor.ofMethod(AbstractConfigBuilder.class,
+-            "withRuntimeValues",
+-            void.class, SmallRyeConfigBuilder.class, Map.class);
+     private static final MethodDescriptor WITH_CONVERTER = MethodDescriptor.ofMethod(AbstractConfigBuilder.class,
+             "withConverter",
+             void.class, SmallRyeConfigBuilder.class, String.class, int.class, Converter.class);
+@@ -630,10 +641,6 @@ private static String getPathWithoutExtension(Path path) {
+     private static final MethodDescriptor ENSURE_LOADED = MethodDescriptor.ofMethod(AbstractConfigBuilder.class,
+             "ensureLoaded",
+             void.class, String.class);
+-    private static final MethodDescriptor MAP_NEW = MethodDescriptor.ofConstructor(HashMap.class, int.class);
+-    private static final MethodDescriptor MAP_PUT = MethodDescriptor.ofMethod(HashMap.class,
+-            "put",
+-            Object.class, Object.class, Object.class);
+ 
+     private static final DotName CONVERTER_NAME = DotName.createSimple(Converter.class.getName());
+     private static final DotName PRIORITY_NAME = DotName.createSimple(Priority.class.getName());
+@@ -652,13 +659,13 @@ private static Map<Object, FieldDescriptor> generateSharedConfig(
+                 .build()) {
+ 
+             MethodCreator clinit = classCreator.getMethodCreator("<clinit>", void.class);
+-            clinit.setModifiers(ACC_STATIC);
++            clinit.setModifiers(Opcodes.ACC_STATIC);
+ 
+             int converterIndex = 0;
+             for (String converter : converters) {
+                 String fieldName = "conv$" + converterIndex++;
+                 FieldDescriptor converterField = classCreator.getFieldCreator(fieldName, Converter.class)
+-                        .setModifiers(ACC_STATIC).getFieldDescriptor();
++                        .setModifiers(Opcodes.ACC_STATIC).getFieldDescriptor();
+                 clinit.writeStaticField(converterField, clinit.newInstance(MethodDescriptor.ofConstructor(converter)));
+                 fields.put(converter, converterField);
+             }
+@@ -666,7 +673,7 @@ private static Map<Object, FieldDescriptor> generateSharedConfig(
+             int mappingIndex = 0;
+             for (ConfigClass mapping : mappings) {
+                 FieldDescriptor mappingField = classCreator.getFieldCreator("mapping$" + mappingIndex++, ConfigClass.class)
+-                        .setModifiers(ACC_STATIC).getFieldDescriptor();
++                        .setModifiers(Opcodes.ACC_STATIC).getFieldDescriptor();
+                 clinit.writeStaticField(mappingField, clinit.invokeStaticMethod(CONFIG_CLASS,
+                         clinit.load(mapping.getType().getName()), clinit.load(mapping.getPrefix())));
+ 
+@@ -693,7 +700,6 @@ private static void generateConfigBuilder(
+             CombinedIndexBuildItem combinedIndex,
+             Map<Object, FieldDescriptor> sharedFields,
+             Map<String, String> defaultValues,
+-            Map<String, String> runtimeValues,
+             Set<String> converters,
+             Set<String> interceptors,
+             Set<String> interceptorFactories,
+@@ -718,31 +724,22 @@ private static void generateConfigBuilder(
+                 .build()) {
+ 
+             MethodCreator clinit = classCreator.getMethodCreator("<clinit>", void.class);
+-            clinit.setModifiers(ACC_STATIC);
++            clinit.setModifiers(Opcodes.ACC_STATIC);
+ 
+             MethodCreator method = classCreator.getMethodCreator(BUILDER_CUSTOMIZER);
+             ResultHandle configBuilder = method.getMethodParam(0);
+ 
+-            FieldDescriptor defaultsField = classCreator.getFieldCreator("defaults", Map.class).setModifiers(ACC_STATIC)
++            FieldDescriptor defaultsField = classCreator.getFieldCreator("defaults", Map.class).setModifiers(Opcodes.ACC_STATIC)
+                     .getFieldDescriptor();
+-            clinit.writeStaticField(defaultsField,
+-                    clinit.newInstance(MAP_NEW, clinit.load((int) ((float) defaultValues.size() / 0.75f + 1.0f))));
++            clinit.writeStaticField(defaultsField, clinit.newInstance(MethodDescriptor.ofConstructor(HashMap.class, int.class),
++                    clinit.load((int) ((float) defaultValues.size() / 0.75f + 1.0f))));
++            MethodDescriptor put = MethodDescriptor.ofMethod(HashMap.class, "put", Object.class, Object.class, Object.class);
+             for (Map.Entry<String, String> entry : defaultValues.entrySet()) {
+-                clinit.invokeVirtualMethod(MAP_PUT, clinit.readStaticField(defaultsField), clinit.load(entry.getKey()),
++                clinit.invokeVirtualMethod(put, clinit.readStaticField(defaultsField), clinit.load(entry.getKey()),
+                         clinit.load(entry.getValue()));
+             }
+             method.invokeStaticMethod(WITH_DEFAULTS, configBuilder, method.readStaticField(defaultsField));
+ 
+-            FieldDescriptor runtimeValuesField = classCreator.getFieldCreator("runtimeValues", Map.class)
+-                    .setModifiers(ACC_STATIC).getFieldDescriptor();
+-            clinit.writeStaticField(runtimeValuesField,
+-                    clinit.newInstance(MAP_NEW, clinit.load((int) ((float) runtimeValues.size() / 0.75f + 1.0f))));
+-            for (Map.Entry<String, String> entry : runtimeValues.entrySet()) {
+-                clinit.invokeVirtualMethod(MAP_PUT, clinit.readStaticField(runtimeValuesField), clinit.load(entry.getKey()),
+-                        clinit.load(entry.getValue()));
+-            }
+-            method.invokeStaticMethod(WITH_RUNTIME_VALUES, configBuilder, method.readStaticField(runtimeValuesField));
+-
+             for (String converter : converters) {
+                 ClassInfo converterClass = combinedIndex.getComputingIndex().getClassByName(converter);
+                 Type type = getConverterType(converterClass, combinedIndex);
+diff --git a/core/runtime/src/main/java/io/quarkus/runtime/configuration/AbstractConfigBuilder.java b/core/runtime/src/main/java/io/quarkus/runtime/configuration/AbstractConfigBuilder.java
+index 98aa0347dc4..5cee4de8e33 100644
+--- a/core/runtime/src/main/java/io/quarkus/runtime/configuration/AbstractConfigBuilder.java
++++ b/core/runtime/src/main/java/io/quarkus/runtime/configuration/AbstractConfigBuilder.java
+@@ -17,7 +17,6 @@
+ import io.smallrye.config.SmallRyeConfig;
+ import io.smallrye.config.SmallRyeConfigBuilder;
+ import io.smallrye.config.SmallRyeConfigBuilderCustomizer;
+-import io.smallrye.config.common.MapBackedConfigSource;
+ 
+ /**
+  * Convenience helper to generate the {@link SmallRyeConfigBuilderCustomizer} bytecode, by wrapping methods that
+@@ -29,11 +28,6 @@ protected static void withDefaultValues(SmallRyeConfigBuilder builder, Map<Strin
+         builder.withDefaultValues(values);
+     }
+ 
+-    protected static void withRuntimeValues(SmallRyeConfigBuilder builder, Map<String, String> values) {
+-        builder.withSources(new MapBackedConfigSource("Runtime Values", values, 0) {
+-        });
+-    }
+-
+     @SuppressWarnings("unchecked")
+     protected static <T> void withConverter(SmallRyeConfigBuilder builder, String type, int priority, Converter<T> converter) {
+         try {
+diff --git a/extensions/hibernate-orm/deployment/src/main/java/io/quarkus/hibernate/orm/deployment/HibernateOrmProcessor.java b/extensions/hibernate-orm/deployment/src/main/java/io/quarkus/hibernate/orm/deployment/HibernateOrmProcessor.java
+index 153e1f33499..4bcdced02ca 100644
+--- a/extensions/hibernate-orm/deployment/src/main/java/io/quarkus/hibernate/orm/deployment/HibernateOrmProcessor.java
++++ b/extensions/hibernate-orm/deployment/src/main/java/io/quarkus/hibernate/orm/deployment/HibernateOrmProcessor.java
+@@ -58,6 +58,8 @@
+ import org.jboss.logging.Logger;
+ import org.jboss.logmanager.Level;
+ 
++import com.fasterxml.jackson.databind.Module;
++
+ import io.quarkus.agroal.spi.JdbcDataSourceBuildItem;
+ import io.quarkus.agroal.spi.JdbcDataSourceSchemaReadyBuildItem;
+ import io.quarkus.arc.deployment.BeanContainerBuildItem;
+@@ -310,6 +312,19 @@ public ImpliedBlockingPersistenceUnitTypeBuildItem defineTypeOfImpliedPU(
+         }
+     }
+ 
++    @BuildStep
++    public void allowJacksonModuleDiscovery(Capabilities capabilities,
++            List<PersistenceUnitDescriptorBuildItem> persistenceUnits,
++            BuildProducer<ServiceProviderBuildItem> serviceProviders) {
++        if (capabilities.isMissing(Capability.JACKSON) || persistenceUnits.isEmpty()) {
++            // We won't be using Hibernate's default FormatMapper relying on Jackson for sure
++            return;
++        }
++        // Hibernate's default FormatMapper relying on Jackson requires
++        // service loading to discover modules in the classpath.
++        serviceProviders.produce(ServiceProviderBuildItem.allProvidersFromClassPath(Module.class.getName()));
++    }
++
+     @BuildStep
+     public void configurationDescriptorBuilding(
+             HibernateOrmConfig hibernateOrmConfig,
+diff --git a/extensions/picocli/deployment/src/test/java/io/quarkus/picocli/deployment/AvailableConfigSourcesTest.java b/extensions/picocli/deployment/src/test/java/io/quarkus/picocli/deployment/AvailableConfigSourcesTest.java
+index d14bc9785df..bbf6e13437f 100644
+--- a/extensions/picocli/deployment/src/test/java/io/quarkus/picocli/deployment/AvailableConfigSourcesTest.java
++++ b/extensions/picocli/deployment/src/test/java/io/quarkus/picocli/deployment/AvailableConfigSourcesTest.java
+@@ -27,7 +27,7 @@ public class AvailableConfigSourcesTest {
+     void sources() {
+         ConfigValue value = config.getConfigValue("my.prop");
+         assertEquals("1234", value.getValue());
+-        assertEquals("Runtime Values", value.getConfigSourceName());
++        assertEquals("DefaultValuesConfigSource", value.getConfigSourceName());
+ 
+         for (final ConfigSource configSource : config.getConfigSources()) {
+             if (configSource.getName().contains("application.properties")) {
+diff --git a/extensions/resteasy-classic/rest-client-config/runtime/src/main/java/io/quarkus/restclient/config/AbstractRestClientConfigBuilder.java b/extensions/resteasy-classic/rest-client-config/runtime/src/main/java/io/quarkus/restclient/config/AbstractRestClientConfigBuilder.java
+index 73cccb95731..41a74ca33ff 100644
+--- a/extensions/resteasy-classic/rest-client-config/runtime/src/main/java/io/quarkus/restclient/config/AbstractRestClientConfigBuilder.java
++++ b/extensions/resteasy-classic/rest-client-config/runtime/src/main/java/io/quarkus/restclient/config/AbstractRestClientConfigBuilder.java
+@@ -287,10 +287,6 @@ private record MicroProfileFallbacks(Map<String, String> names) implements Funct
+         public String apply(final String name) {
+             int indexOfRestClient = indexOfRestClient(name);
+             if (indexOfRestClient != -1) {
+-                int disableDefaultMapper = name.indexOf(".disable-default-mapper", indexOfRestClient);
+-                if (disableDefaultMapper != -1) {
+-                    return "microprofile.rest.client.disable.default.mapper";
+-                }
+                 for (Map.Entry<String, String> entry : names.entrySet()) {
+                     String original = entry.getKey();
+                     String target = entry.getValue();
+diff --git a/extensions/resteasy-classic/rest-client-config/runtime/src/main/java/io/quarkus/restclient/config/RestClientsConfig.java b/extensions/resteasy-classic/rest-client-config/runtime/src/main/java/io/quarkus/restclient/config/RestClientsConfig.java
+index c85fba05521..cd93020eaa2 100644
+--- a/extensions/resteasy-classic/rest-client-config/runtime/src/main/java/io/quarkus/restclient/config/RestClientsConfig.java
++++ b/extensions/resteasy-classic/rest-client-config/runtime/src/main/java/io/quarkus/restclient/config/RestClientsConfig.java
+@@ -669,7 +669,7 @@ default Optional<String> uriReload() {
+          * always throws an exception if HTTP response code >= 400.
+          * This property is not applicable to the RESTEasy Client.
+          */
+-        @WithDefault("false")
++        @WithDefault("${microprofile.rest.client.disable.default.mapper:false}")
+         Boolean disableDefaultMapper();
+ 
+         /**
+diff --git a/extensions/resteasy-classic/rest-client-config/runtime/src/test/java/io/quarkus/restclient/config/RestClientConfigTest.java b/extensions/resteasy-classic/rest-client-config/runtime/src/test/java/io/quarkus/restclient/config/RestClientConfigTest.java
+index 4e9d0e4acd4..f14db6f12e0 100644
+--- a/extensions/resteasy-classic/rest-client-config/runtime/src/test/java/io/quarkus/restclient/config/RestClientConfigTest.java
++++ b/extensions/resteasy-classic/rest-client-config/runtime/src/test/java/io/quarkus/restclient/config/RestClientConfigTest.java
+@@ -8,7 +8,6 @@
+ 
+ import java.math.BigInteger;
+ import java.util.List;
+-import java.util.Map;
+ 
+ import org.eclipse.microprofile.rest.client.ext.QueryParamStyle;
+ import org.junit.jupiter.api.Test;
+@@ -18,7 +17,6 @@
+ import io.quarkus.restclient.config.key.SharedThreeConfigKeyRestClient;
+ import io.quarkus.restclient.config.key.SharedTwoConfigKeyRestClient;
+ import io.quarkus.runtime.configuration.ConfigUtils;
+-import io.smallrye.config.PropertiesConfigSource;
+ import io.smallrye.config.SmallRyeConfig;
+ import io.smallrye.config.SmallRyeConfigBuilder;
+ import io.smallrye.config.SmallRyeConfigBuilderCustomizer;
+@@ -72,7 +70,6 @@ public List<RegisteredRestClient> getRestClients() {
+         assertEquals(1, restClientsConfig.clients().size());
+         assertTrue(restClientsConfig.clients().containsKey(ConfigKeyRestClient.class.getName()));
+         verifyConfig(restClientsConfig.getClient(ConfigKeyRestClient.class));
+-        assertTrue(restClientsConfig.getClient(ConfigKeyRestClient.class).disableDefaultMapper());
+     }
+ 
+     @Test
+@@ -129,7 +126,6 @@ public List<RegisteredRestClient> getRestClients() {
+                         }.configBuilder(builder);
+                     }
+                 })
+-                .withSources(new PropertiesConfigSource(Map.of("microprofile.rest.client.disable.default.mapper", "true"), ""))
+                 .build();
+ 
+         RestClientsConfig restClientsConfig = config.getConfigMapping(RestClientsConfig.class);
+@@ -152,7 +148,6 @@ public List<RegisteredRestClient> getRestClients() {
+         assertTrue(clientConfig.proxyAddress().isPresent());
+         assertTrue(clientConfig.queryParamStyle().isPresent());
+         assertThat(clientConfig.queryParamStyle().get()).isEqualTo(QueryParamStyle.COMMA_SEPARATED);
+-        assertThat(clientConfig.disableDefaultMapper()).isTrue();
+     }
+ 
+     @Test
+diff --git a/extensions/resteasy-classic/rest-client-config/runtime/src/test/resources/application.properties b/extensions/resteasy-classic/rest-client-config/runtime/src/test/resources/application.properties
+index b933a51a1f4..8e4560a7ddb 100644
+--- a/extensions/resteasy-classic/rest-client-config/runtime/src/test/resources/application.properties
++++ b/extensions/resteasy-classic/rest-client-config/runtime/src/test/resources/application.properties
+@@ -29,7 +29,6 @@ quarkus.rest-client.key.hostname-verifier=io.quarkus.restclient.configuration.My
+ quarkus.rest-client.key.connection-ttl=30000
+ quarkus.rest-client.key.connection-pool-size=10
+ quarkus.rest-client.key.max-chunk-size=1024
+-quarkus.rest-client.key.disable-default-mapper=true
+ 
+ quarkus.rest-client."io.quarkus.restclient.config.MPRestClient".url=http://localhost:8080
+ io.quarkus.restclient.config.MPRestClient/mp-rest/url=http://localhost:8081
+diff --git a/extensions/resteasy-classic/resteasy-client/deployment/src/test/java/io/quarkus/restclient/configuration/RestClientOverrideRuntimeConfigTest.java b/extensions/resteasy-classic/resteasy-client/deployment/src/test/java/io/quarkus/restclient/configuration/RestClientOverrideRuntimeConfigTest.java
+index a067a21318d..2d4f24991ff 100644
+--- a/extensions/resteasy-classic/resteasy-client/deployment/src/test/java/io/quarkus/restclient/configuration/RestClientOverrideRuntimeConfigTest.java
++++ b/extensions/resteasy-classic/resteasy-client/deployment/src/test/java/io/quarkus/restclient/configuration/RestClientOverrideRuntimeConfigTest.java
+@@ -42,12 +42,12 @@ public class RestClientOverrideRuntimeConfigTest {
+     @Test
+     void overrideConfig() {
+         // Build time property recording
+-        Optional<ConfigSource> runtimeValues = config.getConfigSource("Runtime Values");
+-        assertTrue(runtimeValues.isPresent());
+-        assertTrue(runtimeValues.get().getPropertyNames()
++        Optional<ConfigSource> specifiedDefaultValues = config.getConfigSource("DefaultValuesConfigSource");
++        assertTrue(specifiedDefaultValues.isPresent());
++        assertTrue(specifiedDefaultValues.get().getPropertyNames()
+                 .contains("io.quarkus.restclient.configuration.EchoClient/mp-rest/url"));
+         assertEquals("http://nohost",
+-                runtimeValues.get().getValue("io.quarkus.restclient.configuration.EchoClient/mp-rest/url"));
++                specifiedDefaultValues.get().getValue("io.quarkus.restclient.configuration.EchoClient/mp-rest/url"));
+         assertTrue(StreamSupport.stream(config.getPropertyNames().spliterator(), false).anyMatch(
+                 property -> property.equals("quarkus.rest-client.\"io.quarkus.restclient.configuration.EchoClient\".url")));
+ 
+@@ -59,9 +59,9 @@ void overrideConfig() {
+         assertEquals(mpValue.getValue(), quarkusValue.getValue());
+         assertEquals("RestClientRuntimeConfigSource", quarkusValue.getConfigSourceName());
+         // There is no relocate for MP names, so it keeps the same name
+-        assertEquals("io.quarkus.restclient.configuration.EchoClient/mp-rest/url", mpValue.getName());
++        assertEquals(mpValue.getName(), "io.quarkus.restclient.configuration.EchoClient/mp-rest/url");
+         // We use the Quarkus name, because that is the one that has priority
+-        assertEquals("quarkus.rest-client.\"io.quarkus.restclient.configuration.EchoClient\".url", quarkusValue.getName());
++        assertEquals(quarkusValue.getName(), "quarkus.rest-client.\"io.quarkus.restclient.configuration.EchoClient\".url");
+ 
+         assertTrue(restClientsConfig.clients().containsKey("io.quarkus.restclient.configuration.EchoClient"));
+         Optional<String> url = restClientsConfig.clients().get("io.quarkus.restclient.configuration.EchoClient").url();
+diff --git a/integration-tests/test-extension/extension/deployment/src/test/java/io/quarkus/config/RecorderRuntimeConfigTest.java b/integration-tests/test-extension/extension/deployment/src/test/java/io/quarkus/config/RecorderRuntimeConfigTest.java
+index 669cd9ab784..97f3dbba50d 100644
+--- a/integration-tests/test-extension/extension/deployment/src/test/java/io/quarkus/config/RecorderRuntimeConfigTest.java
++++ b/integration-tests/test-extension/extension/deployment/src/test/java/io/quarkus/config/RecorderRuntimeConfigTest.java
+@@ -15,6 +15,7 @@
+ 
+ import io.quarkus.extest.runtime.config.TestMappingRunTime;
+ import io.quarkus.test.QuarkusUnitTest;
++import io.smallrye.config.DefaultValuesConfigSource;
+ import io.smallrye.config.SmallRyeConfig;
+ 
+ public class RecorderRuntimeConfigTest {
+@@ -37,12 +38,12 @@ void runtimeConfig() {
+         assertEquals("from-application", mappingRunTime.recordProfiled().get());
+ 
+         // Make sure that when we merge all the defaults, we override the non-profiled name
+-        Optional<ConfigSource> configSource = config.getConfigSource("Runtime Values");
++        Optional<ConfigSource> configSource = config.getConfigSource("DefaultValuesConfigSource");
+         assertTrue(configSource.isPresent());
+-        ConfigSource runtimeValues = configSource.get();
+-        assertEquals("from-application", runtimeValues.getValue("%test.recorded.profiled.property"));
+-        assertEquals("recorded", runtimeValues.getValue("recorded.profiled.property"));
+-        assertEquals("from-application", runtimeValues.getValue("%test.quarkus.mapping.rt.record-profiled"));
+-        assertEquals("recorded", runtimeValues.getValue("quarkus.mapping.rt.record-profiled"));
++        DefaultValuesConfigSource defaultValuesConfigSource = (DefaultValuesConfigSource) configSource.get();
++        assertEquals("from-application", defaultValuesConfigSource.getValue("%test.recorded.profiled.property"));
++        assertEquals("recorded", defaultValuesConfigSource.getValue("recorded.profiled.property"));
++        assertEquals("from-application", defaultValuesConfigSource.getValue("%test.quarkus.mapping.rt.record-profiled"));
++        assertEquals("recorded", defaultValuesConfigSource.getValue("quarkus.mapping.rt.record-profiled"));
+     }
+ }
+diff --git a/integration-tests/test-extension/extension/deployment/src/test/java/io/quarkus/extest/ConfiguredBeanTest.java b/integration-tests/test-extension/extension/deployment/src/test/java/io/quarkus/extest/ConfiguredBeanTest.java
+index 8298f3efe9a..b250419603d 100644
+--- a/integration-tests/test-extension/extension/deployment/src/test/java/io/quarkus/extest/ConfiguredBeanTest.java
++++ b/integration-tests/test-extension/extension/deployment/src/test/java/io/quarkus/extest/ConfiguredBeanTest.java
+@@ -91,11 +91,11 @@ public void testBuiltTimeNamedMapWithProfiles() {
+     }
+ 
+     @Test
+-    public void testConfigRuntimeValuesSourceOrdinal() {
+-        Optional<ConfigSource> source = config.getConfigSource("Runtime Values");
++    public void testConfigDefaultValuesSourceOrdinal() {
++        Optional<ConfigSource> source = config.getConfigSource("DefaultValuesConfigSource");
+         assertTrue(source.isPresent());
+-        ConfigSource runtimeValues = source.get();
+-        assertEquals(0, runtimeValues.getOrdinal());
++        ConfigSource defaultValues = source.get();
++        assertEquals(Integer.MIN_VALUE, defaultValues.getOrdinal());
+ 
+         ConfigSource applicationProperties = null;
+         for (ConfigSource configSource : config.getConfigSources()) {
+@@ -107,33 +107,33 @@ public void testConfigRuntimeValuesSourceOrdinal() {
+         assertNotNull(applicationProperties);
+         assertEquals(1000, applicationProperties.getOrdinal());
+ 
+-        assertEquals("9999", runtimeValues.getValue("%test.my.prop"));
++        assertEquals("9999", defaultValues.getValue("%test.my.prop"));
+         assertEquals("9999", applicationProperties.getValue("%test.my.prop"));
+-        assertEquals("1234", runtimeValues.getValue("my.prop"));
++        assertEquals("1234", defaultValues.getValue("my.prop"));
+         assertEquals("1234", applicationProperties.getValue("my.prop"));
+ 
+         assertEquals("9999", config.getRawValue("my.prop"));
+     }
+ 
+     @Test
+-    public void testProfileRuntimeValuesSource() {
+-        Optional<ConfigSource> source = config.getConfigSource("Runtime Values");
++    public void testProfileDefaultValuesSource() {
++        Optional<ConfigSource> source = config.getConfigSource("DefaultValuesConfigSource");
+         assertTrue(source.isPresent());
+-        ConfigSource runtimeValues = source.get();
++        ConfigSource defaultValues = source.get();
+ 
+-        assertEquals("1234", runtimeValues.getValue("%prod.my.prop"));
+-        assertEquals("5678", runtimeValues.getValue("%dev.my.prop"));
+-        assertEquals("9999", runtimeValues.getValue("%test.my.prop"));
++        assertEquals("1234", defaultValues.getValue("%prod.my.prop"));
++        assertEquals("5678", defaultValues.getValue("%dev.my.prop"));
++        assertEquals("9999", defaultValues.getValue("%test.my.prop"));
+         // this runs with the test profile
+         assertEquals("9999", config.getValue("my.prop", String.class));
+ 
+         // runtime properties coming from env must not be recorded
+-        assertNull(runtimeValues.getValue("should.not.be.recorded"));
+-        assertNull(runtimeValues.getValue("SHOULD_NOT_BE_RECORDED"));
+-        assertNull(runtimeValues.getValue("quarkus.mapping.rt.do-not-record"));
+-        assertNull(runtimeValues.getValue("%prod.quarkus.mapping.rt.do-not-record"));
+-        assertNull(runtimeValues.getValue("%dev.quarkus.mapping.rt.do-not-record"));
+-        assertEquals("value", config.getConfigValue("quarkus.mapping.rt.do-not-record").getValue());
++        assertNull(defaultValues.getValue("should.not.be.recorded"));
++        assertNull(defaultValues.getValue("SHOULD_NOT_BE_RECORDED"));
++        assertNull(defaultValues.getValue("quarkus.mapping.rt.do-not-record"));
++        assertNull(defaultValues.getValue("%prod.quarkus.mapping.rt.do-not-record"));
++        assertNull(defaultValues.getValue("%dev.quarkus.mapping.rt.do-not-record"));
++        assertEquals("value", config.getRawValue("quarkus.mapping.rt.do-not-record"));
+     }
+ 
+     @Test
+@@ -143,11 +143,11 @@ void shadowBuildTimeToRunTimeConfig() {
+         assertEquals("quarkus.bt.bt-config-value", btConfigValue.getName());
+         assertEquals("value", btConfigValue.getValue());
+ 
+-        Optional<ConfigSource> source = config.getConfigSource("Runtime Values");
++        Optional<ConfigSource> source = config.getConfigSource("DefaultValuesConfigSource");
+         assertTrue(source.isPresent());
+-        ConfigSource runtimeValues = source.get();
++        ConfigSource defaultValues = source.get();
+ 
+-        assertTrue(runtimeValues.getPropertyNames().contains("quarkus.bt.bt-config-value"));
+-        assertEquals("${test.record.expansion}", runtimeValues.getValue("quarkus.bt.bt-config-value"));
++        assertTrue(defaultValues.getPropertyNames().contains("quarkus.bt.bt-config-value"));
++        assertEquals("${test.record.expansion}", defaultValues.getValue("quarkus.bt.bt-config-value"));
+     }
+ }
+diff --git a/integration-tests/test-extension/extension/deployment/src/test/java/io/quarkus/extest/RuntimeValuesTest.java b/integration-tests/test-extension/extension/deployment/src/test/java/io/quarkus/extest/RuntimeDefaultsTest.java
+similarity index 51%
+rename from integration-tests/test-extension/extension/deployment/src/test/java/io/quarkus/extest/RuntimeValuesTest.java
+rename to integration-tests/test-extension/extension/deployment/src/test/java/io/quarkus/extest/RuntimeDefaultsTest.java
+index c191c3bf3ba..0abaa281e09 100644
+--- a/integration-tests/test-extension/extension/deployment/src/test/java/io/quarkus/extest/RuntimeValuesTest.java
++++ b/integration-tests/test-extension/extension/deployment/src/test/java/io/quarkus/extest/RuntimeDefaultsTest.java
+@@ -16,7 +16,7 @@
+ import io.quarkus.test.QuarkusUnitTest;
+ import io.smallrye.config.SmallRyeConfig;
+ 
+-public class RuntimeValuesTest {
++public class RuntimeDefaultsTest {
+     @RegisterExtension
+     static final QuarkusUnitTest TEST = new QuarkusUnitTest()
+             .withApplicationRoot((jar) -> jar
+@@ -27,46 +27,44 @@ public class RuntimeValuesTest {
+     SmallRyeConfig config;
+ 
+     @Test
+-    void doNotRecordEnvRuntimeValues() {
+-        Optional<ConfigSource> runtimeValues = config.getConfigSource("Runtime Values");
+-        assertTrue(runtimeValues.isPresent());
++    void doNotRecordEnvRuntimeDefaults() {
++        Optional<ConfigSource> defaultValues = config.getConfigSource("DefaultValuesConfigSource");
++        assertTrue(defaultValues.isPresent());
+         // Do not record Env values for runtime
+-        assertNull(runtimeValues.get().getValue("quarkus.mapping.rt.do-not-record"));
+-        assertEquals("value", config.getConfigValue("quarkus.mapping.rt.do-not-record").getValue());
++        assertNull(defaultValues.get().getValue("quarkus.mapping.rt.do-not-record"));
++        assertEquals("value", config.getRawValue("quarkus.mapping.rt.do-not-record"));
+         // Property available in both Env and application.properties, ok to record application.properties value
+-        assertEquals("from-app", runtimeValues.get().getValue("bt.ok.to.record"));
++        assertEquals("from-app", defaultValues.get().getValue("bt.ok.to.record"));
+         // You still get the value from Env
+-        assertEquals("from-env", config.getConfigValue("bt.ok.to.record").getValue());
++        assertEquals("from-env", config.getRawValue("bt.ok.to.record"));
+         // Do not record any of the other properties
+-        assertNull(runtimeValues.get().getValue(("do.not.record")));
+-        assertNull(runtimeValues.get().getValue(("DO_NOT_RECORD")));
+-        assertEquals("value", config.getConfigValue("do.not.record").getValue());
++        assertNull(defaultValues.get().getValue(("do.not.record")));
++        assertNull(defaultValues.get().getValue(("DO_NOT_RECORD")));
++        assertEquals("value", config.getRawValue("do.not.record"));
+     }
+ 
+     @Test
+-    void doNotRecordActiveUnprofiledRuntimeValues() {
+-        Optional<ConfigSource> runtimeValues = config.getConfigSource("Runtime Values");
+-        assertTrue(runtimeValues.isPresent());
+-        assertEquals("properties", config.getConfigValue("bt.profile.record").getValue());
++    void doNotRecordActiveUnprofiledPropertiesDefaults() {
++        Optional<ConfigSource> defaultValues = config.getConfigSource("DefaultValuesConfigSource");
++        assertTrue(defaultValues.isPresent());
++        assertEquals("properties", config.getRawValue("bt.profile.record"));
+         // Property needs to be recorded as is, including the profile name
+-        assertEquals("properties", runtimeValues.get().getValue("%test.bt.profile.record"));
+-        assertNull(runtimeValues.get().getValue("bt.profile.record"));
++        assertEquals("properties", defaultValues.get().getValue("%test.bt.profile.record"));
++        assertNull(defaultValues.get().getValue("bt.profile.record"));
+     }
+ 
+     @Test
+-    void recordDefaultFromMappingEvenIfInActiveProfile() {
+-        Optional<ConfigSource> runtimeValues = config.getConfigSource("Runtime Values");
+-        assertTrue(runtimeValues.isPresent());
+-        assertEquals("from-app", runtimeValues.get().getValue("%test.quarkus.mapping.rt.record-default"));
++    void recordDefaultFromRootEvenIfInActiveProfile() {
+         Optional<ConfigSource> defaultValues = config.getConfigSource("DefaultValuesConfigSource");
+         assertTrue(defaultValues.isPresent());
++        assertEquals("from-app", defaultValues.get().getValue("%test.quarkus.mapping.rt.record-default"));
+         assertEquals("from-default", defaultValues.get().getValue("quarkus.mapping.rt.record-default"));
+     }
+ 
+     @Test
+     void recordProfile() {
+-        Optional<ConfigSource> runtimeValues = config.getConfigSource("Runtime Values");
+-        assertTrue(runtimeValues.isPresent());
+-        assertEquals("record", config.getConfigValue("quarkus.profile").getValue());
++        Optional<ConfigSource> defaultValues = config.getConfigSource("DefaultValuesConfigSource");
++        assertTrue(defaultValues.isPresent());
++        assertEquals("record", config.getRawValue("quarkus.profile"));
+     }
+ }
+diff --git a/pom.xml b/pom.xml
+index 4673d2d3e19..ecae77e2274 100644
+--- a/pom.xml
++++ b/pom.xml
+@@ -71,12 +71,12 @@
+         <jacoco.version>0.8.13</jacoco.version>
+         <kubernetes-client.version>7.3.1</kubernetes-client.version> <!-- Please check with Java Operator SDK team before updating -->
+         <rest-assured.version>5.5.6</rest-assured.version>
+-        <hibernate-orm.version>7.1.4.Final</hibernate-orm.version> <!-- WARNING when updating, also align the versions below -->
++        <hibernate-orm.version>7.1.12.Final</hibernate-orm.version> <!-- WARNING when updating, also align the versions below -->
+         <jakarta.persistence-api.version>3.2.0</jakarta.persistence-api.version> <!-- version controlled by Hibernate ORM's needs -->
+         <antlr.version>4.13.2</antlr.version> <!-- version controlled by Hibernate ORM's needs -->
+         <bytebuddy.version>1.17.6</bytebuddy.version> <!-- version controlled by Hibernate ORM's needs -->
+         <hibernate-models.version>1.0.1</hibernate-models.version> <!-- version controlled by Hibernate ORM's needs -->
+-        <hibernate-reactive.version>3.1.8.Final</hibernate-reactive.version> <!-- highly sensitive to Hibernate ORM upgrades -->
++        <hibernate-reactive.version>3.1.11.Final</hibernate-reactive.version> <!-- highly sensitive to Hibernate ORM upgrades -->
+         <hibernate-validator.version>9.0.1.Final</hibernate-validator.version>
+         <hibernate-search.version>8.1.2.Final</hibernate-search.version>
+         <hibernate-tools.version>7.1.4.Final</hibernate-tools.version>

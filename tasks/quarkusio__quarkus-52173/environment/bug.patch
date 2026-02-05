@@ -1,0 +1,357 @@
+diff --git a/core/deployment/src/main/java/io/quarkus/deployment/builditem/ModuleEnableNativeAccessBuildItem.java b/core/deployment/src/main/java/io/quarkus/deployment/builditem/ModuleEnableNativeAccessBuildItem.java
+deleted file mode 100644
+index 7b72c62d194..00000000000
+--- a/core/deployment/src/main/java/io/quarkus/deployment/builditem/ModuleEnableNativeAccessBuildItem.java
++++ /dev/null
+@@ -1,36 +0,0 @@
+-package io.quarkus.deployment.builditem;
+-
+-import io.quarkus.builder.item.MultiBuildItem;
+-import io.smallrye.common.constraint.Assert;
+-
+-/**
+- * This will generate the equivalent of "--enable-native-access moduleName" for
+- * all runners of the generated application.
+- * This is being introduced currently to have the API in place, however it's currently very limited:
+- * when generating a runnable Jar we can only generate an Enable-Native-Access entry in the Manifest
+- * for the modules normally identified by ALL-UNNAMED.
+- * This is considered acceptable at the time of writing as extensions are generally placed on the
+- * classpath for both fast-jar and uber-jar packaging formats. We expect this to evolve as further packaging
+- * formats are introduced which would better leverage the module system.
+- * We specifically don't allow enabling native access for "ALL-UNNAMED" explicitly while using this API to
+- * encourage using the module names that a library has or will have in the near future:
+- * for this reason, when a module name is provided which doesn't exist, we map it to the unnamed module.
+- * It is not possible to allow native code access to other modules via an agent, other approaches
+- * will need to be identified to reconfigure at runtime.
+- */
+-public final class ModuleEnableNativeAccessBuildItem extends MultiBuildItem {
+-
+-    private final String moduleName;
+-
+-    public ModuleEnableNativeAccessBuildItem(final String moduleName) {
+-        this.moduleName = Assert.checkNotEmptyParam("moduleName", moduleName);
+-        if (ModuleOpenBuildItem.ALL_UNNAMED.equals(moduleName)) {
+-            throw new IllegalArgumentException(
+-                    "You're not expected to use the unnamed module as identifier - please check the javadoc");
+-        }
+-    }
+-
+-    public String moduleName() {
+-        return moduleName;
+-    }
+-}
+diff --git a/core/deployment/src/main/java/io/quarkus/deployment/builditem/ModuleOpenBuildItem.java b/core/deployment/src/main/java/io/quarkus/deployment/builditem/ModuleOpenBuildItem.java
+index 65953c4c2de..cd51fe333df 100644
+--- a/core/deployment/src/main/java/io/quarkus/deployment/builditem/ModuleOpenBuildItem.java
++++ b/core/deployment/src/main/java/io/quarkus/deployment/builditem/ModuleOpenBuildItem.java
+@@ -34,7 +34,7 @@ public final class ModuleOpenBuildItem extends MultiBuildItem {
+      * (yes technically there's multiple: each classloader comes with one)
+      * so to encourage future-proofing of code using this API.
+      */
+-    static final String ALL_UNNAMED = "ALL-UNNAMED";
++    private static final String ALL_UNNAMED = "ALL-UNNAMED";
+ 
+     private final String openedModuleName;
+     private final String openingModuleName;
+diff --git a/core/deployment/src/main/java/io/quarkus/deployment/jvm/ResolvedJVMRequirements.java b/core/deployment/src/main/java/io/quarkus/deployment/jvm/ResolvedJVMRequirements.java
+index 2723a86fe35..3722e02055f 100644
+--- a/core/deployment/src/main/java/io/quarkus/deployment/jvm/ResolvedJVMRequirements.java
++++ b/core/deployment/src/main/java/io/quarkus/deployment/jvm/ResolvedJVMRequirements.java
+@@ -9,7 +9,6 @@
+ 
+ import io.quarkus.builder.BuildException;
+ import io.quarkus.builder.item.SimpleBuildItem;
+-import io.quarkus.deployment.builditem.ModuleEnableNativeAccessBuildItem;
+ import io.quarkus.deployment.builditem.ModuleOpenBuildItem;
+ 
+ /**
+@@ -23,15 +22,11 @@
+ public final class ResolvedJVMRequirements extends SimpleBuildItem {
+ 
+     private static final Attributes.Name ADD_OPENS_JARATTRIBUTENAME = new Attributes.Name("Add-Opens");
+-    private static final Attributes.Name ENABLE_NATIVE_JARATTRIBUTENAME = new Attributes.Name("Enable-Native-Access");
+ 
+     private final List<ModuleOpenBuildItem> addOpens;
+-    private final List<ModuleEnableNativeAccessBuildItem> enableNativeAccesses;
+ 
+-    public ResolvedJVMRequirements(final List<ModuleOpenBuildItem> addOpens,
+-            List<ModuleEnableNativeAccessBuildItem> enableNativeAccesses) throws BuildException {
++    public ResolvedJVMRequirements(final List<ModuleOpenBuildItem> addOpens) throws BuildException {
+         this.addOpens = addOpens;
+-        this.enableNativeAccesses = enableNativeAccesses;
+     }
+ 
+     public void renderAddOpensElementToJarManifest(final Attributes attributes) {
+@@ -39,7 +34,6 @@ public void renderAddOpensElementToJarManifest(final Attributes attributes) {
+         //get opened to is implicitly the Jar itself, so it will always point to ALL-UNNAMED:
+         //we're ignoring the ModuleOpenBuildItem#openingModuleName in this context.
+         //N.B.2: if the app is a module, this Manifest attribute will apparently be ignored!
+-        // See: https://docs.oracle.com/en/java/javase/25/docs/specs/jar/jar.html#main-attributes
+         final Collection<String> modulesToAddOpens = new TreeSet<>(); //Choose a TreeSet as it will sort them, providing a stable order for reproducibility
+         for (ModuleOpenBuildItem moduleOpenBuildItem : addOpens) {
+             for (String packageName : moduleOpenBuildItem.packageNames()) {
+@@ -56,9 +50,6 @@ public void renderAddOpensElementToJarManifest(final Attributes attributes) {
+             }
+             attributes.put(ADD_OPENS_JARATTRIBUTENAME, String.join(" ", modulesToAddOpens));
+         }
+-        if (!enableNativeAccesses.isEmpty()) {
+-            attributes.put(ENABLE_NATIVE_JARATTRIBUTENAME, "ALL-UNNAMED");//This is the only supported value for now
+-        }
+     }
+ 
+     public void applyJavaModuleConfigurationToRuntime(JvmModulesReconfigurer reconfigurer,
+diff --git a/core/deployment/src/main/java/io/quarkus/deployment/steps/JvmRequirementsBuildStep.java b/core/deployment/src/main/java/io/quarkus/deployment/steps/JvmRequirementsBuildStep.java
+index f2c74c9db75..7b745b5b1ed 100644
+--- a/core/deployment/src/main/java/io/quarkus/deployment/steps/JvmRequirementsBuildStep.java
++++ b/core/deployment/src/main/java/io/quarkus/deployment/steps/JvmRequirementsBuildStep.java
+@@ -4,15 +4,14 @@
+ 
+ import io.quarkus.builder.BuildException;
+ import io.quarkus.deployment.annotations.BuildStep;
+-import io.quarkus.deployment.builditem.ModuleEnableNativeAccessBuildItem;
+ import io.quarkus.deployment.builditem.ModuleOpenBuildItem;
+ import io.quarkus.deployment.jvm.ResolvedJVMRequirements;
+ 
+ /**
+  * Build step that resolves and aggregates JVM requirements for the Quarkus application.
+  * <p>
+- * This build step processes module open requirements (--add-opens) and access
+- * to native (--enable-native-access) that are needed at runtime for the generated application.
++ * This build step processes module open requirements (--add-opens) that are needed
++ * at runtime for the generated application.
+  * More JVM requirements in the same ballpark might be added in the future.
+  */
+ public class JvmRequirementsBuildStep {
+@@ -28,9 +27,8 @@ public class JvmRequirementsBuildStep {
+      * @return a resolved JVM requirements build item containing all JVM requirements.
+      */
+     @BuildStep
+-    ResolvedJVMRequirements resolveJVMRequirements(final List<ModuleOpenBuildItem> addOpens,
+-            final List<ModuleEnableNativeAccessBuildItem> enableNativeAccesses) throws BuildException {
+-        return new ResolvedJVMRequirements(addOpens, enableNativeAccesses);
++    ResolvedJVMRequirements resolveJVMRequirements(final List<ModuleOpenBuildItem> addOpens) throws BuildException {
++        return new ResolvedJVMRequirements(addOpens);
+     }
+ 
+ }
+diff --git a/extensions/jdbc/jdbc-mssql/deployment/src/main/java/io/quarkus/jdbc/mssql/deployment/MsSQLProcessor.java b/extensions/jdbc/jdbc-mssql/deployment/src/main/java/io/quarkus/jdbc/mssql/deployment/MsSQLProcessor.java
+index c137a5f4983..0c00c19eb29 100644
+--- a/extensions/jdbc/jdbc-mssql/deployment/src/main/java/io/quarkus/jdbc/mssql/deployment/MsSQLProcessor.java
++++ b/extensions/jdbc/jdbc-mssql/deployment/src/main/java/io/quarkus/jdbc/mssql/deployment/MsSQLProcessor.java
+@@ -12,7 +12,6 @@
+ import io.quarkus.deployment.annotations.BuildProducer;
+ import io.quarkus.deployment.annotations.BuildStep;
+ import io.quarkus.deployment.builditem.FeatureBuildItem;
+-import io.quarkus.deployment.builditem.ModuleEnableNativeAccessBuildItem;
+ import io.quarkus.deployment.builditem.NativeImageEnableAllCharsetsBuildItem;
+ import io.quarkus.deployment.builditem.SslNativeConfigBuildItem;
+ import io.quarkus.deployment.builditem.nativeimage.NativeImageResourceBundleBuildItem;
+@@ -28,11 +27,6 @@ FeatureBuildItem feature() {
+         return new FeatureBuildItem(Feature.JDBC_MSSQL);
+     }
+ 
+-    @BuildStep
+-    ModuleEnableNativeAccessBuildItem enableNativeAccess() {
+-        return new ModuleEnableNativeAccessBuildItem("com.microsoft.sqlserver.jdbc");
+-    }
+-
+     @BuildStep
+     void registerDriver(BuildProducer<JdbcDriverBuildItem> jdbcDriver,
+             SslNativeConfigBuildItem sslNativeConfigBuildItem) {
+diff --git a/extensions/picocli/deployment/src/main/java/io/quarkus/picocli/deployment/PicocliProcessor.java b/extensions/picocli/deployment/src/main/java/io/quarkus/picocli/deployment/PicocliProcessor.java
+index 65a2723052e..18c452474e5 100644
+--- a/extensions/picocli/deployment/src/main/java/io/quarkus/picocli/deployment/PicocliProcessor.java
++++ b/extensions/picocli/deployment/src/main/java/io/quarkus/picocli/deployment/PicocliProcessor.java
+@@ -22,7 +22,6 @@
+ import io.quarkus.deployment.builditem.CombinedIndexBuildItem;
+ import io.quarkus.deployment.builditem.FeatureBuildItem;
+ import io.quarkus.deployment.builditem.IndexDependencyBuildItem;
+-import io.quarkus.deployment.builditem.ModuleEnableNativeAccessBuildItem;
+ import io.quarkus.deployment.builditem.QuarkusApplicationClassBuildItem;
+ import io.quarkus.gizmo.MethodDescriptor;
+ import io.quarkus.picocli.runtime.DefaultPicocliCommandLineFactory;
+@@ -38,12 +37,6 @@ FeatureBuildItem feature() {
+         return new FeatureBuildItem(Feature.PICOCLI);
+     }
+ 
+-    @BuildStep
+-    ModuleEnableNativeAccessBuildItem allowNativeLibraryLoad() {
+-        // Need to generate an --enable-native-access because of org.fusesource.jansi.internal.JansiLoader
+-        return new ModuleEnableNativeAccessBuildItem("org.fusesource.jansi");
+-    }
+-
+     @BuildStep
+     void addScopeToCommands(BuildProducer<AutoAddScopeBuildItem> autoAddScope) {
+         // First add @Dependent to all classes annotated with @Command that:
+diff --git a/extensions/vertx-http/deployment/src/main/java/io/quarkus/vertx/http/deployment/VertxHttpProcessor.java b/extensions/vertx-http/deployment/src/main/java/io/quarkus/vertx/http/deployment/VertxHttpProcessor.java
+index 01559ac7f0c..11259b20996 100644
+--- a/extensions/vertx-http/deployment/src/main/java/io/quarkus/vertx/http/deployment/VertxHttpProcessor.java
++++ b/extensions/vertx-http/deployment/src/main/java/io/quarkus/vertx/http/deployment/VertxHttpProcessor.java
+@@ -43,7 +43,6 @@
+ import io.quarkus.deployment.builditem.HotDeploymentWatchedFileBuildItem;
+ import io.quarkus.deployment.builditem.LaunchModeBuildItem;
+ import io.quarkus.deployment.builditem.LogCategoryBuildItem;
+-import io.quarkus.deployment.builditem.ModuleEnableNativeAccessBuildItem;
+ import io.quarkus.deployment.builditem.NativeImageFeatureBuildItem;
+ import io.quarkus.deployment.builditem.RunTimeConfigBuilderBuildItem;
+ import io.quarkus.deployment.builditem.ServiceStartBuildItem;
+@@ -638,22 +637,10 @@ private static boolean isSslConfigured() {
+ 
+     @BuildStep
+     NativeImageFeatureBuildItem Brotli4jFeature(VertxHttpBuildTimeConfig httpBuildTimeConfig) {
+-        if (isBrotliEnabled(httpBuildTimeConfig)) {
++        if (httpBuildTimeConfig.compressors().isPresent()
++                && httpBuildTimeConfig.compressors().get().stream().anyMatch(s -> s.equalsIgnoreCase("br"))) {
+             return new NativeImageFeatureBuildItem(Brotli4jFeature.class.getName());
+         }
+         return null;
+     }
+-
+-    @BuildStep
+-    ModuleEnableNativeAccessBuildItem brotli4jEnableNativeAccess(VertxHttpBuildTimeConfig httpBuildTimeConfig) {
+-        if (isBrotliEnabled(httpBuildTimeConfig)) {
+-            return new ModuleEnableNativeAccessBuildItem("com.aayushatharva.brotli4j");
+-        }
+-        return null;
+-    }
+-
+-    private static boolean isBrotliEnabled(VertxHttpBuildTimeConfig httpBuildTimeConfig) {
+-        return httpBuildTimeConfig.compressors().isPresent()
+-                && httpBuildTimeConfig.compressors().get().stream().anyMatch(s -> s.equalsIgnoreCase("br"));
+-    }
+ }
+diff --git a/integration-tests/test-extension/extension/deployment/src/main/java/io/quarkus/extest/deployment/ModulesCustomProcessor.java b/integration-tests/test-extension/extension/deployment/src/main/java/io/quarkus/extest/deployment/ModulesCustomProcessor.java
+index 8d4131e22eb..767e5008593 100644
+--- a/integration-tests/test-extension/extension/deployment/src/main/java/io/quarkus/extest/deployment/ModulesCustomProcessor.java
++++ b/integration-tests/test-extension/extension/deployment/src/main/java/io/quarkus/extest/deployment/ModulesCustomProcessor.java
+@@ -1,7 +1,6 @@
+ package io.quarkus.extest.deployment;
+ 
+ import io.quarkus.deployment.annotations.BuildStep;
+-import io.quarkus.deployment.builditem.ModuleEnableNativeAccessBuildItem;
+ import io.quarkus.deployment.builditem.ModuleOpenBuildItem;
+ 
+ public class ModulesCustomProcessor {
+@@ -10,10 +9,4 @@ public class ModulesCustomProcessor {
+     ModuleOpenBuildItem openModules() {
+         return new ModuleOpenBuildItem("java.base", "test-module-fake-name", "java.util");
+     }
+-
+-    @BuildStep
+-    ModuleEnableNativeAccessBuildItem allowNativeLibraryLoad() {
+-        return new ModuleEnableNativeAccessBuildItem("another-fake-module");
+-    }
+-
+ }
+diff --git a/integration-tests/test-extension/extension/deployment/src/test/java/io/quarkus/extest/AbstractModuleEnableNativeAccessManifestTest.java b/integration-tests/test-extension/extension/deployment/src/test/java/io/quarkus/extest/AbstractModuleEnableNativeAccessManifestTest.java
+deleted file mode 100644
+index b0ad18804e1..00000000000
+--- a/integration-tests/test-extension/extension/deployment/src/test/java/io/quarkus/extest/AbstractModuleEnableNativeAccessManifestTest.java
++++ /dev/null
+@@ -1,42 +0,0 @@
+-package io.quarkus.extest;
+-
+-import static org.assertj.core.api.Assertions.assertThat;
+-
+-import java.io.FileInputStream;
+-import java.io.InputStream;
+-import java.nio.file.Path;
+-import java.util.jar.JarInputStream;
+-import java.util.jar.Manifest;
+-
+-import org.junit.jupiter.api.Test;
+-
+-import io.quarkus.test.ProdModeTestResults;
+-
+-/**
+- * Base test class that verifies when a {@link io.quarkus.deployment.builditem.ModuleEnableNativeAccessBuildItem}
+- * is produced during build, the generated JAR manifest contains the {@code Enable-Native-Access: ALL-UNNAMED} entry.
+- * Subclasses configure the specific packaging type (uber-jar, fast-jar) and provide the test results.
+- */
+-abstract class AbstractModuleEnableNativeAccessManifestTest {
+-
+-    abstract ProdModeTestResults prodModeTestResults();
+-
+-    @Test
+-    void testEnableNativeAccessManifestEntry() throws Exception {
+-        ProdModeTestResults results = prodModeTestResults();
+-        assertThat(results.getResults()).hasSize(1);
+-        Path jarPath = results.getResults().get(0).getPath();
+-
+-        try (InputStream fileInputStream = new FileInputStream(jarPath.toFile());
+-                JarInputStream stream = new JarInputStream(fileInputStream)) {
+-            Manifest manifest = stream.getManifest();
+-            assertThat(manifest).isNotNull();
+-
+-            String enableNativeAccess = manifest.getMainAttributes().getValue("Enable-Native-Access");
+-            assertThat(enableNativeAccess)
+-                    .as("Manifest should contain Enable-Native-Access entry when ModuleEnableNativeAccessBuildItem is produced")
+-                    .isNotNull()
+-                    .isEqualTo("ALL-UNNAMED");
+-        }
+-    }
+-}
+diff --git a/integration-tests/test-extension/extension/deployment/src/test/java/io/quarkus/extest/ModuleEnableNativeAccessFastJarManifestTest.java b/integration-tests/test-extension/extension/deployment/src/test/java/io/quarkus/extest/ModuleEnableNativeAccessFastJarManifestTest.java
+deleted file mode 100644
+index 73d02bbd066..00000000000
+--- a/integration-tests/test-extension/extension/deployment/src/test/java/io/quarkus/extest/ModuleEnableNativeAccessFastJarManifestTest.java
++++ /dev/null
+@@ -1,26 +0,0 @@
+-package io.quarkus.extest;
+-
+-import org.junit.jupiter.api.extension.RegisterExtension;
+-
+-import io.quarkus.test.ProdBuildResults;
+-import io.quarkus.test.ProdModeTestResults;
+-import io.quarkus.test.QuarkusProdModeTest;
+-
+-/**
+- * Verifies the Enable-Native-Access manifest entry for fast-jar packaging.
+- */
+-public class ModuleEnableNativeAccessFastJarManifestTest extends AbstractModuleEnableNativeAccessManifestTest {
+-
+-    @RegisterExtension
+-    static final QuarkusProdModeTest config = new QuarkusProdModeTest()
+-            .withEmptyApplication()
+-            .overrideConfigKey("quarkus.package.jar.type", "fast-jar");
+-
+-    @ProdBuildResults
+-    private ProdModeTestResults prodModeTestResults;
+-
+-    @Override
+-    ProdModeTestResults prodModeTestResults() {
+-        return prodModeTestResults;
+-    }
+-}
+diff --git a/integration-tests/test-extension/extension/deployment/src/test/java/io/quarkus/extest/ModuleEnableNativeAccessManifestTest.java b/integration-tests/test-extension/extension/deployment/src/test/java/io/quarkus/extest/ModuleEnableNativeAccessManifestTest.java
+deleted file mode 100644
+index e2a224233d6..00000000000
+--- a/integration-tests/test-extension/extension/deployment/src/test/java/io/quarkus/extest/ModuleEnableNativeAccessManifestTest.java
++++ /dev/null
+@@ -1,26 +0,0 @@
+-package io.quarkus.extest;
+-
+-import org.junit.jupiter.api.extension.RegisterExtension;
+-
+-import io.quarkus.test.ProdBuildResults;
+-import io.quarkus.test.ProdModeTestResults;
+-import io.quarkus.test.QuarkusProdModeTest;
+-
+-/**
+- * Verifies the Enable-Native-Access manifest entry for uber-jar packaging.
+- */
+-public class ModuleEnableNativeAccessManifestTest extends AbstractModuleEnableNativeAccessManifestTest {
+-
+-    @RegisterExtension
+-    static final QuarkusProdModeTest config = new QuarkusProdModeTest()
+-            .withEmptyApplication()
+-            .overrideConfigKey("quarkus.package.jar.type", "uber-jar");
+-
+-    @ProdBuildResults
+-    private ProdModeTestResults prodModeTestResults;
+-
+-    @Override
+-    ProdModeTestResults prodModeTestResults() {
+-        return prodModeTestResults;
+-    }
+-}

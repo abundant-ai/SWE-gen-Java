@@ -1,0 +1,598 @@
+diff --git a/http-client-core/src/main/java/io/micronaut/http/client/HttpClientConfiguration.java b/http-client-core/src/main/java/io/micronaut/http/client/HttpClientConfiguration.java
+index d4fafd1bb2..f1dc120523 100644
+--- a/http-client-core/src/main/java/io/micronaut/http/client/HttpClientConfiguration.java
++++ b/http-client-core/src/main/java/io/micronaut/http/client/HttpClientConfiguration.java
+@@ -924,6 +924,9 @@ public abstract class HttpClientConfiguration {
+ 
+         private boolean enabled = DEFAULT_ENABLED;
+ 
++        @NonNull
++        private HttpClientConfiguration.ConnectionPoolConfiguration.ConnectionLocality connectionLocality = ConnectionLocality.PREFERRED;
++
+         /**
+          * Whether connection pooling is enabled.
+          * [available in the Netty HTTP client]
+@@ -1062,6 +1065,61 @@ public abstract class HttpClientConfiguration {
+         public void setMaxConcurrentHttp2Connections(int maxConcurrentHttp2Connections) {
+             this.maxConcurrentHttp2Connections = maxConcurrentHttp2Connections;
+         }
++
++        /**
++         * Optimize locality of client connections depending on which event loop makes a request.
++         * [available in the Netty HTTP client]
++         *
++         * @return The locality configuration
++         * @since 4.8.0
++         */
++        public @NonNull HttpClientConfiguration.ConnectionPoolConfiguration.ConnectionLocality getConnectionLocality() {
++            return connectionLocality;
++        }
++
++        /**
++         * Optimize locality of client connections depending on which event loop makes a request.
++         * [available in the Netty HTTP client]
++         *
++         * @param connectionLocality The locality configuration
++         * @since 4.8.0
++         */
++        public void setConnectionLocality(@NonNull HttpClientConfiguration.ConnectionPoolConfiguration.ConnectionLocality connectionLocality) {
++            this.connectionLocality = connectionLocality;
++        }
++
++        /**
++         * Options for {@link #connectionLocality}.
++         *
++         * @since 4.8.0
++         */
++        public enum ConnectionLocality {
++            /**
++             * Do not consider locality when selecting a connection.
++             */
++            IGNORE,
++            /**
++             * If a request is made from an event loop, and a connection is already in the pool
++             * from that same event loop, prefer using that connection. When a new connection needs
++             * to be created, also prefer the current event loop.
++             */
++            PREFERRED,
++            /**
++             * If a request is made from an event loop, and a connection is already in the pool
++             * from that same event loop, use that connection. Otherwise, force creating a new
++             * connection on the same event loop. Please ensure that settings such as
++             * {@link #maxPendingConnections} are also high enough to create new connections.
++             */
++            ENFORCED_IF_SAME_GROUP,
++            /**
++             * Same as {@link #ENFORCED_IF_SAME_GROUP}, but if a request is made from outside the
++             * event loop group of the client, fail <i>a</i> request. Note that there is no
++             * guarantee that the offending request is the only request seeing a failure, so the
++             * exception should only be used as a warning that you are using the client in a way
++             * that you did not intend.
++             */
++            ENFORCED_ALWAYS,
++        }
+     }
+ 
+     /**
+diff --git a/http-client/src/main/java/io/micronaut/http/client/netty/ConnectionManager.java b/http-client/src/main/java/io/micronaut/http/client/netty/ConnectionManager.java
+index 1eccca969a..74ffcf4c21 100644
+--- a/http-client/src/main/java/io/micronaut/http/client/netty/ConnectionManager.java
++++ b/http-client/src/main/java/io/micronaut/http/client/netty/ConnectionManager.java
+@@ -46,6 +46,7 @@ import io.netty.channel.ChannelOption;
+ import io.netty.channel.ChannelOutboundHandlerAdapter;
+ import io.netty.channel.ChannelPipeline;
+ import io.netty.channel.ChannelPromise;
++import io.netty.channel.EventLoop;
+ import io.netty.channel.EventLoopGroup;
+ import io.netty.channel.nio.NioEventLoopGroup;
+ import io.netty.handler.codec.DecoderException;
+@@ -109,6 +110,7 @@ import io.netty.util.concurrent.EventExecutor;
+ import io.netty.util.concurrent.Future;
+ import io.netty.util.concurrent.GenericFutureListener;
+ import io.netty.util.concurrent.ScheduledFuture;
++import io.netty.util.internal.ThreadExecutorMap;
+ import org.slf4j.Logger;
+ import reactor.core.publisher.Mono;
+ import reactor.core.publisher.Sinks;
+@@ -363,12 +365,10 @@ public class ConnectionManager {
+ 
+     private void initBootstrap() {
+         this.bootstrap = new Bootstrap()
+-            .group(group)
+             .channelFactory(socketChannelFactory)
+             .option(ChannelOption.SO_KEEPALIVE, true);
+         if (httpVersion.isHttp3()) {
+             this.udpBootstrap = new Bootstrap()
+-                .group(group)
+                 .channelFactory(udpChannelFactory);
+         }
+ 
+@@ -450,11 +450,12 @@ public class ConnectionManager {
+      * Use the bootstrap to connect to the given host. Also does some proxy setup. This method is
+      * not final: The test suite overrides it to return embedded channels instead.
+      *
+-     * @param requestKey The host to connect to
++     * @param requestKey         The host to connect to
+      * @param channelInitializer The initializer to use
++     * @param requestingThread   A hint which thread may use this connection (not 100% reliable)
+      * @return Future that terminates when the TCP connection is established.
+      */
+-    ChannelFuture doConnect(DefaultHttpClient.RequestKey requestKey, CustomizerAwareInitializer channelInitializer) {
++    ChannelFuture doConnect(DefaultHttpClient.RequestKey requestKey, CustomizerAwareInitializer channelInitializer, @NonNull Thread requestingThread) {
+         String host = requestKey.getHost();
+         int port = requestKey.getPort();
+         Bootstrap localBootstrap = bootstrap.clone();
+@@ -465,9 +466,30 @@ public class ConnectionManager {
+         localBootstrap.handler(channelInitializer)
+             .remoteAddress(host, port);
+         channelInitializer.bootstrappedCustomizer = clientCustomizer.specializeForBootstrap(localBootstrap);
++        assignGroup(localBootstrap, requestingThread);
+         return localBootstrap.connect();
+     }
+ 
++    private void assignGroup(Bootstrap bootstrap, Thread requestingThread) {
++        HttpClientConfiguration.ConnectionPoolConfiguration.ConnectionLocality locality = configuration.getConnectionPoolConfiguration().getConnectionLocality();
++        if (locality == HttpClientConfiguration.ConnectionPoolConfiguration.ConnectionLocality.IGNORE) {
++            bootstrap.group(group);
++            return;
++        }
++        EventLoop loop = (EventLoop) findEventLoop(requestingThread);
++        if (loop == null) {
++            if (locality == HttpClientConfiguration.ConnectionPoolConfiguration.ConnectionLocality.ENFORCED_ALWAYS) {
++                throw new IllegalStateException("Attempted to open a HTTP connection from thread " +
++                    requestingThread + " which is not part of event loop group " + group +
++                    ", but configured the pool in locality mode ENFORCED_ALWAYS, which disallows " +
++                    "requesting from outside this group");
++            }
++            bootstrap.group(group);
++        } else {
++            bootstrap.group(loop);
++        }
++    }
++
+     /**
+      * Builds an {@link SslContext} for the given URI if necessary.
+      *
+@@ -574,7 +596,7 @@ public class ConnectionManager {
+                 // failed
+                 ch.close();
+             }
+-        });
++        }, Thread.currentThread());
+         withPropagation(connectFuture, future -> {
+             if (!future.isSuccess()) {
+                 initial.tryEmitError(future.cause());
+@@ -844,6 +866,27 @@ public class ConnectionManager {
+         return HttpClientExceptionUtils.populateServiceId(exc, informationalServiceId, configuration);
+     }
+ 
++    @Nullable
++    private EventExecutor findEventLoop(Thread thread) {
++        if (thread == Thread.currentThread()) {
++            // shortcut to avoid the loop
++            EventExecutor executor = ThreadExecutorMap.currentExecutor();
++            if (executor != null) {
++                if (executor == group || executor.parent() == group) {
++                    return executor;
++                } else {
++                    return null;
++                }
++            }
++        }
++        for (EventExecutor executor : group) {
++            if (executor.inEventLoop(thread)) {
++                return executor;
++            }
++        }
++        return null;
++    }
++
+     abstract static class CustomizerAwareInitializer extends ChannelInitializer<Channel> {
+         NettyClientCustomizer bootstrappedCustomizer;
+     }
+@@ -1205,9 +1248,9 @@ public class ConnectionManager {
+         }
+ 
+         @Override
+-        void openNewConnection(@Nullable BlockHint blockHint) throws Exception {
++        void openNewConnection(@Nullable BlockHint blockHint, @NonNull Thread requestingThread) throws Exception {
+             // open a new connection
+-            ChannelFuture channelFuture = openConnectionFuture();
++            ChannelFuture channelFuture = openConnectionFuture(requestingThread);
+             if (blockHint != null && blockHint.blocks(channelFuture.channel().eventLoop())) {
+                 channelFuture.channel().close();
+                 onNewConnectionFailure(BlockHint.createException());
+@@ -1220,7 +1263,12 @@ public class ConnectionManager {
+             });
+         }
+ 
+-        private ChannelFuture openConnectionFuture() {
++        @Override
++        boolean containsThread(@NonNull Thread thread) {
++            return findEventLoop(thread) != null;
++        }
++
++        private ChannelFuture openConnectionFuture(@NonNull Thread requestingThread) {
+             CustomizerAwareInitializer initializer;
+             if (requestKey.isSecure()) {
+                 if (httpVersion.isHttp3()) {
+@@ -1228,6 +1276,7 @@ public class ConnectionManager {
+                     Bootstrap localBootstrap = udpBootstrap.clone()
+                         .handler(channelInitializer)
+                         .localAddress(0);
++                    assignGroup(localBootstrap, requestingThread);
+                     channelInitializer.bootstrappedCustomizer = clientCustomizer.specializeForBootstrap(localBootstrap);
+                     return localBootstrap.bind();
+                 }
+@@ -1260,7 +1309,7 @@ public class ConnectionManager {
+                     case H2C -> new Http2UpgradeInitializer(this);
+                 };
+             }
+-            return doConnect(requestKey, initializer);
++            return doConnect(requestKey, initializer, requestingThread);
+         }
+ 
+         public void shutdown() {
+@@ -1381,6 +1430,11 @@ public class ConnectionManager {
+                 }
+             }
+ 
++            @Override
++            boolean inEventLoop(Thread thread) {
++                return channel.eventLoop().inEventLoop(thread);
++            }
++
+             @Override
+             public final boolean dispatch(PendingRequest sink) {
+                 if (!tryEarmarkForRequest()) {
+diff --git a/http-client/src/main/java/io/micronaut/http/client/netty/DefaultHttpClient.java b/http-client/src/main/java/io/micronaut/http/client/netty/DefaultHttpClient.java
+index f2a77ed029..9f8a2286f3 100644
+--- a/http-client/src/main/java/io/micronaut/http/client/netty/DefaultHttpClient.java
++++ b/http-client/src/main/java/io/micronaut/http/client/netty/DefaultHttpClient.java
+@@ -196,8 +196,10 @@ import java.util.Objects;
+ import java.util.Optional;
+ import java.util.OptionalLong;
+ import java.util.concurrent.ExecutorService;
++import java.util.concurrent.ScheduledExecutorService;
+ import java.util.concurrent.ThreadFactory;
+ import java.util.concurrent.TimeoutException;
++import java.util.concurrent.atomic.AtomicReference;
+ import java.util.function.BiFunction;
+ import java.util.function.Function;
+ 
+@@ -886,11 +888,15 @@ public class DefaultHttpClient implements
+     private <I, O, E> Mono<HttpResponse<O>> exchange(io.micronaut.http.HttpRequest<I> request, Argument<O> bodyType, Argument<E> errorType, @Nullable BlockHint blockHint) {
+         setupConversionService(request);
+         PropagatedContext propagatedContext = PropagatedContext.getOrEmpty();
++        // if a connection is available immediately, we can use its executor for the timeout
++        // instead of a random executor for the whole group
++        AtomicReference<ScheduledExecutorService> scheduler = new AtomicReference<>(connectionManager.getGroup());
+         ExecutionFlow<HttpResponse<O>> mono = resolveRequestURI(request).flatMap(uri -> {
+             MutableHttpRequest<?> mutableRequest = toMutableRequest(request).uri(uri);
+             //noinspection unchecked
+             return sendRequestWithRedirects(
+                 propagatedContext,
++                scheduler,
+                 blockHint,
+                 mutableRequest,
+                 (req, resp) -> InternalByteBody.bufferFlow(resp.byteBody())
+@@ -908,7 +914,7 @@ public class DefaultHttpClient implements
+         }
+         if (requestTimeout != null) {
+             if (!requestTimeout.isNegative()) {
+-                mono = mono.timeout(requestTimeout, connectionManager.getGroup(), null)
++                mono = mono.timeout(requestTimeout, scheduler.get(), null)
+                     .onErrorResume(throwable -> {
+                         if (throwable instanceof TimeoutException) {
+                             return ExecutionFlow.error(ReadTimeoutException.TIMEOUT_EXCEPTION);
+@@ -1508,11 +1514,23 @@ public class DefaultHttpClient implements
+         return toMono(mono, propagatedContext).doOnTerminate(requestBody::close);
+     }
+ 
++    private ExecutionFlow<HttpResponse<?>> sendRequestWithRedirects(
++        PropagatedContext propagatedContext,
++        @Nullable BlockHint blockHint,
++        MutableHttpRequest<?> request,
++        BiFunction<MutableHttpRequest<?>, NettyClientByteBodyResponse, ? extends ExecutionFlow<? extends HttpResponse<?>>> readResponse
++    ) {
++        return sendRequestWithRedirects(propagatedContext, new AtomicReference<>(), blockHint, request, readResponse);
++    }
++
+     /**
+      * This is the high-level request method. It sits above {@link #sendRawRequest} and handles
+      * things like filters, error handling, response parsing, request writing.
+      *
+      * @param propagatedContext The context propagated from the original client call
++     * @param preferredScheduler A reference holding the preferred scheduler for timeouts. This is
++     *                           replaced by the connection event loop ASAP so that callers can take
++     *                           advantage of locality
+      * @param blockHint         The optional block hint
+      * @param request           The request to send. Must have resolved absolute URI (see {@link #resolveURI})
+      * @param readResponse      Function that reads the response from the raw
+@@ -1523,6 +1541,7 @@ public class DefaultHttpClient implements
+      */
+     private ExecutionFlow<HttpResponse<?>> sendRequestWithRedirects(
+         PropagatedContext propagatedContext,
++        AtomicReference<ScheduledExecutorService> preferredScheduler,
+         @Nullable BlockHint blockHint,
+         MutableHttpRequest<?> request,
+         BiFunction<MutableHttpRequest<?>, NettyClientByteBodyResponse, ? extends ExecutionFlow<? extends HttpResponse<?>>> readResponse
+@@ -1543,6 +1562,7 @@ public class DefaultHttpClient implements
+                     try (PropagatedContext.Scope ignore = propagatedContext.propagate()) {
+                         return sendRequestWithRedirectsNoFilter(
+                             propagatedContext,
++                            preferredScheduler,
+                             blockHint,
+                             MutableHttpRequestWrapper.wrapIfNecessary(conversionService, request),
+                             readResponse
+@@ -1558,6 +1578,7 @@ public class DefaultHttpClient implements
+ 
+     private ExecutionFlow<HttpResponse<?>> sendRequestWithRedirectsNoFilter(
+         PropagatedContext propagatedContext,
++        AtomicReference<ScheduledExecutorService> preferredScheduler,
+         @Nullable BlockHint blockHint,
+         MutableHttpRequest<?> request,
+         BiFunction<MutableHttpRequest<?>, NettyClientByteBodyResponse, ? extends ExecutionFlow<? extends HttpResponse<?>>> readResponse
+@@ -1576,6 +1597,8 @@ public class DefaultHttpClient implements
+         // first: connect
+         return connectionManager.connect(requestKey, blockHint)
+             .flatMap(poolHandle -> {
++                preferredScheduler.set(poolHandle.channel.eventLoop());
++
+                 // build the raw request
+                 request.setAttribute(NettyClientHttpRequest.CHANNEL, poolHandle.channel);
+ 
+diff --git a/http-client/src/main/java/io/micronaut/http/client/netty/PoolResizer.java b/http-client/src/main/java/io/micronaut/http/client/netty/PoolResizer.java
+index c832681fed..2246c1318a 100644
+--- a/http-client/src/main/java/io/micronaut/http/client/netty/PoolResizer.java
++++ b/http-client/src/main/java/io/micronaut/http/client/netty/PoolResizer.java
+@@ -16,6 +16,7 @@
+ package io.micronaut.http.client.netty;
+ 
+ import io.micronaut.core.annotation.Internal;
++import io.micronaut.core.annotation.NonNull;
+ import io.micronaut.core.annotation.Nullable;
+ import io.micronaut.core.execution.DelayedExecutionFlow;
+ import io.micronaut.core.execution.ExecutionFlow;
+@@ -23,13 +24,17 @@ import io.micronaut.http.client.HttpClientConfiguration;
+ import io.micronaut.http.client.exceptions.HttpClientException;
+ import org.slf4j.Logger;
+ 
++import java.util.ArrayList;
++import java.util.Arrays;
+ import java.util.Deque;
++import java.util.Iterator;
+ import java.util.List;
+ import java.util.concurrent.ConcurrentLinkedDeque;
+-import java.util.concurrent.CopyOnWriteArrayList;
+ import java.util.concurrent.atomic.AtomicBoolean;
+ import java.util.concurrent.atomic.AtomicInteger;
+ import java.util.concurrent.atomic.AtomicReference;
++import java.util.concurrent.locks.Lock;
++import java.util.concurrent.locks.ReentrantLock;
+ import java.util.function.Consumer;
+ 
+ /**
+@@ -53,8 +58,8 @@ abstract class PoolResizer {
+     private final AtomicInteger pendingConnectionCount = new AtomicInteger(0);
+ 
+     private final Deque<PendingRequest> pendingRequests = new ConcurrentLinkedDeque<>();
+-    private final List<ResizerConnection> http1Connections = new CopyOnWriteArrayList<>();
+-    private final List<ResizerConnection> http2Connections = new CopyOnWriteArrayList<>();
++    private final ConnectionList http1Connections = new ConnectionList();
++    private final ConnectionList http2Connections = new ConnectionList();
+ 
+     PoolResizer(Logger log, HttpClientConfiguration.ConnectionPoolConfiguration connectionPoolConfiguration) {
+         this.log = log;
+@@ -98,6 +103,49 @@ abstract class PoolResizer {
+         }
+     }
+ 
++    private ResizerConnection[] sort(PendingRequest request, ConnectionList connections) {
++        ResizerConnection[] items = connections.unsafeItems;
++        if (items.length == 0) {
++            return items;
++        }
++        HttpClientConfiguration.ConnectionPoolConfiguration.ConnectionLocality locality = connectionPoolConfiguration.getConnectionLocality();
++        if (locality == HttpClientConfiguration.ConnectionPoolConfiguration.ConnectionLocality.PREFERRED) {
++            // this is a very simple selection sort. There's usually only one or two connections on
++            // the same thread
++            int copies = 0;
++            for (int i = 1; i < items.length; i++) {
++                ResizerConnection connection = items[i];
++                if (connection.inEventLoop(request.requestingThread)) {
++                    // place that connection at the front
++                    System.arraycopy(items, 0, items, 1, i);
++                    items[0] = connection;
++                    if (copies++ > 4) {
++                        // prevent n² worst-case performance
++                        break;
++                    }
++                }
++            }
++        } else if (locality == HttpClientConfiguration.ConnectionPoolConfiguration.ConnectionLocality.ENFORCED_IF_SAME_GROUP ||
++            locality == HttpClientConfiguration.ConnectionPoolConfiguration.ConnectionLocality.ENFORCED_ALWAYS) {
++
++            List<ResizerConnection> options = new ArrayList<>();
++            for (ResizerConnection item : items) {
++                if (item.inEventLoop(request.requestingThread)) {
++                    options.add(item);
++                }
++            }
++            if (!options.isEmpty() ||
++                locality == HttpClientConfiguration.ConnectionPoolConfiguration.ConnectionLocality.ENFORCED_ALWAYS ||
++                containsThread(request.requestingThread)) {
++
++                return options.toArray(new ResizerConnection[0]);
++            }
++            // escape hatch: in ENFORCED_IF_SAME_GROUP, we can use any connection if the
++            // requesting thread is *not* in the same event loop group.
++        }
++        return items;
++    }
++
+     private void doSomeWork() {
+         BlockHint blockedPendingRequests = null;
+         while (true) {
+@@ -106,14 +154,14 @@ abstract class PoolResizer {
+                 break;
+             }
+             boolean dispatched = false;
+-            for (ResizerConnection c : http2Connections) {
++            for (ResizerConnection c : sort(toDispatch, http2Connections)) {
+                 if (dispatchSafe(c, toDispatch)) {
+                     dispatched = true;
+                     break;
+                 }
+             }
+             if (!dispatched) {
+-                for (ResizerConnection c : http1Connections) {
++                for (ResizerConnection c : sort(toDispatch, http1Connections)) {
+                     if (dispatchSafe(c, toDispatch)) {
+                         dispatched = true;
+                         break;
+@@ -131,8 +179,8 @@ abstract class PoolResizer {
+         // snapshot our fields
+         int pendingRequestCount = this.pendingRequests.size();
+         int pendingConnectionCount = this.pendingConnectionCount.get();
+-        int http1ConnectionCount = this.http1Connections.size();
+-        int http2ConnectionCount = this.http2Connections.size();
++        int http1ConnectionCount = this.http1Connections.unsafeItems.length;
++        int http2ConnectionCount = this.http2Connections.unsafeItems.length;
+ 
+         if (pendingRequestCount == 0) {
+             // if there are no pending requests, there is nothing to do.
+@@ -151,10 +199,17 @@ abstract class PoolResizer {
+         }
+ 
+         if (connectionsToOpen > 0) {
++            Iterator<PendingRequest> pendingRequestIterator = this.pendingRequests.iterator();
++            if (!pendingRequestIterator.hasNext()) {
++                // no pending requests now
++                return;
++            }
++            // we need to pass a preferred thread to openNewConnection. This is the best we can do
++            Thread preferredThread = pendingRequestIterator.next().requestingThread;
+             this.pendingConnectionCount.addAndGet(connectionsToOpen);
+             for (int i = 0; i < connectionsToOpen; i++) {
+                 try {
+-                    openNewConnection(blockedPendingRequests);
++                    openNewConnection(blockedPendingRequests, preferredThread);
+                 } catch (Exception e) {
+                     try {
+                         onNewConnectionFailure(e);
+@@ -162,6 +217,9 @@ abstract class PoolResizer {
+                         log.error("Internal error", f);
+                     }
+                 }
++                if (pendingRequestIterator.hasNext()) {
++                    preferredThread = pendingRequestIterator.next().requestingThread;
++                }
+             }
+             dirty();
+         }
+@@ -183,7 +241,9 @@ abstract class PoolResizer {
+         }
+     }
+ 
+-    abstract void openNewConnection(@Nullable BlockHint blockedPendingRequests) throws Exception;
++    abstract void openNewConnection(@Nullable BlockHint blockedPendingRequests, @NonNull Thread requestingThread) throws Exception;
++
++    abstract boolean containsThread(@NonNull Thread thread);
+ 
+     static boolean incrementWithLimit(AtomicInteger variable, int limit) {
+         while (true) {
+@@ -250,11 +310,72 @@ abstract class PoolResizer {
+     }
+ 
+     final void forEachConnection(Consumer<ResizerConnection> c) {
+-        for (ResizerConnection http1Connection : http1Connections) {
+-            c.accept(http1Connection);
++        http1Connections.forEach(c);
++        http2Connections.forEach(c);
++    }
++
++    /**
++     * This is a concurrent list implementation that is similar to
++     * {@link java.util.concurrent.CopyOnWriteArrayList}, but with some extra optimization for
++     * {@link #doSomeWork()}.
++     */
++    private static final class ConnectionList {
++        private static final ResizerConnection[] EMPTY = new ResizerConnection[0];
++
++        private final Lock lock = new ReentrantLock();
++
++        /**
++         * Copy of {@link #safeItems} <i>only</i> for use in {@link #doSomeWork()}, without lock.
++         * {@link #doSomeWork()} may shuffle and reorder this array in-place as needed.
++         */
++        private volatile ResizerConnection[] unsafeItems = EMPTY;
++        /**
++         * Items for concurrent access, guarded by {@link #lock}.
++         */
++        private ResizerConnection[] safeItems = EMPTY;
++
++        void forEach(Consumer<ResizerConnection> c) {
++            ResizerConnection[] items;
++            lock.lock();
++            try {
++                items = safeItems;
++            } finally {
++                lock.unlock();
++            }
++            for (ResizerConnection item : items) {
++                c.accept(item);
++            }
+         }
+-        for (ResizerConnection http2Connection : http2Connections) {
+-            c.accept(http2Connection);
++
++        void add(ResizerConnection connection) {
++            lock.lock();
++            try {
++                ResizerConnection[] prev = safeItems;
++                ResizerConnection[] next = Arrays.copyOf(prev, prev.length + 1);
++                next[prev.length] = connection;
++                this.safeItems = next;
++                this.unsafeItems = next.clone();
++            } finally {
++                lock.unlock();
++            }
++        }
++
++        void remove(ResizerConnection connection) {
++            lock.lock();
++            try {
++                ResizerConnection[] prev = safeItems;
++                int index = Arrays.asList(prev).indexOf(connection);
++                if (index == -1) {
++                    return;
++                }
++                ResizerConnection[] next = Arrays.copyOf(prev, prev.length - 1);
++                System.arraycopy(prev, index + 1, next, index, prev.length - index - 1);
++
++                this.safeItems = next;
++                this.unsafeItems = next.clone();
++            } finally {
++                lock.unlock();
++            }
+         }
+     }
+ 
+@@ -276,6 +397,8 @@ abstract class PoolResizer {
+     }
+ 
+     abstract static class ResizerConnection {
++        abstract boolean inEventLoop(Thread thread);
++
+         /**
+          * Attempt to dispatch a stream on this connection.
+          *
+@@ -287,6 +410,7 @@ abstract class PoolResizer {
+     }
+ 
+     static final class PendingRequest extends AtomicBoolean {
++        final Thread requestingThread = Thread.currentThread();
+         final @Nullable BlockHint blockHint;
+         private final DelayedExecutionFlow<ConnectionManager.PoolHandle> sink = DelayedExecutionFlow.create();
+ 

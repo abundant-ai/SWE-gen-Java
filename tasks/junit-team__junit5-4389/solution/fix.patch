@@ -1,0 +1,154 @@
+diff --git a/junit-platform-engine/src/testFixtures/java/org/junit/platform/fakes/FaultyTestEngines.java b/junit-platform-engine/src/testFixtures/java/org/junit/platform/fakes/FaultyTestEngines.java
+new file mode 100644
+index 000000000..9199a1388
+--- /dev/null
++++ b/junit-platform-engine/src/testFixtures/java/org/junit/platform/fakes/FaultyTestEngines.java
+@@ -0,0 +1,63 @@
++/*
++ * Copyright 2015-2025 the original author or authors.
++ *
++ * All rights reserved. This program and the accompanying materials are
++ * made available under the terms of the Eclipse Public License v2.0 which
++ * accompanies this distribution and is available at
++ *
++ * https://www.eclipse.org/legal/epl-v20.html
++ */
++
++package org.junit.platform.fakes;
++
++import org.junit.platform.engine.DiscoverySelector;
++import org.junit.platform.engine.EngineDiscoveryRequest;
++import org.junit.platform.engine.ExecutionRequest;
++import org.junit.platform.engine.SelectorResolutionResult;
++import org.junit.platform.engine.TestDescriptor;
++import org.junit.platform.engine.TestExecutionResult;
++import org.junit.platform.engine.UniqueId;
++import org.junit.platform.engine.support.descriptor.EngineDescriptor;
++
++public class FaultyTestEngines {
++
++	public static TestEngineStub createEngineThatCannotResolveAnything(String engineId) {
++		return new TestEngineStub(engineId) {
++			@Override
++			public TestDescriptor discover(EngineDiscoveryRequest discoveryRequest, UniqueId uniqueId) {
++				discoveryRequest.getSelectorsByType(DiscoverySelector.class) //
++						.forEach(selector -> discoveryRequest.getDiscoveryListener().selectorProcessed(uniqueId,
++							selector, SelectorResolutionResult.unresolved()));
++				return new EngineDescriptor(uniqueId, "Some Engine");
++			}
++
++			@Override
++			public void execute(ExecutionRequest request) {
++				var listener = request.getEngineExecutionListener();
++				var rootTestDescriptor = request.getRootTestDescriptor();
++				listener.executionStarted(rootTestDescriptor);
++				listener.executionFinished(rootTestDescriptor, TestExecutionResult.successful());
++			}
++		};
++	}
++
++	public static TestEngineStub createEngineThatFailsToResolveAnything(String engineId, Throwable rootCause) {
++		return new TestEngineStub(engineId) {
++			@Override
++			public TestDescriptor discover(EngineDiscoveryRequest discoveryRequest, UniqueId uniqueId) {
++				discoveryRequest.getSelectorsByType(DiscoverySelector.class) //
++						.forEach(selector -> discoveryRequest.getDiscoveryListener().selectorProcessed(uniqueId,
++							selector, SelectorResolutionResult.failed(rootCause)));
++				return new EngineDescriptor(uniqueId, "Some Engine");
++			}
++
++			@Override
++			public void execute(ExecutionRequest request) {
++				var listener = request.getEngineExecutionListener();
++				var rootTestDescriptor = request.getRootTestDescriptor();
++				listener.executionStarted(rootTestDescriptor);
++				listener.executionFinished(rootTestDescriptor, TestExecutionResult.successful());
++			}
++		};
++	}
++}
+diff --git a/junit-platform-launcher/src/main/java/org/junit/platform/launcher/core/DiscoveryIssueCollector.java b/junit-platform-launcher/src/main/java/org/junit/platform/launcher/core/DiscoveryIssueCollector.java
+index e5aed7169..4c7fa3538 100644
+--- a/junit-platform-launcher/src/main/java/org/junit/platform/launcher/core/DiscoveryIssueCollector.java
++++ b/junit-platform-launcher/src/main/java/org/junit/platform/launcher/core/DiscoveryIssueCollector.java
+@@ -10,12 +10,18 @@
+ 
+ package org.junit.platform.launcher.core;
+ 
++import static org.junit.platform.engine.SelectorResolutionResult.Status.FAILED;
++import static org.junit.platform.engine.SelectorResolutionResult.Status.UNRESOLVED;
++
+ import java.util.ArrayList;
+ import java.util.List;
+ 
+ import org.junit.platform.engine.DiscoveryIssue;
+ import org.junit.platform.engine.DiscoveryIssue.Severity;
++import org.junit.platform.engine.DiscoverySelector;
++import org.junit.platform.engine.SelectorResolutionResult;
+ import org.junit.platform.engine.UniqueId;
++import org.junit.platform.engine.discovery.UniqueIdSelector;
+ import org.junit.platform.launcher.LauncherDiscoveryListener;
+ 
+ class DiscoveryIssueCollector implements LauncherDiscoveryListener {
+@@ -27,6 +33,21 @@ class DiscoveryIssueCollector implements LauncherDiscoveryListener {
+ 		this.issues.clear();
+ 	}
+ 
++	@Override
++	public void selectorProcessed(UniqueId engineId, DiscoverySelector selector, SelectorResolutionResult result) {
++		if (result.getStatus() == FAILED) {
++			this.issues.add(DiscoveryIssue.builder(Severity.ERROR, selector + " resolution failed") //
++					.cause(result.getThrowable()) //
++					.build());
++		}
++		else if (result.getStatus() == UNRESOLVED && selector instanceof UniqueIdSelector) {
++			UniqueId uniqueId = ((UniqueIdSelector) selector).getUniqueId();
++			if (uniqueId.hasPrefix(engineId)) {
++				this.issues.add(DiscoveryIssue.create(Severity.ERROR, selector + " could not be resolved"));
++			}
++		}
++	}
++
+ 	@Override
+ 	public void issueEncountered(UniqueId engineId, DiscoveryIssue issue) {
+ 		this.issues.add(issue);
+diff --git a/junit-platform-launcher/src/main/java/org/junit/platform/launcher/listeners/discovery/AbortOnFailureLauncherDiscoveryListener.java b/junit-platform-launcher/src/main/java/org/junit/platform/launcher/listeners/discovery/AbortOnFailureLauncherDiscoveryListener.java
+index 11a742921..3892a8ae5 100644
+--- a/junit-platform-launcher/src/main/java/org/junit/platform/launcher/listeners/discovery/AbortOnFailureLauncherDiscoveryListener.java
++++ b/junit-platform-launcher/src/main/java/org/junit/platform/launcher/listeners/discovery/AbortOnFailureLauncherDiscoveryListener.java
+@@ -10,15 +10,8 @@
+ 
+ package org.junit.platform.launcher.listeners.discovery;
+ 
+-import static org.junit.platform.engine.SelectorResolutionResult.Status.FAILED;
+-import static org.junit.platform.engine.SelectorResolutionResult.Status.UNRESOLVED;
+-
+-import org.junit.platform.commons.JUnitException;
+ import org.junit.platform.commons.util.ExceptionUtils;
+-import org.junit.platform.engine.DiscoverySelector;
+-import org.junit.platform.engine.SelectorResolutionResult;
+ import org.junit.platform.engine.UniqueId;
+-import org.junit.platform.engine.discovery.UniqueIdSelector;
+ import org.junit.platform.launcher.EngineDiscoveryResult;
+ import org.junit.platform.launcher.LauncherDiscoveryListener;
+ 
+@@ -33,19 +26,6 @@ class AbortOnFailureLauncherDiscoveryListener implements LauncherDiscoveryListen
+ 		result.getThrowable().ifPresent(ExceptionUtils::throwAsUncheckedException);
+ 	}
+ 
+-	@Override
+-	public void selectorProcessed(UniqueId engineId, DiscoverySelector selector, SelectorResolutionResult result) {
+-		if (result.getStatus() == FAILED) {
+-			throw new JUnitException(selector + " resolution failed", result.getThrowable().orElse(null));
+-		}
+-		if (result.getStatus() == UNRESOLVED && selector instanceof UniqueIdSelector) {
+-			UniqueId uniqueId = ((UniqueIdSelector) selector).getUniqueId();
+-			if (uniqueId.hasPrefix(engineId)) {
+-				throw new JUnitException(selector + " could not be resolved");
+-			}
+-		}
+-	}
+-
+ 	@Override
+ 	public boolean equals(Object obj) {
+ 		if (this == obj) {

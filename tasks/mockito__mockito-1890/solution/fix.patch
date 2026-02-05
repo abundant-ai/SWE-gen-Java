@@ -1,0 +1,227 @@
+diff --git a/src/main/java/org/mockito/internal/stubbing/BaseStubbing.java b/src/main/java/org/mockito/internal/stubbing/BaseStubbing.java
+index 73dab853d..b3bd07442 100644
+--- a/src/main/java/org/mockito/internal/stubbing/BaseStubbing.java
++++ b/src/main/java/org/mockito/internal/stubbing/BaseStubbing.java
+@@ -7,11 +7,10 @@ package org.mockito.internal.stubbing;
+ import static org.mockito.internal.exceptions.Reporter.notAnException;
+ import static org.mockito.internal.progress.ThreadSafeMockingProgress.mockingProgress;
+ 
+-import org.mockito.creation.instance.Instantiator;
+-import org.mockito.internal.configuration.plugins.Plugins;
+ import org.mockito.internal.stubbing.answers.CallsRealMethods;
+ import org.mockito.internal.stubbing.answers.Returns;
+ import org.mockito.internal.stubbing.answers.ThrowsException;
++import org.mockito.internal.stubbing.answers.ThrowsExceptionForClassType;
+ import org.mockito.stubbing.Answer;
+ import org.mockito.stubbing.OngoingStubbing;
+ 
+@@ -75,8 +74,7 @@ public abstract class BaseStubbing<T> implements OngoingStubbing<T> {
+             mockingProgress().reset();
+             throw notAnException();
+         }
+-        Instantiator instantiator = Plugins.getInstantiatorProvider().getInstantiator(null);
+-        return thenThrow(instantiator.newInstance(throwableType));
++        return thenAnswer(new ThrowsExceptionForClassType(throwableType));
+     }
+ 
+     @Override
+diff --git a/src/main/java/org/mockito/internal/stubbing/StubberImpl.java b/src/main/java/org/mockito/internal/stubbing/StubberImpl.java
+index d707cf8b3..3f37af64b 100644
+--- a/src/main/java/org/mockito/internal/stubbing/StubberImpl.java
++++ b/src/main/java/org/mockito/internal/stubbing/StubberImpl.java
+@@ -14,10 +14,10 @@ import static org.mockito.internal.util.MockUtil.isMock;
+ import java.util.LinkedList;
+ import java.util.List;
+ 
+-import org.mockito.internal.configuration.plugins.Plugins;
+ import org.mockito.internal.stubbing.answers.CallsRealMethods;
+ import org.mockito.internal.stubbing.answers.Returns;
+ import org.mockito.internal.stubbing.answers.ThrowsException;
++import org.mockito.internal.stubbing.answers.ThrowsExceptionForClassType;
+ import org.mockito.internal.util.MockUtil;
+ import org.mockito.quality.Strictness;
+ import org.mockito.stubbing.Answer;
+@@ -89,18 +89,7 @@ public class StubberImpl implements Stubber {
+             mockingProgress().reset();
+             throw notAnException();
+         }
+-        Throwable e = null;
+-        try {
+-            e = Plugins.getInstantiatorProvider().getInstantiator(null).newInstance(toBeThrown);
+-        } finally {
+-            if (e == null) {
+-                //this means that an exception or error was thrown when trying to create new instance
+-                //we don't want 'catch' statement here because we want the exception to be thrown to the user
+-                //however, we do want to clean up state (e.g. "stubbing started").
+-                mockingProgress().reset();
+-            }
+-        }
+-        return doThrow(e);
++        return doAnswer(new ThrowsExceptionForClassType(toBeThrown));
+     }
+ 
+     @Override
+diff --git a/src/main/java/org/mockito/internal/stubbing/answers/AbstractThrowsException.java b/src/main/java/org/mockito/internal/stubbing/answers/AbstractThrowsException.java
+new file mode 100644
+index 000000000..47bf6d669
+--- /dev/null
++++ b/src/main/java/org/mockito/internal/stubbing/answers/AbstractThrowsException.java
+@@ -0,0 +1,56 @@
++/*
++ * Copyright (c) 2020 Mockito contributors
++ * This program is made available under the terms of the MIT License.
++ */
++package org.mockito.internal.stubbing.answers;
++
++import static org.mockito.internal.exceptions.Reporter.cannotStubWithNullThrowable;
++import static org.mockito.internal.exceptions.Reporter.checkedExceptionInvalid;
++
++import org.mockito.internal.exceptions.stacktrace.ConditionalStackTraceFilter;
++import org.mockito.internal.util.MockUtil;
++import org.mockito.invocation.InvocationOnMock;
++import org.mockito.stubbing.Answer;
++import org.mockito.stubbing.ValidableAnswer;
++
++public abstract class AbstractThrowsException implements Answer<Object>, ValidableAnswer {
++
++    private final ConditionalStackTraceFilter filter = new ConditionalStackTraceFilter();
++
++    protected abstract Throwable getThrowable();
++
++    public Object answer(InvocationOnMock invocation) throws Throwable {
++        Throwable throwable = getThrowable();
++        if (throwable == null) {
++            throw new IllegalStateException("throwable is null: " +
++                "you shall not call #answer if #validateFor fails!");
++        }
++        if (MockUtil.isMock(throwable)) {
++            throw throwable;
++        }
++        Throwable t = throwable.fillInStackTrace();
++
++        if (t == null) {
++            //Custom exceptions sometimes return null, see #866
++            throw throwable;
++        }
++        filter.filter(t);
++        throw t;
++    }
++
++    @Override
++    public void validateFor(InvocationOnMock invocation) {
++        Throwable throwable = getThrowable();
++        if (throwable == null) {
++            throw cannotStubWithNullThrowable();
++        }
++
++        if (throwable instanceof RuntimeException || throwable instanceof Error) {
++            return;
++        }
++
++        if (!new InvocationInfo(invocation).isValidException(throwable)) {
++            throw checkedExceptionInvalid(throwable);
++        }
++    }
++}
+diff --git a/src/main/java/org/mockito/internal/stubbing/answers/ThrowsException.java b/src/main/java/org/mockito/internal/stubbing/answers/ThrowsException.java
+index bc1b987f3..1250a8888 100644
+--- a/src/main/java/org/mockito/internal/stubbing/answers/ThrowsException.java
++++ b/src/main/java/org/mockito/internal/stubbing/answers/ThrowsException.java
+@@ -4,25 +4,19 @@
+  */
+ package org.mockito.internal.stubbing.answers;
+ 
+-import static org.mockito.internal.exceptions.Reporter.cannotStubWithNullThrowable;
+-import static org.mockito.internal.exceptions.Reporter.checkedExceptionInvalid;
+ 
+ import java.io.Serializable;
+ 
+-import org.mockito.internal.exceptions.stacktrace.ConditionalStackTraceFilter;
+-import org.mockito.internal.util.MockUtil;
+ import org.mockito.invocation.InvocationOnMock;
+-import org.mockito.stubbing.Answer;
+ import org.mockito.stubbing.ValidableAnswer;
+ 
+ /**
+  * An answer that always throws the same throwable.
+  */
+-public class ThrowsException implements Answer<Object>, ValidableAnswer, Serializable {
++public class ThrowsException extends AbstractThrowsException implements Serializable {
+ 
+     private static final long serialVersionUID = 1128820328555183980L;
+     private final Throwable throwable;
+-    private final ConditionalStackTraceFilter filter = new ConditionalStackTraceFilter();
+ 
+     /**
+      * Creates a new answer always throwing the given throwable. If it is null,
+@@ -33,36 +27,9 @@ public class ThrowsException implements Answer<Object>, ValidableAnswer, Seriali
+         this.throwable = throwable;
+     }
+ 
+-    public Object answer(InvocationOnMock invocation) throws Throwable {
+-        if (throwable == null) {
+-            throw new IllegalStateException("throwable is null: " +
+-                "you shall not call #answer if #validateFor fails!");
+-        }
+-        if (MockUtil.isMock(throwable)) {
+-            throw throwable;
+-        }
+-        Throwable t = throwable.fillInStackTrace();
+-
+-        if (t == null) {
+-            //Custom exceptions sometimes return null, see #866
+-            throw throwable;
+-        }
+-        filter.filter(t);
+-        throw t;
+-    }
+-
+     @Override
+-    public void validateFor(InvocationOnMock invocation) {
+-        if (throwable == null) {
+-            throw cannotStubWithNullThrowable();
+-        }
+-
+-        if (throwable instanceof RuntimeException || throwable instanceof Error) {
+-            return;
+-        }
+-
+-        if (!new InvocationInfo(invocation).isValidException(throwable)) {
+-            throw checkedExceptionInvalid(throwable);
+-        }
++    protected Throwable getThrowable() {
++        return throwable;
+     }
++
+ }
+diff --git a/src/main/java/org/mockito/internal/stubbing/answers/ThrowsExceptionForClassType.java b/src/main/java/org/mockito/internal/stubbing/answers/ThrowsExceptionForClassType.java
+new file mode 100644
+index 000000000..2c3d92395
+--- /dev/null
++++ b/src/main/java/org/mockito/internal/stubbing/answers/ThrowsExceptionForClassType.java
+@@ -0,0 +1,25 @@
++/*
++ * Copyright (c) 2020 Mockito contributors
++ * This program is made available under the terms of the MIT License.
++ */
++package org.mockito.internal.stubbing.answers;
++
++import java.io.Serializable;
++
++import org.mockito.creation.instance.Instantiator;
++import org.mockito.internal.configuration.plugins.Plugins;
++
++public class ThrowsExceptionForClassType extends AbstractThrowsException implements Serializable {
++
++    private final Class<? extends Throwable> throwableClass;
++
++    public ThrowsExceptionForClassType(Class<? extends Throwable> throwableClass) {
++        this.throwableClass = throwableClass;
++    }
++
++    @Override
++    protected Throwable getThrowable() {
++        Instantiator instantiator = Plugins.getInstantiatorProvider().getInstantiator(null);
++        return instantiator.newInstance(throwableClass);
++    }
++}

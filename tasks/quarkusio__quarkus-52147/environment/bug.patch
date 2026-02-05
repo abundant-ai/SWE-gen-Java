@@ -1,0 +1,1208 @@
+diff --git a/docs/src/main/asciidoc/cdi-reference.adoc b/docs/src/main/asciidoc/cdi-reference.adoc
+index aaff0fa3caf..76a4f5cd53c 100644
+--- a/docs/src/main/asciidoc/cdi-reference.adoc
++++ b/docs/src/main/asciidoc/cdi-reference.adoc
+@@ -718,8 +718,7 @@ public class TracerConfiguration {
+ 
+ NOTE: The runtime profile has absolutely no effect on the bean resolution using `@IfBuildProfile` and `@UnlessBuildProfile`.
+ 
+-TIP: `@IfBuildProfile` and `@UnlessBuildProfile` may be put on a stereotype.
+-A bean will only be enabled if **all** the conditions defined by these annotations are satisfied.
++TIP: It is also possible to use `@IfBuildProfile` and `@UnlessBuildProfile` on stereotypes.
+ 
+ [[enable_build_properties]]
+ === Enabling Beans for Quarkus Build Properties
+@@ -749,8 +748,7 @@ public class TracerConfiguration {
+ }
+ ----
+ 
+-TIP: `@IfBuildProperty` and `@UnlessBuildProperty` are repeatable annotations and may be put on a stereotype.
+-A bean will only be enabled if **all** the conditions defined by these annotations are satisfied.
++TIP: `@IfBuildProperty` and `@UnlessBuildProperty` are repeatable annotations, i.e. a bean will only be enabled if **all** the conditions defined by these annotations are satisfied.
+ 
+ If instead, it is required that the `RealTracer` bean is only used if the `some.tracer.enabled` property is not `false`, then `@UnlessBuildProperty` would be ideal. The code would look like:
+ 
+@@ -773,7 +771,9 @@ public class TracerConfiguration {
+ }
+ ----
+ 
+-NOTE: Properties set at runtime have absolutely no effect on the bean resolution using `@IfBuildProperty` / `@UnlessBuildProperty`.
++NOTE: Properties set at runtime have absolutely no effect on the bean resolution using `@IfBuildProperty`.
++
++TIP: It is also possible to use `@IfBuildProperty` and `@UnlessBuildProperty` on stereotypes.
+ 
+ === Declaring Selected Alternatives
+ 
+@@ -1065,9 +1065,6 @@ Alternatively, you can use the `@LookupIfProperty` and `@LookupUnlessProperty` a
+  }
+ ----
+ 
+-TIP: `@LookupIfProperty` and `@LookupUnlessProperty` are repeatable annotations and may be put on a stereotype.
+-A bean will only be obtained if **all** the conditions defined by these annotations are satisfied.
+-
+ === Sorting beans obtained with programmatic lookup
+ 
+ If there is more than one bean that matches the required type and qualifiers and is eligible for injection, it is possible to iterate (or stream) available bean instances.
+diff --git a/extensions/arc/deployment/src/main/java/io/quarkus/arc/deployment/BuildTimeEnabledProcessor.java b/extensions/arc/deployment/src/main/java/io/quarkus/arc/deployment/BuildTimeEnabledProcessor.java
+index 24c7f5baf9f..0aabb8a88f3 100644
+--- a/extensions/arc/deployment/src/main/java/io/quarkus/arc/deployment/BuildTimeEnabledProcessor.java
++++ b/extensions/arc/deployment/src/main/java/io/quarkus/arc/deployment/BuildTimeEnabledProcessor.java
+@@ -15,27 +15,24 @@
+ import java.util.Map;
+ import java.util.Optional;
+ import java.util.Set;
+-import java.util.function.Predicate;
++import java.util.function.Function;
+ import java.util.stream.Collectors;
+ 
+-import jakarta.enterprise.inject.Vetoed;
+-
+ import org.eclipse.microprofile.config.Config;
+ import org.eclipse.microprofile.config.spi.ConfigProviderResolver;
+ import org.jboss.jandex.AnnotationInstance;
+ import org.jboss.jandex.AnnotationTarget;
+ import org.jboss.jandex.AnnotationTarget.Kind;
+-import org.jboss.jandex.AnnotationTransformation;
+ import org.jboss.jandex.AnnotationValue;
+ import org.jboss.jandex.ClassInfo;
+-import org.jboss.jandex.Declaration;
+ import org.jboss.jandex.DotName;
+ import org.jboss.jandex.EquivalenceKey;
+ import org.jboss.jandex.IndexView;
+ import org.jboss.logging.Logger;
+ 
+-import io.quarkus.arc.VetoedProducer;
++import io.quarkus.arc.processor.AnnotationsTransformer;
+ import io.quarkus.arc.processor.DotNames;
++import io.quarkus.arc.processor.Transformation;
+ import io.quarkus.arc.profile.IfBuildProfile;
+ import io.quarkus.arc.profile.UnlessBuildProfile;
+ import io.quarkus.arc.properties.IfBuildProperty;
+@@ -63,13 +60,16 @@ public class BuildTimeEnabledProcessor {
+ 
+     @BuildStep
+     BuildTimeEnabledStereotypesBuildItem findEnablementStereotypes(CombinedIndexBuildItem combinedIndex) {
+-        IndexView index = combinedIndex.getComputingIndex();
++        IndexView index = combinedIndex.getIndex();
+ 
+         // find all stereotypes
+         Set<DotName> stereotypeNames = new HashSet<>();
+         for (AnnotationInstance annotation : index.getAnnotations(DotNames.STEREOTYPE)) {
+-            // `Stereotype` is `@Target(ANNOTATION_TYPE)`
+-            stereotypeNames.add(annotation.target().asClass().name());
++            if (annotation.target() != null
++                    && annotation.target().kind() == Kind.CLASS
++                    && annotation.target().asClass().isAnnotation()) {
++                stereotypeNames.add(annotation.target().asClass().name());
++            }
+         }
+         // ideally, we would also consider all `StereotypeRegistrarBuildItem`s here,
+         // but there is a build step cycle involving Spring DI and RESTEasy Reactive
+@@ -85,9 +85,10 @@ BuildTimeEnabledStereotypesBuildItem findEnablementStereotypes(CombinedIndexBuil
+             worklist.add(stereotypeToScan);
+             while (!worklist.isEmpty()) {
+                 DotName stereotype = worklist.poll();
+-                if (!alreadySeen.add(stereotype)) {
++                if (alreadySeen.contains(stereotype)) {
+                     continue;
+                 }
++                alreadySeen.add(stereotype);
+ 
+                 ClassInfo stereotypeClass = index.getClassByName(stereotype);
+                 if (stereotypeClass == null) {
+@@ -96,11 +97,23 @@ BuildTimeEnabledStereotypesBuildItem findEnablementStereotypes(CombinedIndexBuil
+ 
+                 for (DotName enablementAnnotation : List.of(IF_BUILD_PROFILE, UNLESS_BUILD_PROFILE, IF_BUILD_PROPERTY,
+                         UNLESS_BUILD_PROPERTY)) {
+-                    for (AnnotationInstance ann : stereotypeClass.declaredAnnotationsWithRepeatable(
+-                            enablementAnnotation, index)) {
++                    AnnotationInstance ann = stereotypeClass.declaredAnnotation(enablementAnnotation);
++                    if (ann != null) {
+                         result.computeIfAbsent(enablementAnnotation, ignored -> new ArrayList<>()).add(ann);
+                     }
+                 }
++                for (Map.Entry<DotName, DotName> entry : Map.of(IF_BUILD_PROPERTY_CONTAINER, IF_BUILD_PROPERTY,
++                        UNLESS_BUILD_PROPERTY_CONTAINER, UNLESS_BUILD_PROPERTY).entrySet()) {
++                    DotName enablementContainerAnnotation = entry.getKey();
++                    DotName enablementAnnotation = entry.getValue();
++
++                    AnnotationInstance containerAnn = stereotypeClass.declaredAnnotation(enablementContainerAnnotation);
++                    if (containerAnn != null) {
++                        for (AnnotationInstance ann : containerAnn.value().asNestedArray()) {
++                            result.computeIfAbsent(enablementAnnotation, ignored -> new ArrayList<>()).add(ann);
++                        }
++                    }
++                }
+ 
+                 for (AnnotationInstance metaAnn : stereotypeClass.declaredAnnotations()) {
+                     if (stereotypeNames.contains(metaAnn.name())) {
+@@ -123,10 +136,10 @@ BuildTimeEnabledStereotypesBuildItem findEnablementStereotypes(CombinedIndexBuil
+     @BuildStep
+     void ifBuildProfile(CombinedIndexBuildItem index, BuildTimeEnabledStereotypesBuildItem stereotypes,
+             BuildProducer<BuildTimeConditionBuildItem> producer) {
+-        enablementAnnotations(IF_BUILD_PROFILE, index.getComputingIndex(), stereotypes, producer,
+-                new Predicate<AnnotationInstance>() {
++        enablementAnnotations(IF_BUILD_PROFILE, null, index.getIndex(), stereotypes, producer,
++                new Function<AnnotationInstance, Boolean>() {
+                     @Override
+-                    public boolean test(AnnotationInstance annotation) {
++                    public Boolean apply(AnnotationInstance annotation) {
+                         return BuildProfile.from(annotation).enabled();
+                     }
+                 });
+@@ -135,10 +148,10 @@ public boolean test(AnnotationInstance annotation) {
+     @BuildStep
+     void unlessBuildProfile(CombinedIndexBuildItem index, BuildTimeEnabledStereotypesBuildItem stereotypes,
+             BuildProducer<BuildTimeConditionBuildItem> producer) {
+-        enablementAnnotations(UNLESS_BUILD_PROFILE, index.getComputingIndex(), stereotypes, producer,
+-                new Predicate<AnnotationInstance>() {
++        enablementAnnotations(UNLESS_BUILD_PROFILE, null, index.getIndex(), stereotypes, producer,
++                new Function<AnnotationInstance, Boolean>() {
+                     @Override
+-                    public boolean test(AnnotationInstance annotation) {
++                    public Boolean apply(AnnotationInstance annotation) {
+                         return BuildProfile.from(annotation).disabled();
+                     }
+                 });
+@@ -148,10 +161,10 @@ public boolean test(AnnotationInstance annotation) {
+     void ifBuildProperty(CombinedIndexBuildItem index, BuildTimeEnabledStereotypesBuildItem stereotypes,
+             BuildProducer<BuildTimeConditionBuildItem> conditions) {
+         Config config = ConfigProviderResolver.instance().getConfig();
+-        enablementAnnotations(IF_BUILD_PROPERTY, index.getComputingIndex(), stereotypes, conditions,
+-                new Predicate<AnnotationInstance>() {
++        enablementAnnotations(IF_BUILD_PROPERTY, IF_BUILD_PROPERTY_CONTAINER, index.getIndex(), stereotypes, conditions,
++                new Function<AnnotationInstance, Boolean>() {
+                     @Override
+-                    public boolean test(AnnotationInstance annotation) {
++                    public Boolean apply(AnnotationInstance annotation) {
+                         return BuildProperty.from(annotation).enabled(config);
+                     }
+                 });
+@@ -161,24 +174,24 @@ public boolean test(AnnotationInstance annotation) {
+     void unlessBuildProperty(CombinedIndexBuildItem index, BuildTimeEnabledStereotypesBuildItem stereotypes,
+             BuildProducer<BuildTimeConditionBuildItem> conditions) {
+         Config config = ConfigProviderResolver.instance().getConfig();
+-        enablementAnnotations(UNLESS_BUILD_PROPERTY, index.getComputingIndex(), stereotypes, conditions,
+-                new Predicate<AnnotationInstance>() {
++        enablementAnnotations(UNLESS_BUILD_PROPERTY, UNLESS_BUILD_PROPERTY_CONTAINER, index.getIndex(), stereotypes, conditions,
++                new Function<AnnotationInstance, Boolean>() {
+                     @Override
+-                    public boolean test(AnnotationInstance annotation) {
++                    public Boolean apply(AnnotationInstance annotation) {
+                         return BuildProperty.from(annotation).disabled(config);
+                     }
+                 });
+     }
+ 
+-    private void enablementAnnotations(DotName annotationName, IndexView index,
++    private void enablementAnnotations(DotName annotationName, DotName containingAnnotationName, IndexView index,
+             BuildTimeEnabledStereotypesBuildItem stereotypes, BuildProducer<BuildTimeConditionBuildItem> producer,
+-            Predicate<AnnotationInstance> predicate) {
++            Function<AnnotationInstance, Boolean> test) {
+ 
+         // instances of enablement annotation directly on affected declarations
+-        List<AnnotationInstance> annotationInstances = getAnnotations(index, annotationName);
++        List<AnnotationInstance> annotationInstances = getAnnotations(index, annotationName, containingAnnotationName);
+         for (AnnotationInstance annotation : annotationInstances) {
+             AnnotationTarget target = annotation.target();
+-            boolean enabled = predicate.test(annotation);
++            boolean enabled = test.apply(annotation);
+             if (enabled) {
+                 LOGGER.debugf("Enabling %s due to %s", target, annotation);
+             } else {
+@@ -194,7 +207,7 @@ private void enablementAnnotations(DotName annotationName, IndexView index,
+             for (AnnotationInstance stereotypeUsage : getAnnotations(index, stereotype.name)) {
+                 AnnotationTarget target = stereotypeUsage.target();
+                 for (AnnotationInstance annotation : stereotype.getEnablementAnnotations(annotationName)) {
+-                    boolean enabled = predicate.test(annotation);
++                    boolean enabled = test.apply(annotation);
+                     if (enabled) {
+                         LOGGER.debugf("Enabling %s  due to %s on stereotype %s", target, annotation, stereotype.name);
+                     } else {
+@@ -216,9 +229,10 @@ private void enablementAnnotations(DotName annotationName, IndexView index,
+ 
+         // instances of stereotypes (with enablement annotation) inherited from a superclass
+         for (ClassInfo clazz : classesWithPossiblyInheritedStereotype) {
+-            if (!processedClasses.add(clazz.name())) {
++            if (processedClasses.contains(clazz.name())) {
+                 continue;
+             }
++            processedClasses.add(clazz.name());
+ 
+             ClassInfo superclass = index.getClassByName(clazz.superName());
+             Set<DotName> seenStereotypes = new HashSet<>(); // avoid "inheriting" the same annotation multiple times
+@@ -235,7 +249,7 @@ private void enablementAnnotations(DotName annotationName, IndexView index,
+                     }
+ 
+                     for (AnnotationInstance annotation : stereotype.getEnablementAnnotations(annotationName)) {
+-                        boolean enabled = predicate.test(annotation);
++                        boolean enabled = test.apply(annotation);
+                         if (enabled) {
+                             LOGGER.debugf("Enabling %s due to %s on stereotype %s inherited from %s",
+                                     clazz, annotation, stereotype.name, superclass.name());
+@@ -275,18 +289,20 @@ void conditionTransformer(List<BuildTimeConditionBuildItem> buildTimeConditions,
+         }
+ 
+         // the transformer just tries to match targets and then enables or disables the bean accordingly
+-        annotationsTransformer.produce(new AnnotationsTransformerBuildItem(new AnnotationTransformation() {
++        annotationsTransformer.produce(new AnnotationsTransformerBuildItem(new AnnotationsTransformer() {
+             @Override
+-            public void apply(TransformationContext ctx) {
+-                Declaration target = ctx.declaration();
++            public void transform(TransformationContext ctx) {
++                AnnotationTarget target = ctx.getTarget();
+                 if (!enabled.getOrDefault(EquivalenceKey.of(target), Boolean.TRUE)) {
++                    Transformation transform = ctx.transform();
+                     if (target.kind() == Kind.CLASS) {
+                         // Veto the class
+-                        ctx.add(Vetoed.class);
++                        transform.add(DotNames.VETOED);
+                     } else {
+                         // Veto the producer
+-                        ctx.add(VetoedProducer.class);
++                        transform.add(DotNames.VETOED_PRODUCER);
+                     }
++                    transform.done();
+                 }
+             }
+         }));
+@@ -313,7 +329,7 @@ BuildExclusionsBuildItem buildExclusions(List<BuildTimeConditionBuildItem> build
+ 
+     private static List<AnnotationInstance> getAnnotations(IndexView index, DotName annotationName) {
+         List<AnnotationInstance> result = new ArrayList<>();
+-        for (AnnotationInstance annotation : index.getAnnotationsWithRepeatable(annotationName, index)) {
++        for (AnnotationInstance annotation : index.getAnnotations(annotationName)) {
+             AnnotationTarget target = annotation.target();
+             if (target != null && (target.kind() != Kind.CLASS || !target.asClass().isAnnotation())) {
+                 result.add(annotation);
+@@ -322,6 +338,30 @@ private static List<AnnotationInstance> getAnnotations(IndexView index, DotName
+         return result;
+     }
+ 
++    private static List<AnnotationInstance> getAnnotations(IndexView index, DotName annotationName,
++            DotName containingAnnotationName) {
++
++        // Single annotation
++        List<AnnotationInstance> annotationInstances = getAnnotations(index, annotationName);
++        if (containingAnnotationName == null) {
++            return annotationInstances;
++        }
++        // Collect containing annotation instances
++        // Note that we can't just use the IndexView.getAnnotationsWithRepeatable() method because the containing annotation is not part of the index
++        for (AnnotationInstance containingInstance : index.getAnnotations(containingAnnotationName)) {
++            AnnotationTarget target = containingInstance.target();
++            if (target != null && (target.kind() != Kind.CLASS || !target.asClass().isAnnotation())) {
++                for (AnnotationInstance nestedInstance : containingInstance.value().asNestedArray()) {
++                    // We need to set the target of the containing instance
++                    annotationInstances.add(
++                            AnnotationInstance.create(nestedInstance.name(), target, nestedInstance.values()));
++                }
++            }
++        }
++
++        return annotationInstances;
++    }
++
+     private static class BuildProfile {
+         private final Set<String> allOf;
+         private final Set<String> anyOf;
+diff --git a/extensions/arc/deployment/src/main/java/io/quarkus/arc/deployment/LookupConditionsProcessor.java b/extensions/arc/deployment/src/main/java/io/quarkus/arc/deployment/LookupConditionsProcessor.java
+index 8555c240c62..ce433b34d37 100644
+--- a/extensions/arc/deployment/src/main/java/io/quarkus/arc/deployment/LookupConditionsProcessor.java
++++ b/extensions/arc/deployment/src/main/java/io/quarkus/arc/deployment/LookupConditionsProcessor.java
+@@ -1,9 +1,7 @@
+ package io.quarkus.arc.deployment;
+ 
+-import java.util.ArrayDeque;
+ import java.util.ArrayList;
+-import java.util.Deque;
+-import java.util.HashSet;
++import java.util.Collections;
+ import java.util.List;
+ import java.util.Optional;
+ import java.util.Set;
+@@ -13,19 +11,15 @@
+ import org.jboss.jandex.AnnotationInstance;
+ import org.jboss.jandex.AnnotationTarget;
+ import org.jboss.jandex.AnnotationValue;
+-import org.jboss.jandex.ClassInfo;
+ import org.jboss.jandex.DotName;
+ import org.jboss.jandex.IndexView;
+ 
+ import io.quarkus.arc.lookup.LookupIfProperty;
+ import io.quarkus.arc.lookup.LookupUnlessProperty;
+ import io.quarkus.arc.processor.BeanInfo;
+-import io.quarkus.arc.processor.DotNames;
+-import io.quarkus.arc.processor.StereotypeInfo;
+ import io.quarkus.arc.runtime.SuppressConditions;
+ import io.quarkus.deployment.annotations.BuildProducer;
+ import io.quarkus.deployment.annotations.BuildStep;
+-import io.quarkus.deployment.builditem.CombinedIndexBuildItem;
+ import io.quarkus.gizmo2.Const;
+ import io.quarkus.gizmo2.Expr;
+ import io.quarkus.gizmo2.creator.BlockCreator;
+@@ -51,89 +45,26 @@ public class LookupConditionsProcessor {
+     private static final MethodDesc SUPPRESS_UNLESS_PROPERTY = MethodDesc.of(SuppressConditions.class, "suppressUnlessProperty",
+             boolean.class, String.class, String.class, boolean.class);
+ 
+-    @BuildStep
+-    LookupConditionsStereotypesBuildItem findLookupConditionStereotypes(CombinedIndexBuildItem combinedIndex) {
+-        IndexView index = combinedIndex.getComputingIndex();
+-
+-        // find all stereotypes
+-        Set<DotName> stereotypeNames = new HashSet<>();
+-        for (AnnotationInstance annotation : index.getAnnotations(DotNames.STEREOTYPE)) {
+-            // `Stereotype` is `@Target(ANNOTATION_TYPE)`
+-            stereotypeNames.add(annotation.target().asClass().name());
+-        }
+-        // ideally, we would also consider all `StereotypeRegistrarBuildItem`s here,
+-        // but there is a build step cycle involving Spring DI and RESTEasy Reactive
+-        // that I'm not capable of breaking
+-
+-        // for each stereotype, find all lookup annotations, present either directly or transitively
+-        List<LookupConditionsStereotypesBuildItem.LookupConditionsStereotype> lookupStereotypes = new ArrayList<>();
+-        for (DotName stereotypeToScan : stereotypeNames) {
+-            List<AnnotationInstance> ifAnnotations = new ArrayList<>();
+-            List<AnnotationInstance> unlessAnnotations = new ArrayList<>();
+-
+-            Set<DotName> alreadySeen = new HashSet<>(); // to guard against hypothetical stereotype cycle
+-            Deque<DotName> worklist = new ArrayDeque<>();
+-            worklist.add(stereotypeToScan);
+-            while (!worklist.isEmpty()) {
+-                DotName stereotype = worklist.poll();
+-                if (!alreadySeen.add(stereotype)) {
+-                    continue;
+-                }
+-
+-                ClassInfo stereotypeClass = index.getClassByName(stereotype);
+-                if (stereotypeClass == null) {
+-                    continue;
+-                }
+-
+-                ifAnnotations.addAll(stereotypeClass.declaredAnnotationsWithRepeatable(LOOK_UP_IF_PROPERTY, index));
+-                unlessAnnotations.addAll(stereotypeClass.declaredAnnotationsWithRepeatable(LOOK_UP_UNLESS_PROPERTY, index));
+-
+-                for (AnnotationInstance metaAnn : stereotypeClass.declaredAnnotations()) {
+-                    if (stereotypeNames.contains(metaAnn.name())) {
+-                        worklist.add(metaAnn.name());
+-                    }
+-                }
+-            }
+-
+-            if (!ifAnnotations.isEmpty() || !unlessAnnotations.isEmpty()) {
+-                lookupStereotypes.add(new LookupConditionsStereotypesBuildItem.LookupConditionsStereotype(stereotypeToScan,
+-                        ifAnnotations, unlessAnnotations));
+-            }
+-        }
+-
+-        return new LookupConditionsStereotypesBuildItem(lookupStereotypes);
+-    }
+-
+     @BuildStep
+     void suppressConditionsGenerators(BuildProducer<SuppressConditionGeneratorBuildItem> generators,
+-            LookupConditionsStereotypesBuildItem lookupConditionStereotypes,
+             BeanArchiveIndexBuildItem beanArchiveIndex) {
+         IndexView index = beanArchiveIndex.getIndex();
+ 
+         generators.produce(new SuppressConditionGeneratorBuildItem(new Function<BeanInfo, Consumer<BlockCreator>>() {
++
+             @Override
+             public Consumer<BlockCreator> apply(BeanInfo bean) {
+                 Optional<AnnotationTarget> maybeTarget = bean.getTarget();
+                 if (maybeTarget.isPresent()) {
+                     AnnotationTarget target = maybeTarget.get();
+-                    List<AnnotationInstance> ifPropertyList = new ArrayList<>(
+-                            target.declaredAnnotationsWithRepeatable(LOOK_UP_IF_PROPERTY, index));
+-                    List<AnnotationInstance> unlessPropertyList = new ArrayList<>(
+-                            target.declaredAnnotationsWithRepeatable(LOOK_UP_UNLESS_PROPERTY, index));
+-                    for (StereotypeInfo stereotype : bean.getStereotypes()) {
+-                        var conditions = lookupConditionStereotypes.get(stereotype.getName());
+-                        if (conditions != null) {
+-                            ifPropertyList.addAll(conditions.ifAnnotations());
+-                            unlessPropertyList.addAll(conditions.unlessAnnotations());
+-                        }
+-                    }
++                    List<AnnotationInstance> ifPropertyList = findAnnotations(target, LOOK_UP_IF_PROPERTY,
++                            LOOK_UP_IF_CONTAINER, index);
++                    List<AnnotationInstance> unlessPropertyList = findAnnotations(target, LOOK_UP_UNLESS_PROPERTY,
++                            LOOK_UP_UNLESS_PROPERTY_CONTAINER, index);
+                     if (!ifPropertyList.isEmpty() || !unlessPropertyList.isEmpty()) {
+                         return new Consumer<BlockCreator>() {
+                             @Override
+                             public void accept(BlockCreator suppressed) {
+-                                // if at least one condition fails, we mark the bean as suppressed
+-                                // this means all conditions must pass, which is how we implement
+-                                // the documented "logical AND of all conditions" behavior
+                                 for (AnnotationInstance ifProperty : ifPropertyList) {
+                                     String propertyName = ifProperty.value(NAME).asString();
+                                     String expectedStringValue = ifProperty.value(STRING_VALUE).asString();
+@@ -162,4 +93,37 @@ public void accept(BlockCreator suppressed) {
+             }
+         }));
+     }
++
++    List<AnnotationInstance> findAnnotations(AnnotationTarget target, DotName annotationName, DotName containingAnnotationName,
++            IndexView index) {
++        AnnotationInstance annotation;
++        AnnotationInstance container;
++        switch (target.kind()) {
++            case CLASS -> {
++                annotation = target.asClass().declaredAnnotation(annotationName);
++                container = target.asClass().declaredAnnotation(containingAnnotationName);
++            }
++            case FIELD -> {
++                annotation = target.asField().annotation(annotationName);
++                container = target.asField().annotation(containingAnnotationName);
++            }
++            case METHOD -> {
++                annotation = target.asMethod().annotation(annotationName);
++                container = target.asMethod().annotation(containingAnnotationName);
++            }
++            default -> throw new IllegalStateException("Invalid bean target: " + target);
++        }
++        if (annotation == null && container == null) {
++            return Collections.emptyList();
++        }
++        List<AnnotationInstance> ret = new ArrayList<>();
++        if (annotation != null) {
++            ret.add(annotation);
++        }
++        if (container != null) {
++            Collections.addAll(ret, container.value().asNestedArray());
++        }
++        return ret;
++    }
++
+ }
+diff --git a/extensions/arc/deployment/src/main/java/io/quarkus/arc/deployment/LookupConditionsStereotypesBuildItem.java b/extensions/arc/deployment/src/main/java/io/quarkus/arc/deployment/LookupConditionsStereotypesBuildItem.java
+deleted file mode 100644
+index 3e8c1265127..00000000000
+--- a/extensions/arc/deployment/src/main/java/io/quarkus/arc/deployment/LookupConditionsStereotypesBuildItem.java
++++ /dev/null
+@@ -1,32 +0,0 @@
+-package io.quarkus.arc.deployment;
+-
+-import java.util.HashMap;
+-import java.util.List;
+-import java.util.Map;
+-
+-import org.jboss.jandex.AnnotationInstance;
+-import org.jboss.jandex.DotName;
+-
+-import io.quarkus.builder.item.SimpleBuildItem;
+-
+-final class LookupConditionsStereotypesBuildItem extends SimpleBuildItem {
+-    private final Map<DotName, LookupConditionsStereotype> map;
+-
+-    LookupConditionsStereotypesBuildItem(List<LookupConditionsStereotype> lookupConditionsStereotypes) {
+-        Map<DotName, LookupConditionsStereotype> map = new HashMap<>();
+-        for (LookupConditionsStereotype lookupConditionsStereotype : lookupConditionsStereotypes) {
+-            map.put(lookupConditionsStereotype.name, lookupConditionsStereotype);
+-        }
+-        this.map = map;
+-    }
+-
+-    LookupConditionsStereotype get(DotName stereotype) {
+-        return map.get(stereotype);
+-    }
+-
+-    record LookupConditionsStereotype(
+-            DotName name,
+-            List<AnnotationInstance> ifAnnotations,
+-            List<AnnotationInstance> unlessAnnotations) {
+-    }
+-}
+diff --git a/extensions/arc/deployment/src/test/java/io/quarkus/arc/test/lookup/LookupConditionOnInheritedStereotypeTest.java b/extensions/arc/deployment/src/test/java/io/quarkus/arc/test/lookup/LookupConditionOnInheritedStereotypeTest.java
+deleted file mode 100644
+index aa2142f2d6e..00000000000
+--- a/extensions/arc/deployment/src/test/java/io/quarkus/arc/test/lookup/LookupConditionOnInheritedStereotypeTest.java
++++ /dev/null
+@@ -1,100 +0,0 @@
+-package io.quarkus.arc.test.lookup;
+-
+-import static org.junit.jupiter.api.Assertions.assertEquals;
+-import static org.junit.jupiter.api.Assertions.assertTrue;
+-
+-import java.lang.annotation.Inherited;
+-import java.lang.annotation.Retention;
+-import java.lang.annotation.RetentionPolicy;
+-
+-import jakarta.enterprise.inject.Instance;
+-import jakarta.enterprise.inject.Stereotype;
+-import jakarta.inject.Inject;
+-import jakarta.inject.Singleton;
+-
+-import org.junit.jupiter.api.Test;
+-import org.junit.jupiter.api.extension.RegisterExtension;
+-
+-import io.quarkus.arc.lookup.LookupIfProperty;
+-import io.quarkus.test.QuarkusUnitTest;
+-
+-public class LookupConditionOnInheritedStereotypeTest {
+-    @RegisterExtension
+-    static final QuarkusUnitTest config = new QuarkusUnitTest()
+-            .withApplicationRoot(jar -> jar.addClasses(AlphaStereotype.class, AlphaService.class,
+-                    BravoStereotype.class, BravoService.class, CharlieStereotype.class, CharlieService.class))
+-            .overrideConfigKey("service.alpha.enabled", "true")
+-            .overrideConfigKey("service.bravo.enabled", "false");
+-
+-    @Inject
+-    Instance<AlphaService> alpha;
+-
+-    @Inject
+-    Instance<BravoService> bravo;
+-
+-    @Inject
+-    Instance<CharlieService> charlie;
+-
+-    @Test
+-    public void testConditions() {
+-        assertTrue(alpha.isResolvable());
+-        assertEquals("alpha", alpha.get().ping());
+-        assertTrue(bravo.isUnsatisfied());
+-        assertTrue(charlie.isResolvable());
+-        assertEquals("charlie", charlie.get().ping());
+-    }
+-
+-    @Stereotype
+-    @LookupIfProperty(name = "service.alpha.enabled", stringValue = "true")
+-    @Retention(RetentionPolicy.RUNTIME)
+-    @Inherited
+-    @interface AlphaStereotype {
+-    }
+-
+-    @AlphaStereotype
+-    static class AlphaServiceParent {
+-    }
+-
+-    @Singleton
+-    static class AlphaService extends AlphaServiceParent {
+-        public String ping() {
+-            return "alpha";
+-        }
+-    }
+-
+-    @Stereotype
+-    @LookupIfProperty(name = "service.bravo.enabled", stringValue = "true")
+-    @Retention(RetentionPolicy.RUNTIME)
+-    @Inherited
+-    @interface BravoStereotype {
+-    }
+-
+-    @BravoStereotype
+-    static class BravoServiceParent {
+-    }
+-
+-    @Singleton
+-    static class BravoService extends BravoServiceParent {
+-        public String ping() {
+-            return "bravo";
+-        }
+-    }
+-
+-    @Stereotype
+-    @LookupIfProperty(name = "service.charlie.enabled", stringValue = "true", lookupIfMissing = true)
+-    @Retention(RetentionPolicy.RUNTIME)
+-    @Inherited
+-    @interface CharlieStereotype {
+-    }
+-
+-    @CharlieStereotype
+-    static class CharlieServiceParent {
+-    }
+-
+-    @Singleton
+-    static class CharlieService extends CharlieServiceParent {
+-        public String ping() {
+-            return "charlie";
+-        }
+-    }
+-}
+diff --git a/extensions/arc/deployment/src/test/java/io/quarkus/arc/test/lookup/LookupConditionOnStereotypeTest.java b/extensions/arc/deployment/src/test/java/io/quarkus/arc/test/lookup/LookupConditionOnStereotypeTest.java
+deleted file mode 100644
+index ecfd8706efa..00000000000
+--- a/extensions/arc/deployment/src/test/java/io/quarkus/arc/test/lookup/LookupConditionOnStereotypeTest.java
++++ /dev/null
+@@ -1,96 +0,0 @@
+-package io.quarkus.arc.test.lookup;
+-
+-import static org.junit.jupiter.api.Assertions.assertEquals;
+-import static org.junit.jupiter.api.Assertions.assertTrue;
+-
+-import java.lang.annotation.Retention;
+-import java.lang.annotation.RetentionPolicy;
+-
+-import jakarta.enterprise.inject.Instance;
+-import jakarta.enterprise.inject.Produces;
+-import jakarta.enterprise.inject.Stereotype;
+-import jakarta.inject.Inject;
+-import jakarta.inject.Singleton;
+-
+-import org.junit.jupiter.api.Test;
+-import org.junit.jupiter.api.extension.RegisterExtension;
+-
+-import io.quarkus.arc.lookup.LookupIfProperty;
+-import io.quarkus.test.QuarkusUnitTest;
+-
+-public class LookupConditionOnStereotypeTest {
+-    @RegisterExtension
+-    static final QuarkusUnitTest config = new QuarkusUnitTest()
+-            .withApplicationRoot(jar -> jar.addClasses(AlphaStereotype.class, AlphaService.class,
+-                    BravoStereotype.class, BravoService.class, CharlieStereotype.class, CharlieService.class))
+-            .overrideConfigKey("service.alpha.enabled", "true")
+-            .overrideConfigKey("service.bravo.enabled", "false");
+-
+-    @Inject
+-    Instance<AlphaService> alpha;
+-
+-    @Inject
+-    Instance<BravoService> bravo;
+-
+-    @Inject
+-    Instance<CharlieService> charlie;
+-
+-    @Test
+-    public void testConditions() {
+-        assertTrue(alpha.isResolvable());
+-        assertEquals("alpha", alpha.get().ping());
+-        assertTrue(bravo.isUnsatisfied());
+-        assertTrue(charlie.isResolvable());
+-        assertEquals("charlie", charlie.get().ping());
+-    }
+-
+-    @Stereotype
+-    @LookupIfProperty(name = "service.alpha.enabled", stringValue = "true")
+-    @Retention(RetentionPolicy.RUNTIME)
+-    @interface AlphaStereotype {
+-    }
+-
+-    @Singleton
+-    @AlphaStereotype
+-    static class AlphaService {
+-        public String ping() {
+-            return "alpha";
+-        }
+-    }
+-
+-    @Stereotype
+-    @LookupIfProperty(name = "service.bravo.enabled", stringValue = "true")
+-    @Retention(RetentionPolicy.RUNTIME)
+-    @interface BravoStereotype {
+-    }
+-
+-    @Singleton
+-    @BravoStereotype
+-    static class BravoService {
+-        public String ping() {
+-            return "bravo";
+-        }
+-    }
+-
+-    @Stereotype
+-    @LookupIfProperty(name = "service.charlie.enabled", stringValue = "true", lookupIfMissing = true)
+-    @Retention(RetentionPolicy.RUNTIME)
+-    @interface CharlieStereotype {
+-    }
+-
+-    static class CharlieService {
+-        public String ping() {
+-            return "charlie";
+-        }
+-    }
+-
+-    @Singleton
+-    static class CharlieProducer {
+-        @Produces
+-        @Singleton
+-        @CharlieStereotype
+-        public CharlieService produce() {
+-            return new CharlieService();
+-        }
+-    }
+-}
+diff --git a/extensions/arc/deployment/src/test/java/io/quarkus/arc/test/lookup/LookupMultipleConditionsOnInheritedStereotypesTest.java b/extensions/arc/deployment/src/test/java/io/quarkus/arc/test/lookup/LookupMultipleConditionsOnInheritedStereotypesTest.java
+deleted file mode 100644
+index d0dc9f1fd83..00000000000
+--- a/extensions/arc/deployment/src/test/java/io/quarkus/arc/test/lookup/LookupMultipleConditionsOnInheritedStereotypesTest.java
++++ /dev/null
+@@ -1,124 +0,0 @@
+-package io.quarkus.arc.test.lookup;
+-
+-import static org.junit.jupiter.api.Assertions.assertEquals;
+-import static org.junit.jupiter.api.Assertions.assertTrue;
+-
+-import java.lang.annotation.Inherited;
+-import java.lang.annotation.Retention;
+-import java.lang.annotation.RetentionPolicy;
+-
+-import jakarta.enterprise.inject.Instance;
+-import jakarta.enterprise.inject.Stereotype;
+-import jakarta.inject.Inject;
+-import jakarta.inject.Singleton;
+-
+-import org.junit.jupiter.api.Test;
+-import org.junit.jupiter.api.extension.RegisterExtension;
+-
+-import io.quarkus.arc.lookup.LookupIfProperty;
+-import io.quarkus.test.QuarkusUnitTest;
+-
+-public class LookupMultipleConditionsOnInheritedStereotypesTest {
+-    @RegisterExtension
+-    static final QuarkusUnitTest config = new QuarkusUnitTest()
+-            .withApplicationRoot(jar -> jar.addClasses(AlphaStereotype.class, BravoStereotype.class,
+-                    AlphaBravoStereotype.class, CharlieStereotype.class, CharlieDeltaStereotype.class,
+-                    EchoFoxtrotStereotype.class, FirstService.class, SecondService.class, ThirdService.class))
+-            .overrideConfigKey("service.alpha.enabled", "true")
+-            .overrideConfigKey("service.delta.enabled", "true")
+-            .overrideConfigKey("service.echo.enabled", "true")
+-            .overrideConfigKey("service.foxtrot.enabled", "true");
+-
+-    @Inject
+-    Instance<FirstService> first;
+-
+-    @Inject
+-    Instance<SecondService> second;
+-
+-    @Inject
+-    Instance<ThirdService> third;
+-
+-    @Test
+-    public void testConditions() {
+-        assertTrue(first.isResolvable());
+-        assertEquals("first", first.get().ping());
+-        assertTrue(second.isUnsatisfied());
+-        assertTrue(third.isResolvable());
+-        assertEquals("third", third.get().ping());
+-    }
+-
+-    @Stereotype
+-    @LookupIfProperty(name = "service.alpha.enabled", stringValue = "true")
+-    @Retention(RetentionPolicy.RUNTIME)
+-    @interface AlphaStereotype {
+-    }
+-
+-    @Stereotype
+-    @LookupIfProperty(name = "service.bravo.enabled", stringValue = "true", lookupIfMissing = true)
+-    @Retention(RetentionPolicy.RUNTIME)
+-    @interface BravoStereotype {
+-    }
+-
+-    @Stereotype
+-    @AlphaStereotype
+-    @BravoStereotype
+-    @Retention(RetentionPolicy.RUNTIME)
+-    @Inherited
+-    @interface AlphaBravoStereotype {
+-    }
+-
+-    @Stereotype
+-    @LookupIfProperty(name = "service.charlie.enabled", stringValue = "true")
+-    @Retention(RetentionPolicy.RUNTIME)
+-    @interface CharlieStereotype {
+-    }
+-
+-    @Stereotype
+-    @CharlieStereotype
+-    @LookupIfProperty(name = "service.delta.enabled", stringValue = "true")
+-    @Retention(RetentionPolicy.RUNTIME)
+-    @Inherited
+-    @interface CharlieDeltaStereotype {
+-    }
+-
+-    @Stereotype
+-    @LookupIfProperty(name = "service.echo.enabled", stringValue = "true")
+-    @LookupIfProperty(name = "service.foxtrot.enabled", stringValue = "true")
+-    @Retention(RetentionPolicy.RUNTIME)
+-    @Inherited
+-    @interface EchoFoxtrotStereotype {
+-    }
+-
+-    @AlphaBravoStereotype
+-    static class FirstServiceParent {
+-    }
+-
+-    @Singleton
+-    static class FirstService extends FirstServiceParent {
+-        public String ping() {
+-            return "first";
+-        }
+-    }
+-
+-    @CharlieDeltaStereotype
+-    static class SecondServiceParent {
+-    }
+-
+-    @Singleton
+-    static class SecondService extends SecondServiceParent {
+-        public String ping() {
+-            return "service";
+-        }
+-    }
+-
+-    @EchoFoxtrotStereotype
+-    static class ThirdServiceParent {
+-    }
+-
+-    @Singleton
+-    static class ThirdService extends ThirdServiceParent {
+-        public String ping() {
+-            return "third";
+-        }
+-    }
+-}
+diff --git a/extensions/arc/deployment/src/test/java/io/quarkus/arc/test/lookup/LookupMultipleConditionsOnStereotypesTest.java b/extensions/arc/deployment/src/test/java/io/quarkus/arc/test/lookup/LookupMultipleConditionsOnStereotypesTest.java
+deleted file mode 100644
+index bd2a3ca61b6..00000000000
+--- a/extensions/arc/deployment/src/test/java/io/quarkus/arc/test/lookup/LookupMultipleConditionsOnStereotypesTest.java
++++ /dev/null
+@@ -1,120 +0,0 @@
+-package io.quarkus.arc.test.lookup;
+-
+-import static org.junit.jupiter.api.Assertions.assertEquals;
+-import static org.junit.jupiter.api.Assertions.assertTrue;
+-
+-import java.lang.annotation.Retention;
+-import java.lang.annotation.RetentionPolicy;
+-
+-import jakarta.enterprise.inject.Instance;
+-import jakarta.enterprise.inject.Produces;
+-import jakarta.enterprise.inject.Stereotype;
+-import jakarta.inject.Inject;
+-import jakarta.inject.Singleton;
+-
+-import org.junit.jupiter.api.Test;
+-import org.junit.jupiter.api.extension.RegisterExtension;
+-
+-import io.quarkus.arc.lookup.LookupIfProperty;
+-import io.quarkus.test.QuarkusUnitTest;
+-
+-public class LookupMultipleConditionsOnStereotypesTest {
+-    @RegisterExtension
+-    static final QuarkusUnitTest config = new QuarkusUnitTest()
+-            .withApplicationRoot(jar -> jar.addClasses(AlphaStereotype.class, BravoStereotype.class,
+-                    AlphaBravoStereotype.class, CharlieStereotype.class, CharlieDeltaStereotype.class,
+-                    EchoFoxtrotStereotype.class, FirstService.class, SecondService.class, ThirdService.class))
+-            .overrideConfigKey("service.alpha.enabled", "true")
+-            .overrideConfigKey("service.delta.enabled", "true")
+-            .overrideConfigKey("service.echo.enabled", "true")
+-            .overrideConfigKey("service.foxtrot.enabled", "true");
+-
+-    @Inject
+-    Instance<FirstService> first;
+-
+-    @Inject
+-    Instance<SecondService> second;
+-
+-    @Inject
+-    Instance<ThirdService> third;
+-
+-    @Test
+-    public void testConditions() {
+-        assertTrue(first.isResolvable());
+-        assertEquals("first", first.get().ping());
+-        assertTrue(second.isUnsatisfied());
+-        assertTrue(third.isResolvable());
+-        assertEquals("third", third.get().ping());
+-    }
+-
+-    @Stereotype
+-    @LookupIfProperty(name = "service.alpha.enabled", stringValue = "true")
+-    @Retention(RetentionPolicy.RUNTIME)
+-    @interface AlphaStereotype {
+-    }
+-
+-    @Stereotype
+-    @LookupIfProperty(name = "service.bravo.enabled", stringValue = "true", lookupIfMissing = true)
+-    @Retention(RetentionPolicy.RUNTIME)
+-    @interface BravoStereotype {
+-    }
+-
+-    @Stereotype
+-    @AlphaStereotype
+-    @BravoStereotype
+-    @Retention(RetentionPolicy.RUNTIME)
+-    @interface AlphaBravoStereotype {
+-    }
+-
+-    @Stereotype
+-    @LookupIfProperty(name = "service.charlie.enabled", stringValue = "true")
+-    @Retention(RetentionPolicy.RUNTIME)
+-    @interface CharlieStereotype {
+-    }
+-
+-    @Stereotype
+-    @CharlieStereotype
+-    @LookupIfProperty(name = "service.delta.enabled", stringValue = "true")
+-    @Retention(RetentionPolicy.RUNTIME)
+-    @interface CharlieDeltaStereotype {
+-    }
+-
+-    @Stereotype
+-    @LookupIfProperty(name = "service.echo.enabled", stringValue = "true")
+-    @LookupIfProperty(name = "service.foxtrot.enabled", stringValue = "true")
+-    @Retention(RetentionPolicy.RUNTIME)
+-    @interface EchoFoxtrotStereotype {
+-    }
+-
+-    @Singleton
+-    @AlphaBravoStereotype
+-    static class FirstService {
+-        public String ping() {
+-            return "first";
+-        }
+-    }
+-
+-    @Singleton
+-    @CharlieDeltaStereotype
+-    static class SecondService {
+-        public String ping() {
+-            return "service";
+-        }
+-    }
+-
+-    static class ThirdService {
+-        public String ping() {
+-            return "third";
+-        }
+-    }
+-
+-    @Singleton
+-    static class ThirdProducer {
+-        @Produces
+-        @Singleton
+-        @EchoFoxtrotStereotype
+-        public ThirdService produce() {
+-            return new ThirdService();
+-        }
+-    }
+-}
+diff --git a/extensions/arc/deployment/src/test/java/io/quarkus/arc/test/lookup/LookupMultipleConditionsTest.java b/extensions/arc/deployment/src/test/java/io/quarkus/arc/test/lookup/LookupMultipleConditionsTest.java
+deleted file mode 100644
+index 1443a1a755c..00000000000
+--- a/extensions/arc/deployment/src/test/java/io/quarkus/arc/test/lookup/LookupMultipleConditionsTest.java
++++ /dev/null
+@@ -1,55 +0,0 @@
+-package io.quarkus.arc.test.lookup;
+-
+-import static org.junit.jupiter.api.Assertions.assertEquals;
+-import static org.junit.jupiter.api.Assertions.assertTrue;
+-
+-import jakarta.enterprise.inject.Instance;
+-import jakarta.inject.Inject;
+-import jakarta.inject.Singleton;
+-
+-import org.junit.jupiter.api.Test;
+-import org.junit.jupiter.api.extension.RegisterExtension;
+-
+-import io.quarkus.arc.lookup.LookupIfProperty;
+-import io.quarkus.test.QuarkusUnitTest;
+-
+-public class LookupMultipleConditionsTest {
+-    @RegisterExtension
+-    static final QuarkusUnitTest config = new QuarkusUnitTest()
+-            .withApplicationRoot(jar -> jar.addClasses(AlphaService.class, BravoService.class))
+-            .overrideConfigKey("service.alpha.enabled", "true")
+-            .overrideConfigKey("service.alpha.active", "true")
+-            .overrideConfigKey("service.bravo.enabled", "true")
+-            .overrideConfigKey("service.bravo.active", "false");
+-
+-    @Inject
+-    Instance<AlphaService> alpha;
+-
+-    @Inject
+-    Instance<BravoService> bravo;
+-
+-    @Test
+-    public void testConditions() {
+-        assertTrue(alpha.isResolvable());
+-        assertEquals("alpha", alpha.get().ping());
+-        assertTrue(bravo.isUnsatisfied());
+-    }
+-
+-    @LookupIfProperty(name = "service.alpha.enabled", stringValue = "true")
+-    @LookupIfProperty(name = "service.alpha.active", stringValue = "true")
+-    @Singleton
+-    static class AlphaService {
+-        public String ping() {
+-            return "alpha";
+-        }
+-    }
+-
+-    @LookupIfProperty(name = "service.bravo.enabled", stringValue = "true")
+-    @LookupIfProperty(name = "service.bravo.active", stringValue = "true")
+-    @Singleton
+-    static class BravoService {
+-        public String ping() {
+-            return "bravo";
+-        }
+-    }
+-}
+diff --git a/extensions/arc/runtime/src/main/java/io/quarkus/arc/lookup/LookupIfProperty.java b/extensions/arc/runtime/src/main/java/io/quarkus/arc/lookup/LookupIfProperty.java
+index fd5b0056c5c..a7de40972f6 100644
+--- a/extensions/arc/runtime/src/main/java/io/quarkus/arc/lookup/LookupIfProperty.java
++++ b/extensions/arc/runtime/src/main/java/io/quarkus/arc/lookup/LookupIfProperty.java
+@@ -11,8 +11,8 @@
+ /**
+  * Indicates that a bean should only be obtained by programmatic lookup if the property matches the provided value.
+  * <p>
+- * This annotation is repeatable and may be put on a stereotype. A bean will be included if all the conditions
+- * defined by the {@link LookupIfProperty} and {@link LookupUnlessProperty} annotations are satisfied.
++ * This annotation is repeatable. A bean will be included if all the conditions defined by the {@link LookupIfProperty} and
++ * {@link LookupUnlessProperty} annotations are satisfied.
+  *
+  * <pre>
+  * <code>
+@@ -60,19 +60,18 @@
+ public @interface LookupIfProperty {
+ 
+     /**
+-     * Name of the runtime property to check.
++     * Name of the runtime property to check
+      */
+     String name();
+ 
+     /**
+-     * Expected {@code String} value of the runtime property (specified by {@code name})
+-     * if the bean should be looked up at runtime.
++     * Expected {@code String} value of the runtime property (specified by {@code name}) if the bean should be looked up at
++     * runtime.
+      */
+     String stringValue();
+ 
+     /**
+-     * Determines if the bean should be looked up when the property specified by {@code name}
+-     * has not been specified at all.
++     * Determines if the bean is to be looked up when the property name specified by {@code name} has not been specified at all
+      */
+     boolean lookupIfMissing() default false;
+ 
+diff --git a/extensions/arc/runtime/src/main/java/io/quarkus/arc/lookup/LookupUnlessProperty.java b/extensions/arc/runtime/src/main/java/io/quarkus/arc/lookup/LookupUnlessProperty.java
+index 2ef987fac2f..ec1f7072afe 100644
+--- a/extensions/arc/runtime/src/main/java/io/quarkus/arc/lookup/LookupUnlessProperty.java
++++ b/extensions/arc/runtime/src/main/java/io/quarkus/arc/lookup/LookupUnlessProperty.java
+@@ -11,8 +11,8 @@
+ /**
+  * Indicates that a bean should only be obtained by programmatic lookup if the property does not match the provided value.
+  * <p>
+- * This annotation is repeatable and may be put on a stereotype. A bean will be included if all the conditions
+- * defined by the {@link LookupUnlessProperty} and {@link LookupIfProperty} annotations are satisfied.
++ * This annotation is repeatable. A bean will be included if all the conditions defined by the {@link LookupUnlessProperty}
++ * and {@link LookupIfProperty} annotations are satisfied.
+  *
+  * <pre>
+  * <code>
+@@ -60,19 +60,19 @@
+ public @interface LookupUnlessProperty {
+ 
+     /**
+-     * Name of the runtime property to check.
++     * Name of the runtime time property to check
+      */
+     String name();
+ 
+     /**
+-     * Expected {@code String} value of the runtime property (specified by {@code name})
+-     * if the bean should NOT be looked up at runtime.
++     * Expected {@code String} value of the runtime time property (specified by {@code name}) if the bean should be skipped at
++     * runtime.
+      */
+     String stringValue();
+ 
+     /**
+-     * Determines if the bean should be looked up when the property specified by {@code name}
+-     * has not been specified at all.
++     * Determines if the bean should be looked up when the property name specified by {@code name} has not been specified at
++     * all
+      */
+     boolean lookupIfMissing() default false;
+ 
+diff --git a/extensions/arc/runtime/src/main/java/io/quarkus/arc/profile/IfBuildProfile.java b/extensions/arc/runtime/src/main/java/io/quarkus/arc/profile/IfBuildProfile.java
+index 93f248b280e..ddf7ca9532a 100644
+--- a/extensions/arc/runtime/src/main/java/io/quarkus/arc/profile/IfBuildProfile.java
++++ b/extensions/arc/runtime/src/main/java/io/quarkus/arc/profile/IfBuildProfile.java
+@@ -6,7 +6,7 @@
+ import java.lang.annotation.Target;
+ 
+ /**
+- * When applied to a bean class or producer method or field, the bean will only be enabled
++ * When applied to a bean class or producer method (or field), the bean will only be enabled
+  * if the Quarkus build time profile matches the rules of the annotation values.
+  *
+  * <blockquote>
+@@ -42,9 +42,6 @@
+  * </pre>
+  *
+  * </blockquote>
+- *
+- * This annotation may be put on a stereotype. A bean will be enabled if all the conditions
+- * defined by the {@link IfBuildProfile} and {@link UnlessBuildProfile} annotations are satisfied.
+  */
+ @Retention(RetentionPolicy.RUNTIME)
+ @Target({ ElementType.METHOD, ElementType.TYPE, ElementType.FIELD })
+diff --git a/extensions/arc/runtime/src/main/java/io/quarkus/arc/profile/UnlessBuildProfile.java b/extensions/arc/runtime/src/main/java/io/quarkus/arc/profile/UnlessBuildProfile.java
+index 9719b03b832..ddc3bdd8eb0 100644
+--- a/extensions/arc/runtime/src/main/java/io/quarkus/arc/profile/UnlessBuildProfile.java
++++ b/extensions/arc/runtime/src/main/java/io/quarkus/arc/profile/UnlessBuildProfile.java
+@@ -6,7 +6,7 @@
+ import java.lang.annotation.Target;
+ 
+ /**
+- * When applied to a bean class or producer method or field, the bean will only be enabled
++ * When applied to a bean class or producer method (or field), the bean will only be enabled
+  * if the Quarkus build time profile does <b>not</b> match the rules of the annotation values.
+  *
+  * <blockquote>
+@@ -43,9 +43,6 @@
+  * </pre>
+  *
+  * </blockquote>
+- *
+- * This annotation may be put on a stereotype. A bean will be enabled if all the conditions
+- * defined by the {@link IfBuildProfile} and {@link UnlessBuildProfile} annotations are satisfied.
+  */
+ @Retention(RetentionPolicy.RUNTIME)
+ @Target({ ElementType.METHOD, ElementType.TYPE, ElementType.FIELD })
+diff --git a/extensions/arc/runtime/src/main/java/io/quarkus/arc/properties/IfBuildProperty.java b/extensions/arc/runtime/src/main/java/io/quarkus/arc/properties/IfBuildProperty.java
+index 174f784a75b..9dac62c08ab 100644
+--- a/extensions/arc/runtime/src/main/java/io/quarkus/arc/properties/IfBuildProperty.java
++++ b/extensions/arc/runtime/src/main/java/io/quarkus/arc/properties/IfBuildProperty.java
+@@ -7,14 +7,14 @@
+ import java.lang.annotation.Target;
+ 
+ /**
+- * When applied to a bean class or producer method or field, the bean will only be enabled
++ * When applied to a bean class or producer method (or field), the bean will only be enabled
+  * if the Quarkus build time property matches the provided value.
+  * <p>
+  * By default, the bean is not enabled when the build time property is not defined at all, but this behavior is configurable
+  * via the {@code enableIfMissing} property.
+  * <p>
+- * This annotation is repeatable and may be put on a stereotype. A bean will be enabled if all the conditions
+- * defined by the {@link IfBuildProperty} and {@link UnlessBuildProperty} annotations are satisfied.
++ * This annotation is repeatable. A bean will only be enabled if all the conditions defined by the {@link IfBuildProperty}
++ * annotations are satisfied.
+  */
+ @Repeatable(IfBuildProperty.List.class)
+ @Retention(RetentionPolicy.RUNTIME)
+diff --git a/extensions/arc/runtime/src/main/java/io/quarkus/arc/properties/UnlessBuildProperty.java b/extensions/arc/runtime/src/main/java/io/quarkus/arc/properties/UnlessBuildProperty.java
+index feea546520d..6854eeb0ce7 100644
+--- a/extensions/arc/runtime/src/main/java/io/quarkus/arc/properties/UnlessBuildProperty.java
++++ b/extensions/arc/runtime/src/main/java/io/quarkus/arc/properties/UnlessBuildProperty.java
+@@ -7,14 +7,14 @@
+ import java.lang.annotation.Target;
+ 
+ /**
+- * When applied to a bean class or producer method or field, the bean will only be enabled
++ * When applied to a bean class or producer method (or field), the bean will only be enabled
+  * if the Quarkus build time property does not match the provided value.
+  * <p>
+  * By default, the bean is not enabled when the build time property is not defined at all, but this behavior is configurable
+  * via the {@code enableIfMissing} property.
+  * <p>
+- * This annotation is repeatable and may be put on a stereotype. A bean will be enabled if all the conditions
+- * defined by the {@link IfBuildProperty} and {@link UnlessBuildProperty} annotations are satisfied.
++ * This annotation is repeatable. A bean will only be enabled if all the conditions defined by the
++ * {@link UnlessBuildProperty} annotations are satisfied.
+  */
+ @Repeatable(UnlessBuildProperty.List.class)
+ @Retention(RetentionPolicy.RUNTIME)

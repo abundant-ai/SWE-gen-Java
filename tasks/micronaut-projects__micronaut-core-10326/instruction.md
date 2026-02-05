@@ -1,0 +1,13 @@
+Micronaut’s Netty HTTP server request processing currently passes a streamed request object through the internal request-handling pipeline, and downstream handlers extract the body by doing type/instance checks on the request. This breaks once the request handling pipeline is refactored to provide the body independently: request handlers should be able to receive the request metadata and the body as separate values without needing to inspect the concrete request type.
+
+When constructing/processing Netty requests, a request object like `NettyHttpRequest` must be created with an explicit `ByteBody` instance (including the empty-body case via `ByteBody.empty()`), and the internal `RequestHandler` contract must accept the body as a separate `ByteBody` parameter rather than relying on a streamed request wrapper. Any code path that previously assumed the body was embedded in a `StreamedHttpRequest` (or performed `instanceof` checks to determine whether the request is streamed vs full) should continue to work, but now using the explicitly supplied `ByteBody`.
+
+Expected behavior:
+- Request processing should succeed for requests with no content and for requests with content, without requiring any `instanceof` checks on the request object to obtain the body.
+- Creating a `NettyHttpRequest` with a Netty `HttpRequest` and `ByteBody.empty()` must behave as a valid request whose headers can be iterated and read correctly (e.g. `getHeaders().forEach(...)` must yield the same header names/values that were set on the underlying Netty request).
+- Common request operations must continue to work with the refactored request/body separation, including calling `mutate()` on `NettyHttpRequest` (including calling `mutate()` on the result of a previous `mutate()`), changing the URI/path and adding headers, and reading query parameters.
+
+Actual behavior to fix:
+- After the refactor, parts of the request pipeline still assume the body is carried by the streamed request type, leading to incorrect body access and/or runtime failures/compilation failures where `RequestHandler` implementations and callers disagree on the method signature.
+
+Update the request handling pipeline so that `RequestHandler` (and any related collaborators) consistently uses a signature that takes the request and a separate `ByteBody`, and ensure Netty request creation/processing passes the correct `ByteBody` through all relevant code paths.

@@ -1,0 +1,122 @@
+diff --git a/http-server-netty/src/main/java/io/micronaut/http/server/netty/handler/PipeliningServerHandler.java b/http-server-netty/src/main/java/io/micronaut/http/server/netty/handler/PipeliningServerHandler.java
+index 37b1de3ac3..1b40e04850 100644
+--- a/http-server-netty/src/main/java/io/micronaut/http/server/netty/handler/PipeliningServerHandler.java
++++ b/http-server-netty/src/main/java/io/micronaut/http/server/netty/handler/PipeliningServerHandler.java
+@@ -66,6 +66,7 @@ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ import reactor.core.publisher.Flux;
+ 
++import java.io.EOFException;
+ import java.util.ArrayDeque;
+ import java.util.ArrayList;
+ import java.util.List;
+@@ -208,6 +209,7 @@ public final class PipeliningServerHandler extends ChannelInboundHandlerAdapter
+                 queued.handler.discardOutbound();
+             }
+         }
++        inboundHandler.discard();
+         outboundQueue.clear();
+         requestHandler.removed();
+     }
+@@ -338,6 +340,9 @@ public final class PipeliningServerHandler extends ChannelInboundHandlerAdapter
+          */
+         void readComplete() {
+         }
++
++        void discard() {
++        }
+     }
+ 
+     /**
+@@ -516,6 +521,14 @@ public final class PipeliningServerHandler extends ChannelInboundHandlerAdapter
+             streamingInboundHandler.dest.setExpectedLengthFrom(request.headers());
+             requestHandler.accept(ctx, request, new StreamingNettyByteBody(streamingInboundHandler.dest), outboundAccess);
+         }
++
++        @Override
++        void discard() {
++            for (HttpContent content : buffer) {
++                content.release();
++            }
++            buffer.clear();
++        }
+     }
+ 
+     /**
+@@ -544,6 +557,12 @@ public final class PipeliningServerHandler extends ChannelInboundHandlerAdapter
+             }
+         }
+ 
++        @Override
++        void discard() {
++            // note: this has to match RoutingInBoundHandler#IGNORABLE_ERROR_MESSAGE
++            handleUpstreamError(new EOFException("Connection closed before full body was received"));
++        }
++
+         @Override
+         void handleUpstreamError(Throwable cause) {
+             if (inboundHandler instanceof DecompressingInboundHandler dih) {
+@@ -688,6 +707,12 @@ public final class PipeliningServerHandler extends ChannelInboundHandlerAdapter
+         void handleUpstreamError(Throwable cause) {
+             delegate.handleUpstreamError(cause);
+         }
++
++        @Override
++        void discard() {
++            dispose();
++            delegate.discard();
++        }
+     }
+ 
+     /**
+diff --git a/http-server/src/main/java/io/micronaut/http/server/RequestLifecycle.java b/http-server/src/main/java/io/micronaut/http/server/RequestLifecycle.java
+index bb53ad1bd2..9d47b67fda 100644
+--- a/http-server/src/main/java/io/micronaut/http/server/RequestLifecycle.java
++++ b/http-server/src/main/java/io/micronaut/http/server/RequestLifecycle.java
+@@ -36,7 +36,12 @@ import io.micronaut.http.body.MessageBodyHandlerRegistry;
+ import io.micronaut.http.exceptions.HttpStatusException;
+ import io.micronaut.http.filter.FilterRunner;
+ import io.micronaut.http.filter.GenericHttpFilter;
+-import io.micronaut.http.server.exceptions.*;
++import io.micronaut.http.server.exceptions.ExceptionHandler;
++import io.micronaut.http.server.exceptions.NotAcceptableException;
++import io.micronaut.http.server.exceptions.NotAllowedException;
++import io.micronaut.http.server.exceptions.NotFoundException;
++import io.micronaut.http.server.exceptions.NotWebSocketRequestException;
++import io.micronaut.http.server.exceptions.UnsupportedMediaException;
+ import io.micronaut.http.server.exceptions.response.ErrorContext;
+ import io.micronaut.http.server.types.files.FileCustomizableResponseType;
+ import io.micronaut.inject.BeanDefinition;
+@@ -249,7 +254,8 @@ public class RequestLifecycle {
+             }
+             if (RouteExecutor.isIgnorable(cause)) {
+                 RouteExecutor.logIgnoredException(cause);
+-                return ExecutionFlow.empty();
++                // the client won't see this response, but we need one for filters and such
++                return ExecutionFlow.just(HttpResponse.badRequest("Stream closed"));
+             }
+             return createDefaultErrorResponseFlow(request, cause);
+         }
+diff --git a/http-server/src/main/java/io/micronaut/http/server/util/DefaultHttpHostResolver.java b/http-server/src/main/java/io/micronaut/http/server/util/DefaultHttpHostResolver.java
+index ea3e552552..2ecb5d77c9 100644
+--- a/http-server/src/main/java/io/micronaut/http/server/util/DefaultHttpHostResolver.java
++++ b/http-server/src/main/java/io/micronaut/http/server/util/DefaultHttpHostResolver.java
+@@ -173,10 +173,14 @@ public class DefaultHttpHostResolver implements HttpHostResolver {
+         }
+ 
+         Integer port;
+-        if (isPortInHost && host != null && host.contains(":")) {
+-            String[] parts = host.split(":");
+-            host = parts[0].trim();
+-            port = Integer.valueOf(parts[1].trim());
++        int separatorIndex = host == null ? -1 : host.indexOf(':');
++        if (isPortInHost && separatorIndex != -1) {
++            try {
++                port = Integer.valueOf(host.substring(separatorIndex + 1).trim());
++            } catch (NumberFormatException e) {
++                port = null;
++            }
++            host = host.substring(0, separatorIndex).trim();
+         } else if (portHeader != null) {
+             port = headers.get(portHeader, Integer.class).orElse(null);
+         } else {

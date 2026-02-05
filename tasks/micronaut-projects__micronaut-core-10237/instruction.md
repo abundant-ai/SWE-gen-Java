@@ -1,0 +1,13 @@
+Micronaut Core 4.2.0 introduced a major performance regression during annotation processing (notably Gradle’s `kaptKotlin` task), where builds can take ~5x longer than with 4.1.6 on the same sources. Profiling indicates excessive time spent in logic related to querying a type’s enclosed elements. The regression is tied to how `EnclosedElementsQuery` enumerates methods/fields across class hierarchies and interfaces.
+
+The element-query implementation needs to be corrected so that querying enclosed elements does not repeatedly re-walk or over-process the type hierarchy and does not include irrelevant members. In particular:
+
+When querying enclosed methods for a concrete (non-abstract) class, the query should avoid processing abstract interface methods that are not actually implemented by the class (i.e., interface abstract methods should not be treated as candidates for the concrete class’s enclosed methods unless they are concretely present/implemented in the resolved method set).
+
+Repeated queries for the same element/query combination should not re-do the full computation every time. Calling the element query APIs multiple times during annotation processing should reuse prior results where applicable so the overall annotation processing time does not grow dramatically with repeated queries.
+
+Method hiding/overriding resolution must be correct. The method used to determine whether one method hides another (commonly exposed as a `hides` check on method elements or within the query resolution) currently yields incorrect results in some inheritance/interface scenarios, leading to wrong effective method sets. This can affect downstream behavior such as the number of executable methods seen on generated proxy/bean definitions.
+
+The corrected behavior should ensure that Micronaut’s type model and bean/proxy generation see the correct enclosed methods and that introduction advice can add/implement additional interface methods without inflating or corrupting the method set. For example, when generating a proxy for a concrete class that has one declared executable method and an introduced listener-style interface, the resulting bean definition should expose exactly the expected executable methods and the introduced interface method should be discoverable via `findMethod` and invocable at runtime.
+
+Overall expected result: annotation processing for Kotlin KAPT (and also KSP) should no longer suffer the 4.2.0 performance regression caused by enclosed-element querying, while preserving correct semantics for method discovery, method hiding/overriding, and introduced interface methods on both concrete and abstract classes.
