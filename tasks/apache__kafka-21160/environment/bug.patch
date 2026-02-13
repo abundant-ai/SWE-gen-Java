@@ -1,0 +1,214 @@
+diff --git a/docs/streams/upgrade-guide.html b/docs/streams/upgrade-guide.html
+index bb6ea53864..5037410f3d 100644
+--- a/docs/streams/upgrade-guide.html
++++ b/docs/streams/upgrade-guide.html
+@@ -108,15 +108,6 @@
+ 
+     <p>Since 2.6.0 release, Kafka Streams depends on a RocksDB version that requires MacOS 10.14 or higher.</p>
+ 
+-    <h3><a id="streams_api_changes_430" href="#streams_api_changes_430">Streams API changes in 4.3.0</a></h3>
+-
+-    <p>The streams thread metrics <code>commit-ratio</code>, <code>process-ratio</code>, <code>punctuate-ratio</code>, and <code>poll-ratio</code> have been updated.
+-        They now report, over a rolling measurement window,
+-        the ratio of time this thread spends performing the given action (<code>{action}</code>) to the total elapsed time in that window.
+-        The effective window duration is determined by the metrics configuration: <code>metrics.sample.window.ms</code> (per-sample window length)
+-        and <code>metrics.num.samples</code> (number of rolling windows).
+-    </p>
+-
+     <h3><a id="streams_api_changes_420" href="#streams_api_changes_420">Streams API changes in 4.2.0</a></h3>
+ 
+     <p>
+diff --git a/streams/src/main/java/org/apache/kafka/streams/processor/internals/StreamThread.java b/streams/src/main/java/org/apache/kafka/streams/processor/internals/StreamThread.java
+index ba87bcd463..405ea720b6 100644
+--- a/streams/src/main/java/org/apache/kafka/streams/processor/internals/StreamThread.java
++++ b/streams/src/main/java/org/apache/kafka/streams/processor/internals/StreamThread.java
+@@ -42,9 +42,7 @@ import org.apache.kafka.common.errors.TimeoutException;
+ import org.apache.kafka.common.errors.UnsupportedVersionException;
+ import org.apache.kafka.common.internals.KafkaFutureImpl;
+ import org.apache.kafka.common.message.StreamsGroupHeartbeatResponseData;
+-import org.apache.kafka.common.metrics.MetricConfig;
+ import org.apache.kafka.common.metrics.Sensor;
+-import org.apache.kafka.common.metrics.stats.WindowedSum;
+ import org.apache.kafka.common.requests.StreamsGroupHeartbeatResponse;
+ import org.apache.kafka.common.serialization.ByteArrayDeserializer;
+ import org.apache.kafka.common.utils.LogContext;
+@@ -377,15 +375,6 @@ public class StreamThread extends Thread implements ProcessingThread {
+     private final boolean eosEnabled;
+     private final boolean processingThreadsEnabled;
+ 
+-    private final WindowedSum pollLatencyWindowedSum = new WindowedSum();
+-    private final WindowedSum totalCommitLatencyWindowedSum = new WindowedSum();
+-    private final WindowedSum processLatencyWindowedSum = new WindowedSum();
+-    private final WindowedSum punctuateLatencyWindowedSum = new WindowedSum();
+-    private final WindowedSum runOnceLatencyWindowedSum = new WindowedSum();
+-    private final MetricConfig metricsConfig;
+-
+-    private boolean latencyWindowsInitialized = false;
+-
+     private volatile long fetchDeadlineClientInstanceId = -1;
+     private volatile KafkaFutureImpl<Uuid> mainConsumerInstanceIdFuture = new KafkaFutureImpl<>();
+     private volatile KafkaFutureImpl<Uuid> restoreConsumerInstanceIdFuture = new KafkaFutureImpl<>();
+@@ -799,7 +788,6 @@ public class StreamThread extends Thread implements ProcessingThread {
+         this.shutdownErrorHook = shutdownErrorHook;
+         this.streamsUncaughtExceptionHandler = streamsUncaughtExceptionHandler;
+         this.cacheResizer = cacheResizer;
+-        this.metricsConfig = streamsMetrics.metricsRegistry().config();
+ 
+         // The following sensors are created here but their references are not stored in this object, since within
+         // this object they are not recorded. The sensors are created here so that the stream threads starts with all
+@@ -899,7 +887,6 @@ public class StreamThread extends Thread implements ProcessingThread {
+         boolean cleanRun = false;
+         try {
+             taskManager.init();
+-            initLatencyWindowsIfNeeded(time.milliseconds());
+             cleanRun = runLoop();
+         } catch (final Throwable e) {
+             failedStreamThreadSensor.record();
+@@ -1288,13 +1275,11 @@ public class StreamThread extends Thread implements ProcessingThread {
+ 
+         now = time.milliseconds();
+         final long runOnceLatency = now - startMs;
+-
+-        recordWindowedSum(now, pollLatency, totalCommitLatency, totalProcessLatency, totalPunctuateLatency, runOnceLatency);
+-        recordRatio(now, pollLatencyWindowedSum, pollRatioSensor);
+-        recordRatio(now, totalCommitLatencyWindowedSum, commitRatioSensor);
+-        recordRatio(now, processLatencyWindowedSum, processRatioSensor);
+-        recordRatio(now, punctuateLatencyWindowedSum, punctuateRatioSensor);
+         processRecordsSensor.record(totalProcessed, now);
++        processRatioSensor.record((double) totalProcessLatency / runOnceLatency, now);
++        punctuateRatioSensor.record((double) totalPunctuateLatency / runOnceLatency, now);
++        pollRatioSensor.record((double) pollLatency / runOnceLatency, now);
++        commitRatioSensor.record((double) totalCommitLatency / runOnceLatency, now);
+ 
+         final long timeSinceLastLog = now - lastLogSummaryMs;
+         if (logSummaryIntervalMs > 0 && timeSinceLastLog > logSummaryIntervalMs) {
+@@ -1377,10 +1362,8 @@ public class StreamThread extends Thread implements ProcessingThread {
+ 
+         now = time.milliseconds();
+         final long runOnceLatency = now - startMs;
+-
+-        recordWindowedSum(now, pollLatency, totalCommitLatency, 0, 0, runOnceLatency);
+-        recordRatio(now, pollLatencyWindowedSum, pollRatioSensor);
+-        recordRatio(now, totalCommitLatencyWindowedSum, commitRatioSensor);
++        pollRatioSensor.record((double) pollLatency / runOnceLatency, now);
++        commitRatioSensor.record((double) totalCommitLatency / runOnceLatency, now);
+ 
+         if (logSummaryIntervalMs > 0 && now - lastLogSummaryMs > logSummaryIntervalMs) {
+             log.info("Committed {} total tasks since the last update", totalCommittedSinceLastSummary);
+@@ -2120,46 +2103,4 @@ public class StreamThread extends Thread implements ProcessingThread {
+     Optional<StreamsRebalanceData> streamsRebalanceData() {
+         return streamsRebalanceData;
+     }
+-
+-    /**
+-     * Initialize both WindowedSum instances at exactly the same timestamp so
+-     * their windows are aligned from the very beginning.
+-     */
+-    private void initLatencyWindowsIfNeeded(final long now) {
+-        if (!latencyWindowsInitialized) {
+-            // Start both windows at the same instant with a zero record
+-            pollLatencyWindowedSum.record(metricsConfig, 0.0, now);
+-            totalCommitLatencyWindowedSum.record(metricsConfig, 0, now);
+-            processLatencyWindowedSum.record(metricsConfig, 0, now);
+-            punctuateLatencyWindowedSum.record(metricsConfig, 0, now);
+-            runOnceLatencyWindowedSum.record(metricsConfig, 0.0, now);
+-            latencyWindowsInitialized = true;
+-        }
+-    }
+-
+-    private void recordWindowedSum(final long now,
+-                                   final double pollLatency,
+-                                   final double totalCommitLatency,
+-                                   final double processLatency,
+-                                   final double punctuateLatency,
+-                                   final double runOnceLatency) {
+-        pollLatencyWindowedSum.record(metricsConfig, pollLatency, now);
+-        totalCommitLatencyWindowedSum.record(metricsConfig, totalCommitLatency, now);
+-        processLatencyWindowedSum.record(metricsConfig, processLatency, now);
+-        punctuateLatencyWindowedSum.record(metricsConfig, punctuateLatency, now);
+-        runOnceLatencyWindowedSum.record(metricsConfig, runOnceLatency, now);
+-    }
+-
+-    private void recordRatio(final long now, final WindowedSum windowedSum, final Sensor ratioSensor) {
+-        final double runOnceLatencyWindow =
+-            runOnceLatencyWindowedSum.measure(metricsConfig, now);
+-
+-        if (runOnceLatencyWindow > 0.0) {
+-            final double latencyWindow =
+-                windowedSum.measure(metricsConfig, now);
+-            ratioSensor.record(latencyWindow / runOnceLatencyWindow);
+-        } else {
+-            ratioSensor.record(0.0, now);
+-        }
+-    }
+ }
+diff --git a/streams/src/main/java/org/apache/kafka/streams/processor/internals/metrics/ThreadMetrics.java b/streams/src/main/java/org/apache/kafka/streams/processor/internals/metrics/ThreadMetrics.java
+index 73fa53ebcd..b45bde5ddd 100644
+--- a/streams/src/main/java/org/apache/kafka/streams/processor/internals/metrics/ThreadMetrics.java
++++ b/streams/src/main/java/org/apache/kafka/streams/processor/internals/metrics/ThreadMetrics.java
+@@ -82,17 +82,13 @@ public class ThreadMetrics {
+     private static final String PUNCTUATE_AVG_LATENCY_DESCRIPTION = "The average punctuate latency";
+     private static final String PUNCTUATE_MAX_LATENCY_DESCRIPTION = "The maximum punctuate latency";
+     private static final String PROCESS_RATIO_DESCRIPTION =
+-        "The ratio, over a rolling measurement window, of the time this thread spent " +
+-            "processing active tasks to the total elapsed time in that window.";
++        "The fraction of time the thread spent on processing active tasks";
+     private static final String PUNCTUATE_RATIO_DESCRIPTION =
+-        "The ratio, over a rolling measurement window, of the time this thread spent " +
+-            "punctuating active tasks to the total elapsed time in that window.";
++        "The fraction of time the thread spent on punctuating active tasks";
+     private static final String POLL_RATIO_DESCRIPTION =
+-        "The ratio, over a rolling measurement window, of the time this thread spent " +
+-            "polling records from the consumer to the total elapsed time in that window.";
++        "The fraction of time the thread spent on polling records from consumer";
+     private static final String COMMIT_RATIO_DESCRIPTION =
+-        "The ratio, over a rolling measurement window, of the time this thread spent " +
+-            "committing all tasks to the total elapsed time in that window.";
++        "The fraction of time the thread spent on committing all tasks";
+     private static final String BLOCKED_TIME_DESCRIPTION =
+         "The total time the thread spent blocked on kafka in nanoseconds";
+     private static final String THREAD_START_TIME_DESCRIPTION =
+diff --git a/streams/src/test/java/org/apache/kafka/streams/processor/internals/metrics/ThreadMetricsTest.java b/streams/src/test/java/org/apache/kafka/streams/processor/internals/metrics/ThreadMetricsTest.java
+index 63a3512049..87891ab389 100644
+--- a/streams/src/test/java/org/apache/kafka/streams/processor/internals/metrics/ThreadMetricsTest.java
++++ b/streams/src/test/java/org/apache/kafka/streams/processor/internals/metrics/ThreadMetricsTest.java
+@@ -53,8 +53,7 @@ public class ThreadMetricsTest {
+     @Test
+     public void shouldGetProcessRatioSensor() {
+         final String operation = "process-ratio";
+-        final String ratioDescription = "The ratio, over a rolling measurement window, of the time this thread spent " +
+-            "processing active tasks to the total elapsed time in that window.";
++        final String ratioDescription = "The fraction of time the thread spent on processing active tasks";
+         when(streamsMetrics.threadLevelSensor(THREAD_ID, operation, RecordingLevel.INFO)).thenReturn(expectedSensor);
+         when(streamsMetrics.threadLevelTagMap(THREAD_ID)).thenReturn(tagMap);
+ 
+@@ -149,8 +148,7 @@ public class ThreadMetricsTest {
+     @Test
+     public void shouldGetPollRatioSensor() {
+         final String operation = "poll-ratio";
+-        final String ratioDescription = "The ratio, over a rolling measurement window, of the time this thread " +
+-            "spent polling records from the consumer to the total elapsed time in that window.";
++        final String ratioDescription = "The fraction of time the thread spent on polling records from consumer";
+         when(streamsMetrics.threadLevelSensor(THREAD_ID, operation, RecordingLevel.INFO)).thenReturn(expectedSensor);
+         when(streamsMetrics.threadLevelTagMap(THREAD_ID)).thenReturn(tagMap);
+ 
+@@ -270,8 +268,7 @@ public class ThreadMetricsTest {
+     @Test
+     public void shouldGetCommitRatioSensor() {
+         final String operation = "commit-ratio";
+-        final String ratioDescription = "The ratio, over a rolling measurement window, of the time this thread spent " +
+-            "committing all tasks to the total elapsed time in that window.";
++        final String ratioDescription = "The fraction of time the thread spent on committing all tasks";
+         when(streamsMetrics.threadLevelSensor(THREAD_ID, operation, RecordingLevel.INFO)).thenReturn(expectedSensor);
+         when(streamsMetrics.threadLevelTagMap(THREAD_ID)).thenReturn(tagMap);
+ 
+@@ -330,8 +327,7 @@ public class ThreadMetricsTest {
+     @Test
+     public void shouldGetPunctuateRatioSensor() {
+         final String operation = "punctuate-ratio";
+-        final String ratioDescription = "The ratio, over a rolling measurement window, of the time this thread spent " +
+-            "punctuating active tasks to the total elapsed time in that window.";
++        final String ratioDescription = "The fraction of time the thread spent on punctuating active tasks";
+         when(streamsMetrics.threadLevelSensor(THREAD_ID, operation, RecordingLevel.INFO)).thenReturn(expectedSensor);
+         when(streamsMetrics.threadLevelTagMap(THREAD_ID)).thenReturn(tagMap);
+ 

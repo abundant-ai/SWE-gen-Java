@@ -1,0 +1,900 @@
+diff --git a/retrofit/src/main/java/retrofit/DefaultCallAdapterFactory.java b/retrofit/src/main/java/retrofit/DefaultCallAdapterFactory.java
+index a4919c3d..a1147cc0 100644
+--- a/retrofit/src/main/java/retrofit/DefaultCallAdapterFactory.java
++++ b/retrofit/src/main/java/retrofit/DefaultCallAdapterFactory.java
+@@ -28,7 +28,7 @@ final class DefaultCallAdapterFactory implements CallAdapter.Factory {
+   }
+ 
+   @Override public String toString() {
+-    return "Built-in CallAdapterFactory";
++    return "Default CallAdapterFactory";
+   }
+ 
+   @Override public CallAdapter<?> get(Type returnType) {
+diff --git a/retrofit/src/main/java/retrofit/MethodHandler.java b/retrofit/src/main/java/retrofit/MethodHandler.java
+new file mode 100644
+index 00000000..5886a224
+--- /dev/null
++++ b/retrofit/src/main/java/retrofit/MethodHandler.java
+@@ -0,0 +1,97 @@
++/*
++ * Copyright (C) 2015 Square, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package retrofit;
++
++import com.squareup.okhttp.OkHttpClient;
++import com.squareup.okhttp.ResponseBody;
++import java.lang.reflect.Method;
++import java.lang.reflect.Type;
++import retrofit.http.Streaming;
++
++import static retrofit.Utils.methodError;
++
++final class MethodHandler<T> {
++  @SuppressWarnings("unchecked")
++  static MethodHandler<?> create(Method method, OkHttpClient client, Endpoint endpoint,
++      CallAdapter.Factory callAdapterFactory, Converter.Factory converterFactory) {
++    CallAdapter<Object> callAdapter =
++        (CallAdapter<Object>) createCallAdapter(method, callAdapterFactory);
++    Converter<Object> responseConverter =
++        (Converter<Object>) createResponseConverter(method, callAdapter.responseType(),
++            converterFactory);
++    RequestFactory requestFactory = RequestFactoryParser.parse(method, endpoint, converterFactory);
++    return new MethodHandler<>(client, requestFactory, callAdapter, responseConverter);
++  }
++
++  private static CallAdapter<?> createCallAdapter(Method method,
++      CallAdapter.Factory adapterFactory) {
++    Type returnType = method.getGenericReturnType();
++    if (Utils.hasUnresolvableType(returnType)) {
++      throw methodError(method,
++          "Method return type must not include a type variable or wildcard: %s", returnType);
++    }
++
++    if (returnType == void.class) {
++      throw methodError(method, "Service methods cannot return void.");
++    }
++
++    CallAdapter<?> adapter = adapterFactory.get(returnType);
++    if (adapter == null) {
++      throw methodError(method, "Call adapter factory '%s' was unable to handle return type %s",
++          adapterFactory, returnType);
++    }
++    return adapter;
++  }
++
++  private static Converter<?> createResponseConverter(Method method, Type responseType,
++      Converter.Factory converterFactory) {
++    if (responseType == ResponseBody.class) {
++      boolean isStreaming = method.isAnnotationPresent(Streaming.class);
++      return new OkHttpResponseBodyConverter(isStreaming);
++    }
++
++    if (converterFactory == null) {
++      throw methodError(method, "Method response type is "
++          + responseType
++          + " but no converter factory registered. "
++          + "Either add a converter factory to the Retrofit instance or use ResponseBody.");
++    }
++
++    Converter<?> converter = converterFactory.get(responseType);
++    if (converter == null) {
++      throw methodError(method, "Converter factory '%s' was unable to handle response type %s",
++          converterFactory, responseType);
++    }
++    return converter;
++  }
++
++  private final OkHttpClient client;
++  private final RequestFactory requestFactory;
++  private final CallAdapter<T> callAdapter;
++  private final Converter<T> responseConverter;
++
++  private MethodHandler(OkHttpClient client, RequestFactory requestFactory,
++      CallAdapter<T> callAdapter, Converter<T> responseConverter) {
++    this.client = client;
++    this.requestFactory = requestFactory;
++    this.callAdapter = callAdapter;
++    this.responseConverter = responseConverter;
++  }
++
++  Object invoke(Object... args) {
++    return callAdapter.adapt(new OkHttpCall<>(client, requestFactory, responseConverter, args));
++  }
++}
+diff --git a/retrofit/src/main/java/retrofit/OkHttpCall.java b/retrofit/src/main/java/retrofit/OkHttpCall.java
+index 0c33f230..6ba1ca99 100644
+--- a/retrofit/src/main/java/retrofit/OkHttpCall.java
++++ b/retrofit/src/main/java/retrofit/OkHttpCall.java
+@@ -15,36 +15,33 @@
+  */
+ package retrofit;
+ 
+-import com.squareup.okhttp.HttpUrl;
+ import com.squareup.okhttp.OkHttpClient;
+ import com.squareup.okhttp.Request;
+ import com.squareup.okhttp.ResponseBody;
+ import java.io.IOException;
+ 
+-import static retrofit.Utils.closeQueitly;
++import static retrofit.Utils.closeQuietly;
+ 
+ final class OkHttpCall<T> implements Call<T> {
+   private final OkHttpClient client;
+-  private final Endpoint endpoint;
++  private final RequestFactory requestFactory;
+   private final Converter<T> responseConverter;
+-  private final MethodInfo methodInfo;
+   private final Object[] args;
+ 
+   private volatile com.squareup.okhttp.Call rawCall;
+   private boolean executed; // Guarded by this.
+ 
+-  OkHttpCall(OkHttpClient client, Endpoint endpoint, Converter<T> responseConverter,
+-      MethodInfo methodInfo, Object[] args) {
++  OkHttpCall(OkHttpClient client, RequestFactory requestFactory, Converter<T> responseConverter,
++      Object[] args) {
+     this.client = client;
+-    this.endpoint = endpoint;
++    this.requestFactory = requestFactory;
+     this.responseConverter = responseConverter;
+-    this.methodInfo = methodInfo;
+     this.args = args;
+   }
+ 
+   @SuppressWarnings("CloneDoesntCallSuperClone") // We are a final type & this saves clearing state.
+   @Override public OkHttpCall<T> clone() {
+-    return new OkHttpCall<>(client, endpoint, responseConverter, methodInfo, args);
++    return new OkHttpCall<>(client, requestFactory, responseConverter, args);
+   }
+ 
+   public void enqueue(final Callback<T> callback) {
+@@ -109,20 +106,7 @@ final class OkHttpCall<T> implements Call<T> {
+   }
+ 
+   private com.squareup.okhttp.Call createRawCall() {
+-    HttpUrl url = endpoint.url();
+-    RequestBuilder requestBuilder = new RequestBuilder(url, methodInfo);
+-
+-    Object[] args = this.args;
+-    if (args != null) {
+-      RequestBuilderAction[] actions = methodInfo.requestBuilderActions;
+-      for (int i = 0, count = args.length; i < count; i++) {
+-        actions[i].perform(requestBuilder, args[i]);
+-      }
+-    }
+-
+-    Request request = requestBuilder.build();
+-
+-    return client.newCall(request);
++    return client.newCall(requestFactory.create(args));
+   }
+ 
+   private Response<T> parseResponse(com.squareup.okhttp.Response rawResponse) throws IOException {
+@@ -140,7 +124,7 @@ final class OkHttpCall<T> implements Call<T> {
+         ResponseBody bufferedBody = Utils.readBodyToBytesIfNecessary(rawBody);
+         return Response.error(bufferedBody, rawResponse);
+       } finally {
+-        closeQueitly(rawBody);
++        closeQuietly(rawBody);
+       }
+     }
+ 
+diff --git a/retrofit/src/main/java/retrofit/OkHttpResponseBodyConverter.java b/retrofit/src/main/java/retrofit/OkHttpResponseBodyConverter.java
+index 039a464c..3538c789 100644
+--- a/retrofit/src/main/java/retrofit/OkHttpResponseBodyConverter.java
++++ b/retrofit/src/main/java/retrofit/OkHttpResponseBodyConverter.java
+@@ -19,7 +19,7 @@ import com.squareup.okhttp.RequestBody;
+ import com.squareup.okhttp.ResponseBody;
+ import java.io.IOException;
+ 
+-import static retrofit.Utils.closeQueitly;
++import static retrofit.Utils.closeQuietly;
+ 
+ final class OkHttpResponseBodyConverter implements Converter<ResponseBody> {
+   private final boolean isStreaming;
+@@ -37,7 +37,7 @@ final class OkHttpResponseBodyConverter implements Converter<ResponseBody> {
+     try {
+       return Utils.readBodyToBytesIfNecessary(body);
+     } finally {
+-      closeQueitly(body);
++      closeQuietly(body);
+     }
+   }
+ 
+diff --git a/retrofit/src/main/java/retrofit/RequestBuilder.java b/retrofit/src/main/java/retrofit/RequestBuilder.java
+index 7e7d73ba..b6d89fc5 100644
+--- a/retrofit/src/main/java/retrofit/RequestBuilder.java
++++ b/retrofit/src/main/java/retrofit/RequestBuilder.java
+@@ -28,51 +28,44 @@ import java.net.URLEncoder;
+ import okio.BufferedSink;
+ 
+ final class RequestBuilder {
+-  private final String requestMethod;
+-  private final boolean requestHasBody;
++  private final String method;
+   private final HttpUrl.Builder urlBuilder;
++  private String pathUrl;
++
+   private final Request.Builder requestBuilder;
++  private MediaType mediaType;
+ 
++  private final boolean hasBody;
+   private MultipartBuilder multipartBuilder;
+   private FormEncodingBuilder formEncodingBuilder;
+   private RequestBody body;
+ 
+-  private String relativeUrl;
+-  private MediaType mediaType;
+-
+-  RequestBuilder(HttpUrl url, MethodInfo methodInfo) {
+-    requestMethod = methodInfo.requestMethod;
+-    requestHasBody = methodInfo.requestHasBody;
+-    mediaType = methodInfo.mediaType;
+-    relativeUrl = methodInfo.requestUrl;
++  RequestBuilder(String method, HttpUrl url, String pathUrl, String queryParams, Headers headers,
++      MediaType mediaType, boolean hasBody, boolean isFormEncoded, boolean isMultipart) {
++    this.method = method;
+ 
+-    urlBuilder = url.newBuilder();
+-    requestBuilder = new Request.Builder();
++    HttpUrl.Builder urlBuilder = url.newBuilder();
++    if (queryParams != null) {
++      urlBuilder.query(queryParams);
++    }
++    this.urlBuilder = urlBuilder;
++    this.pathUrl = pathUrl;
+ 
+-    Headers headers = methodInfo.headers;
++    Request.Builder requestBuilder = new Request.Builder();
+     if (headers != null) {
+       requestBuilder.headers(headers);
+     }
++    this.requestBuilder = requestBuilder;
++    this.mediaType = mediaType;
+ 
+-    String requestQuery = methodInfo.requestQuery;
+-    if (requestQuery != null) {
+-      urlBuilder.query(requestQuery);
+-    }
++    this.hasBody = hasBody;
+ 
+-    switch (methodInfo.bodyEncoding) {
+-      case FORM_URL_ENCODED:
+-        // Will be set to 'body' in 'build'.
+-        formEncodingBuilder = new FormEncodingBuilder();
+-        break;
+-      case MULTIPART:
+-        // Will be set to 'body' in 'build'.
+-        multipartBuilder = new MultipartBuilder();
+-        break;
+-      case NONE:
+-        // If present, 'body' will be set in 'setArguments' call.
+-        break;
+-      default:
+-        throw new IllegalArgumentException("Unknown request type: " + methodInfo.bodyEncoding);
++    if (isFormEncoded) {
++      // Will be set to 'body' in 'build'.
++      formEncodingBuilder = new FormEncodingBuilder();
++    } else if (isMultipart) {
++      // Will be set to 'body' in 'build'.
++      multipartBuilder = new MultipartBuilder();
+     }
+   }
+ 
+@@ -92,9 +85,9 @@ final class RequestBuilder {
+         // encode spaces rather than +. Query encoding difference specified in HTML spec.
+         // Any remaining plus signs represent spaces as already URLEncoded.
+         encodedValue = encodedValue.replace("+", "%20");
+-        relativeUrl = relativeUrl.replace("{" + name + "}", encodedValue);
++        pathUrl = pathUrl.replace("{" + name + "}", encodedValue);
+       } else {
+-        relativeUrl = relativeUrl.replace("{" + name + "}", String.valueOf(value));
++        pathUrl = pathUrl.replace("{" + name + "}", String.valueOf(value));
+       }
+     } catch (UnsupportedEncodingException e) {
+       throw new RuntimeException(
+@@ -127,7 +120,8 @@ final class RequestBuilder {
+   }
+ 
+   Request build() {
+-    urlBuilder.encodedPath(relativeUrl);
++    // TODO this should append, not replace.
++    HttpUrl url = urlBuilder.encodedPath(pathUrl).build();
+ 
+     RequestBody body = this.body;
+     if (body == null) {
+@@ -136,7 +130,7 @@ final class RequestBuilder {
+         body = formEncodingBuilder.build();
+       } else if (multipartBuilder != null) {
+         body = multipartBuilder.build();
+-      } else if (requestHasBody) {
++      } else if (hasBody) {
+         // Body is absent, make an empty body.
+         body = RequestBody.create(null, new byte[0]);
+       }
+@@ -152,8 +146,8 @@ final class RequestBuilder {
+     }
+ 
+     return requestBuilder
+-        .url(urlBuilder.build())
+-        .method(requestMethod, body)
++        .url(url)
++        .method(method, body)
+         .build();
+   }
+ 
+diff --git a/retrofit/src/main/java/retrofit/RequestFactory.java b/retrofit/src/main/java/retrofit/RequestFactory.java
+new file mode 100644
+index 00000000..96b98eb4
+--- /dev/null
++++ b/retrofit/src/main/java/retrofit/RequestFactory.java
+@@ -0,0 +1,65 @@
++/*
++ * Copyright (C) 2015 Square, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package retrofit;
++
++import com.squareup.okhttp.Headers;
++import com.squareup.okhttp.HttpUrl;
++import com.squareup.okhttp.MediaType;
++import com.squareup.okhttp.Request;
++
++final class RequestFactory {
++  private final String method;
++  private final Endpoint endpoint;
++  private final String pathUrl;
++  private final String queryParams;
++  private final Headers headers;
++  private final MediaType mediaType;
++  private final boolean hasBody;
++  private final boolean isFormEncoded;
++  private final boolean isMultipart;
++  private final RequestBuilderAction[] requestBuilderActions;
++
++  RequestFactory(String method, Endpoint endpoint, String pathUrl, String queryParams,
++      Headers headers, MediaType mediaType, boolean hasBody, boolean isFormEncoded,
++      boolean isMultipart, RequestBuilderAction[] requestBuilderActions) {
++    this.method = method;
++    this.endpoint = endpoint;
++    this.pathUrl = pathUrl;
++    this.queryParams = queryParams;
++    this.headers = headers;
++    this.mediaType = mediaType;
++    this.hasBody = hasBody;
++    this.isFormEncoded = isFormEncoded;
++    this.isMultipart = isMultipart;
++    this.requestBuilderActions = requestBuilderActions;
++  }
++
++  Request create(Object... args) {
++    HttpUrl url = endpoint.url();
++    RequestBuilder requestBuilder =
++        new RequestBuilder(method, url, pathUrl, queryParams, headers, mediaType, hasBody,
++            isFormEncoded, isMultipart);
++
++    if (args != null) {
++      RequestBuilderAction[] actions = requestBuilderActions;
++      for (int i = 0, count = args.length; i < count; i++) {
++        actions[i].perform(requestBuilder, args[i]);
++      }
++    }
++
++    return requestBuilder.build();
++  }
++}
+diff --git a/retrofit/src/main/java/retrofit/RequestFactoryParser.java b/retrofit/src/main/java/retrofit/RequestFactoryParser.java
+new file mode 100644
+index 00000000..f20f36cf
+--- /dev/null
++++ b/retrofit/src/main/java/retrofit/RequestFactoryParser.java
+@@ -0,0 +1,362 @@
++/*
++ * Copyright (C) 2013 Square, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package retrofit;
++
++import com.squareup.okhttp.MediaType;
++import com.squareup.okhttp.RequestBody;
++import java.lang.annotation.Annotation;
++import java.lang.reflect.Method;
++import java.lang.reflect.Type;
++import java.util.LinkedHashSet;
++import java.util.Map;
++import java.util.Set;
++import java.util.regex.Matcher;
++import java.util.regex.Pattern;
++import retrofit.http.Body;
++import retrofit.http.DELETE;
++import retrofit.http.Field;
++import retrofit.http.FieldMap;
++import retrofit.http.FormUrlEncoded;
++import retrofit.http.GET;
++import retrofit.http.HEAD;
++import retrofit.http.HTTP;
++import retrofit.http.Header;
++import retrofit.http.Headers;
++import retrofit.http.Multipart;
++import retrofit.http.PATCH;
++import retrofit.http.POST;
++import retrofit.http.PUT;
++import retrofit.http.Part;
++import retrofit.http.PartMap;
++import retrofit.http.Path;
++import retrofit.http.Query;
++import retrofit.http.QueryMap;
++
++import static retrofit.Utils.methodError;
++
++/** Request metadata about a service interface declaration. */
++final class RequestFactoryParser {
++  // Upper and lower characters, digits, underscores, and hyphens, starting with a character.
++  private static final String PARAM = "[a-zA-Z][a-zA-Z0-9_-]*";
++  private static final Pattern PARAM_NAME_REGEX = Pattern.compile(PARAM);
++  private static final Pattern PARAM_URL_REGEX = Pattern.compile("\\{(" + PARAM + ")\\}");
++
++  static RequestFactory parse(Method method, Endpoint endpoint,
++      Converter.Factory converterFactory) {
++    RequestFactoryParser parser = new RequestFactoryParser(method);
++    parser.parseMethodAnnotations();
++    parser.parseParameters(converterFactory);
++    return parser.toRequestFactory(endpoint);
++  }
++
++  private final Method method;
++
++  private String httpMethod;
++  private boolean hasBody;
++  private boolean isFormEncoded;
++  private boolean isMultipart;
++  private String pathUrl;
++  private String queryParams;
++  private com.squareup.okhttp.Headers headers;
++  private MediaType mediaType;
++  private RequestBuilderAction[] requestBuilderActions;
++
++  private Set<String> pathUrlParamNames;
++
++  private RequestFactoryParser(Method method) {
++    this.method = method;
++  }
++
++  private RequestFactory toRequestFactory(Endpoint endpoint) {
++    return new RequestFactory(httpMethod, endpoint, pathUrl, queryParams, headers, mediaType,
++        hasBody, isFormEncoded, isMultipart, requestBuilderActions);
++  }
++
++  private RuntimeException parameterError(int index, String message, Object... args) {
++    return methodError(method, message + " (parameter #" + (index + 1) + ")", args);
++  }
++
++  private void parseMethodAnnotations() {
++    for (Annotation annotation : method.getAnnotations()) {
++      if (annotation instanceof DELETE) {
++        parseHttpMethodAndPath("DELETE", ((DELETE) annotation).value(), false);
++      } else if (annotation instanceof GET) {
++        parseHttpMethodAndPath("GET", ((GET) annotation).value(), false);
++      } else if (annotation instanceof HEAD) {
++        parseHttpMethodAndPath("HEAD", ((HEAD) annotation).value(), false);
++      } else if (annotation instanceof PATCH) {
++        parseHttpMethodAndPath("PATCH", ((PATCH) annotation).value(), true);
++      } else if (annotation instanceof POST) {
++        parseHttpMethodAndPath("POST", ((POST) annotation).value(), true);
++      } else if (annotation instanceof PUT) {
++        parseHttpMethodAndPath("PUT", ((PUT) annotation).value(), true);
++      } else if (annotation instanceof HTTP) {
++        HTTP http = (HTTP) annotation;
++        parseHttpMethodAndPath(http.method(), http.path(), http.hasBody());
++      } else if (annotation instanceof Headers) {
++        String[] headersToParse = ((Headers) annotation).value();
++        if (headersToParse.length == 0) {
++          throw methodError(method, "@Headers annotation is empty.");
++        }
++        headers = parseHeaders(headersToParse);
++      } else if (annotation instanceof Multipart) {
++        if (isFormEncoded) {
++          throw methodError(method, "Only one encoding annotation is allowed.");
++        }
++        isMultipart = true;
++      } else if (annotation instanceof FormUrlEncoded) {
++        if (isMultipart) {
++          throw methodError(method, "Only one encoding annotation is allowed.");
++        }
++        isFormEncoded = true;
++      }
++    }
++
++    if (httpMethod == null) {
++      throw methodError(method, "HTTP method annotation is required (e.g., @GET, @POST, etc.).");
++    }
++    if (!hasBody) {
++      if (isMultipart) {
++        throw methodError(method,
++            "Multipart can only be specified on HTTP methods with request body (e.g., @POST).");
++      }
++      if (isFormEncoded) {
++        throw methodError(method,
++            "FormUrlEncoded can only be specified on HTTP methods with request body "
++                + "(e.g., @POST).");
++      }
++    }
++  }
++
++  private void parseHttpMethodAndPath(String httpMethod, String value, boolean hasBody) {
++    if (this.httpMethod != null) {
++      throw methodError(method, "Only one HTTP method is allowed. Found: %s and %s.",
++          this.httpMethod, httpMethod);
++    }
++    if (value == null || value.length() == 0 || value.charAt(0) != '/') {
++      throw methodError(method, "URL path \"%s\" must start with '/'.", value);
++    }
++
++    // Get the relative URL path and existing query string, if present.
++    String pathUrl = value;
++    String queryParams = null;
++    int question = value.indexOf('?');
++    if (question != -1 && question < value.length() - 1) {
++      pathUrl = value.substring(0, question);
++      queryParams = value.substring(question + 1);
++
++      // Ensure the query string does not have any named parameters.
++      Matcher queryParamMatcher = PARAM_URL_REGEX.matcher(queryParams);
++      if (queryParamMatcher.find()) {
++        throw methodError(method,
++            "URL query string \"%s\" must not have replace block. For dynamic query"
++                + " parameters use @Query.", queryParams);
++      }
++    }
++
++    this.httpMethod = httpMethod;
++    this.hasBody = hasBody;
++    this.pathUrl = pathUrl;
++    this.pathUrlParamNames = parsePathParameters(pathUrl);
++    this.queryParams = queryParams;
++  }
++
++  private com.squareup.okhttp.Headers parseHeaders(String[] headers) {
++    com.squareup.okhttp.Headers.Builder builder = new com.squareup.okhttp.Headers.Builder();
++    for (String header : headers) {
++      int colon = header.indexOf(':');
++      if (colon == -1 || colon == 0 || colon == header.length() - 1) {
++        throw methodError(method,
++            "@Headers value must be in the form \"Name: Value\". Found: \"%s\"", header);
++      }
++      String headerName = header.substring(0, colon);
++      String headerValue = header.substring(colon + 1).trim();
++      if ("Content-Type".equalsIgnoreCase(headerName)) {
++        mediaType = MediaType.parse(headerValue);
++      } else {
++        builder.add(headerName, headerValue);
++      }
++    }
++    return builder.build();
++  }
++
++  private void parseParameters(Converter.Factory converterFactory) {
++    Type[] methodParameterTypes = method.getGenericParameterTypes();
++    Annotation[][] methodParameterAnnotationArrays = method.getParameterAnnotations();
++
++    boolean gotField = false;
++    boolean gotPart = false;
++    boolean gotBody = false;
++
++    int count = methodParameterAnnotationArrays.length;
++    RequestBuilderAction[] requestBuilderActions = new RequestBuilderAction[count];
++    for (int i = 0; i < count; i++) {
++      Type methodParameterType = methodParameterTypes[i];
++      Annotation[] methodParameterAnnotations = methodParameterAnnotationArrays[i];
++      if (methodParameterAnnotations != null) {
++        for (Annotation methodParameterAnnotation : methodParameterAnnotations) {
++          if (requestBuilderActions[i] != null) {
++            throw parameterError(i, "Multiple Retrofit annotations found, only one allowed.");
++          }
++
++          if (methodParameterAnnotation instanceof Path) {
++            Path path = (Path) methodParameterAnnotation;
++            String name = path.value();
++            validatePathName(i, name);
++            requestBuilderActions[i] = new RequestBuilderAction.Path(name, path.encoded());
++
++          } else if (methodParameterAnnotation instanceof Query) {
++            Query query = (Query) methodParameterAnnotation;
++            requestBuilderActions[i] =
++                new RequestBuilderAction.Query(query.value(), query.encoded());
++
++          } else if (methodParameterAnnotation instanceof QueryMap) {
++            if (!Map.class.isAssignableFrom(Utils.getRawType(methodParameterType))) {
++              throw parameterError(i, "@QueryMap parameter type must be Map.");
++            }
++            QueryMap queryMap = (QueryMap) methodParameterAnnotation;
++            requestBuilderActions[i] = new RequestBuilderAction.QueryMap(queryMap.encoded());
++
++          } else if (methodParameterAnnotation instanceof Header) {
++            Header header = (Header) methodParameterAnnotation;
++            requestBuilderActions[i] = new RequestBuilderAction.Header(header.value());
++
++          } else if (methodParameterAnnotation instanceof Field) {
++            if (!isFormEncoded) {
++              throw parameterError(i, "@Field parameters can only be used with form encoding.");
++            }
++            Field field = (Field) methodParameterAnnotation;
++            requestBuilderActions[i] =
++                new RequestBuilderAction.Field(field.value(), field.encoded());
++            gotField = true;
++
++          } else if (methodParameterAnnotation instanceof FieldMap) {
++            if (!isFormEncoded) {
++              throw parameterError(i, "@FieldMap parameters can only be used with form encoding.");
++            }
++            if (!Map.class.isAssignableFrom(Utils.getRawType(methodParameterType))) {
++              throw parameterError(i, "@FieldMap parameter type must be Map.");
++            }
++            FieldMap fieldMap = (FieldMap) methodParameterAnnotation;
++            requestBuilderActions[i] = new RequestBuilderAction.FieldMap(fieldMap.encoded());
++            gotField = true;
++
++          } else if (methodParameterAnnotation instanceof Part) {
++            if (!isMultipart) {
++              throw parameterError(i, "@Part parameters can only be used with multipart encoding.");
++            }
++            Part part = (Part) methodParameterAnnotation;
++            com.squareup.okhttp.Headers headers = com.squareup.okhttp.Headers.of(
++                "Content-Disposition", "name=\"" + part.value() + "\"",
++                "Content-Transfer-Encoding", part.encoding());
++            Converter<?> converter;
++            if (methodParameterType == RequestBody.class) {
++              converter = new OkHttpRequestBodyConverter();
++            } else {
++              if (converterFactory == null) {
++                throw parameterError(i, "@Part parameter is %s"
++                    + " but no converter factory registered. Either add a converter factory"
++                    + " to the Retrofit instance or use RequestBody.",
++                    methodParameterType);
++              }
++              converter = converterFactory.get(methodParameterType);
++            }
++            requestBuilderActions[i] = new RequestBuilderAction.Part<>(headers, converter);
++            gotPart = true;
++
++          } else if (methodParameterAnnotation instanceof PartMap) {
++            if (!isMultipart) {
++              throw parameterError(i,
++                  "@PartMap parameters can only be used with multipart encoding.");
++            }
++            if (!Map.class.isAssignableFrom(Utils.getRawType(methodParameterType))) {
++              throw parameterError(i, "@PartMap parameter type must be Map.");
++            }
++            PartMap partMap = (PartMap) methodParameterAnnotation;
++            requestBuilderActions[i] =
++                new RequestBuilderAction.PartMap(converterFactory, partMap.encoding());
++            gotPart = true;
++
++          } else if (methodParameterAnnotation instanceof Body) {
++            if (isFormEncoded || isMultipart) {
++              throw parameterError(i,
++                  "@Body parameters cannot be used with form or multi-part encoding.");
++            }
++            if (gotBody) {
++              throw methodError(method, "Multiple @Body method annotations found.");
++            }
++
++            Converter<?> converter;
++            if (methodParameterType == RequestBody.class) {
++              converter = new OkHttpRequestBodyConverter();
++            } else {
++              if (converterFactory == null) {
++                throw parameterError(i, "@Body parameter is %s"
++                        + " but no converter factory registered. Either add a converter factory"
++                        + " to the Retrofit instance or use RequestBody.",
++                    methodParameterType);
++              }
++              converter = converterFactory.get(methodParameterType);
++            }
++
++            requestBuilderActions[i] = new RequestBuilderAction.Body<>(converter);
++            gotBody = true;
++          }
++        }
++      }
++
++      if (requestBuilderActions[i] == null) {
++        throw parameterError(i, "No Retrofit annotation found.");
++      }
++    }
++
++    if (!isFormEncoded && !isMultipart && !hasBody && gotBody) {
++      throw methodError(method, "Non-body HTTP method cannot contain @Body.");
++    }
++    if (isFormEncoded && !gotField) {
++      throw methodError(method, "Form-encoded method must contain at least one @Field.");
++    }
++    if (isMultipart && !gotPart) {
++      throw methodError(method, "Multipart method must contain at least one @Part.");
++    }
++
++    this.requestBuilderActions = requestBuilderActions;
++  }
++
++  private void validatePathName(int index, String name) {
++    if (!PARAM_NAME_REGEX.matcher(name).matches()) {
++      throw parameterError(index, "@Path parameter name must match %s. Found: %s",
++          PARAM_URL_REGEX.pattern(), name);
++    }
++    // Verify URL replacement name is actually present in the URL path.
++    if (!pathUrlParamNames.contains(name)) {
++      throw parameterError(index, "URL \"%s\" does not contain \"{%s}\".", pathUrl, name);
++    }
++  }
++
++  /**
++   * Gets the set of unique path parameters used in the given URI. If a parameter is used twice
++   * in the URI, it will only show up once in the set.
++   */
++  static Set<String> parsePathParameters(String path) {
++    Matcher m = PARAM_URL_REGEX.matcher(path);
++    Set<String> patterns = new LinkedHashSet<>();
++    while (m.find()) {
++      patterns.add(m.group(1));
++    }
++    return patterns;
++  }
++}
+diff --git a/retrofit/src/main/java/retrofit/Response.java b/retrofit/src/main/java/retrofit/Response.java
+index 5492a7a0..b3a63e61 100644
+--- a/retrofit/src/main/java/retrofit/Response.java
++++ b/retrofit/src/main/java/retrofit/Response.java
+@@ -29,7 +29,7 @@ public final class Response<T> {
+   /**
+    * TODO
+    */
+-  public static <T, B extends T> Response<T> fakeSuccess(B body) {
++  public static <T> Response<T> fakeSuccess(T body) {
+     return success(body, new com.squareup.okhttp.Response.Builder() //
+         .code(200)
+         .protocol(Protocol.HTTP_1_1)
+@@ -41,9 +41,8 @@ public final class Response<T> {
+   /**
+    * TODO
+    */
+-  public static <T, B extends T> Response<T> success(B body,
+-      com.squareup.okhttp.Response rawResponse) {
+-    return new Response<T>(rawResponse, body, null);
++  public static <T> Response<T> success(T body, com.squareup.okhttp.Response rawResponse) {
++    return new Response<>(rawResponse, body, null);
+   }
+ 
+   /**
+diff --git a/retrofit/src/main/java/retrofit/Retrofit.java b/retrofit/src/main/java/retrofit/Retrofit.java
+index 0c79f145..d0d0589c 100644
+--- a/retrofit/src/main/java/retrofit/Retrofit.java
++++ b/retrofit/src/main/java/retrofit/Retrofit.java
+@@ -85,7 +85,8 @@ import static retrofit.Utils.checkNotNull;
+  * @author Jake Wharton (jw@squareup.com)
+  */
+ public final class Retrofit {
+-  private final Map<Method, MethodInfo> methodInfoCache = new LinkedHashMap<>();
++  private final Map<Method, MethodHandler<?>> methodHandlerCache = new LinkedHashMap<>();
++
+   private final OkHttpClient client;
+   private final Endpoint endpoint;
+   private final Converter.Factory converterFactory;
+@@ -108,35 +109,27 @@ public final class Retrofit {
+   }
+ 
+   private final InvocationHandler handler = new InvocationHandler() {
+-    @Override public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
++    @Override public Object invoke(Object proxy, Method method, Object... args) throws Throwable {
+       // If the method is a method from Object then defer to normal invocation.
+       if (method.getDeclaringClass() == Object.class) {
+         return method.invoke(this, args);
+       }
+-      return invokeMethod(method, args);
++      return loadMethodHandler(method).invoke(args);
+     }
+   };
+ 
+-  // Package-private avoids synthetic accessor method from InvocationHandler. Also for testing.
+-  Object invokeMethod(Method method, Object... args) {
+-    MethodInfo methodInfo = loadMethodInfo(method);
+-    Converter<?> responseConverter = methodInfo.responseConverter;
+-    Call call = new OkHttpCall<>(client, endpoint, responseConverter, methodInfo, args);
+-    return methodInfo.adapter.adapt(call);
+-  }
++  MethodHandler<?> loadMethodHandler(Method method) {
++    Map<Method, MethodHandler<?>> cache = methodHandlerCache;
+ 
+-  private MethodInfo loadMethodInfo(Method method) {
+-    MethodInfo methodInfo = methodInfoCache.get(method);
+-    if (methodInfo == null) {
+-      synchronized (methodInfoCache) {
+-        methodInfo = methodInfoCache.get(method);
+-        if (methodInfo == null) {
+-          methodInfo = new MethodInfo(method, adapterFactory, converterFactory);
+-          methodInfoCache.put(method, methodInfo);
+-        }
++    MethodHandler<?> handler;
++    synchronized (cache) {
++      handler = cache.get(method);
++      if (handler == null) {
++        handler = MethodHandler.create(method, client, endpoint, adapterFactory, converterFactory);
++        cache.put(method, handler);
+       }
+     }
+-    return methodInfo;
++    return handler;
+   }
+ 
+   public OkHttpClient client() {
+diff --git a/retrofit/src/main/java/retrofit/Utils.java b/retrofit/src/main/java/retrofit/Utils.java
+index decdad80..42038b67 100644
+--- a/retrofit/src/main/java/retrofit/Utils.java
++++ b/retrofit/src/main/java/retrofit/Utils.java
+@@ -22,6 +22,7 @@ import java.io.Closeable;
+ import java.io.IOException;
+ import java.lang.reflect.Array;
+ import java.lang.reflect.GenericArrayType;
++import java.lang.reflect.Method;
+ import java.lang.reflect.ParameterizedType;
+ import java.lang.reflect.Type;
+ import java.lang.reflect.TypeVariable;
+@@ -40,7 +41,7 @@ final class Utils {
+     return object;
+   }
+ 
+-  static void closeQueitly(Closeable closeable) {
++  static void closeQuietly(Closeable closeable) {
+     if (closeable == null) return;
+     try {
+       closeable.close();
+@@ -151,6 +152,15 @@ final class Utils {
+     }
+   }
+ 
++  static RuntimeException methodError(Method method, String message, Object... args) {
++    message = String.format(message, args);
++    return new IllegalArgumentException(message
++        + "\n    for method "
++        + method.getDeclaringClass().getSimpleName()
++        + "."
++        + method.getName());
++  }
++
+   static class SynchronousExecutor implements Executor {
+     @Override public void execute(Runnable runnable) {
+       runnable.run();

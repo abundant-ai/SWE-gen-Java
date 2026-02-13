@@ -1,0 +1,120 @@
+diff --git a/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/connection/Exchange.kt b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/connection/Exchange.kt
+index 39ee4a629..4484ca66e 100644
+--- a/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/connection/Exchange.kt
++++ b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/connection/Exchange.kt
+@@ -46,6 +46,10 @@ class Exchange(
+   internal var isDuplex: Boolean = false
+     private set
+ 
++  /** True if the request body should not be used, but the socket, instead. */
++  internal var isSocket: Boolean = false
++    private set
++
+   /** True if there was an exception on the connection to the peer. */
+   internal var hasFailure: Boolean = false
+     private set
+@@ -143,11 +147,10 @@ class Exchange(
+   fun peekTrailers(): Headers? = codec.peekTrailers()
+ 
+   fun upgradeToSocket(): Socket {
++    isSocket = true
+     call.timeoutEarlyExit()
+     (codec.carrier as RealConnection).useAsSocket()
+ 
+-    eventListener.requestBodyStart(call)
+-
+     return object : Socket {
+       override fun cancel() {
+         this@Exchange.cancel()
+@@ -233,6 +236,7 @@ class Exchange(
+   ) : ForwardingSink(delegate) {
+     private var completed = false
+     private var bytesReceived = 0L
++    private var invokeStartEvent = isSocket
+     private var closed = false
+ 
+     @Throws(IOException::class)
+@@ -247,6 +251,10 @@ class Exchange(
+         )
+       }
+       try {
++        if (invokeStartEvent) {
++          invokeStartEvent = false
++          eventListener.requestBodyStart(call)
++        }
+         super.write(source, byteCount)
+         this.bytesReceived += byteCount
+       } catch (e: IOException) {
+diff --git a/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/http/CallServerInterceptor.kt b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/http/CallServerInterceptor.kt
+index f87deff9f..8ca73379d 100644
+--- a/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/http/CallServerInterceptor.kt
++++ b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/http/CallServerInterceptor.kt
+@@ -44,39 +44,41 @@ object CallServerInterceptor : Interceptor {
+     try {
+       exchange.writeRequestHeaders(request)
+ 
+-      if (hasRequestBody) {
+-        // If there's a "Expect: 100-continue" header on the request, wait for a "HTTP/1.1 100
+-        // Continue" response before transmitting the request body. If we don't get that, return
+-        // what we did get (such as a 4xx response) without ever transmitting the request body.
+-        if ("100-continue".equals(request.header("Expect"), ignoreCase = true)) {
+-          exchange.flushRequest()
+-          responseBuilder = exchange.readResponseHeaders(expectContinue = true)
+-          exchange.responseHeadersStart()
+-          invokeStartEvent = false
+-        }
+-        if (responseBuilder == null) {
+-          if (requestBody.isDuplex()) {
+-            // Prepare a duplex body so that the application can send a request body later.
++      if (!isUpgradeRequest) {
++        if (hasRequestBody) {
++          // If there's a "Expect: 100-continue" header on the request, wait for a "HTTP/1.1 100
++          // Continue" response before transmitting the request body. If we don't get that, return
++          // what we did get (such as a 4xx response) without ever transmitting the request body.
++          if ("100-continue".equals(request.header("Expect"), ignoreCase = true)) {
+             exchange.flushRequest()
+-            val bufferedRequestBody = exchange.createRequestBody(request, true).buffer()
+-            requestBody.writeTo(bufferedRequestBody)
++            responseBuilder = exchange.readResponseHeaders(expectContinue = true)
++            exchange.responseHeadersStart()
++            invokeStartEvent = false
++          }
++          if (responseBuilder == null) {
++            if (requestBody.isDuplex()) {
++              // Prepare a duplex body so that the application can send a request body later.
++              exchange.flushRequest()
++              val bufferedRequestBody = exchange.createRequestBody(request, true).buffer()
++              requestBody.writeTo(bufferedRequestBody)
++            } else {
++              // Write the request body if the "Expect: 100-continue" expectation was met.
++              val bufferedRequestBody = exchange.createRequestBody(request, false).buffer()
++              requestBody.writeTo(bufferedRequestBody)
++              bufferedRequestBody.close()
++            }
+           } else {
+-            // Write the request body if the "Expect: 100-continue" expectation was met.
+-            val bufferedRequestBody = exchange.createRequestBody(request, false).buffer()
+-            requestBody.writeTo(bufferedRequestBody)
+-            bufferedRequestBody.close()
++            exchange.noRequestBody()
++            if (!exchange.connection.isMultiplexed) {
++              // If the "Expect: 100-continue" expectation wasn't met, prevent the HTTP/1 connection
++              // from being reused. Otherwise we're still obligated to transmit the request body to
++              // leave the connection in a consistent state.
++              exchange.noNewExchangesOnConnection()
++            }
+           }
+         } else {
+           exchange.noRequestBody()
+-          if (!exchange.connection.isMultiplexed) {
+-            // If the "Expect: 100-continue" expectation wasn't met, prevent the HTTP/1 connection
+-            // from being reused. Otherwise we're still obligated to transmit the request body to
+-            // leave the connection in a consistent state.
+-            exchange.noNewExchangesOnConnection()
+-          }
+         }
+-      } else if (!isUpgradeRequest) {
+-        exchange.noRequestBody()
+       }
+ 
+       if (requestBody == null || !requestBody.isDuplex()) {

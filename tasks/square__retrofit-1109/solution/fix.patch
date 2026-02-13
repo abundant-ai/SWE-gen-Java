@@ -1,0 +1,228 @@
+diff --git a/retrofit-adapters/rxjava/src/main/java/retrofit/RxJavaCallAdapterFactory.java b/retrofit-adapters/rxjava/src/main/java/retrofit/RxJavaCallAdapterFactory.java
+index 279d13eb..d955651d 100644
+--- a/retrofit-adapters/rxjava/src/main/java/retrofit/RxJavaCallAdapterFactory.java
++++ b/retrofit-adapters/rxjava/src/main/java/retrofit/RxJavaCallAdapterFactory.java
+@@ -38,7 +38,8 @@ public final class RxJavaCallAdapterFactory implements CallAdapter.Factory {
+   private RxJavaCallAdapterFactory() {
+   }
+ 
+-  @Override public CallAdapter<?> get(Type returnType, Annotation[] annotations) {
++  @Override
++  public CallAdapter<?> get(Type returnType, Annotation[] annotations, Retrofit retrofit) {
+     Class<?> rawType = Utils.getRawType(returnType);
+     boolean isSingle = "rx.Single".equals(rawType.getCanonicalName());
+     if (rawType != Observable.class && !isSingle) {
+diff --git a/retrofit/src/main/java/retrofit/CallAdapter.java b/retrofit/src/main/java/retrofit/CallAdapter.java
+index 4fd172a6..d8dba7b0 100644
+--- a/retrofit/src/main/java/retrofit/CallAdapter.java
++++ b/retrofit/src/main/java/retrofit/CallAdapter.java
+@@ -38,6 +38,6 @@ public interface CallAdapter<T> {
+      * Returns a call adapter for interface methods that return {@code returnType}, or null if this
+      * factory doesn't adapt that type.
+      */
+-    CallAdapter<?> get(Type returnType, Annotation[] annotations);
++    CallAdapter<?> get(Type returnType, Annotation[] annotations, Retrofit retrofit);
+   }
+ }
+diff --git a/retrofit/src/main/java/retrofit/DefaultCallAdapter.java b/retrofit/src/main/java/retrofit/DefaultCallAdapter.java
+index 220169a4..64f9bf91 100644
+--- a/retrofit/src/main/java/retrofit/DefaultCallAdapter.java
++++ b/retrofit/src/main/java/retrofit/DefaultCallAdapter.java
+@@ -24,8 +24,9 @@ import java.lang.reflect.Type;
+  * is a thread provided by OkHttp's dispatcher.
+  */
+ final class DefaultCallAdapter implements CallAdapter<Call<?>> {
+-  public static final Factory FACTORY = new Factory() {
+-    @Override public CallAdapter<?> get(Type returnType, Annotation[] annotations) {
++  static final Factory FACTORY = new Factory() {
++    @Override
++    public CallAdapter<?> get(Type returnType, Annotation[] annotations, Retrofit retrofit) {
+       if (Utils.getRawType(returnType) != Call.class) {
+         return null;
+       }
+diff --git a/retrofit/src/main/java/retrofit/ExecutorCallAdapterFactory.java b/retrofit/src/main/java/retrofit/ExecutorCallAdapterFactory.java
+index 655f60e2..218fc1f7 100644
+--- a/retrofit/src/main/java/retrofit/ExecutorCallAdapterFactory.java
++++ b/retrofit/src/main/java/retrofit/ExecutorCallAdapterFactory.java
+@@ -27,7 +27,8 @@ final class ExecutorCallAdapterFactory implements CallAdapter.Factory {
+     this.callbackExecutor = callbackExecutor;
+   }
+ 
+-  @Override public CallAdapter<Call<?>> get(Type returnType, Annotation[] annotations) {
++  @Override
++  public CallAdapter<Call<?>> get(Type returnType, Annotation[] annotations, Retrofit retrofit) {
+     if (Utils.getRawType(returnType) != Call.class) {
+       return null;
+     }
+diff --git a/retrofit/src/main/java/retrofit/MethodHandler.java b/retrofit/src/main/java/retrofit/MethodHandler.java
+index 2312996f..b269a7cc 100644
+--- a/retrofit/src/main/java/retrofit/MethodHandler.java
++++ b/retrofit/src/main/java/retrofit/MethodHandler.java
+@@ -24,19 +24,17 @@ import java.util.List;
+ 
+ final class MethodHandler<T> {
+   @SuppressWarnings("unchecked")
+-  static MethodHandler<?> create(Method method, OkHttpClient client, BaseUrl baseUrl,
+-      List<CallAdapter.Factory> callAdapterFactories, List<Converter.Factory> converterFactories) {
+-    CallAdapter<Object> callAdapter =
+-        (CallAdapter<Object>) createCallAdapter(method, callAdapterFactories);
++  static MethodHandler<?> create(Retrofit retrofit, Method method) {
++    CallAdapter<Object> callAdapter = (CallAdapter<Object>) createCallAdapter(method, retrofit);
+     Converter<ResponseBody, Object> responseConverter =
+         (Converter<ResponseBody, Object>) createResponseConverter(method,
+-            callAdapter.responseType(), converterFactories);
+-    RequestFactory requestFactory = RequestFactoryParser.parse(method, baseUrl, converterFactories);
+-    return new MethodHandler<>(client, requestFactory, callAdapter, responseConverter);
++            callAdapter.responseType(), retrofit.converterFactories());
++    RequestFactory requestFactory =
++        RequestFactoryParser.parse(method, retrofit.baseUrl(), retrofit.converterFactories());
++    return new MethodHandler<>(retrofit.client(), requestFactory, callAdapter, responseConverter);
+   }
+ 
+-  private static CallAdapter<?> createCallAdapter(Method method,
+-      List<CallAdapter.Factory> adapterFactories) {
++  private static CallAdapter<?> createCallAdapter(Method method, Retrofit retrofit) {
+     Type returnType = method.getGenericReturnType();
+     if (Utils.hasUnresolvableType(returnType)) {
+       throw Utils.methodError(method,
+@@ -47,7 +45,7 @@ final class MethodHandler<T> {
+     }
+     Annotation[] annotations = method.getAnnotations();
+     try {
+-      return Utils.resolveCallAdapter(adapterFactories, returnType, annotations);
++      return retrofit.callAdapter(returnType, annotations);
+     } catch (RuntimeException e) { // Wide exception range because factories are user code.
+       throw Utils.methodError(e, method, "Unable to create call adapter for %s", returnType);
+     }
+diff --git a/retrofit/src/main/java/retrofit/Retrofit.java b/retrofit/src/main/java/retrofit/Retrofit.java
+index 50562c3f..23065793 100644
+--- a/retrofit/src/main/java/retrofit/Retrofit.java
++++ b/retrofit/src/main/java/retrofit/Retrofit.java
+@@ -19,9 +19,11 @@ import com.squareup.okhttp.HttpUrl;
+ import com.squareup.okhttp.OkHttpClient;
+ import com.squareup.okhttp.RequestBody;
+ import com.squareup.okhttp.ResponseBody;
++import java.lang.annotation.Annotation;
+ import java.lang.reflect.InvocationHandler;
+ import java.lang.reflect.Method;
+ import java.lang.reflect.Proxy;
++import java.lang.reflect.Type;
+ import java.util.ArrayList;
+ import java.util.Collections;
+ import java.util.LinkedHashMap;
+@@ -146,8 +148,7 @@ public final class Retrofit {
+     synchronized (methodHandlerCache) {
+       handler = methodHandlerCache.get(method);
+       if (handler == null) {
+-        handler =
+-            MethodHandler.create(method, client, baseUrl, adapterFactories, converterFactories);
++        handler = MethodHandler.create(this, method);
+         methodHandlerCache.put(method, handler);
+       }
+     }
+@@ -162,6 +163,50 @@ public final class Retrofit {
+     return baseUrl;
+   }
+ 
++  public List<CallAdapter.Factory> callAdapterFactories() {
++    return Collections.unmodifiableList(adapterFactories);
++  }
++
++  /**
++   * Returns the {@link CallAdapter} for {@code returnType} from the available {@linkplain
++   * #callAdapterFactories() factories}.
++   */
++  public CallAdapter<?> callAdapter(Type returnType, Annotation[] annotations) {
++    return nextCallAdapter(null, returnType, annotations);
++  }
++
++  /**
++   * Returns the {@link CallAdapter} for {@code returnType} from the available {@linkplain
++   * #callAdapterFactories() factories} except {@code skipPast}.
++   */
++  public CallAdapter<?> nextCallAdapter(CallAdapter.Factory skipPast, Type returnType,
++      Annotation[] annotations) {
++    checkNotNull(returnType, "returnType == null");
++    checkNotNull(annotations, "annotations == null");
++
++    int start = adapterFactories.indexOf(skipPast) + 1;
++    for (int i = start, count = adapterFactories.size(); i < count; i++) {
++      CallAdapter<?> adapter = adapterFactories.get(i).get(returnType, annotations, this);
++      if (adapter != null) {
++        return adapter;
++      }
++    }
++
++    StringBuilder builder = new StringBuilder("Could not locate call adapter for ")
++        .append(returnType)
++        .append(". Tried:");
++    for (int i = start, count = adapterFactories.size(); i < count; i++) {
++      builder.append("\n * ").append(adapterFactories.get(i).getClass().getName());
++    }
++    if (skipPast != null) {
++      builder.append("\nSkipped:");
++      for (int i = 0; i < start; i++) {
++        builder.append("\n * ").append(adapterFactories.get(i).getClass().getName());
++      }
++    }
++    throw new IllegalArgumentException(builder.toString());
++  }
++
+   /**
+    * TODO
+    */
+@@ -169,10 +214,6 @@ public final class Retrofit {
+     return Collections.unmodifiableList(converterFactories);
+   }
+ 
+-  public List<CallAdapter.Factory> callAdapterFactories() {
+-    return Collections.unmodifiableList(adapterFactories);
+-  }
+-
+   public Executor callbackExecutor() {
+     return callbackExecutor;
+   }
+diff --git a/retrofit/src/main/java/retrofit/Utils.java b/retrofit/src/main/java/retrofit/Utils.java
+index 053b12d0..751b9b11 100644
+--- a/retrofit/src/main/java/retrofit/Utils.java
++++ b/retrofit/src/main/java/retrofit/Utils.java
+@@ -62,24 +62,6 @@ final class Utils {
+     return false;
+   }
+ 
+-  static CallAdapter<?> resolveCallAdapter(List<CallAdapter.Factory> adapterFactories, Type type,
+-      Annotation[] annotations) {
+-    for (int i = 0, count = adapterFactories.size(); i < count; i++) {
+-      CallAdapter<?> adapter = adapterFactories.get(i).get(type, annotations);
+-      if (adapter != null) {
+-        return adapter;
+-      }
+-    }
+-
+-    StringBuilder builder = new StringBuilder("Could not locate call adapter for ")
+-        .append(type)
+-        .append(". Tried:");
+-    for (CallAdapter.Factory adapterFactory : adapterFactories) {
+-      builder.append("\n * ").append(adapterFactory.getClass().getName());
+-    }
+-    throw new IllegalArgumentException(builder.toString());
+-  }
+-
+   static Converter<?, RequestBody> resolveRequestBodyConverter(
+       List<Converter.Factory> converterFactories, Type type, Annotation[] annotations) {
+     for (int i = 0, count = converterFactories.size(); i < count; i++) {
+diff --git a/samples/src/main/java/com/example/retrofit/CustomCallAdapter.java b/samples/src/main/java/com/example/retrofit/CustomCallAdapter.java
+index eba5385f..a3a8ba28 100644
+--- a/samples/src/main/java/com/example/retrofit/CustomCallAdapter.java
++++ b/samples/src/main/java/com/example/retrofit/CustomCallAdapter.java
+@@ -36,8 +36,8 @@ import retrofit.http.GET;
+  */
+ public final class CustomCallAdapter {
+   public static class ListenableFutureCallAdapterFactory implements CallAdapter.Factory {
+-    @Override
+-    public CallAdapter<ListenableFuture<?>> get(Type returnType, Annotation[] annotations) {
++    @Override public CallAdapter<ListenableFuture<?>> get(Type returnType, Annotation[] annotations,
++        Retrofit retrofit) {
+       TypeToken<?> token = TypeToken.of(returnType);
+       if (token.getRawType() != ListenableFuture.class) {
+         return null;

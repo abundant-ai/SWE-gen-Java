@@ -1,0 +1,7 @@
+`GroupCoordinatorService#onMetadataUpdate(...)` is being invoked with `null` arguments in some call paths, even though `null` is not a valid/expected input for this API. This leads to inconsistent behavior: in some cases the call may proceed until a later failure (or silently do nothing), rather than failing fast and making the contract explicit.
+
+Update `GroupCoordinatorService#onMetadataUpdate` to require that its arguments are non-null and to fail immediately when called with `null`. When any required argument is `null`, the method should throw a `NullPointerException` (rather than continuing and failing later or accepting the input). Ensure this non-null contract is consistently enforced for metadata update handling, including any internal helper types used to represent coordinator metadata changes.
+
+Additionally, any coordinator-metadata delta object constructed from a metadata delta (e.g., `KRaftCoordinatorMetadataDelta`) must reject `null` input: constructing it with `null` should throw `NullPointerException`.
+
+After these changes, all call sites should pass real (non-null) metadata update values into `onMetadataUpdate`, and the system should no longer tolerate `null` as a metadata update payload.

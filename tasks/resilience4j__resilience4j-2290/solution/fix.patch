@@ -1,0 +1,279 @@
+diff --git a/resilience4j-circuitbreaker/src/main/java/io/github/resilience4j/circuitbreaker/CircuitBreakerConfig.java b/resilience4j-circuitbreaker/src/main/java/io/github/resilience4j/circuitbreaker/CircuitBreakerConfig.java
+index d09d31f4..43cf6d9e 100644
+--- a/resilience4j-circuitbreaker/src/main/java/io/github/resilience4j/circuitbreaker/CircuitBreakerConfig.java
++++ b/resilience4j-circuitbreaker/src/main/java/io/github/resilience4j/circuitbreaker/CircuitBreakerConfig.java
+@@ -48,6 +48,7 @@ public class CircuitBreakerConfig implements Serializable {
+     public static final int DEFAULT_SLIDING_WINDOW_SIZE = 100;
+     public static final int DEFAULT_SLOW_CALL_DURATION_THRESHOLD = 60; // Seconds
+     public static final int DEFAULT_WAIT_DURATION_IN_HALF_OPEN_STATE = 0; // Seconds. It is an optional parameter
++    public static final State DEFAULT_TRANSITION_TO_STATE_AFTER_WAIT_DURATION = State.OPEN; // OPEN|CLOSED. It is an optional parameter
+     public static final SlidingWindowType DEFAULT_SLIDING_WINDOW_TYPE = SlidingWindowType.COUNT_BASED;
+     public static final SlidingWindowSynchronizationStrategy DEFAULT_SLIDING_WINDOW_SYNCHRONIZATION_STRATEGY =
+             SlidingWindowSynchronizationStrategy.SYNCHRONIZED;
+@@ -94,6 +95,7 @@ public class CircuitBreakerConfig implements Serializable {
+         .ofSeconds(DEFAULT_SLOW_CALL_DURATION_THRESHOLD);
+     private Duration maxWaitDurationInHalfOpenState = Duration
+         .ofSeconds(DEFAULT_WAIT_DURATION_IN_HALF_OPEN_STATE);
++    private State transitionToStateAfterWaitDuration = DEFAULT_TRANSITION_TO_STATE_AFTER_WAIT_DURATION;
+     private transient Clock clock = DEFAULT_CLOCK;
+ 
+     private CircuitBreakerConfig() {
+@@ -206,6 +208,10 @@ public class CircuitBreakerConfig implements Serializable {
+         return maxWaitDurationInHalfOpenState;
+     }
+ 
++    public State getTransitionToStateAfterWaitDuration() {
++        return transitionToStateAfterWaitDuration;
++    }
++
+     public Clock getClock() {
+         return clock;
+     }
+@@ -366,6 +372,7 @@ public class CircuitBreakerConfig implements Serializable {
+             .ofSeconds(DEFAULT_SLOW_CALL_DURATION_THRESHOLD);
+         private Duration maxWaitDurationInHalfOpenState = Duration
+             .ofSeconds(DEFAULT_WAIT_DURATION_IN_HALF_OPEN_STATE);
++        private State transitionToStateAfterWaitDuration = DEFAULT_TRANSITION_TO_STATE_AFTER_WAIT_DURATION;
+         private byte createWaitIntervalFunctionCounter = 0;
+         private Clock clock = DEFAULT_CLOCK;
+ 
+@@ -390,6 +397,7 @@ public class CircuitBreakerConfig implements Serializable {
+             this.slowCallRateThreshold = baseConfig.slowCallRateThreshold;
+             this.slowCallDurationThreshold = baseConfig.slowCallDurationThreshold;
+             this.maxWaitDurationInHalfOpenState = baseConfig.maxWaitDurationInHalfOpenState;
++            this.transitionToStateAfterWaitDuration = baseConfig.transitionToStateAfterWaitDuration;
+             this.writableStackTraceEnabled = baseConfig.writableStackTraceEnabled;
+             this.recordResultPredicate = baseConfig.recordResultPredicate;
+             this.clock = baseConfig.clock;
+@@ -560,6 +568,26 @@ public class CircuitBreakerConfig implements Serializable {
+             return this;
+         }
+ 
++        /**
++         * Configures CircuitBreaker transition after max wait duration in half open state. Possible values are
++         * OPEN or CLOSE, by default the value is OPEN.
++         *
++         * @param transitionToStateAfterWaitDuration transition to state after wait duration in half open state
++         * @return the CircuitBreakerConfig.Builder
++         * @throws IllegalArgumentException if {@code transitionToStateAfterWaitDuration == null ||
++         * transitionToStateAfterWaitDuration != State.OPEN && transitionToStateAfterWaitDuration != State.CLOSED}
++         */
++        public Builder transitionToStateAfterWaitDuration(State transitionToStateAfterWaitDuration) {
++            if (transitionToStateAfterWaitDuration == null) {
++                throw new IllegalArgumentException("transitionToStateAfterWaitDuration must not be null");
++            }
++            if (transitionToStateAfterWaitDuration != State.OPEN && transitionToStateAfterWaitDuration != State.CLOSED) {
++                throw new IllegalArgumentException("transitionToStateAfterWaitDuration must be either OPEN or CLOSED");
++            }
++            this.transitionToStateAfterWaitDuration = transitionToStateAfterWaitDuration;
++            return this;
++        }
++
+         /**
+          * Configures the number of permitted calls when the CircuitBreaker is half open.
+          * <p>
+@@ -896,6 +924,7 @@ public class CircuitBreakerConfig implements Serializable {
+             config.slidingWindowSynchronizationStrategy = slidingWindowSynchronizationStrategy;
+             config.slowCallDurationThreshold = slowCallDurationThreshold;
+             config.maxWaitDurationInHalfOpenState = maxWaitDurationInHalfOpenState;
++            config.transitionToStateAfterWaitDuration = transitionToStateAfterWaitDuration;
+             config.slowCallRateThreshold = slowCallRateThreshold;
+             config.failureRateThreshold = failureRateThreshold;
+             config.slidingWindowSize = slidingWindowSize;
+diff --git a/resilience4j-circuitbreaker/src/main/java/io/github/resilience4j/circuitbreaker/internal/CircuitBreakerStateMachine.java b/resilience4j-circuitbreaker/src/main/java/io/github/resilience4j/circuitbreaker/internal/CircuitBreakerStateMachine.java
+index 8e8a3261..2879b00a 100644
+--- a/resilience4j-circuitbreaker/src/main/java/io/github/resilience4j/circuitbreaker/internal/CircuitBreakerStateMachine.java
++++ b/resilience4j-circuitbreaker/src/main/java/io/github/resilience4j/circuitbreaker/internal/CircuitBreakerStateMachine.java
+@@ -452,22 +452,15 @@ public final class CircuitBreakerStateMachine implements CircuitBreaker {
+     }
+ 
+     private CircuitBreakerState getCircuitBreakerStateObjectFromState(State state){
+-        switch (state) {
+-            case DISABLED:
+-                return new DisabledState();
+-            case CLOSED:
+-                return new ClosedState();
+-            case METRICS_ONLY:
+-                return new MetricsOnlyState();
+-            case HALF_OPEN: 
+-                return new HalfOpenState(1);
+-            case FORCED_OPEN: 
+-                return new ForcedOpenState(1);
+-            case OPEN: 
+-                return new OpenState(1, CircuitBreakerMetrics.forClosed(getCircuitBreakerConfig()));
+-            default: 
+-                return new ClosedState();
+-        }
++        return switch (state) {
++            case DISABLED -> new DisabledState();
++            case CLOSED -> new ClosedState();
++            case METRICS_ONLY -> new MetricsOnlyState();
++            case HALF_OPEN -> new HalfOpenState(1);
++            case FORCED_OPEN -> new ForcedOpenState(1);
++            case OPEN -> new OpenState(1, CircuitBreakerMetrics.forClosed(getCircuitBreakerConfig()));
++            default -> new ClosedState();
++        };
+     }
+ 
+     private interface CircuitBreakerState {
+@@ -1073,7 +1066,7 @@ public final class CircuitBreakerStateMachine implements CircuitBreaker {
+         private final int attempts;
+         private final CircuitBreakerMetrics circuitBreakerMetrics;
+         @Nullable
+-        private final ScheduledFuture<?> transitionToOpenFuture;
++        private final ScheduledFuture<?> transitionToFuture;
+ 
+         HalfOpenState(int attempts) {
+             int permittedNumberOfCallsInHalfOpenState = circuitBreakerConfig
+@@ -1085,12 +1078,13 @@ public final class CircuitBreakerStateMachine implements CircuitBreaker {
+             this.attempts = attempts;
+ 
+             final long maxWaitDurationInHalfOpenState = circuitBreakerConfig.getMaxWaitDurationInHalfOpenState().toMillis();
+-            if (maxWaitDurationInHalfOpenState >= 1) {
++            final CircuitBreaker.State transitionState = circuitBreakerConfig.getTransitionToStateAfterWaitDuration();
++            if (maxWaitDurationInHalfOpenState >= 1 && transitionState != null) {
+                 ScheduledExecutorService scheduledExecutorService = schedulerFactory.getScheduler();
+-                transitionToOpenFuture = scheduledExecutorService
+-                    .schedule(this::toOpenState, maxWaitDurationInHalfOpenState, TimeUnit.MILLISECONDS);
++                transitionToFuture = scheduledExecutorService
++                    .schedule(() -> toState(transitionState), maxWaitDurationInHalfOpenState, TimeUnit.MILLISECONDS);
+             } else {
+-                transitionToOpenFuture = null;
++                transitionToFuture = null;
+             }
+         }
+ 
+@@ -1122,18 +1116,22 @@ public final class CircuitBreakerStateMachine implements CircuitBreaker {
+ 
+         @Override
+         public void preTransitionHook() {
+-            cancelAutomaticTransitionToOpen();
++            cancelAutomaticTransition();
+         }
+ 
+-        private void cancelAutomaticTransitionToOpen() {
+-            if (transitionToOpenFuture != null && !transitionToOpenFuture.isDone()) {
+-                transitionToOpenFuture.cancel(true);
++        private void cancelAutomaticTransition() {
++            if (transitionToFuture != null && !transitionToFuture.isDone()) {
++                transitionToFuture.cancel(true);
+             }
+         }
+ 
+-        private void toOpenState() {
++        private void toState(State transitionState) {
+             if (isHalfOpen.compareAndSet(true, false)) {
+-                transitionToOpenState();
++                switch (transitionState) {
++                    case OPEN -> transitionToOpenState();
++                    case CLOSED -> transitionToClosedState();
++                    default -> throw new IllegalArgumentException("Unsuported transition state: " + transitionState);
++                }
+             }
+         }
+ 
+diff --git a/resilience4j-commons-configuration/src/main/java/io/github/resilience4j/commons/configuration/circuitbreaker/configure/CommonsConfigurationCircuitBreakerConfiguration.java b/resilience4j-commons-configuration/src/main/java/io/github/resilience4j/commons/configuration/circuitbreaker/configure/CommonsConfigurationCircuitBreakerConfiguration.java
+index 84a5c682..317196c3 100644
+--- a/resilience4j-commons-configuration/src/main/java/io/github/resilience4j/commons/configuration/circuitbreaker/configure/CommonsConfigurationCircuitBreakerConfiguration.java
++++ b/resilience4j-commons-configuration/src/main/java/io/github/resilience4j/commons/configuration/circuitbreaker/configure/CommonsConfigurationCircuitBreakerConfiguration.java
+@@ -40,6 +40,7 @@ public class CommonsConfigurationCircuitBreakerConfiguration extends CommonCircu
+     protected static final String SLOW_CALL_DURATION_THRESHOLD = "slowCallDurationThreshold";
+     protected static final String RECORD_EXCEPTIONS = "recordExceptions";
+     protected static final String MAX_WAIT_DURATION_IN_HALF_OPEN_STATE = "maxWaitDurationInHalfOpenState";
++    protected static final String TRANSITION_TO_STATE_AFTER_WAIT_DURATION = "transitionToStateAfterWaitDuration";
+     protected static final String SLIDING_WINDOW_TYPE = "slidingWindowType";
+     protected static final String MINIMUM_NUMBER_OF_CALLS = "minimumNumberOfCalls";
+     protected static final String AUTOMATIC_TRANSITION_FROM_OPEN_TO_HALF_OPEN_ENABLED = "automaticTransitionFromOpenToHalfOpenEnabled";
+@@ -98,6 +99,8 @@ public class CommonsConfigurationCircuitBreakerConfiguration extends CommonCircu
+             instanceProperties.setSlowCallDurationThreshold(configuration.getDuration(SLOW_CALL_DURATION_THRESHOLD));
+         if (configuration.containsKey(MAX_WAIT_DURATION_IN_HALF_OPEN_STATE))
+             instanceProperties.setMaxWaitDurationInHalfOpenState(configuration.getDuration(MAX_WAIT_DURATION_IN_HALF_OPEN_STATE));
++        if (configuration.containsKey(TRANSITION_TO_STATE_AFTER_WAIT_DURATION))
++            instanceProperties.setTransitionToStateAfterWaitDuration(configuration.get(CircuitBreaker.State.class, TRANSITION_TO_STATE_AFTER_WAIT_DURATION));
+         if (configuration.containsKey(FAILURE_RATE_THRESHOLD))
+             instanceProperties.setFailureRateThreshold(configuration.getFloat(FAILURE_RATE_THRESHOLD));
+         if (configuration.containsKey(SLOW_CALL_RATE_THRESHOLD))
+@@ -150,7 +153,7 @@ public class CommonsConfigurationCircuitBreakerConfiguration extends CommonCircu
+ 
+         if(configuration.containsKey(INITIAL_STATE))
+             instanceProperties.setInitialState(configuration.getEnum(INITIAL_STATE, CircuitBreaker.State.class));
+- 
++
+         return instanceProperties;
+     };
+ }
+diff --git a/resilience4j-framework-common/src/main/java/io/github/resilience4j/common/circuitbreaker/configuration/CommonCircuitBreakerConfigurationProperties.java b/resilience4j-framework-common/src/main/java/io/github/resilience4j/common/circuitbreaker/configuration/CommonCircuitBreakerConfigurationProperties.java
+index 5cdc76cf..f706feef 100644
+--- a/resilience4j-framework-common/src/main/java/io/github/resilience4j/common/circuitbreaker/configuration/CommonCircuitBreakerConfigurationProperties.java
++++ b/resilience4j-framework-common/src/main/java/io/github/resilience4j/common/circuitbreaker/configuration/CommonCircuitBreakerConfigurationProperties.java
+@@ -138,6 +138,10 @@ public class CommonCircuitBreakerConfigurationProperties extends CommonPropertie
+                 builder.maxWaitDurationInHalfOpenState(properties.getMaxWaitDurationInHalfOpenState());
+             }
+ 
++            if (properties.getTransitionToStateAfterWaitDuration() != null) {
++                builder.transitionToStateAfterWaitDuration(properties.getTransitionToStateAfterWaitDuration());
++            }
++
+             if (properties.getSlidingWindowSize() != null) {
+                 builder.slidingWindowSize(properties.getSlidingWindowSize());
+             }
+@@ -177,7 +181,7 @@ public class CommonCircuitBreakerConfigurationProperties extends CommonPropertie
+             if (properties.ignoreExceptionPredicate != null) {
+                 buildIgnoreExceptionPredicate(properties, builder);
+             }
+-            
++
+             if (properties.automaticTransitionFromOpenToHalfOpenEnabled != null) {
+                 builder.automaticTransitionFromOpenToHalfOpenEnabled(
+                     properties.automaticTransitionFromOpenToHalfOpenEnabled);
+@@ -308,6 +312,9 @@ public class CommonCircuitBreakerConfigurationProperties extends CommonPropertie
+         @Nullable
+         private Duration maxWaitDurationInHalfOpenState;
+ 
++        @Nullable
++        private State transitionToStateAfterWaitDuration;
++
+         @Nullable
+         private Float failureRateThreshold;
+ 
+@@ -469,11 +476,11 @@ public class CommonCircuitBreakerConfigurationProperties extends CommonPropertie
+             this.automaticTransitionFromOpenToHalfOpenEnabled = automaticTransitionFromOpenToHalfOpenEnabled;
+             return this;
+         }
+-        
++
+         /**
+          * Returns state by which Circuit breaker was initialized
+          *
+-         * @return initialState 
++         * @return initialState
+          */
+         @Nullable
+         public State getInitialState(){
+@@ -714,6 +721,11 @@ public class CommonCircuitBreakerConfigurationProperties extends CommonPropertie
+             return maxWaitDurationInHalfOpenState;
+         }
+ 
++        @Nullable
++        public State getTransitionToStateAfterWaitDuration() {
++            return transitionToStateAfterWaitDuration;
++        }
++
+         public InstanceProperties setSlowCallDurationThreshold(Duration slowCallDurationThreshold) {
+             Objects.requireNonNull(slowCallDurationThreshold);
+             if (slowCallDurationThreshold.toNanos() < 1) {
+@@ -736,6 +748,14 @@ public class CommonCircuitBreakerConfigurationProperties extends CommonPropertie
+             return this;
+         }
+ 
++        public void setTransitionToStateAfterWaitDuration(State transitionToStateAfterWaitDuration) {
++            Objects.requireNonNull(transitionToStateAfterWaitDuration);
++            if (transitionToStateAfterWaitDuration != State.OPEN && transitionToStateAfterWaitDuration != State.CLOSED) {
++                throw new IllegalArgumentException("transitionToStateAfterWaitDuration must be either OPEN or CLOSED");
++            }
++            this.transitionToStateAfterWaitDuration = transitionToStateAfterWaitDuration;
++        }
++
+         @Nullable
+         public SlidingWindowType getSlidingWindowType() {
+             return slidingWindowType;

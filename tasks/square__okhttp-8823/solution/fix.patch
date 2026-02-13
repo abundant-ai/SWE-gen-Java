@@ -1,0 +1,636 @@
+diff --git a/android-test/src/androidTest/java/okhttp/android/test/AndroidAsyncDnsTest.kt b/android-test/src/androidTest/java/okhttp/android/test/AndroidAsyncDnsTest.kt
+new file mode 100644
+index 000000000..106ae3c47
+--- /dev/null
++++ b/android-test/src/androidTest/java/okhttp/android/test/AndroidAsyncDnsTest.kt
+@@ -0,0 +1,214 @@
++/*
++ * Copyright (c) 2022 Square, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ *
++ */
++package okhttp.android.test
++
++import android.content.Context
++import android.net.ConnectivityManager
++import android.os.Build
++import androidx.test.platform.app.InstrumentationRegistry
++import assertk.assertThat
++import assertk.assertions.hasMessage
++import assertk.assertions.isEmpty
++import assertk.assertions.isEqualTo
++import assertk.assertions.isNotEmpty
++import assertk.assertions.isNull
++import assertk.fail
++import java.net.InetAddress
++import java.net.UnknownHostException
++import java.util.concurrent.CountDownLatch
++import mockwebserver3.MockResponse
++import mockwebserver3.junit4.MockWebServerRule
++import okhttp3.AsyncDns
++import okhttp3.HttpUrl.Companion.toHttpUrl
++import okhttp3.OkHttpClient
++import okhttp3.Request
++import okhttp3.android.AndroidAsyncDns
++import okhttp3.tls.HandshakeCertificates
++import okhttp3.tls.HeldCertificate
++import okio.IOException
++import org.junit.Assume.assumeTrue
++import org.junit.AssumptionViolatedException
++import org.junit.Before
++import org.junit.Ignore
++import org.junit.Rule
++import org.junit.Test
++
++/**
++ * Run with "./gradlew :android-test:connectedCheck -PandroidBuild=true" and make sure ANDROID_SDK_ROOT is set.
++ */
++class AndroidAsyncDnsTest {
++  @JvmField @Rule
++  val serverRule = MockWebServerRule()
++  private lateinit var client: OkHttpClient
++
++  private val localhost: HandshakeCertificates by lazy {
++    // Generate a self-signed cert for the server to serve and the client to trust.
++    val heldCertificate =
++      HeldCertificate
++        .Builder()
++        .addSubjectAlternativeName("localhost")
++        .build()
++    return@lazy HandshakeCertificates
++      .Builder()
++      .addPlatformTrustedCertificates()
++      .heldCertificate(heldCertificate)
++      .addTrustedCertificate(heldCertificate.certificate)
++      .build()
++  }
++
++  @Before
++  fun init() {
++    assumeTrue("Supported on API 29+", Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q)
++
++    client =
++      OkHttpClient
++        .Builder()
++        .dns(AsyncDns.toDns(AndroidAsyncDns.IPv4, AndroidAsyncDns.IPv6))
++        .sslSocketFactory(localhost.sslSocketFactory(), localhost.trustManager)
++        .build()
++
++    serverRule.server.useHttps(localhost.sslSocketFactory())
++  }
++
++  @Test
++  @Ignore("java.net.UnknownHostException: No results for localhost, in CI.")
++  fun testRequest() {
++    serverRule.server.enqueue(MockResponse())
++
++    val call = client.newCall(Request(serverRule.server.url("/")))
++
++    call.execute().use { response ->
++      assertThat(response.code).isEqualTo(200)
++    }
++  }
++
++  @Test
++  fun testRequestExternal() {
++    assumeNetwork()
++
++    val call = client.newCall(Request("https://google.com/robots.txt".toHttpUrl()))
++
++    call.execute().use { response ->
++      assertThat(response.code).isEqualTo(200)
++    }
++  }
++
++  @Test
++  fun testRequestInvalid() {
++    val call = client.newCall(Request("https://google.invalid/".toHttpUrl()))
++
++    try {
++      call.execute()
++      fail("Request can't succeed")
++    } catch (ioe: IOException) {
++      assertThat(ioe).hasMessage("No results for google.invalid")
++    }
++  }
++
++  @Test
++  @Ignore("No results on CI for localhost")
++  fun testDnsRequest() {
++    val (allAddresses, exception) = dnsQuery("localhost")
++
++    assertThat(exception).isNull()
++    assertThat(allAddresses).isNotEmpty()
++  }
++
++  private fun dnsQuery(hostname: String): Pair<List<InetAddress>, Exception?> {
++    val allAddresses = mutableListOf<InetAddress>()
++    var exception: Exception? = null
++    val latch = CountDownLatch(1)
++
++    // assumes an IPv4 address
++    AndroidAsyncDns.IPv4.query(
++      hostname,
++      object : AsyncDns.Callback {
++        override fun onResponse(
++          hostname: String,
++          addresses: List<InetAddress>,
++        ) {
++          allAddresses.addAll(addresses)
++          latch.countDown()
++        }
++
++        override fun onFailure(
++          hostname: String,
++          e: IOException,
++        ) {
++          exception = e
++          latch.countDown()
++        }
++      },
++    )
++
++    latch.await()
++
++    return Pair(allAddresses, exception)
++  }
++
++  @Test
++  fun testDnsRequestExternal() {
++    assumeNetwork()
++
++    val (allAddresses, exception) = dnsQuery("google.com")
++
++    assertThat(exception).isNull()
++    assertThat(allAddresses).isNotEmpty()
++  }
++
++  @Test
++  fun testDnsRequestInvalid() {
++    val (allAddresses, exception) = dnsQuery("google.invalid")
++
++    assertThat(exception).isNull()
++    assertThat(allAddresses).isEmpty()
++  }
++
++  @Test
++  fun testRequestOnNetwork() {
++    assumeNetwork()
++
++    val context = InstrumentationRegistry.getInstrumentation().context
++    val connectivityManager =
++      context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
++
++    val network =
++      connectivityManager.activeNetwork ?: throw AssumptionViolatedException("No active network")
++
++    val client =
++      OkHttpClient
++        .Builder()
++        .dns(AsyncDns.toDns(AndroidAsyncDns.IPv4, AndroidAsyncDns.IPv6))
++        .socketFactory(network.socketFactory)
++        .build()
++
++    val call =
++      client.newCall(Request("https://google.com/robots.txt".toHttpUrl()))
++
++    call.execute().use { response ->
++      assertThat(response.code).isEqualTo(200)
++    }
++  }
++
++  private fun assumeNetwork() {
++    try {
++      InetAddress.getByName("www.google.com")
++    } catch (uhe: UnknownHostException) {
++      throw AssumptionViolatedException(uhe.message, uhe)
++    }
++  }
++}
+diff --git a/android-test/src/test/kotlin/okhttp/android/test/AndroidAsyncDnsTest.kt b/android-test/src/test/kotlin/okhttp/android/test/AndroidAsyncDnsTest.kt
+new file mode 100644
+index 000000000..da3b0876d
+--- /dev/null
++++ b/android-test/src/test/kotlin/okhttp/android/test/AndroidAsyncDnsTest.kt
+@@ -0,0 +1,53 @@
++/*
++ * Copyright (C) 2024 Block, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++@file:Suppress("INVISIBLE_MEMBER", "INVISIBLE_REFERENCE")
++
++package okhttp.android.test
++
++import assertk.assertFailure
++import assertk.assertions.hasMessage
++import assertk.assertions.isInstanceOf
++import java.net.UnknownHostException
++import okhttp3.AsyncDns
++import okhttp3.android.AndroidAsyncDns
++import org.junit.Test
++import org.junit.runner.RunWith
++import org.robolectric.RobolectricTestRunner
++import org.robolectric.annotation.Config
++import org.robolectric.shadow.api.Shadow
++
++@Config(shadows = [ShadowDnsResolver::class], sdk = [34])
++@RunWith(RobolectricTestRunner::class)
++class AndroidAsyncDnsTest {
++  @Test
++  fun testDnsRequestInvalid() {
++    val asyncDns = AndroidAsyncDns.IPv4
++    val shadowDns: ShadowDnsResolver = Shadow.extract(asyncDns.resolver)
++
++    shadowDns.responder = {
++      throw IllegalArgumentException("Network.fromNetworkHandle refusing to instantiate NETID_UNSET Network.")
++    }
++
++    val dns = AsyncDns.toDns(asyncDns)
++
++    assertFailure {
++      dns.lookup("google.invalid")
++    }.apply {
++      hasMessage("Network.fromNetworkHandle refusing to instantiate NETID_UNSET Network.")
++      isInstanceOf(UnknownHostException::class)
++    }
++  }
++}
+diff --git a/okhttp-dnsoverhttps/src/test/java/okhttp3/dnsoverhttps/DnsRecordCodecTest.kt b/okhttp-dnsoverhttps/src/test/java/okhttp3/dnsoverhttps/DnsRecordCodecTest.kt
+index 9fa9272e1..c8c406256 100644
+--- a/okhttp-dnsoverhttps/src/test/java/okhttp3/dnsoverhttps/DnsRecordCodecTest.kt
++++ b/okhttp-dnsoverhttps/src/test/java/okhttp3/dnsoverhttps/DnsRecordCodecTest.kt
+@@ -22,8 +22,8 @@ import assertk.assertions.isEqualTo
+ import java.net.InetAddress
+ import java.net.UnknownHostException
+ import kotlin.test.assertFailsWith
+-import okhttp3.dnsoverhttps.DnsRecordCodec.TYPE_A
+-import okhttp3.dnsoverhttps.DnsRecordCodec.TYPE_AAAA
++import okhttp3.AsyncDns.Companion.TYPE_A
++import okhttp3.AsyncDns.Companion.TYPE_AAAA
+ import okhttp3.dnsoverhttps.DnsRecordCodec.decodeAnswers
+ import okio.ByteString.Companion.decodeHex
+ import org.junit.jupiter.api.Test
+diff --git a/okhttp/api/android/okhttp.api b/okhttp/api/android/okhttp.api
+index 355bb5d27..e42132275 100644
+--- a/okhttp/api/android/okhttp.api
++++ b/okhttp/api/android/okhttp.api
+@@ -27,6 +27,33 @@ public final class okhttp3/Address {
+ 	public final fun url ()Lokhttp3/HttpUrl;
+ }
+ 
++public abstract interface class okhttp3/AsyncDns {
++	public static final field Companion Lokhttp3/AsyncDns$Companion;
++	public static final field TYPE_A I
++	public static final field TYPE_AAAA I
++	public abstract fun query (Ljava/lang/String;Lokhttp3/AsyncDns$Callback;)V
++}
++
++public abstract interface class okhttp3/AsyncDns$Callback {
++	public abstract fun onFailure (Ljava/lang/String;Ljava/io/IOException;)V
++	public abstract fun onResponse (Ljava/lang/String;Ljava/util/List;)V
++}
++
++public final class okhttp3/AsyncDns$Companion {
++	public static final field TYPE_A I
++	public static final field TYPE_AAAA I
++	public final fun toDns ([Lokhttp3/AsyncDns;)Lokhttp3/Dns;
++}
++
++public final class okhttp3/AsyncDns$DnsClass : java/lang/Enum {
++	public static final field IPV4 Lokhttp3/AsyncDns$DnsClass;
++	public static final field IPV6 Lokhttp3/AsyncDns$DnsClass;
++	public static fun getEntries ()Lkotlin/enums/EnumEntries;
++	public final fun getType ()I
++	public static fun valueOf (Ljava/lang/String;)Lokhttp3/AsyncDns$DnsClass;
++	public static fun values ()[Lokhttp3/AsyncDns$DnsClass;
++}
++
+ public abstract interface class okhttp3/Authenticator {
+ 	public static final field Companion Lokhttp3/Authenticator$Companion;
+ 	public static final field JAVA_NET_AUTHENTICATOR Lokhttp3/Authenticator;
+@@ -1270,3 +1297,15 @@ public abstract class okhttp3/WebSocketListener {
+ 	public fun onOpen (Lokhttp3/WebSocket;Lokhttp3/Response;)V
+ }
+ 
++public final class okhttp3/android/AndroidAsyncDns : okhttp3/AsyncDns {
++	public static final field Companion Lokhttp3/android/AndroidAsyncDns$Companion;
++	public fun <init> (Lokhttp3/AsyncDns$DnsClass;Landroid/net/Network;)V
++	public synthetic fun <init> (Lokhttp3/AsyncDns$DnsClass;Landroid/net/Network;ILkotlin/jvm/internal/DefaultConstructorMarker;)V
++	public fun query (Ljava/lang/String;Lokhttp3/AsyncDns$Callback;)V
++}
++
++public final class okhttp3/android/AndroidAsyncDns$Companion {
++	public final fun getIPv4 ()Lokhttp3/android/AndroidAsyncDns;
++	public final fun getIPv6 ()Lokhttp3/android/AndroidAsyncDns;
++}
++
+diff --git a/okhttp/api/jvm/okhttp.api b/okhttp/api/jvm/okhttp.api
+index 355bb5d27..f53b06124 100644
+--- a/okhttp/api/jvm/okhttp.api
++++ b/okhttp/api/jvm/okhttp.api
+@@ -27,6 +27,33 @@ public final class okhttp3/Address {
+ 	public final fun url ()Lokhttp3/HttpUrl;
+ }
+ 
++public abstract interface class okhttp3/AsyncDns {
++	public static final field Companion Lokhttp3/AsyncDns$Companion;
++	public static final field TYPE_A I
++	public static final field TYPE_AAAA I
++	public abstract fun query (Ljava/lang/String;Lokhttp3/AsyncDns$Callback;)V
++}
++
++public abstract interface class okhttp3/AsyncDns$Callback {
++	public abstract fun onFailure (Ljava/lang/String;Ljava/io/IOException;)V
++	public abstract fun onResponse (Ljava/lang/String;Ljava/util/List;)V
++}
++
++public final class okhttp3/AsyncDns$Companion {
++	public static final field TYPE_A I
++	public static final field TYPE_AAAA I
++	public final fun toDns ([Lokhttp3/AsyncDns;)Lokhttp3/Dns;
++}
++
++public final class okhttp3/AsyncDns$DnsClass : java/lang/Enum {
++	public static final field IPV4 Lokhttp3/AsyncDns$DnsClass;
++	public static final field IPV6 Lokhttp3/AsyncDns$DnsClass;
++	public static fun getEntries ()Lkotlin/enums/EnumEntries;
++	public final fun getType ()I
++	public static fun valueOf (Ljava/lang/String;)Lokhttp3/AsyncDns$DnsClass;
++	public static fun values ()[Lokhttp3/AsyncDns$DnsClass;
++}
++
+ public abstract interface class okhttp3/Authenticator {
+ 	public static final field Companion Lokhttp3/Authenticator$Companion;
+ 	public static final field JAVA_NET_AUTHENTICATOR Lokhttp3/Authenticator;
+diff --git a/okhttp/src/androidMain/kotlin/okhttp3/android/AndroidAsyncDns.kt b/okhttp/src/androidMain/kotlin/okhttp3/android/AndroidAsyncDns.kt
+new file mode 100644
+index 000000000..7c2964189
+--- /dev/null
++++ b/okhttp/src/androidMain/kotlin/okhttp3/android/AndroidAsyncDns.kt
+@@ -0,0 +1,100 @@
++/*
++ * Copyright (c) 2022 Square, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ *
++ */
++
++package okhttp3.android
++
++import android.net.DnsResolver
++import android.net.Network
++import android.os.Build
++import androidx.annotation.RequiresApi
++import java.net.InetAddress
++import java.net.UnknownHostException
++import java.util.concurrent.Executors
++import okhttp3.AsyncDns
++import okhttp3.ExperimentalOkHttpApi
++import okhttp3.internal.SuppressSignatureCheck
++
++/**
++ * DNS implementation based on android.net.DnsResolver, which submits a request for
++ * A or AAAA records, and returns the addresses or exception.
++ *
++ * Two instances must be used to get all results for an address.
++ *
++ * @param network network to use, if not selects the default network.
++ */
++@RequiresApi(Build.VERSION_CODES.Q)
++@ExperimentalOkHttpApi
++@SuppressSignatureCheck
++class AndroidAsyncDns(
++  private val dnsClass: AsyncDns.DnsClass,
++  private val network: Network? = null,
++) : AsyncDns {
++  @RequiresApi(Build.VERSION_CODES.Q)
++  internal val resolver = DnsResolver.getInstance()
++  private val executor = Executors.newSingleThreadExecutor()
++
++  override fun query(
++    hostname: String,
++    callback: AsyncDns.Callback,
++  ) {
++    try {
++      resolver.query(
++        network,
++        hostname,
++        dnsClass.type,
++        DnsResolver.FLAG_EMPTY,
++        executor,
++        null,
++        object : DnsResolver.Callback<List<InetAddress>> {
++          override fun onAnswer(
++            addresses: List<InetAddress>,
++            rCode: Int,
++          ) {
++            callback.onResponse(hostname, addresses)
++          }
++
++          override fun onError(e: DnsResolver.DnsException) {
++            callback.onFailure(
++              hostname,
++              UnknownHostException(e.message).apply {
++                initCause(e)
++              },
++            )
++          }
++        },
++      )
++    } catch (e: Exception) {
++      // Handle any errors that might leak out
++      // https://issuetracker.google.com/issues/319957694
++      callback.onFailure(
++        hostname,
++        UnknownHostException(e.message).apply {
++          initCause(e)
++        },
++      )
++    }
++  }
++
++  @ExperimentalOkHttpApi
++  companion object {
++    @RequiresApi(Build.VERSION_CODES.Q)
++    val IPv4 = AndroidAsyncDns(dnsClass = AsyncDns.DnsClass.IPV4)
++
++    @RequiresApi(Build.VERSION_CODES.Q)
++    val IPv6 = AndroidAsyncDns(dnsClass = AsyncDns.DnsClass.IPV6)
++  }
++}
+diff --git a/okhttp/src/commonJvmAndroid/kotlin/okhttp3/AsyncDns.kt b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/AsyncDns.kt
+new file mode 100644
+index 000000000..3bd0e3623
+--- /dev/null
++++ b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/AsyncDns.kt
+@@ -0,0 +1,138 @@
++/*
++ * Copyright (c) 2022 Square, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ *
++ */
++
++package okhttp3
++
++import java.net.InetAddress
++import java.net.UnknownHostException
++import java.util.concurrent.CountDownLatch
++import okio.IOException
++
++/**
++ * An async domain name service that resolves IP addresses for host names.
++ *
++ * The main implementations will typically be implemented using specific DNS libraries such as
++ *  * Android DnsResolver
++ *  * OkHttp DnsOverHttps
++ *  * dnsjava Resolver
++ *
++ * Implementations of this interface must be safe for concurrent use.
++ */
++@ExperimentalOkHttpApi
++interface AsyncDns {
++  /**
++   * Query DNS records for `hostname`, in the order they are received.
++   */
++  fun query(
++    hostname: String,
++    callback: Callback,
++  )
++
++  /**
++   * Callback to receive results from the DNS Queries.
++   */
++  @ExperimentalOkHttpApi
++  interface Callback {
++    /**
++     * Return addresses for a dns query for a single class of IPv4 (A) or IPv6 (AAAA).
++     * May be an empty list indicating that the host is unreachable.
++     */
++    fun onResponse(
++      hostname: String,
++      addresses: List<InetAddress>,
++    )
++
++    /**
++     * Returns an error for the DNS query.
++     */
++    fun onFailure(
++      hostname: String,
++      e: IOException,
++    )
++  }
++
++  /**
++   * Class of DNS addresses, such that clients that treat these differently, such
++   * as attempting IPv6 first, can make such decisions.
++   */
++  @ExperimentalOkHttpApi
++  enum class DnsClass(
++    val type: Int,
++  ) {
++    IPV4(TYPE_A),
++    IPV6(TYPE_AAAA),
++  }
++
++  @ExperimentalOkHttpApi
++  companion object {
++    const val TYPE_A = 1
++    const val TYPE_AAAA = 28
++
++    /**
++     * Adapt an AsyncDns implementation to Dns, waiting until onComplete is received
++     * and returning results if available.
++     */
++    fun toDns(vararg asyncDns: AsyncDns): Dns =
++      Dns { hostname ->
++        val allAddresses = mutableListOf<InetAddress>()
++        val allExceptions = mutableListOf<IOException>()
++        val latch = CountDownLatch(asyncDns.size)
++
++        asyncDns.forEach {
++          it.query(
++            hostname,
++            object : Callback {
++              override fun onResponse(
++                hostname: String,
++                addresses: List<InetAddress>,
++              ) {
++                synchronized(allAddresses) {
++                  allAddresses.addAll(addresses)
++                }
++                latch.countDown()
++              }
++
++              override fun onFailure(
++                hostname: String,
++                e: IOException,
++              ) {
++                synchronized(allExceptions) {
++                  allExceptions.add(e)
++                }
++                latch.countDown()
++              }
++            },
++          )
++        }
++
++        latch.await()
++
++        // No mutations should be possible after this point
++        if (allAddresses.isEmpty()) {
++          val first = allExceptions.firstOrNull() ?: UnknownHostException("No results for $hostname")
++
++          allExceptions.drop(1).forEach {
++            first.addSuppressed(it)
++          }
++
++          throw first
++        }
++
++        allAddresses
++      }
++  }
++}

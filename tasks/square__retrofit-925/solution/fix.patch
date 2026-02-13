@@ -1,0 +1,319 @@
+diff --git a/retrofit/src/main/java/retrofit/ExecutorCallAdapterFactory.java b/retrofit/src/main/java/retrofit/ExecutorCallAdapterFactory.java
+new file mode 100644
+index 00000000..8196101e
+--- /dev/null
++++ b/retrofit/src/main/java/retrofit/ExecutorCallAdapterFactory.java
+@@ -0,0 +1,101 @@
++/*
++ * Copyright (C) 2015 Square, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package retrofit;
++
++import java.io.IOException;
++import java.lang.reflect.Type;
++import java.util.concurrent.Executor;
++
++final class ExecutorCallAdapterFactory implements CallAdapter.Factory {
++  private final Executor callbackExecutor;
++
++  ExecutorCallAdapterFactory(Executor callbackExecutor) {
++    this.callbackExecutor = callbackExecutor;
++  }
++
++  @Override public String toString() {
++    return "ExecutorCallAdapterFactory[" + callbackExecutor + ']';
++  }
++
++  @Override public CallAdapter<?> get(Type returnType) {
++    if (Utils.getRawType(returnType) != Call.class) {
++      return null;
++    }
++    final Type responseType = Utils.getCallResponseType(returnType);
++    return new CallAdapter<Object>() {
++      @Override public Type responseType() {
++        return responseType;
++      }
++
++      @Override public Call<Object> adapt(Call<Object> call) {
++        return new ExecutorCallbackCall<>(callbackExecutor, call);
++      }
++    };
++  }
++
++  static final class ExecutorCallbackCall<T> implements Call<T> {
++    private final Executor callbackExecutor;
++    private final Call<T> delegate;
++
++    ExecutorCallbackCall(Executor callbackExecutor, Call<T> delegate) {
++      this.callbackExecutor = callbackExecutor;
++      this.delegate = delegate;
++    }
++
++    @Override public void enqueue(Callback<T> callback) {
++      delegate.enqueue(new ExecutorCallback<>(callbackExecutor, callback));
++    }
++
++    @Override public Response<T> execute() throws IOException {
++      return delegate.execute();
++    }
++
++    @Override public void cancel() {
++      delegate.cancel();
++    }
++
++    @SuppressWarnings("CloneDoesntCallSuperClone") // Performing deep clone.
++    @Override public Call<T> clone() {
++      return new ExecutorCallbackCall<>(callbackExecutor, delegate.clone());
++    }
++  }
++
++  static final class ExecutorCallback<T> implements Callback<T> {
++    private final Executor callbackExecutor;
++    private final Callback<T> delegate;
++
++    ExecutorCallback(Executor callbackExecutor, Callback<T> delegate) {
++      this.callbackExecutor = callbackExecutor;
++      this.delegate = delegate;
++    }
++
++    @Override public void success(final Response<T> response) {
++      callbackExecutor.execute(new Runnable() {
++        @Override public void run() {
++          delegate.success(response);
++        }
++      });
++    }
++
++    @Override public void failure(final Throwable t) {
++      callbackExecutor.execute(new Runnable() {
++        @Override public void run() {
++          delegate.failure(t);
++        }
++      });
++    }
++  }
++}
+diff --git a/retrofit/src/main/java/retrofit/Platform.java b/retrofit/src/main/java/retrofit/Platform.java
+index bd292c48..4f694322 100644
+--- a/retrofit/src/main/java/retrofit/Platform.java
++++ b/retrofit/src/main/java/retrofit/Platform.java
+@@ -19,6 +19,7 @@ import android.os.Build;
+ import android.os.Handler;
+ import android.os.Looper;
+ import com.squareup.okhttp.OkHttpClient;
++import java.lang.reflect.Type;
+ import java.util.concurrent.Executor;
+ import java.util.concurrent.TimeUnit;
+ 
+@@ -41,8 +42,11 @@ class Platform {
+     return new Platform();
+   }
+ 
+-  CallAdapter.Factory defaultCallAdapterFactory() {
+-    return new DefaultCallAdapterFactory(new Utils.SynchronousExecutor());
++  CallAdapter.Factory defaultCallAdapterFactory(Executor callbackExecutor) {
++    if (callbackExecutor != null) {
++      return new ExecutorCallAdapterFactory(callbackExecutor);
++    }
++    return new NothingCallAdapterFactory();
+   }
+ 
+   OkHttpClient defaultClient() {
+@@ -55,8 +59,11 @@ class Platform {
+ 
+   /** Provides sane defaults for operation on Android. */
+   static class Android extends Platform {
+-    CallAdapter.Factory defaultCallAdapterFactory() {
+-      return new DefaultCallAdapterFactory(new MainThreadExecutor());
++    CallAdapter.Factory defaultCallAdapterFactory(Executor callbackExecutor) {
++      if (callbackExecutor == null) {
++        callbackExecutor = new MainThreadExecutor();
++      }
++      return new ExecutorCallAdapterFactory(callbackExecutor);
+     }
+ 
+     static class MainThreadExecutor implements Executor {
+@@ -65,6 +72,40 @@ class Platform {
+       @Override public void execute(Runnable r) {
+         handler.post(r);
+       }
++
++      @Override public String toString() {
++        return "MainThreadExecutor";
++      }
++    }
++  }
++
++  static final class NothingCallAdapterFactory implements CallAdapter.Factory {
++    @Override public CallAdapter<?> get(Type returnType) {
++      if (Utils.getRawType(returnType) != Call.class) {
++        return null;
++      }
++      Type responseType = Utils.getCallResponseType(returnType);
++      return new NothingCallAdapter<>(responseType);
++    }
++
++    @Override public String toString() {
++      return "Default";
++    }
++
++    static final class NothingCallAdapter<T> implements CallAdapter<T> {
++      private final Type responseType;
++
++      NothingCallAdapter(Type responseType) {
++        this.responseType = responseType;
++      }
++
++      @Override public Type responseType() {
++        return responseType;
++      }
++
++      @Override public Call<T> adapt(Call<T> call) {
++        return call;
++      }
+     }
+   }
+ }
+diff --git a/retrofit/src/main/java/retrofit/Retrofit.java b/retrofit/src/main/java/retrofit/Retrofit.java
+index d0d0589c..55eb0a1b 100644
+--- a/retrofit/src/main/java/retrofit/Retrofit.java
++++ b/retrofit/src/main/java/retrofit/Retrofit.java
+@@ -24,6 +24,7 @@ import java.lang.reflect.Method;
+ import java.lang.reflect.Proxy;
+ import java.util.LinkedHashMap;
+ import java.util.Map;
++import java.util.concurrent.Executor;
+ import retrofit.http.HTTP;
+ import retrofit.http.Header;
+ 
+@@ -91,13 +92,15 @@ public final class Retrofit {
+   private final Endpoint endpoint;
+   private final Converter.Factory converterFactory;
+   private final CallAdapter.Factory adapterFactory;
++  private final Executor callbackExecutor;
+ 
+   private Retrofit(OkHttpClient client, Endpoint endpoint, Converter.Factory converterFactory,
+-      CallAdapter.Factory adapterFactory) {
++      CallAdapter.Factory adapterFactory, Executor callbackExecutor) {
+     this.client = client;
+     this.endpoint = endpoint;
+     this.converterFactory = converterFactory;
+     this.adapterFactory = adapterFactory;
++    this.callbackExecutor = callbackExecutor;
+   }
+ 
+   /** Create an implementation of the API defined by the {@code service} interface. */
+@@ -119,14 +122,12 @@ public final class Retrofit {
+   };
+ 
+   MethodHandler<?> loadMethodHandler(Method method) {
+-    Map<Method, MethodHandler<?>> cache = methodHandlerCache;
+-
+     MethodHandler<?> handler;
+-    synchronized (cache) {
+-      handler = cache.get(method);
++    synchronized (methodHandlerCache) {
++      handler = methodHandlerCache.get(method);
+       if (handler == null) {
+         handler = MethodHandler.create(method, client, endpoint, adapterFactory, converterFactory);
+-        cache.put(method, handler);
++        methodHandlerCache.put(method, handler);
+       }
+     }
+     return handler;
+@@ -153,6 +154,10 @@ public final class Retrofit {
+     return adapterFactory;
+   }
+ 
++  public Executor callbackExecutor() {
++    return callbackExecutor;
++  }
++
+   /**
+    * Build a new {@link Retrofit}.
+    * <p>
+@@ -164,6 +169,7 @@ public final class Retrofit {
+     private Endpoint endpoint;
+     private Converter.Factory converterFactory;
+     private CallAdapter.Factory adapterFactory;
++    private Executor callbackExecutor;
+ 
+     /** The HTTP client used for requests. */
+     public Builder client(OkHttpClient client) {
+@@ -211,6 +217,15 @@ public final class Retrofit {
+       return this;
+     }
+ 
++    /**
++     * The executor on which {@link Callback} methods are invoked when returning {@link Call} from
++     * your service method.
++     */
++    public Builder callbackExecutor(Executor callbackExecutor) {
++      this.callbackExecutor = checkNotNull(callbackExecutor, "callbackExecutor == null");
++      return this;
++    }
++
+     /** Create the {@link Retrofit} instances. */
+     public Retrofit build() {
+       if (endpoint == null) {
+@@ -222,10 +237,10 @@ public final class Retrofit {
+         client = Platform.get().defaultClient();
+       }
+       if (adapterFactory == null) {
+-        adapterFactory = Platform.get().defaultCallAdapterFactory();
++        adapterFactory = Platform.get().defaultCallAdapterFactory(callbackExecutor);
+       }
+ 
+-      return new Retrofit(client, endpoint, converterFactory, adapterFactory);
++      return new Retrofit(client, endpoint, converterFactory, adapterFactory, callbackExecutor);
+     }
+   }
+ }
+diff --git a/retrofit/src/main/java/retrofit/Utils.java b/retrofit/src/main/java/retrofit/Utils.java
+index 42038b67..d44e89fe 100644
+--- a/retrofit/src/main/java/retrofit/Utils.java
++++ b/retrofit/src/main/java/retrofit/Utils.java
+@@ -28,7 +28,6 @@ import java.lang.reflect.Type;
+ import java.lang.reflect.TypeVariable;
+ import java.lang.reflect.WildcardType;
+ import java.util.Arrays;
+-import java.util.concurrent.Executor;
+ import okio.Buffer;
+ import okio.BufferedSource;
+ import okio.Source;
+@@ -161,10 +160,20 @@ final class Utils {
+         + method.getName());
+   }
+ 
+-  static class SynchronousExecutor implements Executor {
+-    @Override public void execute(Runnable runnable) {
+-      runnable.run();
++  static Type getCallResponseType(Type returnType) {
++    if (!(returnType instanceof ParameterizedType)) {
++      throw new IllegalArgumentException(
++          "Call return type must be parameterized as Call<Foo> or Call<? extends Foo>");
++    }
++    final Type responseType = getSingleParameterUpperBound((ParameterizedType) returnType);
++
++    // Ensure the Call response type is not Response, we automatically deliver the Response object.
++    if (getRawType(responseType) == retrofit.Response.class) {
++      throw new IllegalArgumentException(
++          "Call<T> cannot use Response as its generic parameter. "
++              + "Specify the response body type only (e.g., Call<TweetResponse>).");
+     }
++    return responseType;
+   }
+ 
+   private Utils() {

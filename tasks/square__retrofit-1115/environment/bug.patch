@@ -1,0 +1,423 @@
+diff --git a/retrofit/src/main/java/retrofit/MethodHandler.java b/retrofit/src/main/java/retrofit/MethodHandler.java
+index 3e23affe..b269a7cc 100644
+--- a/retrofit/src/main/java/retrofit/MethodHandler.java
++++ b/retrofit/src/main/java/retrofit/MethodHandler.java
+@@ -20,15 +20,17 @@ import com.squareup.okhttp.ResponseBody;
+ import java.lang.annotation.Annotation;
+ import java.lang.reflect.Method;
+ import java.lang.reflect.Type;
++import java.util.List;
+ 
+ final class MethodHandler<T> {
+   @SuppressWarnings("unchecked")
+   static MethodHandler<?> create(Retrofit retrofit, Method method) {
+     CallAdapter<Object> callAdapter = (CallAdapter<Object>) createCallAdapter(method, retrofit);
+-    Type responseType = callAdapter.responseType();
+     Converter<ResponseBody, Object> responseConverter =
+-        (Converter<ResponseBody, Object>) createResponseConverter(method, retrofit, responseType);
+-    RequestFactory requestFactory = RequestFactoryParser.parse(method, retrofit);
++        (Converter<ResponseBody, Object>) createResponseConverter(method,
++            callAdapter.responseType(), retrofit.converterFactories());
++    RequestFactory requestFactory =
++        RequestFactoryParser.parse(method, retrofit.baseUrl(), retrofit.converterFactories());
+     return new MethodHandler<>(retrofit.client(), requestFactory, callAdapter, responseConverter);
+   }
+ 
+@@ -50,10 +52,10 @@ final class MethodHandler<T> {
+   }
+ 
+   private static Converter<ResponseBody, ?> createResponseConverter(Method method,
+-      Retrofit retrofit, Type responseType) {
++      Type responseType, List<Converter.Factory> converterFactories) {
+     Annotation[] annotations = method.getAnnotations();
+     try {
+-      return retrofit.responseConverter(responseType, annotations);
++      return Utils.resolveResponseBodyConverter(converterFactories, responseType, annotations);
+     } catch (RuntimeException e) { // Wide exception range because factories are user code.
+       throw Utils.methodError(e, method, "Unable to create converter for %s", responseType);
+     }
+diff --git a/retrofit/src/main/java/retrofit/RequestBuilderAction.java b/retrofit/src/main/java/retrofit/RequestBuilderAction.java
+index eea1b052..c4898e93 100644
+--- a/retrofit/src/main/java/retrofit/RequestBuilderAction.java
++++ b/retrofit/src/main/java/retrofit/RequestBuilderAction.java
+@@ -20,6 +20,7 @@ import com.squareup.okhttp.RequestBody;
+ import java.io.IOException;
+ import java.lang.annotation.Annotation;
+ import java.lang.reflect.Array;
++import java.util.List;
+ import java.util.Map;
+ 
+ import static retrofit.Utils.checkNotNull;
+@@ -214,12 +215,13 @@ abstract class RequestBuilderAction {
+   }
+ 
+   static final class PartMap extends RequestBuilderAction {
+-    private final Retrofit retrofit;
++    private final List<Converter.Factory> converterFactories;
+     private final String transferEncoding;
+     private final Annotation[] annotations;
+ 
+-    PartMap(Retrofit retrofit, String transferEncoding, Annotation[] annotations) {
+-      this.retrofit = retrofit;
++    PartMap(List<Converter.Factory> converterFactories, String transferEncoding,
++        Annotation[] annotations) {
++      this.converterFactories = converterFactories;
+       this.transferEncoding = transferEncoding;
+       this.annotations = annotations;
+     }
+@@ -245,7 +247,8 @@ abstract class RequestBuilderAction {
+         Class<?> entryClass = entryValue.getClass();
+         //noinspection unchecked
+         Converter<Object, RequestBody> converter =
+-            (Converter<Object, RequestBody>) retrofit.requestConverter(entryClass, annotations);
++            (Converter<Object, RequestBody>) Utils.resolveRequestBodyConverter(converterFactories,
++                entryClass, annotations);
+         RequestBody body;
+         try {
+           body = converter.convert(entryValue);
+diff --git a/retrofit/src/main/java/retrofit/RequestFactoryParser.java b/retrofit/src/main/java/retrofit/RequestFactoryParser.java
+index d05acfd5..50fe0d96 100644
+--- a/retrofit/src/main/java/retrofit/RequestFactoryParser.java
++++ b/retrofit/src/main/java/retrofit/RequestFactoryParser.java
+@@ -21,6 +21,7 @@ import java.lang.annotation.Annotation;
+ import java.lang.reflect.Method;
+ import java.lang.reflect.Type;
+ import java.util.LinkedHashSet;
++import java.util.List;
+ import java.util.Map;
+ import java.util.Set;
+ import java.util.regex.Matcher;
+@@ -54,11 +55,12 @@ final class RequestFactoryParser {
+   private static final Pattern PARAM_NAME_REGEX = Pattern.compile(PARAM);
+   private static final Pattern PARAM_URL_REGEX = Pattern.compile("\\{(" + PARAM + ")\\}");
+ 
+-  static RequestFactory parse(Method method, Retrofit retrofit) {
++  static RequestFactory parse(Method method, BaseUrl baseUrl,
++      List<Converter.Factory> converterFactories) {
+     RequestFactoryParser parser = new RequestFactoryParser(method);
+     parser.parseMethodAnnotations();
+-    parser.parseParameters(retrofit);
+-    return parser.toRequestFactory(retrofit.baseUrl());
++    parser.parseParameters(converterFactories);
++    return parser.toRequestFactory(baseUrl);
+   }
+ 
+   private final Method method;
+@@ -191,7 +193,7 @@ final class RequestFactoryParser {
+     return builder.build();
+   }
+ 
+-  private void parseParameters(Retrofit retrofit) {
++  private void parseParameters(List<Converter.Factory> converterFactories) {
+     Type[] methodParameterTypes = method.getGenericParameterTypes();
+     Annotation[][] methodParameterAnnotationArrays = method.getParameterAnnotations();
+ 
+@@ -292,8 +294,8 @@ final class RequestFactoryParser {
+                 "Content-Transfer-Encoding", part.encoding());
+             Converter<?, RequestBody> converter;
+             try {
+-              converter =
+-                  retrofit.requestConverter(methodParameterType, methodParameterAnnotations);
++              converter = Utils.resolveRequestBodyConverter(converterFactories, methodParameterType,
++                  methodParameterAnnotations);
+             } catch (RuntimeException e) { // Wide exception range because factories are user code.
+               throw parameterError(e, i, "Unable to create @Part converter for %s",
+                   methodParameterType);
+@@ -310,7 +312,7 @@ final class RequestFactoryParser {
+               throw parameterError(i, "@PartMap parameter type must be Map.");
+             }
+             PartMap partMap = (PartMap) methodParameterAnnotation;
+-            action = new RequestBuilderAction.PartMap(retrofit, partMap.encoding(),
++            action = new RequestBuilderAction.PartMap(converterFactories, partMap.encoding(),
+                 methodParameterAnnotations);
+             gotPart = true;
+ 
+@@ -325,8 +327,8 @@ final class RequestFactoryParser {
+ 
+             Converter<?, RequestBody> converter;
+             try {
+-              converter =
+-                  retrofit.requestConverter(methodParameterType, methodParameterAnnotations);
++              converter = Utils.resolveRequestBodyConverter(converterFactories, methodParameterType,
++                  methodParameterAnnotations);
+             } catch (RuntimeException e) { // Wide exception range because factories are user code.
+               throw parameterError(e, i, "Unable to create @Body converter for %s",
+                   methodParameterType);
+diff --git a/retrofit/src/main/java/retrofit/Retrofit.java b/retrofit/src/main/java/retrofit/Retrofit.java
+index 0df8acb9..23065793 100644
+--- a/retrofit/src/main/java/retrofit/Retrofit.java
++++ b/retrofit/src/main/java/retrofit/Retrofit.java
+@@ -214,56 +214,6 @@ public final class Retrofit {
+     return Collections.unmodifiableList(converterFactories);
+   }
+ 
+-  /**
+-   * Returns a {@link Converter} for {@code type} to {@link RequestBody} from the available
+-   * {@linkplain #converterFactories() factories}.
+-   */
+-  public Converter<?, RequestBody> requestConverter(Type type, Annotation[] annotations) {
+-    checkNotNull(type, "type == null");
+-    checkNotNull(annotations, "annotations == null");
+-
+-    for (int i = 0, count = converterFactories.size(); i < count; i++) {
+-      Converter<?, RequestBody> converter =
+-          converterFactories.get(i).toRequestBody(type, annotations);
+-      if (converter != null) {
+-        return converter;
+-      }
+-    }
+-
+-    StringBuilder builder = new StringBuilder("Could not locate RequestBody converter for ")
+-        .append(type)
+-        .append(". Tried:");
+-    for (Converter.Factory converterFactory : converterFactories) {
+-      builder.append("\n * ").append(converterFactory.getClass().getName());
+-    }
+-    throw new IllegalArgumentException(builder.toString());
+-  }
+-
+-  /**
+-   * Returns a {@link Converter} for {@link ResponseBody} to {@code type} from the available
+-   * {@linkplain #converterFactories() factories}.
+-   */
+-  public Converter<ResponseBody, ?> responseConverter(Type type, Annotation[] annotations) {
+-    checkNotNull(type, "type == null");
+-    checkNotNull(annotations, "annotations == null");
+-
+-    for (int i = 0, count = converterFactories.size(); i < count; i++) {
+-      Converter<ResponseBody, ?> converter =
+-          converterFactories.get(i).fromResponseBody(type, annotations);
+-      if (converter != null) {
+-        return converter;
+-      }
+-    }
+-
+-    StringBuilder builder = new StringBuilder("Could not locate ResponseBody converter for ")
+-        .append(type)
+-        .append(". Tried:");
+-    for (Converter.Factory converterFactory : converterFactories) {
+-      builder.append("\n * ").append(converterFactory.getClass().getName());
+-    }
+-    throw new IllegalArgumentException(builder.toString());
+-  }
+-
+   public Executor callbackExecutor() {
+     return callbackExecutor;
+   }
+diff --git a/retrofit/src/main/java/retrofit/Utils.java b/retrofit/src/main/java/retrofit/Utils.java
+index ee8912bb..751b9b11 100644
+--- a/retrofit/src/main/java/retrofit/Utils.java
++++ b/retrofit/src/main/java/retrofit/Utils.java
+@@ -16,6 +16,7 @@
+  */
+ package retrofit;
+ 
++import com.squareup.okhttp.RequestBody;
+ import com.squareup.okhttp.Response;
+ import com.squareup.okhttp.ResponseBody;
+ import java.io.Closeable;
+@@ -29,6 +30,7 @@ import java.lang.reflect.Type;
+ import java.lang.reflect.TypeVariable;
+ import java.lang.reflect.WildcardType;
+ import java.util.Arrays;
++import java.util.List;
+ import okio.Buffer;
+ import okio.BufferedSource;
+ import okio.Source;
+@@ -60,6 +62,44 @@ final class Utils {
+     return false;
+   }
+ 
++  static Converter<?, RequestBody> resolveRequestBodyConverter(
++      List<Converter.Factory> converterFactories, Type type, Annotation[] annotations) {
++    for (int i = 0, count = converterFactories.size(); i < count; i++) {
++      Converter<?, RequestBody> converter =
++          converterFactories.get(i).toRequestBody(type, annotations);
++      if (converter != null) {
++        return converter;
++      }
++    }
++
++    StringBuilder builder =
++        new StringBuilder("Could not locate RequestBody converter for ").append(type)
++            .append(". Tried:");
++    for (Converter.Factory converterFactory : converterFactories) {
++      builder.append("\n * ").append(converterFactory.getClass().getName());
++    }
++    throw new IllegalArgumentException(builder.toString());
++  }
++
++  static Converter<ResponseBody, ?> resolveResponseBodyConverter(
++      List<Converter.Factory> converterFactories, Type type, Annotation[] annotations) {
++    for (int i = 0, count = converterFactories.size(); i < count; i++) {
++      Converter<ResponseBody, ?> converter =
++          converterFactories.get(i).fromResponseBody(type, annotations);
++      if (converter != null) {
++        return converter;
++      }
++    }
++
++    StringBuilder builder =
++        new StringBuilder("Could not locate ResponseBody converter for ").append(type)
++            .append(". Tried:");
++    for (Converter.Factory converterFactory : converterFactories) {
++      builder.append("\n * ").append(converterFactory.getClass().getName());
++    }
++    throw new IllegalArgumentException(builder.toString());
++  }
++
+   /**
+    * Replace a {@link Response} with an identical copy whose body is backed by a
+    * {@link Buffer} rather than a {@link Source}.
+diff --git a/retrofit/src/test/java/retrofit/RequestBuilderTest.java b/retrofit/src/test/java/retrofit/RequestBuilderTest.java
+index a0dd9de0..ee6d58e5 100644
+--- a/retrofit/src/test/java/retrofit/RequestBuilderTest.java
++++ b/retrofit/src/test/java/retrofit/RequestBuilderTest.java
+@@ -1,6 +1,7 @@
+ // Copyright 2013 Square, Inc.
+ package retrofit;
+ 
++import com.squareup.okhttp.HttpUrl;
+ import com.squareup.okhttp.MediaType;
+ import com.squareup.okhttp.Request;
+ import com.squareup.okhttp.RequestBody;
+@@ -1665,13 +1666,18 @@ public final class RequestBuilderTest {
+     }
+   }
+ 
+-  private final Retrofit retrofit = new Retrofit.Builder()
+-      .baseUrl("http://example.com/")
+-      .addConverterFactory(new ToStringConverterFactory())
+-      .build();
+-
+   private Request buildRequest(Class<?> cls, Object... args) {
+     Method method = TestingUtils.onlyMethod(cls);
+-    return RequestFactoryParser.parse(method, retrofit).create(args);
++
++    BaseUrl baseUrl = new BaseUrl() {
++      @Override public HttpUrl url() {
++        return HttpUrl.parse("http://example.com/");
++      }
++    };
++    List<Converter.Factory> converterFactories =
++        Arrays.asList(new BuiltInConverterFactory(), new ToStringConverterFactory());
++
++    RequestFactory requestFactory = RequestFactoryParser.parse(method, baseUrl, converterFactories);
++    return requestFactory.create(args);
+   }
+ }
+diff --git a/retrofit/src/test/java/retrofit/RetrofitTest.java b/retrofit/src/test/java/retrofit/RetrofitTest.java
+index 37e70036..82de976b 100644
+--- a/retrofit/src/test/java/retrofit/RetrofitTest.java
++++ b/retrofit/src/test/java/retrofit/RetrofitTest.java
+@@ -530,102 +530,6 @@ public final class RetrofitTest {
+     assertThat(converterFactories.get(0)).isInstanceOf(BuiltInConverterFactory.class);
+   }
+ 
+-  @Test public void requestConverterFactoryQueried() {
+-    Type type = String.class;
+-    Annotation[] annotations = new Annotation[0];
+-
+-    Converter<?, RequestBody> expectedAdapter = mock(Converter.class);
+-    Converter.Factory factory = mock(Converter.Factory.class);
+-
+-    Retrofit retrofit = new Retrofit.Builder()
+-        .baseUrl("http://example.com/")
+-        .addConverterFactory(factory)
+-        .build();
+-
+-    doReturn(expectedAdapter).when(factory).toRequestBody(type, annotations);
+-
+-    Converter<?, RequestBody> actualAdapter = retrofit.requestConverter(type, annotations);
+-    assertThat(actualAdapter).isSameAs(expectedAdapter);
+-
+-    verify(factory).toRequestBody(type, annotations);
+-    verifyNoMoreInteractions(factory);
+-  }
+-
+-  @Test public void requestConverterFactoryNoMatchThrows() {
+-    Type type = String.class;
+-    Annotation[] annotations = new Annotation[0];
+-
+-    Converter.Factory factory1 = spy(new Converter.Factory() {
+-      @Override
+-      public Converter<?, RequestBody> toRequestBody(Type returnType, Annotation[] annotations) {
+-        return null;
+-      }
+-    });
+-
+-    Retrofit retrofit = new Retrofit.Builder()
+-        .baseUrl("http://example.com/")
+-        .addConverterFactory(factory1)
+-        .build();
+-
+-    try {
+-      retrofit.requestConverter(type, annotations);
+-    } catch (IllegalArgumentException e) {
+-      assertThat(e).hasMessageStartingWith(
+-          "Could not locate RequestBody converter for class java.lang.String. Tried:");
+-    }
+-
+-    verify(factory1).toRequestBody(type, annotations);
+-    verifyNoMoreInteractions(factory1);
+-  }
+-
+-  @Test public void responseConverterFactoryQueried() {
+-    Type type = String.class;
+-    Annotation[] annotations = new Annotation[0];
+-
+-    Converter<ResponseBody, ?> expectedAdapter = mock(Converter.class);
+-    Converter.Factory factory = mock(Converter.Factory.class);
+-
+-    Retrofit retrofit = new Retrofit.Builder()
+-        .baseUrl("http://example.com/")
+-        .addConverterFactory(factory)
+-        .build();
+-
+-    doReturn(expectedAdapter).when(factory).fromResponseBody(type, annotations);
+-
+-    Converter<ResponseBody, ?> actualAdapter = retrofit.responseConverter(type, annotations);
+-    assertThat(actualAdapter).isSameAs(expectedAdapter);
+-
+-    verify(factory).fromResponseBody(type, annotations);
+-    verifyNoMoreInteractions(factory);
+-  }
+-
+-  @Test public void responseConverterFactoryNoMatchThrows() {
+-    Type type = String.class;
+-    Annotation[] annotations = new Annotation[0];
+-
+-    Converter.Factory factory1 = spy(new Converter.Factory() {
+-      @Override
+-      public Converter<ResponseBody, ?> fromResponseBody(Type returnType, Annotation[] annotations) {
+-        return null;
+-      }
+-    });
+-
+-    Retrofit retrofit = new Retrofit.Builder()
+-        .baseUrl("http://example.com/")
+-        .addConverterFactory(factory1)
+-        .build();
+-
+-    try {
+-      retrofit.responseConverter(type, annotations);
+-    } catch (IllegalArgumentException e) {
+-      assertThat(e).hasMessageStartingWith(
+-          "Could not locate ResponseBody converter for class java.lang.String. Tried:");
+-    }
+-
+-    verify(factory1).fromResponseBody(type, annotations);
+-    verifyNoMoreInteractions(factory1);
+-  }
+-
+   @Test public void converterFactoryPropagated() {
+     Converter.Factory factory = mock(Converter.Factory.class);
+     Retrofit retrofit = new Retrofit.Builder()
+@@ -798,6 +702,7 @@ public final class RetrofitTest {
+               "Could not locate call adapter for class java.lang.String. Tried:");
+     }
+ 
++
+     verify(factory1).get(type, annotations, retrofit);
+     verifyNoMoreInteractions(factory1);
+   }

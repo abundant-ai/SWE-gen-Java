@@ -1,0 +1,117 @@
+diff --git a/okhttp/src/main/kotlin/okhttp3/MultipartReader.kt b/okhttp/src/main/kotlin/okhttp3/MultipartReader.kt
+index 6f100eb23..a1d7375b1 100644
+--- a/okhttp/src/main/kotlin/okhttp3/MultipartReader.kt
++++ b/okhttp/src/main/kotlin/okhttp3/MultipartReader.kt
+@@ -19,6 +19,7 @@ import java.io.Closeable
+ import java.io.IOException
+ import java.net.ProtocolException
+ import okhttp3.internal.http1.HeadersReader
++import okhttp3.internal.limit
+ import okio.Buffer
+ import okio.BufferedSource
+ import okio.ByteString.Companion.encodeUtf8
+@@ -175,10 +176,14 @@ class MultipartReader @Throws(IOException::class) constructor(
+    * one byte left to read.
+    */
+   private fun currentPartBytesRemaining(maxResult: Long): Long {
+-    source.require(crlfDashDashBoundary.size.toLong())
+-
+-    return when (val delimiterIndex = source.buffer.indexOf(crlfDashDashBoundary)) {
+-      -1L -> minOf(maxResult, source.buffer.size - crlfDashDashBoundary.size + 1)
++    // Avoid indexOf scanning repeatedly over the entire source by using limit
++    // Since maxResult could be midway through the boundary, read further to be safe.
++    val limitSource = source.peek().limit(maxResult + crlfDashDashBoundary.size).buffer()
++    limitSource.require(crlfDashDashBoundary.size.toLong())
++
++    val delimiterIndex = limitSource.buffer.indexOf(crlfDashDashBoundary)
++    return when (delimiterIndex) {
++      -1L -> minOf(maxResult, limitSource.buffer.size - crlfDashDashBoundary.size + 1)
+       else -> minOf(maxResult, delimiterIndex)
+     }
+   }
+diff --git a/okhttp/src/main/kotlin/okhttp3/internal/FixedLengthSource.kt b/okhttp/src/main/kotlin/okhttp3/internal/FixedLengthSource.kt
+new file mode 100644
+index 000000000..16126b91b
+--- /dev/null
++++ b/okhttp/src/main/kotlin/okhttp3/internal/FixedLengthSource.kt
+@@ -0,0 +1,80 @@
++/*
++ * Copyright (C) 2024 Square, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package okhttp3.internal
++
++import kotlin.jvm.JvmOverloads
++import okio.Buffer
++import okio.ForwardingSource
++import okio.Source
++
++/**
++ * Return a new [Source] whose [read function][Source.read] returns -1 after [byteCount]
++ * bytes have been read.
++ *
++ * @param onReadExhausted Callback invoked once when the end of bytes has been reached. It receives
++ * `true` if the end of bytes was because the underlying stream did not contain enough bytes and
++ * `false` if [byteCount] bytes were successfully read.
++ */
++@JvmOverloads
++internal fun Source.limit(
++  byteCount: Long,
++  onReadExhausted: (eof: Boolean) -> Unit = {},
++): Source {
++  require(byteCount >= 0) { "byteCount < 0: $byteCount" }
++  return FixedLengthSource(this, byteCount, onReadExhausted, truncate = true)
++}
++
++internal class FixedLengthSource(
++  delegate: Source,
++  private var bytesRemaining: Long,
++  onReadExhausted: (eof: Boolean) -> Unit,
++  private val truncate: Boolean,
++) : ForwardingSource(delegate) {
++  /** `null` once invoked. */
++  private var onReadExhausted: ((eof: Boolean) -> Unit)? = onReadExhausted
++
++  override fun read(
++    sink: Buffer,
++    byteCount: Long,
++  ): Long {
++    val requestBytes =
++      if (truncate) {
++        if (bytesRemaining == 0L) {
++          // If the limit was 0 we want to wait until the first call to this function before
++          // triggering the callback.
++          onReadExhausted?.invoke(false)
++          onReadExhausted = null
++          return -1L
++        }
++        minOf(bytesRemaining, byteCount)
++      } else {
++        byteCount
++      }
++    val readBytes = super.read(sink, requestBytes)
++    if (readBytes == -1L) {
++      onReadExhausted!!(true)
++      onReadExhausted = null
++      return -1L
++    }
++    bytesRemaining -= readBytes
++    if (bytesRemaining == 0L) {
++      onReadExhausted!!(false)
++      onReadExhausted = null
++    }
++    return readBytes
++  }
++}

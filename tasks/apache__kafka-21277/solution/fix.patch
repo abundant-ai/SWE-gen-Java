@@ -1,0 +1,139 @@
+diff --git a/docs/configuration/tiered-storage-configs.md b/docs/configuration/tiered-storage-configs.md
+index ad1e6f43d0..ac6041b660 100644
+--- a/docs/configuration/tiered-storage-configs.md
++++ b/docs/configuration/tiered-storage-configs.md
+@@ -43,6 +43,9 @@ Additional configurations can be provided for different types of clients using t
+     
+     # Configs for admin, producer, and consumer clients
+     <rlmm.prefix>.remote.log.metadata.common.client.<kafka.property> = <value>
++
++    # Configs only for admin client
++    <rlmm.prefix>.remote.log.metadata.admin.<kafka.property> = <value>
+     
+     # Configs only for producer client
+     <rlmm.prefix>.remote.log.metadata.producer.<kafka.property> = <value>
+diff --git a/docs/getting-started/upgrade.md b/docs/getting-started/upgrade.md
+index ae13bbed58..674034b6a6 100644
+--- a/docs/getting-started/upgrade.md
++++ b/docs/getting-started/upgrade.md
+@@ -35,7 +35,7 @@ type: docs
+   * Support dynamically changing configs for dynamic quorum controllers. Previously only brokers and static quorum controllers were supported. For further details, please refer to [KAFKA-18928](https://issues.apache.org/jira/browse/KAFKA-18928). 
+   * Two new configs have been introduced: `group.coordinator.cached.buffer.max.bytes` and `share.coordinator.cached.buffer.max.bytes`. They allow the respective coordinators to set the maximum buffer size retained for reuse. For further details, please refer to [KIP-1196](https://cwiki.apache.org/confluence/x/hA5JFg). 
+   * The new config have been introduced: `remote.log.metadata.topic.min.isr` with 2 as default value. You can correct the min.insync.replicas for the existed __remote_log_metadata topic via kafka-configs.sh if needed. For further details, please refer to [KIP-1235](https://cwiki.apache.org/confluence/x/yommFw).
+-
++  * The new config prefix `remote.log.metadata.admin.` has been introduced. It allows independent configuration of the admin client used by `TopicBasedRemoteLogMetadataManager`. For further details, please refer to [KIP-1208](https://cwiki.apache.org/confluence/x/vYqhFg).
+ 
+ ## Upgrading to 4.2.0
+ 
+diff --git a/storage/src/main/java/org/apache/kafka/server/log/remote/metadata/storage/TopicBasedRemoteLogMetadataManager.java b/storage/src/main/java/org/apache/kafka/server/log/remote/metadata/storage/TopicBasedRemoteLogMetadataManager.java
+index cd2ed67421..00f20fb4f1 100644
+--- a/storage/src/main/java/org/apache/kafka/server/log/remote/metadata/storage/TopicBasedRemoteLogMetadataManager.java
++++ b/storage/src/main/java/org/apache/kafka/server/log/remote/metadata/storage/TopicBasedRemoteLogMetadataManager.java
+@@ -323,7 +323,7 @@ public class TopicBasedRemoteLogMetadataManager implements BrokerReadyCallback,
+         boolean isTopicCreated = false;
+         long startTimeMs = time.milliseconds();
+         boolean initializationFailed = false;
+-        try (Admin admin = Admin.create(rlmmConfig.commonProperties())) {
++        try (Admin admin = Admin.create(rlmmConfig.adminProperties())) {
+             while (!(initialized.get() || closing.get() || initializationFailed)) {
+                 if (time.milliseconds() - startTimeMs > retryMaxTimeoutMs) {
+                     log.error("Timed out to initialize the resources within {} ms.", retryMaxTimeoutMs);
+diff --git a/storage/src/main/java/org/apache/kafka/server/log/remote/metadata/storage/TopicBasedRemoteLogMetadataManagerConfig.java b/storage/src/main/java/org/apache/kafka/server/log/remote/metadata/storage/TopicBasedRemoteLogMetadataManagerConfig.java
+index 52f934ce29..29f117cd54 100644
+--- a/storage/src/main/java/org/apache/kafka/server/log/remote/metadata/storage/TopicBasedRemoteLogMetadataManagerConfig.java
++++ b/storage/src/main/java/org/apache/kafka/server/log/remote/metadata/storage/TopicBasedRemoteLogMetadataManagerConfig.java
+@@ -80,6 +80,7 @@ public final class TopicBasedRemoteLogMetadataManagerConfig {
+     public static final String REMOTE_LOG_METADATA_COMMON_CLIENT_PREFIX = "remote.log.metadata.common.client.";
+     public static final String REMOTE_LOG_METADATA_PRODUCER_PREFIX = "remote.log.metadata.producer.";
+     public static final String REMOTE_LOG_METADATA_CONSUMER_PREFIX = "remote.log.metadata.consumer.";
++    public static final String REMOTE_LOG_METADATA_ADMIN_PREFIX = "remote.log.metadata.admin.";
+     public static final String BROKER_ID = "broker.id";
+     public static final String LOG_DIR = "log.dir";
+ 
+@@ -118,6 +119,7 @@ public final class TopicBasedRemoteLogMetadataManagerConfig {
+     private Map<String, Object> commonProps;
+     private Map<String, Object> consumerProps;
+     private Map<String, Object> producerProps;
++    private Map<String, Object> adminProps;
+ 
+     public TopicBasedRemoteLogMetadataManagerConfig(Map<String, ?> props) {
+         Objects.requireNonNull(props, "props can not be null");
+@@ -137,13 +139,14 @@ public final class TopicBasedRemoteLogMetadataManagerConfig {
+         initializationRetryIntervalMs = (long) parsedConfigs.get(REMOTE_LOG_METADATA_INITIALIZATION_RETRY_INTERVAL_MS_PROP);
+         initializationRetryMaxTimeoutMs = (long) parsedConfigs.get(REMOTE_LOG_METADATA_INITIALIZATION_RETRY_MAX_TIMEOUT_MS_PROP);
+         clientIdPrefix = REMOTE_LOG_METADATA_CLIENT_PREFIX + "_" + props.get(BROKER_ID);
+-        initializeProducerConsumerProperties(props);
++        initializeClientProperties(props);
+     }
+ 
+-    private void initializeProducerConsumerProperties(Map<String, ?> configs) {
++    private void initializeClientProperties(Map<String, ?> configs) {
+         Map<String, Object> commonClientConfigs = new HashMap<>();
+         Map<String, Object> producerOnlyConfigs = new HashMap<>();
+         Map<String, Object> consumerOnlyConfigs = new HashMap<>();
++        Map<String, Object> adminOnlyConfigs = new HashMap<>();
+         for (Map.Entry<String, ?> entry : configs.entrySet()) {
+             String key = entry.getKey();
+             if (key.startsWith(REMOTE_LOG_METADATA_COMMON_CLIENT_PREFIX)) {
+@@ -152,6 +155,8 @@ public final class TopicBasedRemoteLogMetadataManagerConfig {
+                 producerOnlyConfigs.put(key.substring(REMOTE_LOG_METADATA_PRODUCER_PREFIX.length()), entry.getValue());
+             } else if (key.startsWith(REMOTE_LOG_METADATA_CONSUMER_PREFIX)) {
+                 consumerOnlyConfigs.put(key.substring(REMOTE_LOG_METADATA_CONSUMER_PREFIX.length()), entry.getValue());
++            } else if (key.startsWith(REMOTE_LOG_METADATA_ADMIN_PREFIX)) {
++                adminOnlyConfigs.put(key.substring(REMOTE_LOG_METADATA_ADMIN_PREFIX.length()), entry.getValue());
+             }
+         }
+         commonProps = new HashMap<>(commonClientConfigs);
+@@ -161,6 +166,9 @@ public final class TopicBasedRemoteLogMetadataManagerConfig {
+         Map<String, Object> allConsumerConfigs = new HashMap<>(commonClientConfigs);
+         allConsumerConfigs.putAll(consumerOnlyConfigs);
+         consumerProps = createConsumerProps(allConsumerConfigs);
++        Map<String, Object> allAdminConfigs = new HashMap<>(commonClientConfigs);
++        allAdminConfigs.putAll(adminOnlyConfigs);
++        adminProps = createAdminProps(allAdminConfigs);
+     }
+ 
+     public String remoteLogMetadataTopicName() {
+@@ -199,6 +207,7 @@ public final class TopicBasedRemoteLogMetadataManagerConfig {
+         return logDir;
+     }
+ 
++    // Used for testing
+     public Map<String, Object> commonProperties() {
+         return commonProps;
+     }
+@@ -211,6 +220,10 @@ public final class TopicBasedRemoteLogMetadataManagerConfig {
+         return producerProps;
+     }
+ 
++    public Map<String, Object> adminProperties() {
++        return adminProps;
++    }
++
+     private Map<String, Object> createConsumerProps(Map<String, Object> allConsumerConfigs) {
+         Map<String, Object> props = new HashMap<>(allConsumerConfigs);
+         props.put(CommonClientConfigs.CLIENT_ID_CONFIG, clientIdPrefix + "_consumer");
+@@ -232,6 +245,12 @@ public final class TopicBasedRemoteLogMetadataManagerConfig {
+         return Collections.unmodifiableMap(props);
+     }
+ 
++    private Map<String, Object> createAdminProps(Map<String, Object> allAdminConfigs) {
++        Map<String, Object> props = new HashMap<>(allAdminConfigs);
++        props.put(AdminClientConfig.CLIENT_ID_CONFIG, clientIdPrefix + "_admin");
++        return Collections.unmodifiableMap(props);
++    }
++
+     @Override
+     public String toString() {
+         return "TopicBasedRemoteLogMetadataManagerConfig{" +
+@@ -243,9 +262,9 @@ public final class TopicBasedRemoteLogMetadataManagerConfig {
+                 ", metadataTopicMinIsr=" + metadataTopicMinIsr +
+                 ", initializationRetryMaxTimeoutMs=" + initializationRetryMaxTimeoutMs +
+                 ", initializationRetryIntervalMs=" + initializationRetryIntervalMs +
+-                ", commonProps=" + configMapToRedactedString(commonProps, AdminClientConfig.configDef()) +
+                 ", consumerProps=" + configMapToRedactedString(consumerProps, ConsumerConfig.configDef()) +
+                 ", producerProps=" + configMapToRedactedString(producerProps, ProducerConfig.configDef()) +
++                ", adminProps=" + configMapToRedactedString(adminProps, AdminClientConfig.configDef()) +
+                 '}';
+     }
+ 

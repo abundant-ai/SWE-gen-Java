@@ -1,0 +1,809 @@
+diff --git a/pom.xml b/pom.xml
+index 439fd2ff..51f82032 100644
+--- a/pom.xml
++++ b/pom.xml
+@@ -53,7 +53,7 @@
+     <okhttp.version>2.5.0-SNAPSHOT</okhttp.version>
+ 
+     <!-- Adapter Dependencies -->
+-    <rxjava.version>1.0.13</rxjava.version>
++    <rxjava.version>1.0.10</rxjava.version>
+ 
+     <!-- Converter Dependencies -->
+     <gson.version>2.3.1</gson.version>
+diff --git a/retrofit-adapters/rxjava-mock/src/main/java/retrofit/mock/RxJavaBehaviorAdapter.java b/retrofit-adapters/rxjava-mock/src/main/java/retrofit/mock/ObservableBehaviorAdapter.java
+similarity index 54%
+rename from retrofit-adapters/rxjava-mock/src/main/java/retrofit/mock/RxJavaBehaviorAdapter.java
+rename to retrofit-adapters/rxjava-mock/src/main/java/retrofit/mock/ObservableBehaviorAdapter.java
+index 054c5556..3fd67a6c 100644
+--- a/retrofit-adapters/rxjava-mock/src/main/java/retrofit/mock/RxJavaBehaviorAdapter.java
++++ b/retrofit-adapters/rxjava-mock/src/main/java/retrofit/mock/ObservableBehaviorAdapter.java
+@@ -20,29 +20,15 @@ import rx.functions.Func1;
+ 
+ import static java.util.concurrent.TimeUnit.MILLISECONDS;
+ 
+-public final class RxJavaBehaviorAdapter implements NetworkBehavior.Adapter<Object> {
+-  public static RxJavaBehaviorAdapter create() {
+-    return new RxJavaBehaviorAdapter();
++public final class ObservableBehaviorAdapter implements BehaviorAdapter<Observable<?>> {
++  public static ObservableBehaviorAdapter create() {
++    return new ObservableBehaviorAdapter();
+   }
+ 
+-  private RxJavaBehaviorAdapter() {
++  private ObservableBehaviorAdapter() {
+   }
+ 
+-  @Override public Object applyBehavior(NetworkBehavior behavior, Object value) {
+-    if (value instanceof Observable) {
+-      return applyObservableBehavior(behavior, (Observable<?>) value);
+-    }
+-    String name = value.getClass().getCanonicalName();
+-    if ("rx.Single".equals(name)) {
+-      // Apply behavior to the Single from a separate class. This defers classloading such that
+-      // regular Observable operation can be leveraged without relying on this unstable RxJava API.
+-      return SingleHelper.applySingleBehavior(behavior, value);
+-    }
+-    throw new IllegalStateException("Unsupported type " + name);
+-  }
+-
+-  public Observable<?> applyObservableBehavior(final NetworkBehavior behavior,
+-      final Observable<?> value) {
++  @Override public Observable<?> applyBehavior(final Behavior behavior, final Observable<?> value) {
+     return Observable.timer(behavior.calculateDelay(MILLISECONDS), MILLISECONDS)
+         .flatMap(new Func1<Long, Observable<?>>() {
+           @Override public Observable<?> call(Long ignored) {
+diff --git a/retrofit-adapters/rxjava/src/main/java/retrofit/ObservableCallAdapterFactory.java b/retrofit-adapters/rxjava/src/main/java/retrofit/ObservableCallAdapterFactory.java
+new file mode 100644
+index 00000000..9691968b
+--- /dev/null
++++ b/retrofit-adapters/rxjava/src/main/java/retrofit/ObservableCallAdapterFactory.java
+@@ -0,0 +1,180 @@
++/*
++ * Copyright (C) 2015 Square, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package retrofit;
++
++import java.lang.reflect.ParameterizedType;
++import java.lang.reflect.Type;
++import rx.Observable;
++import rx.Subscriber;
++import rx.functions.Action0;
++import rx.functions.Func1;
++import rx.subscriptions.Subscriptions;
++
++/**
++ * TODO docs
++ */
++public final class ObservableCallAdapterFactory implements CallAdapter.Factory {
++  /**
++   * TODO
++   */
++  public static ObservableCallAdapterFactory create() {
++    return new ObservableCallAdapterFactory();
++  }
++
++  private ObservableCallAdapterFactory() {
++  }
++
++  @Override public CallAdapter<?> get(Type returnType) {
++    if (Utils.getRawType(returnType) != Observable.class) {
++      return null;
++    }
++    if (!(returnType instanceof ParameterizedType)) {
++      throw new IllegalStateException("Observable return type must be parameterized"
++          + " as Observable<Foo> or Observable<? extends Foo>");
++    }
++
++    Type observableType = Utils.getSingleParameterUpperBound((ParameterizedType) returnType);
++    Class<?> rawObservableType = Utils.getRawType(observableType);
++
++    if (rawObservableType == Response.class) {
++      if (!(observableType instanceof ParameterizedType)) {
++        throw new IllegalStateException("Response must be parameterized"
++            + " as Response<Foo> or Response<? extends Foo>");
++      }
++      Type responseType = Utils.getSingleParameterUpperBound((ParameterizedType) observableType);
++      return new ResponseCallAdapter<>(responseType);
++    }
++
++    if (rawObservableType == Result.class) {
++      if (!(observableType instanceof ParameterizedType)) {
++        throw new IllegalStateException("Result must be parameterized"
++            + " as Result<Foo> or Result<? extends Foo>");
++      }
++      Type responseType = Utils.getSingleParameterUpperBound((ParameterizedType) observableType);
++      return new ResultCallAdapter<>(responseType);
++    }
++
++    return new SimpleCallAdapter(observableType);
++  }
++
++  static final class CallOnSubscribe<T> implements Observable.OnSubscribe<Response<T>> {
++    private final Call<T> originalCall;
++
++    private CallOnSubscribe(Call<T> originalCall) {
++      this.originalCall = originalCall;
++    }
++
++    @Override public void call(final Subscriber<? super Response<T>> subscriber) {
++      // Since Call is a one-shot type, clone it for each new subscriber.
++      final Call<T> call = originalCall.clone();
++
++      // Attempt to cancel the call if it is still in-flight on unsubscription.
++      subscriber.add(Subscriptions.create(new Action0() {
++        @Override public void call() {
++          call.cancel();
++        }
++      }));
++
++      call.enqueue(new Callback<T>() {
++        @Override public void onResponse(Response<T> response) {
++          if (subscriber.isUnsubscribed()) {
++            return;
++          }
++          try {
++            subscriber.onNext(response);
++          } catch (Throwable t) {
++            subscriber.onError(t);
++            return;
++          }
++          subscriber.onCompleted();
++        }
++
++        @Override public void onFailure(Throwable t) {
++          if (subscriber.isUnsubscribed()) {
++            return;
++          }
++          subscriber.onError(t);
++        }
++      });
++    }
++  }
++
++  static final class ResponseCallAdapter<T> implements CallAdapter<T> {
++    private final Type responseType;
++
++    ResponseCallAdapter(Type responseType) {
++      this.responseType = responseType;
++    }
++
++    @Override public Type responseType() {
++      return responseType;
++    }
++
++    @Override public Observable<Response<T>> adapt(Call<T> call) {
++      return Observable.create(new CallOnSubscribe<>(call));
++    }
++  }
++
++  static final class SimpleCallAdapter<T> implements CallAdapter<T> {
++    private final Type responseType;
++
++    SimpleCallAdapter(Type responseType) {
++      this.responseType = responseType;
++    }
++
++    @Override public Type responseType() {
++      return responseType;
++    }
++
++    @Override public Observable<T> adapt(Call<T> call) {
++      return Observable.create(new CallOnSubscribe<>(call)) //
++          .flatMap(new Func1<Response<T>, Observable<T>>() {
++            @Override public Observable<T> call(Response<T> response) {
++              if (response.isSuccess()) {
++                return Observable.just(response.body());
++              }
++              return Observable.error(new HttpException(response));
++            }
++          });
++    }
++  }
++
++  static final class ResultCallAdapter<T> implements CallAdapter<T> {
++    private final Type responseType;
++
++    ResultCallAdapter(Type responseType) {
++      this.responseType = responseType;
++    }
++
++    @Override public Type responseType() {
++      return responseType;
++    }
++
++    @Override public Observable<Result<T>> adapt(Call<T> call) {
++      return Observable.create(new CallOnSubscribe<>(call)) //
++          .map(new Func1<Response<T>, Result<T>>() {
++            @Override public Result<T> call(Response<T> response) {
++              return Result.response(response);
++            }
++          })
++          .onErrorReturn(new Func1<Throwable, Result<T>>() {
++            @Override public Result<T> call(Throwable throwable) {
++              return Result.error(throwable);
++            }
++          });
++    }
++  }
++}
+diff --git a/retrofit-mock/src/main/java/retrofit/mock/Behavior.java b/retrofit-mock/src/main/java/retrofit/mock/Behavior.java
+new file mode 100644
+index 00000000..713561c5
+--- /dev/null
++++ b/retrofit-mock/src/main/java/retrofit/mock/Behavior.java
+@@ -0,0 +1,122 @@
++/*
++ * Copyright (C) 2013 Square, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package retrofit.mock;
++
++import java.io.IOException;
++import java.util.Random;
++import java.util.concurrent.TimeUnit;
++
++import static java.util.concurrent.TimeUnit.MILLISECONDS;
++
++public final class Behavior {
++  private static final int DEFAULT_DELAY_MS = 2000; // Network calls will take 2 seconds.
++  private static final int DEFAULT_VARIANCE_PERCENT = 40; // Network delay varies by ±40%.
++  private static final int DEFAULT_FAILURE_PERCENT = 3; // 3% of network calls will fail.
++
++  public static Behavior create() {
++    return new Behavior(new Random());
++  }
++
++  public static Behavior create(Random random) {
++    return new Behavior(random);
++  }
++
++  private final Random random;
++
++  private volatile long delayMs = DEFAULT_DELAY_MS;
++  private volatile int variancePercent = DEFAULT_VARIANCE_PERCENT;
++  private volatile int failurePercent = DEFAULT_FAILURE_PERCENT;
++  private volatile IOException failureException = new IOException("Mock failure!");
++
++  private Behavior(Random random) {
++    this.random = random;
++  }
++
++  /** Set the network round trip delay. */
++  public void setDelay(long amount, TimeUnit unit) {
++    if (amount < 0) {
++      throw new IllegalArgumentException("Amount must be positive value.");
++    }
++    this.delayMs = unit.toMillis(amount);
++  }
++
++  /** The network round trip delay. */
++  public long delay(TimeUnit unit) {
++    return MILLISECONDS.convert(delayMs, unit);
++  }
++
++  /** Set the plus-or-minus variance percentage of the network round trip delay. */
++  public void setVariancePercent(int variancePercent) {
++    if (variancePercent < 0 || variancePercent > 100) {
++      throw new IllegalArgumentException("Variance percentage must be between 0 and 100.");
++    }
++    this.variancePercent = variancePercent;
++  }
++
++  /** The plus-or-minus variance percentage of the network round trip delay. */
++  public int variancePercent() {
++    return variancePercent;
++  }
++
++  /** Set the percentage of calls to {@link #calculateIsFailure()} that return {@code true}. */
++  public void setFailurePercent(int failurePercent) {
++    if (failurePercent < 0 || failurePercent > 100) {
++      throw new IllegalArgumentException("Failure percentage must be between 0 and 100.");
++    }
++    this.failurePercent = failurePercent;
++  }
++
++  /** The percentage of calls to {@link #calculateIsFailure()} that return {@code true}. */
++  public int failurePercent() {
++    return failurePercent;
++  }
++
++  /** Set the exception to be used when a failure is triggered. */
++  public void setFailureException(IOException exception) {
++    if (exception == null) {
++      throw new NullPointerException("exception == null");
++    }
++    this.failureException = exception;
++  }
++
++  /** The exception to be used when a failure is triggered. */
++  public IOException failureException() {
++    return failureException;
++  }
++
++  /**
++   * Randomly determine whether this call should result in a network failure in accordance with
++   * configured behavior. When true, {@link #failureException()} should be thrown.
++   */
++  public boolean calculateIsFailure() {
++    int randomValue = random.nextInt(100);
++    return randomValue < failurePercent;
++  }
++
++  /**
++   * Get the delay that should be used for delaying a response in accordance with configured
++   * behavior.
++   */
++  public long calculateDelay(TimeUnit unit) {
++    float delta = variancePercent / 100f; // e.g., 20 / 100f == 0.2f
++    float lowerBound = 1f - delta; // 0.2f --> 0.8f
++    float upperBound = 1f + delta; // 0.2f --> 1.2f
++    float bound = upperBound - lowerBound; // 1.2f - 0.8f == 0.4f
++    float delayPercent = lowerBound + (random.nextFloat() * bound); // 0.8 + (rnd * 0.4)
++    long callDelayMs = (long) (delayMs * delayPercent);
++    return MILLISECONDS.convert(callDelayMs, unit);
++  }
++}
+diff --git a/retrofit-mock/src/main/java/retrofit/mock/BehaviorAdapter.java b/retrofit-mock/src/main/java/retrofit/mock/BehaviorAdapter.java
+new file mode 100644
+index 00000000..5dde8b58
+--- /dev/null
++++ b/retrofit-mock/src/main/java/retrofit/mock/BehaviorAdapter.java
+@@ -0,0 +1,20 @@
++/*
++ * Copyright (C) 2015 Square, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package retrofit.mock;
++
++public interface BehaviorAdapter<T> {
++  T applyBehavior(Behavior behavior, T value);
++}
+diff --git a/retrofit-mock/src/main/java/retrofit/mock/BehaviorCall.java b/retrofit-mock/src/main/java/retrofit/mock/BehaviorCall.java
+index 6857cdc8..2e3bce2a 100644
+--- a/retrofit-mock/src/main/java/retrofit/mock/BehaviorCall.java
++++ b/retrofit-mock/src/main/java/retrofit/mock/BehaviorCall.java
+@@ -29,7 +29,7 @@ import retrofit.Response;
+ import static java.util.concurrent.TimeUnit.MILLISECONDS;
+ 
+ final class BehaviorCall<T> implements Call<T> {
+-  private final NetworkBehavior behavior;
++  private final Behavior behavior;
+   private final ExecutorService backgroundExecutor;
+   private final Executor callbackExecutor;
+   private final Call<T> delegate;
+@@ -38,8 +38,8 @@ final class BehaviorCall<T> implements Call<T> {
+   private volatile boolean canceled;
+   private volatile boolean executed;
+ 
+-  BehaviorCall(NetworkBehavior behavior, ExecutorService backgroundExecutor,
+-      Executor callbackExecutor, Call<T> delegate) {
++  BehaviorCall(Behavior behavior, ExecutorService backgroundExecutor, Executor callbackExecutor,
++      Call<T> delegate) {
+     if (callbackExecutor == null) {
+       callbackExecutor = new Executor() {
+         @Override public void execute(Runnable command) {
+diff --git a/retrofit-mock/src/main/java/retrofit/mock/CallBehaviorAdapter.java b/retrofit-mock/src/main/java/retrofit/mock/CallBehaviorAdapter.java
+index 551f706f..e580d107 100644
+--- a/retrofit-mock/src/main/java/retrofit/mock/CallBehaviorAdapter.java
++++ b/retrofit-mock/src/main/java/retrofit/mock/CallBehaviorAdapter.java
+@@ -20,7 +20,7 @@ import java.util.concurrent.ExecutorService;
+ import retrofit.Call;
+ import retrofit.Retrofit;
+ 
+-public final class CallBehaviorAdapter implements NetworkBehavior.Adapter<Call<?>> {
++public final class CallBehaviorAdapter implements BehaviorAdapter<Call<?>> {
+   private final Executor callbackExecutor;
+   private final ExecutorService backgroundExecutor;
+ 
+@@ -34,7 +34,7 @@ public final class CallBehaviorAdapter implements NetworkBehavior.Adapter<Call<?
+     this.backgroundExecutor = backgroundExecutor;
+   }
+ 
+-  @Override public Call<?> applyBehavior(NetworkBehavior behavior, Call<?> value) {
++  @Override public Call<?> applyBehavior(Behavior behavior, Call<?> value) {
+     return new BehaviorCall<>(behavior, backgroundExecutor, callbackExecutor, value);
+   }
+ }
+diff --git a/retrofit-mock/src/main/java/retrofit/mock/MockRetrofit.java b/retrofit-mock/src/main/java/retrofit/mock/MockRetrofit.java
+index 71aaaca6..dcd966c1 100644
+--- a/retrofit-mock/src/main/java/retrofit/mock/MockRetrofit.java
++++ b/retrofit-mock/src/main/java/retrofit/mock/MockRetrofit.java
+@@ -20,12 +20,12 @@ import java.lang.reflect.Method;
+ import java.lang.reflect.Proxy;
+ 
+ public final class MockRetrofit {
+-  private final NetworkBehavior behavior;
+-  private final NetworkBehavior.Adapter<Object> adapter;
++  private final BehaviorAdapter<Object> adapter;
++  private final Behavior behavior;
+ 
+   @SuppressWarnings("unchecked") //
+-  public MockRetrofit(NetworkBehavior behavior, NetworkBehavior.Adapter<?> adapter) {
+-    this.adapter = (NetworkBehavior.Adapter<Object>) adapter;
++  public MockRetrofit(BehaviorAdapter<?> adapter, Behavior behavior) {
++    this.adapter = (BehaviorAdapter<Object>) adapter;
+     this.behavior = behavior;
+   }
+ 
+@@ -39,9 +39,7 @@ public final class MockRetrofit {
+               return method.invoke(this, args);
+             }
+             method.setAccessible(true); // Just In Case™
+-
+-            Object value = method.invoke(instance, args);
+-            return adapter.applyBehavior(behavior, value);
++            return adapter.applyBehavior(behavior, method.invoke(instance, args));
+           }
+         });
+   }
+diff --git a/retrofit/src/main/java/retrofit/Converter.java b/retrofit/src/main/java/retrofit/Converter.java
+index 5df86878..6a82784a 100644
+--- a/retrofit/src/main/java/retrofit/Converter.java
++++ b/retrofit/src/main/java/retrofit/Converter.java
+@@ -20,7 +20,11 @@ import com.squareup.okhttp.ResponseBody;
+ import java.io.IOException;
+ import java.lang.reflect.Type;
+ 
+-/** Convert objects to and from their representation as HTTP bodies. */
++/**
++ * Convert objects to and from their representation as HTTP bodies. Register a converter with
++ * Retrofit using {@link Retrofit.Builder#addConverter(Type, Converter)} or {@link
++ * Retrofit.Builder#addConverterFactory(Factory)}.
++ */
+ public interface Converter<T> {
+   /** Convert an HTTP response body to a concrete object of the specified type. */
+   T fromBody(ResponseBody body) throws IOException;
+diff --git a/retrofit/src/main/java/retrofit/OkHttpCall.java b/retrofit/src/main/java/retrofit/OkHttpCall.java
+index 574ac6fd..28af644c 100644
+--- a/retrofit/src/main/java/retrofit/OkHttpCall.java
++++ b/retrofit/src/main/java/retrofit/OkHttpCall.java
+@@ -45,7 +45,7 @@ final class OkHttpCall<T> implements Call<T> {
+     return new OkHttpCall<>(client, requestFactory, responseConverter, args);
+   }
+ 
+-  @Override public void enqueue(final Callback<T> callback) {
++  public void enqueue(final Callback<T> callback) {
+     synchronized (this) {
+       if (executed) throw new IllegalStateException("Already executed");
+       executed = true;
+diff --git a/retrofit/src/main/java/retrofit/RequestBuilder.java b/retrofit/src/main/java/retrofit/RequestBuilder.java
+index 7828dab0..b620f3aa 100644
+--- a/retrofit/src/main/java/retrofit/RequestBuilder.java
++++ b/retrofit/src/main/java/retrofit/RequestBuilder.java
+@@ -35,7 +35,7 @@ final class RequestBuilder {
+   private HttpUrl.Builder urlBuilder;
+ 
+   private final Request.Builder requestBuilder;
+-  private MediaType contentType;
++  private MediaType mediaType;
+ 
+   private final boolean hasBody;
+   private MultipartBuilder multipartBuilder;
+@@ -43,17 +43,20 @@ final class RequestBuilder {
+   private RequestBody body;
+ 
+   RequestBuilder(String method, HttpUrl baseUrl, String relativeUrl, Headers headers,
+-      MediaType contentType, boolean hasBody, boolean isFormEncoded, boolean isMultipart) {
++      MediaType mediaType, boolean hasBody, boolean isFormEncoded, boolean isMultipart) {
+     this.method = method;
++
+     this.baseUrl = baseUrl;
+     this.relativeUrl = relativeUrl;
+-    this.requestBuilder = new Request.Builder();
+-    this.contentType = contentType;
+-    this.hasBody = hasBody;
+ 
++    Request.Builder requestBuilder = new Request.Builder();
+     if (headers != null) {
+       requestBuilder.headers(headers);
+     }
++    this.requestBuilder = requestBuilder;
++    this.mediaType = mediaType;
++
++    this.hasBody = hasBody;
+ 
+     if (isFormEncoded) {
+       // Will be set to 'body' in 'build'.
+@@ -70,7 +73,7 @@ final class RequestBuilder {
+ 
+   void addHeader(String name, String value) {
+     if ("Content-Type".equalsIgnoreCase(name)) {
+-      contentType = MediaType.parse(value);
++      mediaType = MediaType.parse(value);
+     } else {
+       requestBuilder.addHeader(name, value);
+     }
+@@ -151,12 +154,12 @@ final class RequestBuilder {
+       }
+     }
+ 
+-    MediaType contentType = this.contentType;
+-    if (contentType != null) {
++    MediaType mediaType = this.mediaType;
++    if (mediaType != null) {
+       if (body != null) {
+-        body = new ContentTypeOverridingRequestBody(body, contentType);
++        body = new MediaTypeOverridingRequestBody(body, mediaType);
+       } else {
+-        requestBuilder.addHeader("Content-Type", contentType.toString());
++        requestBuilder.addHeader("Content-Type", mediaType.toString());
+       }
+     }
+ 
+@@ -166,17 +169,17 @@ final class RequestBuilder {
+         .build();
+   }
+ 
+-  private static class ContentTypeOverridingRequestBody extends RequestBody {
++  private static class MediaTypeOverridingRequestBody extends RequestBody {
+     private final RequestBody delegate;
+-    private final MediaType contentType;
++    private final MediaType mediaType;
+ 
+-    ContentTypeOverridingRequestBody(RequestBody delegate, MediaType contentType) {
++    MediaTypeOverridingRequestBody(RequestBody delegate, MediaType mediaType) {
+       this.delegate = delegate;
+-      this.contentType = contentType;
++      this.mediaType = mediaType;
+     }
+ 
+     @Override public MediaType contentType() {
+-      return contentType;
++      return mediaType;
+     }
+ 
+     @Override public long contentLength() throws IOException {
+diff --git a/retrofit/src/main/java/retrofit/RequestFactory.java b/retrofit/src/main/java/retrofit/RequestFactory.java
+index 0e166819..63527aab 100644
+--- a/retrofit/src/main/java/retrofit/RequestFactory.java
++++ b/retrofit/src/main/java/retrofit/RequestFactory.java
+@@ -24,20 +24,20 @@ final class RequestFactory {
+   private final BaseUrl baseUrl;
+   private final String relativeUrl;
+   private final Headers headers;
+-  private final MediaType contentType;
++  private final MediaType mediaType;
+   private final boolean hasBody;
+   private final boolean isFormEncoded;
+   private final boolean isMultipart;
+   private final RequestBuilderAction[] requestBuilderActions;
+ 
+   RequestFactory(String method, BaseUrl baseUrl, String relativeUrl, Headers headers,
+-      MediaType contentType, boolean hasBody, boolean isFormEncoded, boolean isMultipart,
++      MediaType mediaType, boolean hasBody, boolean isFormEncoded, boolean isMultipart,
+       RequestBuilderAction[] requestBuilderActions) {
+     this.method = method;
+     this.baseUrl = baseUrl;
+     this.relativeUrl = relativeUrl;
+     this.headers = headers;
+-    this.contentType = contentType;
++    this.mediaType = mediaType;
+     this.hasBody = hasBody;
+     this.isFormEncoded = isFormEncoded;
+     this.isMultipart = isMultipart;
+@@ -46,7 +46,7 @@ final class RequestFactory {
+ 
+   Request create(Object... args) {
+     RequestBuilder requestBuilder =
+-        new RequestBuilder(method, baseUrl.url(), relativeUrl, headers, contentType, hasBody,
++        new RequestBuilder(method, baseUrl.url(), relativeUrl, headers, mediaType, hasBody,
+             isFormEncoded, isMultipart);
+ 
+     if (args != null) {
+diff --git a/retrofit/src/main/java/retrofit/RequestFactoryParser.java b/retrofit/src/main/java/retrofit/RequestFactoryParser.java
+index d50bede4..91690cfc 100644
+--- a/retrofit/src/main/java/retrofit/RequestFactoryParser.java
++++ b/retrofit/src/main/java/retrofit/RequestFactoryParser.java
+@@ -70,7 +70,7 @@ final class RequestFactoryParser {
+   private boolean isMultipart;
+   private String relativeUrl;
+   private com.squareup.okhttp.Headers headers;
+-  private MediaType contentType;
++  private MediaType mediaType;
+   private RequestBuilderAction[] requestBuilderActions;
+ 
+   private Set<String> relativeUrlParamNames;
+@@ -80,7 +80,7 @@ final class RequestFactoryParser {
+   }
+ 
+   private RequestFactory toRequestFactory(BaseUrl baseUrl) {
+-    return new RequestFactory(httpMethod, baseUrl, relativeUrl, headers, contentType, hasBody,
++    return new RequestFactory(httpMethod, baseUrl, relativeUrl, headers, mediaType, hasBody,
+         isFormEncoded, isMultipart, requestBuilderActions);
+   }
+ 
+@@ -184,7 +184,7 @@ final class RequestFactoryParser {
+       String headerName = header.substring(0, colon);
+       String headerValue = header.substring(colon + 1).trim();
+       if ("Content-Type".equalsIgnoreCase(headerName)) {
+-        contentType = MediaType.parse(headerValue);
++        mediaType = MediaType.parse(headerValue);
+       } else {
+         builder.add(headerName, headerValue);
+       }
+diff --git a/retrofit/src/main/java/retrofit/Retrofit.java b/retrofit/src/main/java/retrofit/Retrofit.java
+index 508d4da9..c28ba592 100644
+--- a/retrofit/src/main/java/retrofit/Retrofit.java
++++ b/retrofit/src/main/java/retrofit/Retrofit.java
+@@ -22,6 +22,7 @@ import com.squareup.okhttp.ResponseBody;
+ import java.lang.reflect.InvocationHandler;
+ import java.lang.reflect.Method;
+ import java.lang.reflect.Proxy;
++import java.lang.reflect.Type;
+ import java.util.ArrayList;
+ import java.util.Collections;
+ import java.util.LinkedHashMap;
+@@ -109,7 +110,7 @@ public final class Retrofit {
+   /** Create an implementation of the API defined by the {@code service} interface. */
+   @SuppressWarnings("unchecked") // Single-interface proxy creation guarded by parameter safety.
+   public <T> T create(Class<T> service) {
+-    Utils.validateServiceInterface(service);
++    Utils.validateServiceClass(service);
+     return (T) Proxy.newProxyInstance(service.getClassLoader(), new Class<?>[] { service },
+         handler);
+   }
+@@ -205,6 +206,21 @@ public final class Retrofit {
+       return this;
+     }
+ 
++    /** Add converter for serialization and deserialization of {@code type}. */
++    public <T> Builder addConverter(final Type type, final Converter<T> converter) {
++      checkNotNull(type, "type == null");
++      checkNotNull(converter, "converter == null");
++      converterFactories.add(new Converter.Factory() {
++        @Override public Converter<?> get(Type candidate) {
++          return candidate.equals(type) ? converter : null;
++        }
++        @Override public String toString() {
++          return "ConverterFactory(type=" + type + ",converter=" + converter + ")";
++        }
++      });
++      return this;
++    }
++
+     /** Add converter factory for serialization and deserialization of objects. */
+     public Builder addConverterFactory(Converter.Factory converterFactory) {
+       converterFactories.add(checkNotNull(converterFactory, "converterFactory == null"));
+diff --git a/retrofit/src/main/java/retrofit/Utils.java b/retrofit/src/main/java/retrofit/Utils.java
+index b98fb455..0f4b558e 100644
+--- a/retrofit/src/main/java/retrofit/Utils.java
++++ b/retrofit/src/main/java/retrofit/Utils.java
+@@ -94,22 +94,22 @@ final class Utils {
+     }
+ 
+     BufferedSource source = body.source();
+-    Buffer buffer = new Buffer();
++    final Buffer buffer = new Buffer();
+     buffer.writeAll(source);
+     source.close();
+ 
+     return ResponseBody.create(body.contentType(), body.contentLength(), buffer);
+   }
+ 
+-  static <T> void validateServiceInterface(Class<T> service) {
++  static <T> void validateServiceClass(Class<T> service) {
+     if (!service.isInterface()) {
+-      throw new IllegalArgumentException("API declarations must be interfaces.");
++      throw new IllegalArgumentException("Only interface baseUrl definitions are supported.");
+     }
+     // Prevent API interfaces from extending other interfaces. This not only avoids a bug in
+     // Android (http://b.android.com/58753) but it forces composition of API declarations which is
+     // the recommended pattern.
+     if (service.getInterfaces().length > 0) {
+-      throw new IllegalArgumentException("API interfaces must not extend other interfaces.");
++      throw new IllegalArgumentException("Interface definitions must not extend other interfaces.");
+     }
+   }
+ 
+diff --git a/retrofit/src/main/java/retrofit/http/Part.java b/retrofit/src/main/java/retrofit/http/Part.java
+index 154af608..0f591377 100644
+--- a/retrofit/src/main/java/retrofit/http/Part.java
++++ b/retrofit/src/main/java/retrofit/http/Part.java
+@@ -18,7 +18,7 @@ package retrofit.http;
+ import java.lang.annotation.Documented;
+ import java.lang.annotation.Retention;
+ import java.lang.annotation.Target;
+-import retrofit.Retrofit;
++import retrofit.Converter;
+ 
+ import static java.lang.annotation.ElementType.PARAMETER;
+ import static java.lang.annotation.RetentionPolicy.RUNTIME;
+@@ -31,7 +31,7 @@ import static java.lang.annotation.RetentionPolicy.RUNTIME;
+  * <li>If the type is {@link String} the value will also be used directly with a {@code text/plain}
+  * content type.</li>
+  * <li>Other object types will be converted to an appropriate representation by using
+- * {@linkplain Retrofit#converterFactory() a converter}.</li>
++ * {@linkplain Converter a converter}.</li>
+  * </ul>
+  * <p>
+  * Values may be {@code null} which will omit them from the request body.
+diff --git a/retrofit/src/main/java/retrofit/http/PartMap.java b/retrofit/src/main/java/retrofit/http/PartMap.java
+index 512f3545..a8d78844 100644
+--- a/retrofit/src/main/java/retrofit/http/PartMap.java
++++ b/retrofit/src/main/java/retrofit/http/PartMap.java
+@@ -18,7 +18,7 @@ package retrofit.http;
+ import java.lang.annotation.Documented;
+ import java.lang.annotation.Retention;
+ import java.lang.annotation.Target;
+-import retrofit.Retrofit;
++import retrofit.Converter;
+ 
+ import static java.lang.annotation.ElementType.PARAMETER;
+ import static java.lang.annotation.RetentionPolicy.RUNTIME;
+@@ -31,7 +31,7 @@ import static java.lang.annotation.RetentionPolicy.RUNTIME;
+  * <li>If the type is {@link String} the value will also be used directly with a {@code text/plain}
+  * content type.</li>
+  * <li>Other object types will be converted to an appropriate representation by using
+- * {@linkplain Retrofit#converterFactory() a converter}.</li>
++ * {@linkplain Converter a converter}.</li>
+  * </ul>
+  * <p>
+  * <pre>
+diff --git a/samples/src/main/java/com/example/retrofit/SimpleMockService.java b/samples/src/main/java/com/example/retrofit/SimpleMockService.java
+index a591e2be..b05f0084 100644
+--- a/samples/src/main/java/com/example/retrofit/SimpleMockService.java
++++ b/samples/src/main/java/com/example/retrofit/SimpleMockService.java
+@@ -14,10 +14,10 @@ import java.util.concurrent.ExecutorService;
+ import java.util.concurrent.Executors;
+ import retrofit.Call;
+ import retrofit.Retrofit;
++import retrofit.mock.Behavior;
+ import retrofit.mock.CallBehaviorAdapter;
+ import retrofit.mock.Calls;
+ import retrofit.mock.MockRetrofit;
+-import retrofit.mock.NetworkBehavior;
+ 
+ /**
+  * An example of using {@link MockRetrofit} to create a mock service implementation with
+@@ -73,14 +73,14 @@ public final class SimpleMockService {
+         .build();
+ 
+     // Create the Behavior object which manages the fake behavior and the background executor.
+-    NetworkBehavior behavior = NetworkBehavior.create();
++    Behavior behavior = Behavior.create();
+     ExecutorService bg = Executors.newSingleThreadExecutor(new ThreadFactoryBuilder()
+         .setNameFormat("mock-retrofit-%d")
+         .setDaemon(true)
+         .build());
+ 
+     // Create the mock implementation and use MockRetrofit to apply the behavior to it.
+-    MockRetrofit mockRetrofit = new MockRetrofit(behavior, new CallBehaviorAdapter(retrofit, bg));
++    MockRetrofit mockRetrofit = new MockRetrofit(new CallBehaviorAdapter(retrofit, bg), behavior);
+     MockGitHub mockGitHub = new MockGitHub();
+     GitHub gitHub = mockRetrofit.create(GitHub.class, mockGitHub);
+ 

@@ -1,0 +1,11 @@
+When building HTTP requests for interface methods annotated with form encoding, Retrofit’s request construction currently mishandles two related cases: (1) a form-encoded request where there are no fields ends up being treated as having no body (null) instead of an explicit empty form body, and (2) form fields and field maps do not consistently normalize “already encoded” values when specified via parameter annotations.
+
+This causes incorrect behavior for endpoints that require a request body even when there are zero form parameters, and it can also result in double-encoding or inconsistent encoding depending on whether values are supplied via @Field versus @FieldMap and whether the parameter is marked as encoded.
+
+Fix the form body building so that:
+
+If a method is annotated with @FormUrlEncoded and uses a body-capable HTTP method (e.g., POST/PUT/PATCH), the resulting okhttp Request must always include a non-null RequestBody representing an empty application/x-www-form-urlencoded body when there are no @Field or @FieldMap parameters (or when they contribute zero entries at runtime). The request method and URL must remain unchanged; only the body handling should change from “absent” to “present but empty.”
+
+For encoded handling, specifying encoded values via parameter annotations must behave consistently across both @Field and @FieldMap. If a field value is declared as already encoded, Retrofit must ensure it is added to the form body without additional percent-encoding; if it is not declared as encoded, Retrofit must ensure it is encoded exactly once. This normalization must be applied the same way whether the value comes from an individual field or from a map entry.
+
+The public API surface involved includes the form-related annotations (@FormUrlEncoded, @Field, @FieldMap) and the request construction performed by Retrofit’s request builder. After the fix, constructing a Request from a @FormUrlEncoded method should never produce a null body solely because there are no fields, and encoded flags should yield identical on-the-wire form bodies regardless of whether the data is supplied via field parameters or field maps.

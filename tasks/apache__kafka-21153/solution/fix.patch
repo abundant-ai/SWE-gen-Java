@@ -1,0 +1,124 @@
+diff --git a/core/src/main/scala/kafka/server/AbstractFetcherThread.scala b/core/src/main/scala/kafka/server/AbstractFetcherThread.scala
+index 1e8841df0c..62bc936387 100755
+--- a/core/src/main/scala/kafka/server/AbstractFetcherThread.scala
++++ b/core/src/main/scala/kafka/server/AbstractFetcherThread.scala
+@@ -101,6 +101,8 @@ abstract class AbstractFetcherThread(name: String,
+ 
+   protected def endOffsetForEpoch(topicPartition: TopicPartition, epoch: Int): Optional[OffsetAndEpoch]
+ 
++  protected def shouldFetchFromLastTieredOffset(topicPartition: TopicPartition, leaderEndOffset: Long, replicaEndOffset: Long): Boolean
++
+   override def shutdown(): Unit = {
+     initiateShutdown()
+     inLock(partitionMapLock) {
+diff --git a/core/src/main/scala/kafka/server/LocalLeaderEndPoint.scala b/core/src/main/scala/kafka/server/LocalLeaderEndPoint.scala
+index f32d9f8037..852cd85420 100644
+--- a/core/src/main/scala/kafka/server/LocalLeaderEndPoint.scala
++++ b/core/src/main/scala/kafka/server/LocalLeaderEndPoint.scala
+@@ -135,6 +135,34 @@ class LocalLeaderEndPoint(sourceBroker: BrokerEndPoint,
+     new OffsetAndEpoch(localLogStartOffset, epoch.orElse(0))
+   }
+ 
++  override def fetchEarliestPendingUploadOffset(topicPartition: TopicPartition, currentLeaderEpoch: Int): OffsetAndEpoch = {
++    val partition = replicaManager.getPartitionOrException(topicPartition)
++    val log = partition.localLogOrException
++
++    if (!log.remoteLogEnabled()) {
++      new OffsetAndEpoch(-1L, -1)
++    } else {
++      val highestRemoteOffset = log.highestOffsetInRemoteStorage()
++      val logStartOffset = fetchEarliestOffset(topicPartition, currentLeaderEpoch)
++
++      highestRemoteOffset match {
++        case -1L =>
++          val localLogStartOffset = fetchEarliestLocalOffset(topicPartition, currentLeaderEpoch)
++          if (localLogStartOffset.offset() == logStartOffset.offset()) {
++            // No segments have been uploaded yet
++            logStartOffset
++          } else {
++            // Leader currently does not know about the already uploaded segments
++            new OffsetAndEpoch(-1L, -1)
++          }
++        case _ =>
++          val earliestPendingUploadOffset = Math.max(highestRemoteOffset + 1, logStartOffset.offset())
++          val epoch = log.leaderEpochCache.epochForOffset(earliestPendingUploadOffset)
++          new OffsetAndEpoch(earliestPendingUploadOffset, epoch.orElse(0))
++      }
++    }
++  }
++
+   override def fetchEpochEndOffsets(partitions: util.Map[TopicPartition, OffsetForLeaderEpochRequestData.OffsetForLeaderPartition]): util.Map[TopicPartition, EpochEndOffset] = {
+     partitions.asScala.map { case (tp, epochData) =>
+       try {
+diff --git a/core/src/main/scala/kafka/server/RemoteLeaderEndPoint.scala b/core/src/main/scala/kafka/server/RemoteLeaderEndPoint.scala
+index 80d41e3b0c..ba4b1b5173 100644
+--- a/core/src/main/scala/kafka/server/RemoteLeaderEndPoint.scala
++++ b/core/src/main/scala/kafka/server/RemoteLeaderEndPoint.scala
+@@ -105,6 +105,10 @@ class RemoteLeaderEndPoint(logPrefix: String,
+     fetchOffset(topicPartition, currentLeaderEpoch, ListOffsetsRequest.EARLIEST_LOCAL_TIMESTAMP)
+   }
+ 
++  override def fetchEarliestPendingUploadOffset(topicPartition: TopicPartition, currentLeaderEpoch: Int): OffsetAndEpoch = {
++    fetchOffset(topicPartition, currentLeaderEpoch, ListOffsetsRequest.EARLIEST_PENDING_UPLOAD_TIMESTAMP)
++  }
++
+   private def fetchOffset(topicPartition: TopicPartition, currentLeaderEpoch: Int, timestamp: Long): OffsetAndEpoch = {
+     val topic = new ListOffsetsTopic()
+       .setName(topicPartition.topic)
+diff --git a/core/src/main/scala/kafka/server/ReplicaAlterLogDirsThread.scala b/core/src/main/scala/kafka/server/ReplicaAlterLogDirsThread.scala
+index 81bb41100f..7d2e028845 100644
+--- a/core/src/main/scala/kafka/server/ReplicaAlterLogDirsThread.scala
++++ b/core/src/main/scala/kafka/server/ReplicaAlterLogDirsThread.scala
+@@ -68,6 +68,8 @@ class ReplicaAlterLogDirsThread(name: String,
+     replicaMgr.futureLocalLogOrException(topicPartition).endOffsetForEpoch(epoch)
+   }
+ 
++  override protected def shouldFetchFromLastTieredOffset(topicPartition: TopicPartition, leaderEndOffset: Long, replicaEndOffset: Long): Boolean = false
++
+   // process fetched data
+   override def processPartitionData(
+     topicPartition: TopicPartition,
+diff --git a/core/src/main/scala/kafka/server/ReplicaFetcherThread.scala b/core/src/main/scala/kafka/server/ReplicaFetcherThread.scala
+index fa2f6bb7f3..8444704fb1 100644
+--- a/core/src/main/scala/kafka/server/ReplicaFetcherThread.scala
++++ b/core/src/main/scala/kafka/server/ReplicaFetcherThread.scala
+@@ -63,6 +63,17 @@ class ReplicaFetcherThread(name: String,
+     replicaMgr.localLogOrException(topicPartition).endOffsetForEpoch(epoch)
+   }
+ 
++  override protected[server] def shouldFetchFromLastTieredOffset(topicPartition: TopicPartition, leaderEndOffset: Long, replicaEndOffset: Long): Boolean = {
++    val isCompactTopic = replicaMgr.localLog(topicPartition).exists(_.config.compact)
++    val remoteStorageEnabled = replicaMgr.localLog(topicPartition).exists(_.remoteLogEnabled())
++
++    brokerConfig.followerFetchLastTieredOffsetEnable &&
++      remoteStorageEnabled &&
++      !isCompactTopic &&
++      replicaEndOffset == 0 &&
++      leaderEndOffset != 0
++  }
++
+   override def initiateShutdown(): Boolean = {
+     val justShutdown = super.initiateShutdown()
+     if (justShutdown) {
+diff --git a/server/src/main/java/org/apache/kafka/server/LeaderEndPoint.java b/server/src/main/java/org/apache/kafka/server/LeaderEndPoint.java
+index 7a0a3a0703..83d626fa23 100644
+--- a/server/src/main/java/org/apache/kafka/server/LeaderEndPoint.java
++++ b/server/src/main/java/org/apache/kafka/server/LeaderEndPoint.java
+@@ -103,6 +103,17 @@ public interface LeaderEndPoint {
+      */
+     OffsetAndEpoch fetchEarliestLocalOffset(TopicPartition topicPartition, int currentLeaderEpoch);
+ 
++
++    /**
++     * Fetches the earliest offset and epoch that is pending upload for the given topic partition from the leader.
++     *
++     * @param topicPartition     The topic partition for which the earliest pending upload offset is to be fetched.
++     * @param currentLeaderEpoch The current leader epoch of the requesting replica.
++     * @return An OffsetAndEpoch object representing the earliest pending upload offset and its associated epoch
++     * in the leader's topic partition.
++     */
++    OffsetAndEpoch fetchEarliestPendingUploadOffset(TopicPartition topicPartition, int currentLeaderEpoch);
++
+     /**
+      * Builds a fetch request, given a partition map.
+      *

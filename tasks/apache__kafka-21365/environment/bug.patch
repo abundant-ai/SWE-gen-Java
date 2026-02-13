@@ -1,0 +1,573 @@
+diff --git a/streams/integration-tests/src/test/java/org/apache/kafka/streams/integration/KafkaStreamsWrapper.java b/streams/integration-tests/src/test/java/org/apache/kafka/streams/integration/KafkaStreamsWrapper.java
+index 847b7df46a..3178377656 100644
+--- a/streams/integration-tests/src/test/java/org/apache/kafka/streams/integration/KafkaStreamsWrapper.java
++++ b/streams/integration-tests/src/test/java/org/apache/kafka/streams/integration/KafkaStreamsWrapper.java
+@@ -48,11 +48,7 @@ public class KafkaStreamsWrapper extends KafkaStreams {
+     public void setStreamThreadStateListener(final StreamThread.StateListener listener) {
+         if (state == State.CREATED) {
+             for (final StreamThread thread : threads) {
+-                final StreamThread.StateListener originalListener = thread.getStateListener();
+-                thread.setStateListener((t, newState, oldState) -> {
+-                    originalListener.onChange(t, newState, oldState);
+-                    listener.onChange(t, newState, oldState);
+-                });
++                thread.setStateListener(listener);
+             }
+         } else {
+             throw new IllegalStateException("Can only set StateListener in CREATED state. " +
+diff --git a/streams/integration-tests/src/test/java/org/apache/kafka/streams/integration/RebalanceTaskClosureIntegrationTest.java b/streams/integration-tests/src/test/java/org/apache/kafka/streams/integration/RebalanceTaskClosureIntegrationTest.java
+deleted file mode 100644
+index d8acd9fdee..0000000000
+--- a/streams/integration-tests/src/test/java/org/apache/kafka/streams/integration/RebalanceTaskClosureIntegrationTest.java
++++ /dev/null
+@@ -1,244 +0,0 @@
+-/*
+- * Licensed to the Apache Software Foundation (ASF) under one or more
+- * contributor license agreements. See the NOTICE file distributed with
+- * this work for additional information regarding copyright ownership.
+- * The ASF licenses this file to You under the Apache License, Version 2.0
+- * (the "License"); you may not use this file except in compliance with
+- * the License. You may obtain a copy of the License at
+- *
+- *    http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-package org.apache.kafka.streams.integration;
+-
+-import org.apache.kafka.clients.consumer.ConsumerConfig;
+-import org.apache.kafka.common.serialization.LongSerializer;
+-import org.apache.kafka.common.serialization.Serdes;
+-import org.apache.kafka.common.serialization.StringSerializer;
+-import org.apache.kafka.common.utils.Bytes;
+-import org.apache.kafka.common.utils.MockTime;
+-import org.apache.kafka.streams.CloseOptions;
+-import org.apache.kafka.streams.KafkaStreams;
+-import org.apache.kafka.streams.KeyValue;
+-import org.apache.kafka.streams.StreamsConfig;
+-import org.apache.kafka.streams.TopologyWrapper;
+-import org.apache.kafka.streams.integration.utils.EmbeddedKafkaCluster;
+-import org.apache.kafka.streams.integration.utils.IntegrationTestUtils;
+-import org.apache.kafka.streams.processor.StateStore;
+-import org.apache.kafka.streams.processor.StateStoreContext;
+-import org.apache.kafka.streams.processor.internals.StreamThread;
+-import org.apache.kafka.streams.state.KeyValueStore;
+-import org.apache.kafka.streams.state.StoreBuilder;
+-import org.apache.kafka.streams.state.internals.AbstractStoreBuilder;
+-import org.apache.kafka.streams.state.internals.CacheFlushListener;
+-import org.apache.kafka.streams.state.internals.CachedStateStore;
+-import org.apache.kafka.streams.state.internals.RocksDBStore;
+-import org.apache.kafka.test.MockApiProcessorSupplier;
+-import org.apache.kafka.test.TestUtils;
+-
+-import org.junit.jupiter.api.AfterEach;
+-import org.junit.jupiter.api.BeforeEach;
+-import org.junit.jupiter.api.Test;
+-import org.junit.jupiter.api.TestInfo;
+-
+-import java.io.IOException;
+-import java.time.Duration;
+-import java.util.List;
+-import java.util.Properties;
+-import java.util.concurrent.CountDownLatch;
+-import java.util.concurrent.atomic.AtomicInteger;
+-
+-import static org.apache.kafka.streams.utils.TestUtils.safeUniqueTestName;
+-import static org.junit.jupiter.api.Assertions.assertEquals;
+-
+-public class RebalanceTaskClosureIntegrationTest {
+-
+-    private static final int NUM_BROKERS = 1;
+-    protected static final String INPUT_TOPIC_NAME = "input-topic";
+-    private static final int NUM_PARTITIONS = 3;
+-
+-    private final EmbeddedKafkaCluster cluster = new EmbeddedKafkaCluster(NUM_BROKERS);
+-
+-    private KafkaStreamsWrapper streams1;
+-    private KafkaStreamsWrapper streams2;
+-    private String safeTestName;
+-
+-    @BeforeEach
+-    public void before(final TestInfo testInfo) throws InterruptedException, IOException {
+-        cluster.start();
+-        cluster.createTopic(INPUT_TOPIC_NAME, NUM_PARTITIONS, 1);
+-        safeTestName = safeUniqueTestName(testInfo);
+-    }
+-
+-    @AfterEach
+-    public void after() {
+-        cluster.stop();
+-        if (streams1 != null) {
+-            streams1.close(Duration.ofSeconds(30));
+-        }
+-        if (streams2 != null) {
+-            streams2.close(Duration.ofSeconds(30));
+-        }
+-    }
+-
+-    /**
+-     * The conditions that we need to meet:
+-     * <p><ul>
+-     * <li>There is a task with an open store in {@link org.apache.kafka.streams.processor.internals.TasksRegistry#pendingTasksToInit}</li>
+-     * <li>StreamThread gets into PENDING_SHUTDOWN state, so that {@link StreamThread#isStartingRunningOrPartitionAssigned} returns false
+-     * before we call {@link StreamThread#checkStateUpdater} that would move the task to the StateUpdater </li>
+-     * </ul><p>
+-     * If all conditions are met, {@code TaskManager} needs to correctly close the open store during shutdown.
+-     * <p>
+-     * In order to have a task with an open store in the pending task list we first need to have an active task that gets converted
+-     * to a standby one during rebalance(see {@link org.apache.kafka.streams.processor.internals.TaskManager#closeAndRecycleTasks}).
+-     * Second, we need to avoid the second rebalance, to avoid that the pending tasks is closed during such a rebalance, ie, before we enter the shutdown phase.
+-     * <p>
+-     * For that this test:
+-     * <p><ul>
+-     * <li>starts a KS app and waits for it to fully start</li>
+-     * <li>starts another KS app which will trigger reassignment</li>
+-     * <li>waits for {@link CachedStateStore#clearCache} to be called(it's called during task recycle) and locks on it</li>
+-     * <li>sends a message with wrong types to crash the stream thread (this avoids a second rebalance, and enters shutdown directly)</li>
+-     * <li>shutdowns the first KS app</li>
+-     * <li>releases the lock</li>
+-     * </ul><p>
+-     * At this point {@link org.apache.kafka.streams.processor.internals.TaskManager#shutdown} will be called,
+-     * and we will have a pending task to init with an open store(because tasks keep their stores open during recycle).
+-     * <p>
+-     * This test verifies that the open store is closed during shutdown.
+-     */
+-    @Test
+-    public void shouldClosePendingTasksToInitAfterRebalance() throws Exception {
+-        final CountDownLatch recycleLatch = new CountDownLatch(1);
+-        final CountDownLatch pendingShutdownLatch = new CountDownLatch(1);
+-        // Count how many times we initialize and close stores
+-        final AtomicInteger initCount = new AtomicInteger();
+-        final AtomicInteger closeCount = new AtomicInteger();
+-        final StoreBuilder<KeyValueStore<Bytes, byte[]>> storeBuilder = new AbstractStoreBuilder<>("testStateStore", Serdes.Integer(), Serdes.ByteArray(), new MockTime()) {
+-
+-            @Override
+-            public KeyValueStore<Bytes, byte[]> build() {
+-                return new TestRocksDBStore(name, recycleLatch, pendingShutdownLatch, initCount, closeCount);
+-            }
+-        };
+-
+-        final TopologyWrapper topology = new TopologyWrapper();
+-        topology.addSource("ingest", INPUT_TOPIC_NAME);
+-        topology.addProcessor("my-processor", new MockApiProcessorSupplier<>(), "ingest");
+-        topology.addStateStore(storeBuilder, "my-processor");
+-
+-        streams1 = new KafkaStreamsWrapper(topology, props("1"));
+-        streams1.setStreamThreadStateListener((t, newState, oldState) -> {
+-            if (newState == StreamThread.State.PENDING_SHUTDOWN) {
+-                pendingShutdownLatch.countDown();
+-            }
+-        });
+-        streams1.start();
+-
+-        TestUtils.waitForCondition(() -> streams1.state() == KafkaStreams.State.RUNNING, "Streams never reached RUNNING state");
+-
+-        streams2 = new KafkaStreamsWrapper(topology, props("2"));
+-        streams2.start();
+-
+-        TestUtils.waitForCondition(() -> streams2.state() == KafkaStreams.State.RUNNING, "Streams never reached RUNNING state");
+-
+-        // starting the second KS app triggered a rebalance. Which in turn will recycle active tasks that need to become standby.
+-        // That's exactly what we are waiting for
+-        recycleLatch.await();
+-
+-        // sending a message with wrong key and value types to trigger a stream thread failure and avoid the second rebalance
+-        // note that writing this message does not trigger the crash right away -- the thread is still blocked inside `poll()` waiting for the shutdown latch to unlock to complete the previous, still ongoing rebalance
+-        IntegrationTestUtils.produceKeyValuesSynchronously(INPUT_TOPIC_NAME, List.of(new KeyValue<>("key", 1L)),
+-                TestUtils.producerConfig(cluster.bootstrapServers(), StringSerializer.class, LongSerializer.class, new Properties()), cluster.time);
+-        // Now we can close both apps. The StreamThreadStateListener will unblock the clearCache call, letting the rebalance finish.
+-        // After the rebalance finished, the "poison pill" record gets picked up crashing the thread,
+-        // and starting the shutdown directly
+-        // We don't want to let the rebalance finish before we trigger the shutdown, because we want the stream thread to stop before it gets to moving pending tasks from task registry to state updater.
+-        streams1.close(CloseOptions.groupMembershipOperation(CloseOptions.GroupMembershipOperation.LEAVE_GROUP));
+-        streams2.close(CloseOptions.groupMembershipOperation(CloseOptions.GroupMembershipOperation.LEAVE_GROUP));
+-
+-        assertEquals(initCount.get(), closeCount.get());
+-    }
+-
+-    private Properties props(final String storePathSuffix) {
+-        final Properties streamsConfiguration = new Properties();
+-
+-        streamsConfiguration.put(StreamsConfig.APPLICATION_ID_CONFIG, safeTestName);
+-        streamsConfiguration.put(StreamsConfig.BOOTSTRAP_SERVERS_CONFIG, cluster.bootstrapServers());
+-        streamsConfiguration.put(ConsumerConfig.DEFAULT_API_TIMEOUT_MS_CONFIG, 1000);
+-        streamsConfiguration.put(ConsumerConfig.REQUEST_TIMEOUT_MS_CONFIG, 1000);
+-        streamsConfiguration.put(StreamsConfig.STATE_DIR_CONFIG, TestUtils.tempDirectory().getPath() + "/" + storePathSuffix);
+-        streamsConfiguration.put(StreamsConfig.STATESTORE_CACHE_MAX_BYTES_CONFIG, 0);
+-        streamsConfiguration.put(StreamsConfig.COMMIT_INTERVAL_MS_CONFIG, 100L);
+-        streamsConfiguration.put(StreamsConfig.DEFAULT_KEY_SERDE_CLASS_CONFIG, Serdes.LongSerde.class);
+-        streamsConfiguration.put(StreamsConfig.DEFAULT_VALUE_SERDE_CLASS_CONFIG, Serdes.StringSerde.class);
+-        streamsConfiguration.put(StreamsConfig.NUM_STANDBY_REPLICAS_CONFIG, 1);
+-
+-        return streamsConfiguration;
+-    }
+-
+-    private static class TestRocksDBStore extends RocksDBStore implements CachedStateStore<Bytes, byte[]> {
+-
+-        private final CountDownLatch recycleLatch;
+-        private final CountDownLatch pendingShutdownLatch;
+-        private final AtomicInteger initCount;
+-        private final AtomicInteger closeCount;
+-
+-        public TestRocksDBStore(final String name,
+-                                final CountDownLatch recycleLatch,
+-                                final CountDownLatch pendingShutdownLatch,
+-                                final AtomicInteger initCount,
+-                                final AtomicInteger closeCount) {
+-            super(name, "rocksdb");
+-            this.recycleLatch = recycleLatch;
+-            this.pendingShutdownLatch = pendingShutdownLatch;
+-            this.initCount = initCount;
+-            this.closeCount = closeCount;
+-        }
+-
+-        @Override
+-        public void init(final StateStoreContext stateStoreContext,
+-                         final StateStore root) {
+-            initCount.incrementAndGet();
+-            super.init(stateStoreContext, root);
+-        }
+-
+-        @Override
+-        public boolean setFlushListener(final CacheFlushListener<Bytes, byte[]> listener,
+-                                        final boolean sendOldValues) {
+-            return false;
+-        }
+-
+-        @Override
+-        public void flushCache() {
+-        }
+-
+-        @Override
+-        public void clearCache() {
+-            // Clear cache is called during recycle, so we use it as a hook
+-            recycleLatch.countDown();
+-            try {
+-                // after we signaled via recycleLatch, that the task was converted into a "pending task",
+-                // we block the rebalance to complete, until we get the shutdown signal,
+-                // to avoid that the "pending task" get fully initialized
+-                // (otherwise, we don't have a pending task when the shutdown happens)
+-                pendingShutdownLatch.await();
+-            } catch (InterruptedException e) {
+-                throw new RuntimeException(e);
+-            }
+-        }
+-
+-        @Override
+-        public synchronized void close() {
+-            closeCount.incrementAndGet();
+-            super.close();
+-        }
+-    }
+-
+-}
+diff --git a/streams/src/main/java/org/apache/kafka/streams/processor/internals/TaskManager.java b/streams/src/main/java/org/apache/kafka/streams/processor/internals/TaskManager.java
+index 8e6433c009..fdc3256bb0 100644
+--- a/streams/src/main/java/org/apache/kafka/streams/processor/internals/TaskManager.java
++++ b/streams/src/main/java/org/apache/kafka/streams/processor/internals/TaskManager.java
+@@ -1414,20 +1414,10 @@ public class TaskManager {
+         // TODO: change type to `StreamTask`
+         final Set<Task> activeTasks = new TreeSet<>(Comparator.comparing(Task::id));
+         activeTasks.addAll(tasks.activeTasks());
+-        // TODO: change type to `StandbyTask`
+-        final Set<Task> standbyTasks = new TreeSet<>(Comparator.comparing(Task::id));
+-        standbyTasks.addAll(tasks.standbyTasks());
+-
+-        final Set<Task> pendingActiveTasks = tasks.drainPendingActiveTasksToInit();
+-        activeTasks.addAll(pendingActiveTasks);
+-        tasks.addPendingTasksToClose(pendingActiveTasks);
+-        final Set<Task> pendingStandbyTasks = tasks.drainPendingStandbyTasksToInit();
+-        standbyTasks.addAll(pendingStandbyTasks);
+-        tasks.addPendingTasksToClose(pendingStandbyTasks);
+ 
+         executeAndMaybeSwallow(
+             clean,
+-            () -> closeAndCleanUpTasks(activeTasks, standbyTasks, clean),
++            () -> closeAndCleanUpTasks(activeTasks, standbyTaskIterable(), clean),
+             e -> firstException.compareAndSet(null, e),
+             e -> log.warn("Ignoring an exception while unlocking remaining task directories.", e)
+         );
+@@ -1533,7 +1523,7 @@ public class TaskManager {
+                                                       final boolean clean,
+                                                       final AtomicReference<RuntimeException> firstException) {
+         if (!clean) {
+-            return activeTasksToClose;
++            return activeTaskIterable();
+         }
+         final Comparator<Task> byId = Comparator.comparing(Task::id);
+         final Set<Task> tasksToCommit = new TreeSet<>(byId);
+@@ -1591,7 +1581,7 @@ public class TaskManager {
+                 }
+             }
+ 
+-            for (final Task task : activeTasksToClose) {
++            for (final Task task : activeTaskIterable()) {
+                 try {
+                     task.postCommit(true);
+                 } catch (final RuntimeException e) {
+@@ -1626,7 +1616,7 @@ public class TaskManager {
+                                                        final boolean clean,
+                                                        final AtomicReference<RuntimeException> firstException) {
+         if (!clean) {
+-            return standbyTasksToClose;
++            return standbyTaskIterable();
+         }
+         final Set<Task> tasksToCloseDirty = new TreeSet<>(Comparator.comparing(Task::id));
+ 
+diff --git a/streams/src/main/java/org/apache/kafka/streams/processor/internals/Tasks.java b/streams/src/main/java/org/apache/kafka/streams/processor/internals/Tasks.java
+index 4af90d181c..f5d007a591 100644
+--- a/streams/src/main/java/org/apache/kafka/streams/processor/internals/Tasks.java
++++ b/streams/src/main/java/org/apache/kafka/streams/processor/internals/Tasks.java
+@@ -58,7 +58,6 @@ class Tasks implements TasksRegistry {
+     private final Map<TaskId, Set<TopicPartition>> pendingActiveTasksToCreate = new HashMap<>();
+     private final Map<TaskId, Set<TopicPartition>> pendingStandbyTasksToCreate = new HashMap<>();
+     private final Set<Task> pendingTasksToInit = new HashSet<>();
+-    private final Set<Task> pendingTasksToClose = new HashSet<>();
+     private final Set<TaskId> failedTaskIds = new HashSet<>();
+ 
+     // TODO: convert to Stream/StandbyTask when we remove TaskManager#StateMachineTask with mocks
+@@ -125,20 +124,6 @@ class Tasks implements TasksRegistry {
+         return result;
+     }
+ 
+-    @Override
+-    public Set<Task> drainPendingStandbyTasksToInit() {
+-        final Set<Task> result = new HashSet<>();
+-        final Iterator<Task> iterator = pendingTasksToInit.iterator();
+-        while (iterator.hasNext()) {
+-            final Task task = iterator.next();
+-            if (!task.isActive()) {
+-                result.add(task);
+-                iterator.remove();
+-            }
+-        }
+-        return result;
+-    }
+-
+     @Override
+     public Set<Task> pendingTasksToInit() {
+         return Collections.unmodifiableSet(pendingTasksToInit);
+@@ -154,21 +139,6 @@ class Tasks implements TasksRegistry {
+         return !pendingTasksToInit.isEmpty();
+     }
+ 
+-    @Override
+-    public Set<Task> pendingTasksToClose() {
+-        return Collections.unmodifiableSet(pendingTasksToClose);
+-    }
+-
+-    @Override
+-    public void addPendingTasksToClose(final Collection<Task> tasks) {
+-        pendingTasksToClose.addAll(tasks);
+-    }
+-
+-    @Override
+-    public boolean hasPendingTasksToClose() {
+-        return !pendingTasksToClose.isEmpty();
+-    }
+-
+     @Override
+     public void addActiveTasks(final Collection<Task> newTasks) {
+         if (!newTasks.isEmpty()) {
+@@ -223,9 +193,7 @@ class Tasks implements TasksRegistry {
+             throw new IllegalStateException("Attempted to remove a task that is not closed or suspended: " + taskId);
+         }
+ 
+-        if (pendingTasksToClose.contains(taskToRemove)) {
+-            pendingTasksToClose.remove(taskToRemove);
+-        } else if (taskToRemove.isActive()) {
++        if (taskToRemove.isActive()) {
+             if (activeTasksPerId.remove(taskId) == null) {
+                 throw new IllegalArgumentException("Attempted to remove an active task that is not owned: " + taskId);
+             }
+@@ -235,7 +203,7 @@ class Tasks implements TasksRegistry {
+                 throw new IllegalArgumentException("Attempted to remove a standby task that is not owned: " + taskId);
+             }
+         }
+-        failedTaskIds.remove(taskId);
++        failedTaskIds.remove(taskToRemove.id());
+     }
+ 
+     @Override
+@@ -333,11 +301,6 @@ class Tasks implements TasksRegistry {
+         return Collections.unmodifiableCollection(activeTasksPerId.values());
+     }
+ 
+-    @Override
+-    public synchronized Collection<Task> standbyTasks() {
+-        return Collections.unmodifiableCollection(standbyTasksPerId.values());
+-    }
+-
+     /**
+      * All tasks returned by any of the getters are read-only and should NOT be modified;
+      * and the returned task could be modified by other threads concurrently
+diff --git a/streams/src/main/java/org/apache/kafka/streams/processor/internals/TasksRegistry.java b/streams/src/main/java/org/apache/kafka/streams/processor/internals/TasksRegistry.java
+index 6099efb5bc..09c5a79ae0 100644
+--- a/streams/src/main/java/org/apache/kafka/streams/processor/internals/TasksRegistry.java
++++ b/streams/src/main/java/org/apache/kafka/streams/processor/internals/TasksRegistry.java
+@@ -39,20 +39,12 @@ public interface TasksRegistry {
+ 
+     Set<Task> drainPendingActiveTasksToInit();
+ 
+-    Set<Task> drainPendingStandbyTasksToInit();
+-
+     Set<Task> pendingTasksToInit();
+ 
+     void addPendingTasksToInit(final Collection<Task> tasks);
+ 
+     boolean hasPendingTasksToInit();
+ 
+-    Set<Task> pendingTasksToClose();
+-
+-    void addPendingTasksToClose(final Collection<Task> tasks);
+-
+-    boolean hasPendingTasksToClose();
+-
+     void addActiveTasks(final Collection<Task> tasks);
+ 
+     void addStandbyTasks(final Collection<Task> tasks);
+@@ -79,8 +71,6 @@ public interface TasksRegistry {
+ 
+     Collection<Task> activeTasks();
+ 
+-    Collection<Task> standbyTasks();
+-
+     Set<Task> allTasks();
+ 
+     Set<Task> allNonFailedTasks();
+diff --git a/streams/src/test/java/org/apache/kafka/streams/processor/internals/TaskManagerTest.java b/streams/src/test/java/org/apache/kafka/streams/processor/internals/TaskManagerTest.java
+index 86e732185f..798d2d3406 100644
+--- a/streams/src/test/java/org/apache/kafka/streams/processor/internals/TaskManagerTest.java
++++ b/streams/src/test/java/org/apache/kafka/streams/processor/internals/TaskManagerTest.java
+@@ -312,8 +312,12 @@ public class TaskManagerTest {
+         final StreamTask activeTask1 = statefulTask(taskId00, taskId00ChangelogPartitions)
+             .inState(State.RUNNING)
+             .withInputPartitions(taskId00Partitions).build();
++        final StreamTask activeTask2 = statefulTask(taskId01, taskId01ChangelogPartitions)
++            .inState(State.RUNNING)
++            .withInputPartitions(taskId01Partitions).build();
+         final TasksRegistry tasks = mock(TasksRegistry.class);
+         final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks, true);
++        when(tasks.allTasks()).thenReturn(Set.of(activeTask1, activeTask2));
+         final KafkaFuture<Void> mockFuture = KafkaFuture.completedFuture(null);
+         when(schedulingTaskManager.lockTasks(any())).thenReturn(mockFuture);
+ 
+@@ -3497,6 +3501,7 @@ public class TaskManagerTest {
+             .when(task02).suspend();
+         doThrow(new RuntimeException("whatever")).when(activeTaskCreator).close();
+ 
++        when(tasks.allTasks()).thenReturn(Set.of(task00, task01, task02));
+         when(tasks.activeTasks()).thenReturn(Set.of(task00, task01, task02));
+ 
+         taskManager.shutdown(false);
+@@ -3530,7 +3535,6 @@ public class TaskManagerTest {
+ 
+         when(stateUpdater.tasks()).thenReturn(Set.of(standbyTask00)).thenReturn(Set.of());
+         when(stateUpdater.standbyTasks()).thenReturn(Set.of(standbyTask00));
+-        when(tasks.standbyTasks()).thenReturn(Set.of(standbyTask00));
+ 
+         final CompletableFuture<StateUpdater.RemovedTaskResult> futureForStandbyTask = new CompletableFuture<>();
+         when(stateUpdater.remove(taskId00)).thenReturn(futureForStandbyTask);
+@@ -3663,36 +3667,6 @@ public class TaskManagerTest {
+         verify(removedFailedStandbyTaskDuringRemoval).closeDirty();
+     }
+ 
+-    @Test
+-    public void shouldClosePendingTasksToInitDuringShutdown() {
+-        final TasksRegistry tasks = mock(TasksRegistry.class);
+-        final TaskManager taskManager = setUpTaskManager(ProcessingMode.AT_LEAST_ONCE, tasks);
+-
+-        final StandbyTask standbyTask00 = standbyTask(taskId00, taskId00ChangelogPartitions)
+-                .inState(State.CREATED)
+-                .withInputPartitions(taskId00Partitions)
+-                .build();
+-
+-        final StreamTask activeTask01 = statefulTask(taskId01, taskId00ChangelogPartitions)
+-                .inState(State.CREATED)
+-                .withInputPartitions(taskId00Partitions).build();
+-
+-        when(tasks.drainPendingStandbyTasksToInit()).thenReturn(Set.of(standbyTask00));
+-        when(tasks.drainPendingActiveTasksToInit()).thenReturn(Set.of(activeTask01));
+-
+-        taskManager.shutdown(true);
+-
+-        verify(standbyTask00).prepareCommit(true);
+-        verify(standbyTask00).postCommit(true);
+-        verify(standbyTask00).suspend();
+-        verify(standbyTask00).closeClean();
+-
+-        verify(activeTask01).prepareCommit(true);
+-        verify(activeTask01).postCommit(true);
+-        verify(activeTask01).suspend();
+-        verify(activeTask01).closeClean();
+-    }
+-
+     @Test
+     public void shouldInitializeNewStandbyTasks() {
+         final StandbyTask task01 = standbyTask(taskId01, taskId01ChangelogPartitions)
+diff --git a/streams/src/test/java/org/apache/kafka/streams/processor/internals/TasksTest.java b/streams/src/test/java/org/apache/kafka/streams/processor/internals/TasksTest.java
+index 0887c98287..ec4d672f9c 100644
+--- a/streams/src/test/java/org/apache/kafka/streams/processor/internals/TasksTest.java
++++ b/streams/src/test/java/org/apache/kafka/streams/processor/internals/TasksTest.java
+@@ -25,7 +25,6 @@ import org.junit.jupiter.api.Test;
+ 
+ import java.util.Collections;
+ import java.util.HashSet;
+-import java.util.List;
+ import java.util.Set;
+ 
+ import static org.apache.kafka.common.utils.Utils.mkEntry;
+@@ -80,7 +79,6 @@ public class TasksTest {
+         assertEquals(standbyTask, tasks.task(standbyTask.id()));
+ 
+         assertEquals(Set.of(statefulTask, statelessTask), new HashSet<>(tasks.activeTasks()));
+-        assertEquals(Set.of(standbyTask), new HashSet<>(tasks.standbyTasks()));
+         assertEquals(Set.of(statefulTask, statelessTask, standbyTask), tasks.allTasks());
+         assertEquals(Set.of(statefulTask, standbyTask), tasks.tasks(Set.of(statefulTask.id(), standbyTask.id())));
+         assertEquals(Set.of(statefulTask.id(), statelessTask.id(), standbyTask.id()), tasks.allTaskIds());
+@@ -166,24 +164,6 @@ public class TasksTest {
+         assertTrue(tasks.pendingTasksToInit().containsAll(Set.of(standbyTask1, standbyTask2)));
+     }
+ 
+-    @Test
+-    public void shouldVerifyIfPendingStandbyTaskToInitAreDrained() {
+-        final StreamTask activeTask1 = statefulTask(TASK_0_0, Set.of(TOPIC_PARTITION_B_0)).build();
+-        final StreamTask activeTask2 = statefulTask(TASK_0_1, Set.of(TOPIC_PARTITION_B_1)).build();
+-        final StandbyTask standbyTask1 = standbyTask(TASK_1_0, Set.of(TOPIC_PARTITION_A_0)).build();
+-        final StandbyTask standbyTask2 = standbyTask(TASK_1_1, Set.of(TOPIC_PARTITION_A_1)).build();
+-        tasks.addPendingTasksToInit(Set.of(activeTask1, activeTask2, standbyTask1, standbyTask2));
+-
+-        final Set<Task> standbyTasksToInit = tasks.drainPendingStandbyTasksToInit();
+-
+-        assertEquals(2, standbyTasksToInit.size());
+-        assertTrue(standbyTasksToInit.containsAll(Set.of(standbyTask1, standbyTask2)));
+-        assertFalse(standbyTasksToInit.containsAll(Set.of(activeTask1, activeTask2)));
+-        assertEquals(2, tasks.pendingTasksToInit().size());
+-        assertTrue(tasks.hasPendingTasksToInit());
+-        assertTrue(tasks.pendingTasksToInit().containsAll(Set.of(activeTask1, activeTask2)));
+-    }
+-
+     @Test
+     public void shouldAddFailedTask() {
+         final StreamTask activeTask1 = statefulTask(TASK_0_0, Set.of(TOPIC_PARTITION_B_0)).build();
+@@ -250,16 +230,4 @@ public class TasksTest {
+         assertTrue(tasks.pendingActiveTasksToCreate().isEmpty());
+         assertTrue(tasks.pendingStandbyTasksToCreate().isEmpty());
+     }
+-
+-    @Test
+-    public void shouldRemovePendingTaskToClose() {
+-        final StreamTask activeTask1 = statefulTask(TASK_0_0, Set.of(TOPIC_PARTITION_B_0))
+-                .inState(State.SUSPENDED).build();
+-        tasks.addPendingTasksToClose(List.of(activeTask1));
+-        assertTrue(tasks.pendingTasksToClose().contains(activeTask1));
+-
+-        tasks.removeTask(activeTask1);
+-        assertFalse(tasks.pendingTasksToInit().contains(activeTask1));
+-        assertFalse(tasks.allTasks().contains(activeTask1));
+-    }
+ }

@@ -1,0 +1,381 @@
+diff --git a/extensions/oidc-client/runtime/src/main/java/io/quarkus/oidc/client/runtime/OidcClientImpl.java b/extensions/oidc-client/runtime/src/main/java/io/quarkus/oidc/client/runtime/OidcClientImpl.java
+index e363c27f629..c6410b85259 100644
+--- a/extensions/oidc-client/runtime/src/main/java/io/quarkus/oidc/client/runtime/OidcClientImpl.java
++++ b/extensions/oidc-client/runtime/src/main/java/io/quarkus/oidc/client/runtime/OidcClientImpl.java
+@@ -1,5 +1,7 @@
+ package io.quarkus.oidc.client.runtime;
+ 
++import static io.quarkus.oidc.common.runtime.OidcCommonUtils.getClientAssertionProvider;
++
+ import java.io.IOException;
+ import java.net.SocketException;
+ import java.nio.charset.StandardCharsets;
+@@ -94,16 +96,8 @@ private OidcClientImpl(WebClient client, String tokenRequestUri, String tokenRev
+         this.jwtBearerAuthentication = oidcClientConfig.credentials().jwt().source() == Source.BEARER;
+         this.clientJwtKey = jwtBearerAuthentication ? null : clientCredentials.clientJwtKey;
+         this.clientSecret = clientCredentials.clientSecret;
+-        if (jwtBearerAuthentication && oidcClientConfig.credentials().jwt().tokenPath().isPresent()) {
+-            this.clientAssertionProvider = new ClientAssertionProvider(vertx,
+-                    oidcClientConfig.credentials().jwt().tokenPath().get());
+-            if (this.clientAssertionProvider.getClientAssertion() == null) {
+-                throw new OidcClientException("Cannot find a valid JWT bearer token at path: "
+-                        + oidcClientConfig.credentials().jwt().tokenPath().get());
+-            }
+-        } else {
+-            this.clientAssertionProvider = null;
+-        }
++        this.clientAssertionProvider = getClientAssertionProvider(vertx, oidcClientConfig.credentials(),
++                OidcClientException::new);
+     }
+ 
+     @Override
+diff --git a/extensions/oidc-common/runtime/src/main/java/io/quarkus/oidc/common/runtime/ClientAssertionProvider.java b/extensions/oidc-common/runtime/src/main/java/io/quarkus/oidc/common/runtime/ClientAssertionProvider.java
+index 916f9e396aa..0a8b119ba4c 100644
+--- a/extensions/oidc-common/runtime/src/main/java/io/quarkus/oidc/common/runtime/ClientAssertionProvider.java
++++ b/extensions/oidc-common/runtime/src/main/java/io/quarkus/oidc/common/runtime/ClientAssertionProvider.java
+@@ -1,114 +1,21 @@
+ package io.quarkus.oidc.common.runtime;
+ 
+-import java.io.Closeable;
+-import java.io.IOException;
+-import java.nio.file.Files;
+-import java.nio.file.Path;
++/**
++ * Client assertion provider.
++ */
++public sealed interface ClientAssertionProvider permits KubernetesServiceClientAssertionProvider {
++
++    /**
++     * Gets current client assertion. This method should not block. If the client assertion is retrieved with blocking
++     * IO operation, we recommend to keep the assertion up to date using a periodic scheduled task.
++     *
++     * @return client assertion
++     */
++    String getClientAssertion();
++
++    /**
++     * Closes this provider. Use this method to cancel the periodic scheduled task.
++     */
++    void close();
+ 
+-import org.eclipse.microprofile.jwt.Claims;
+-import org.jboss.logging.Logger;
+-
+-import io.vertx.core.Handler;
+-import io.vertx.core.Vertx;
+-import io.vertx.core.json.JsonObject;
+-
+-public final class ClientAssertionProvider implements Closeable {
+-
+-    private record ClientAssertion(String bearerToken, long expiresAt, long timerId) {
+-        private boolean isInvalid() {
+-            final long nowSecs = System.currentTimeMillis() / 1000;
+-            return nowSecs > expiresAt;
+-        }
+-    }
+-
+-    private static final Logger LOG = Logger.getLogger(ClientAssertionProvider.class);
+-    private final Vertx vertx;
+-    private final Path bearerTokenPath;
+-    private volatile ClientAssertion clientAssertion;
+-
+-    public ClientAssertionProvider(Vertx vertx, Path bearerTokenPath) {
+-        this.vertx = vertx;
+-        this.bearerTokenPath = bearerTokenPath;
+-        this.clientAssertion = loadFromFileSystem();
+-    }
+-
+-    public String getClientAssertion() {
+-        ClientAssertion clientAssertion = this.clientAssertion;
+-        if (isInvalid(clientAssertion)) {
+-            clientAssertion = loadClientAssertion();
+-        }
+-        return clientAssertion == null ? null : clientAssertion.bearerToken;
+-    }
+-
+-    @Override
+-    public void close() {
+-        cancelRefresh();
+-        clientAssertion = null;
+-    }
+-
+-    private synchronized ClientAssertion loadClientAssertion() {
+-        if (isInvalid(clientAssertion)) {
+-            cancelRefresh();
+-            clientAssertion = loadFromFileSystem();
+-        }
+-        return clientAssertion;
+-    }
+-
+-    private long scheduleRefresh(long expiresAt) {
+-        // in K8 and OCP, tokens are proactively rotated at 80 % of their TTL
+-        long delay = (long) (expiresAt * 0.85);
+-        return vertx.setTimer(delay, new Handler<Long>() {
+-            @Override
+-            public void handle(Long ignored) {
+-                ClientAssertionProvider.this.clientAssertion = loadFromFileSystem();
+-            }
+-        });
+-    }
+-
+-    private void cancelRefresh() {
+-        if (clientAssertion != null) {
+-            vertx.cancelTimer(clientAssertion.timerId);
+-        }
+-    }
+-
+-    private ClientAssertion loadFromFileSystem() {
+-        if (Files.exists(bearerTokenPath)) {
+-            try {
+-                String bearerToken = Files.readString(bearerTokenPath).trim();
+-                if (bearerToken.isEmpty()) {
+-                    LOG.error(String.format("Bearer token file at path %s is empty or contains only whitespace",
+-                            bearerTokenPath));
+-                    return null;
+-                }
+-                Long expiresAt = getExpiresAtFromExpClaim(bearerToken);
+-                if (expiresAt != null) {
+-                    return new ClientAssertion(bearerToken, expiresAt, scheduleRefresh(expiresAt));
+-                } else {
+-                    LOG.error("Bearer token or its expiry claim is invalid");
+-                }
+-            } catch (IOException e) {
+-                LOG.error("Failed to read file with a bearer token at path: " + bearerTokenPath, e);
+-            }
+-        } else {
+-            LOG.warn("Cannot find a file with a bearer token at path: " + bearerTokenPath);
+-        }
+-        return null;
+-    }
+-
+-    private static boolean isInvalid(ClientAssertion clientAssertion) {
+-        return clientAssertion == null || clientAssertion.isInvalid();
+-    }
+-
+-    private static Long getExpiresAtFromExpClaim(String bearerToken) {
+-        JsonObject claims = OidcCommonUtils.decodeJwtContent(bearerToken);
+-        if (claims == null || !claims.containsKey(Claims.exp.name())) {
+-            return null;
+-        }
+-        try {
+-            return claims.getLong(Claims.exp.name());
+-        } catch (IllegalArgumentException ex) {
+-            LOG.debug("Bearer token expiry claim can not be converted to Long");
+-            return null;
+-        }
+-    }
+ }
+diff --git a/extensions/oidc-common/runtime/src/main/java/io/quarkus/oidc/common/runtime/KubernetesServiceClientAssertionProvider.java b/extensions/oidc-common/runtime/src/main/java/io/quarkus/oidc/common/runtime/KubernetesServiceClientAssertionProvider.java
+new file mode 100644
+index 00000000000..baf21368471
+--- /dev/null
++++ b/extensions/oidc-common/runtime/src/main/java/io/quarkus/oidc/common/runtime/KubernetesServiceClientAssertionProvider.java
+@@ -0,0 +1,115 @@
++package io.quarkus.oidc.common.runtime;
++
++import java.io.Closeable;
++import java.io.IOException;
++import java.nio.file.Files;
++import java.nio.file.Path;
++
++import org.eclipse.microprofile.jwt.Claims;
++import org.jboss.logging.Logger;
++
++import io.vertx.core.Handler;
++import io.vertx.core.Vertx;
++import io.vertx.core.json.JsonObject;
++
++final class KubernetesServiceClientAssertionProvider implements ClientAssertionProvider, Closeable {
++
++    private record ClientAssertion(String bearerToken, long expiresAt, long timerId) {
++        private boolean isInvalid() {
++            final long nowSecs = System.currentTimeMillis() / 1000;
++            return nowSecs > expiresAt;
++        }
++    }
++
++    private static final Logger LOG = Logger.getLogger(KubernetesServiceClientAssertionProvider.class);
++    private final Vertx vertx;
++    private final Path bearerTokenPath;
++    private volatile ClientAssertion clientAssertion;
++
++    KubernetesServiceClientAssertionProvider(Vertx vertx, Path bearerTokenPath) {
++        this.vertx = vertx;
++        this.bearerTokenPath = bearerTokenPath;
++        this.clientAssertion = loadFromFileSystem();
++    }
++
++    @Override
++    public String getClientAssertion() {
++        ClientAssertion clientAssertion = this.clientAssertion;
++        if (isInvalid(clientAssertion)) {
++            clientAssertion = loadClientAssertion();
++        }
++        return clientAssertion == null ? null : clientAssertion.bearerToken;
++    }
++
++    @Override
++    public void close() {
++        cancelRefresh();
++        clientAssertion = null;
++    }
++
++    private synchronized ClientAssertion loadClientAssertion() {
++        if (isInvalid(clientAssertion)) {
++            cancelRefresh();
++            clientAssertion = loadFromFileSystem();
++        }
++        return clientAssertion;
++    }
++
++    private long scheduleRefresh(long expiresAt) {
++        // in K8 and OCP, tokens are proactively rotated at 80 % of their TTL
++        long delay = (long) (expiresAt * 0.85);
++        return vertx.setTimer(delay, new Handler<Long>() {
++            @Override
++            public void handle(Long ignored) {
++                KubernetesServiceClientAssertionProvider.this.clientAssertion = loadFromFileSystem();
++            }
++        });
++    }
++
++    private void cancelRefresh() {
++        if (clientAssertion != null) {
++            vertx.cancelTimer(clientAssertion.timerId);
++        }
++    }
++
++    private ClientAssertion loadFromFileSystem() {
++        if (Files.exists(bearerTokenPath)) {
++            try {
++                String bearerToken = Files.readString(bearerTokenPath).trim();
++                if (bearerToken.isEmpty()) {
++                    LOG.error(String.format("Bearer token file at path %s is empty or contains only whitespace",
++                            bearerTokenPath));
++                    return null;
++                }
++                Long expiresAt = getExpiresAtFromExpClaim(bearerToken);
++                if (expiresAt != null) {
++                    return new ClientAssertion(bearerToken, expiresAt, scheduleRefresh(expiresAt));
++                } else {
++                    LOG.error("Bearer token or its expiry claim is invalid");
++                }
++            } catch (IOException e) {
++                LOG.error("Failed to read file with a bearer token at path: " + bearerTokenPath, e);
++            }
++        } else {
++            LOG.warn("Cannot find a file with a bearer token at path: " + bearerTokenPath);
++        }
++        return null;
++    }
++
++    private static boolean isInvalid(ClientAssertion clientAssertion) {
++        return clientAssertion == null || clientAssertion.isInvalid();
++    }
++
++    private static Long getExpiresAtFromExpClaim(String bearerToken) {
++        JsonObject claims = OidcCommonUtils.decodeJwtContent(bearerToken);
++        if (claims == null || !claims.containsKey(Claims.exp.name())) {
++            return null;
++        }
++        try {
++            return claims.getLong(Claims.exp.name());
++        } catch (IllegalArgumentException ex) {
++            LOG.debug("Bearer token expiry claim can not be converted to Long");
++            return null;
++        }
++    }
++}
+diff --git a/extensions/oidc-common/runtime/src/main/java/io/quarkus/oidc/common/runtime/OidcCommonUtils.java b/extensions/oidc-common/runtime/src/main/java/io/quarkus/oidc/common/runtime/OidcCommonUtils.java
+index 9f294a1e665..16be93f8643 100644
+--- a/extensions/oidc-common/runtime/src/main/java/io/quarkus/oidc/common/runtime/OidcCommonUtils.java
++++ b/extensions/oidc-common/runtime/src/main/java/io/quarkus/oidc/common/runtime/OidcCommonUtils.java
+@@ -48,6 +48,7 @@
+ import io.quarkus.oidc.common.runtime.OidcTlsSupport.TlsConfigSupport;
+ import io.quarkus.oidc.common.runtime.config.OidcClientCommonConfig;
+ import io.quarkus.oidc.common.runtime.config.OidcClientCommonConfig.Credentials;
++import io.quarkus.oidc.common.runtime.config.OidcClientCommonConfig.Credentials.Jwt.Source;
+ import io.quarkus.oidc.common.runtime.config.OidcClientCommonConfig.Credentials.Provider;
+ import io.quarkus.oidc.common.runtime.config.OidcClientCommonConfig.Credentials.Secret;
+ import io.quarkus.oidc.common.runtime.config.OidcCommonConfig;
+@@ -911,4 +912,19 @@ public static Uni<Void> runBlocking(Runnable runnable) {
+             return null;
+         });
+     }
++
++    public static ClientAssertionProvider getClientAssertionProvider(io.vertx.core.Vertx vertx, Credentials credentialsConfig,
++            Function<String, RuntimeException> exceptionCreator) {
++        var jwtConfig = credentialsConfig.jwt();
++        if (jwtConfig.source() == Source.BEARER && jwtConfig.tokenPath().isPresent()) {
++            var clientAssertionProvider = new KubernetesServiceClientAssertionProvider(vertx, jwtConfig.tokenPath().get());
++            if (clientAssertionProvider.getClientAssertion() == null) {
++                throw exceptionCreator
++                        .apply("Cannot find a valid JWT bearer token at path: " + jwtConfig.tokenPath().get());
++            }
++            return clientAssertionProvider;
++        }
++        return null;
++    }
++
+ }
+diff --git a/extensions/oidc/runtime/src/main/java/io/quarkus/oidc/runtime/OidcProviderClientImpl.java b/extensions/oidc/runtime/src/main/java/io/quarkus/oidc/runtime/OidcProviderClientImpl.java
+index 7e3746f94c5..97eaf2e6e49 100644
+--- a/extensions/oidc/runtime/src/main/java/io/quarkus/oidc/runtime/OidcProviderClientImpl.java
++++ b/extensions/oidc/runtime/src/main/java/io/quarkus/oidc/runtime/OidcProviderClientImpl.java
+@@ -1,6 +1,7 @@
+ package io.quarkus.oidc.runtime;
+ 
+ import static io.quarkus.oidc.common.OidcEndpoint.Type.PUSHED_AUTHORIZATION_REQUEST;
++import static io.quarkus.oidc.common.runtime.OidcCommonUtils.getClientAssertionProvider;
+ 
+ import java.io.Closeable;
+ import java.net.SocketException;
+@@ -98,7 +99,7 @@ private OidcProviderClientImpl(WebClient client, Vertx vertx, OidcConfigurationM
+         this.clientSecretBasicAuthScheme = clientCredentials.clientSecretBasicAuthScheme;
+         this.jwtBearerAuthentication = oidcConfig.credentials().jwt()
+                 .source() == OidcClientCommonConfig.Credentials.Jwt.Source.BEARER;
+-        this.clientAssertionProvider = this.jwtBearerAuthentication ? createClientAssertionProvider(vertx, oidcConfig) : null;
++        this.clientAssertionProvider = getClientAssertionProvider(vertx, oidcConfig.credentials(), OIDCException::new);
+         this.clientJwtKey = jwtBearerAuthentication ? null : clientCredentials.clientJwtKey;
+         this.introspectionBasicAuthScheme = initIntrospectionBasicAuthScheme(oidcConfig);
+         this.requestFilters = requestFilters;
+@@ -108,16 +109,6 @@ private OidcProviderClientImpl(WebClient client, Vertx vertx, OidcConfigurationM
+         this.jwtSecret = clientCredentials.jwtSecret;
+     }
+ 
+-    private static ClientAssertionProvider createClientAssertionProvider(Vertx vertx, OidcTenantConfig oidcConfig) {
+-        var clientAssertionProvider = new ClientAssertionProvider(vertx,
+-                oidcConfig.credentials().jwt().tokenPath().get());
+-        if (clientAssertionProvider.getClientAssertion() == null) {
+-            throw new OIDCException("Cannot find a valid JWT bearer token at path: "
+-                    + oidcConfig.credentials().jwt().tokenPath().get());
+-        }
+-        return clientAssertionProvider;
+-    }
+-
+     void setOidcProvider(OidcProvider oidcProvider) {
+         this.oidcProvider = oidcProvider;
+     }
+diff --git a/extensions/oidc/runtime/src/main/java/io/quarkus/oidc/runtime/OidcTenantConfig.java b/extensions/oidc/runtime/src/main/java/io/quarkus/oidc/runtime/OidcTenantConfig.java
+index e581f33843c..a98c1f60471 100644
+--- a/extensions/oidc/runtime/src/main/java/io/quarkus/oidc/runtime/OidcTenantConfig.java
++++ b/extensions/oidc/runtime/src/main/java/io/quarkus/oidc/runtime/OidcTenantConfig.java
+@@ -1378,15 +1378,15 @@ interface RichAuthorizationRequests {
+ 
+         /**
+          * Configures the `authorization_details` request parameter string fields of the authorization request.
+-         * Please note that the `type` field is required. If the `type` is not configured, validation will fail.
+-         * For example, if you configure the `quarkus.oidc.authentication.rar.simple.type=openid_credential`
++         * For example, if you configure the
++         * `quarkus.oidc.authentication.rar.simple.credential_configuration_id=vc-scope-mapping`
+          * property, following `authorization_details` request parameter will be added to the authorization request:
+          *
+          * <pre>
+          * {@code
+          * [
+          *    {
+-         *       "type": "openid_credential"
++         *       "credential_configuration_id": "vc-scope-mapping"
+          *    }
+          * ]
+          * }

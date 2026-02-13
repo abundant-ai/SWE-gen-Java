@@ -1,0 +1,242 @@
+diff --git a/coordinator-common/src/main/java/org/apache/kafka/coordinator/common/runtime/CoordinatorRuntime.java b/coordinator-common/src/main/java/org/apache/kafka/coordinator/common/runtime/CoordinatorRuntime.java
+index b67a71d5b4..1d3fb49ad3 100644
+--- a/coordinator-common/src/main/java/org/apache/kafka/coordinator/common/runtime/CoordinatorRuntime.java
++++ b/coordinator-common/src/main/java/org/apache/kafka/coordinator/common/runtime/CoordinatorRuntime.java
+@@ -773,10 +773,7 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
+             currentBatch.lingerTimeoutTask.ifPresent(TimerTask::cancel);
+ 
+             // Release the buffer only if it is not larger than the maxBatchSize.
+-            // We avoid querying the log's configuration for the max message size here,
+-            // because after a partition leadership change, this throws a NOT_LEADER_OR_FOLLOWER
+-            // exception. Such exceptions can propagate unexpectedly and disrupt subsequent operations.
+-            int maxBatchSize = currentBatch.maxBatchSize;
++            int maxBatchSize = partitionWriter.config(tp).maxMessageSize();
+ 
+             if (currentBatch.builder.buffer().capacity() <= maxBatchSize) {
+                 bufferSupplier.release(currentBatch.builder.buffer());
+diff --git a/core/src/main/scala/kafka/admin/ConfigCommand.scala b/core/src/main/scala/kafka/admin/ConfigCommand.scala
+index b8b2ae4fb3..f004b9956c 100644
+--- a/core/src/main/scala/kafka/admin/ConfigCommand.scala
++++ b/core/src/main/scala/kafka/admin/ConfigCommand.scala
+@@ -23,7 +23,7 @@ import kafka.utils.Implicits._
+ import kafka.utils.Logging
+ import org.apache.kafka.clients.admin.{Admin, AlterClientQuotasOptions, AlterConfigOp, AlterConfigsOptions, ConfigEntry, DescribeClusterOptions, DescribeConfigsOptions, ListConfigResourcesOptions, ListTopicsOptions, ScramCredentialInfo, UserScramCredentialDeletion, UserScramCredentialUpsertion, ScramMechanism => PublicScramMechanism}
+ import org.apache.kafka.common.config.ConfigResource
+-import org.apache.kafka.common.errors.{ClusterAuthorizationException, InvalidConfigurationException, UnsupportedVersionException}
++import org.apache.kafka.common.errors.{InvalidConfigurationException, UnsupportedVersionException}
+ import org.apache.kafka.common.internals.Topic
+ import org.apache.kafka.common.protocol.ApiKeys
+ import org.apache.kafka.common.quota.{ClientQuotaAlteration, ClientQuotaEntity, ClientQuotaFilter, ClientQuotaFilterComponent}
+@@ -367,7 +367,9 @@ object ConfigCommand extends Logging {
+               return
+             }
+           case GroupType =>
+-            if (adminClient.listGroups().all.get.stream.noneMatch(_.groupId == name) && listGroupConfigResources(adminClient).exists(resources => resources.stream.noneMatch(_.name == name))) {
++            if (adminClient.listGroups().all.get.stream.noneMatch(_.groupId() == name) &&
++              adminClient.listConfigResources(java.util.Set.of(ConfigResource.Type.GROUP), new ListConfigResourcesOptions).all.get
++                .stream.noneMatch(_.name == name)) {
+               System.out.println(s"The ${entityType.dropRight(1)} '$name' doesn't exist and doesn't have dynamic config.")
+               return
+             }
+@@ -386,7 +388,8 @@ object ConfigCommand extends Logging {
+         case ClientMetricsType =>
+           adminClient.listConfigResources(java.util.Set.of(ConfigResource.Type.CLIENT_METRICS), new ListConfigResourcesOptions).all().get().asScala.map(_.name).toSeq
+         case GroupType =>
+-          adminClient.listGroups().all.get.asScala.map(_.groupId).toSet ++ listGroupConfigResources(adminClient).map(resources => resources.asScala.map(_.name).toSet).getOrElse(Set.empty)
++          adminClient.listGroups().all.get.asScala.map(_.groupId).toSet ++
++            adminClient.listConfigResources(java.util.Set.of(ConfigResource.Type.GROUP), new ListConfigResourcesOptions).all().get().asScala.map(_.name).toSet
+         case entityType => throw new IllegalArgumentException(s"Invalid entity type: $entityType")
+       })
+ 
+@@ -534,17 +537,6 @@ object ConfigCommand extends Logging {
+     adminClient.describeClientQuotas(ClientQuotaFilter.containsOnly(components.asJava)).entities.get(30, TimeUnit.SECONDS).asScala
+   }
+ 
+-  private def listGroupConfigResources(adminClient: Admin): Option[java.util.Collection[ConfigResource]] = {
+-    try {
+-      Some(adminClient.listConfigResources(java.util.Set.of(ConfigResource.Type.GROUP), new ListConfigResourcesOptions).all.get)
+-    } catch {
+-      // (KIP-1142) 4.1+ admin client vs older broker: treat UnsupportedVersionException and ClusterAuthorizationException as None
+-      case e: ExecutionException if e.getCause.isInstanceOf[UnsupportedVersionException] => None
+-      case e: ExecutionException if e.getCause.isInstanceOf[ClusterAuthorizationException] => None
+-      case e: ExecutionException => throw e.getCause
+-    }
+-  }
+-
+ 
+   class ConfigCommandOptions(args: Array[String]) extends CommandDefaultOptions(args) {
+     val bootstrapServerOpt: OptionSpec[String] = parser.accepts("bootstrap-server", "The Kafka servers to connect to.")
+diff --git a/streams/src/main/java/org/apache/kafka/streams/processor/internals/TaskManager.java b/streams/src/main/java/org/apache/kafka/streams/processor/internals/TaskManager.java
+index 7243fb886e..ecf23470dd 100644
+--- a/streams/src/main/java/org/apache/kafka/streams/processor/internals/TaskManager.java
++++ b/streams/src/main/java/org/apache/kafka/streams/processor/internals/TaskManager.java
+@@ -1500,10 +1500,20 @@ public class TaskManager {
+         // TODO: change type to `StreamTask`
+         final Set<Task> activeTasks = new TreeSet<>(Comparator.comparing(Task::id));
+         activeTasks.addAll(tasks.activeTasks());
++        // TODO: change type to `StandbyTask`
++        final Set<Task> standbyTasks = new TreeSet<>(Comparator.comparing(Task::id));
++        standbyTasks.addAll(tasks.standbyTasks());
++
++        final Set<Task> pendingActiveTasks = tasks.drainPendingActiveTasksToInit();
++        activeTasks.addAll(pendingActiveTasks);
++        tasks.addPendingTasksToClose(pendingActiveTasks);
++        final Set<Task> pendingStandbyTasks = tasks.drainPendingStandbyTasksToInit();
++        standbyTasks.addAll(pendingStandbyTasks);
++        tasks.addPendingTasksToClose(pendingStandbyTasks);
+ 
+         executeAndMaybeSwallow(
+             clean,
+-            () -> closeAndCleanUpTasks(activeTasks, standbyTaskIterable(), clean),
++            () -> closeAndCleanUpTasks(activeTasks, standbyTasks, clean),
+             e -> firstException.compareAndSet(null, e),
+             e -> log.warn("Ignoring an exception while unlocking remaining task directories.", e)
+         );
+@@ -1611,7 +1621,7 @@ public class TaskManager {
+                                                       final boolean clean,
+                                                       final AtomicReference<RuntimeException> firstException) {
+         if (!clean) {
+-            return activeTaskIterable();
++            return activeTasksToClose;
+         }
+         final Comparator<Task> byId = Comparator.comparing(Task::id);
+         final Set<Task> tasksToCommit = new TreeSet<>(byId);
+@@ -1669,7 +1679,7 @@ public class TaskManager {
+                 }
+             }
+ 
+-            for (final Task task : activeTaskIterable()) {
++            for (final Task task : activeTasksToClose) {
+                 try {
+                     task.postCommit(true);
+                 } catch (final RuntimeException e) {
+@@ -1704,7 +1714,7 @@ public class TaskManager {
+                                                        final boolean clean,
+                                                        final AtomicReference<RuntimeException> firstException) {
+         if (!clean) {
+-            return standbyTaskIterable();
++            return standbyTasksToClose;
+         }
+         final Set<Task> tasksToCloseDirty = new HashSet<>();
+ 
+diff --git a/streams/src/main/java/org/apache/kafka/streams/processor/internals/Tasks.java b/streams/src/main/java/org/apache/kafka/streams/processor/internals/Tasks.java
+index 76d6349068..82bd2a9103 100644
+--- a/streams/src/main/java/org/apache/kafka/streams/processor/internals/Tasks.java
++++ b/streams/src/main/java/org/apache/kafka/streams/processor/internals/Tasks.java
+@@ -58,6 +58,7 @@ class Tasks implements TasksRegistry {
+     private final Map<TaskId, Set<TopicPartition>> pendingActiveTasksToCreate = new HashMap<>();
+     private final Map<TaskId, Set<TopicPartition>> pendingStandbyTasksToCreate = new HashMap<>();
+     private final Set<Task> pendingTasksToInit = new HashSet<>();
++    private final Set<Task> pendingTasksToClose = new HashSet<>();
+     private final Set<TaskId> failedTaskIds = new HashSet<>();
+ 
+     // TODO: convert to Stream/StandbyTask when we remove TaskManager#StateMachineTask with mocks
+@@ -124,6 +125,20 @@ class Tasks implements TasksRegistry {
+         return result;
+     }
+ 
++    @Override
++    public Set<Task> drainPendingStandbyTasksToInit() {
++        final Set<Task> result = new HashSet<>();
++        final Iterator<Task> iterator = pendingTasksToInit.iterator();
++        while (iterator.hasNext()) {
++            final Task task = iterator.next();
++            if (!task.isActive()) {
++                result.add(task);
++                iterator.remove();
++            }
++        }
++        return result;
++    }
++
+     @Override
+     public Set<Task> pendingTasksToInit() {
+         return Collections.unmodifiableSet(pendingTasksToInit);
+@@ -139,6 +154,21 @@ class Tasks implements TasksRegistry {
+         return !pendingTasksToInit.isEmpty();
+     }
+ 
++    @Override
++    public Set<Task> pendingTasksToClose() {
++        return Collections.unmodifiableSet(pendingTasksToClose);
++    }
++
++    @Override
++    public void addPendingTasksToClose(final Collection<Task> tasks) {
++        pendingTasksToClose.addAll(tasks);
++    }
++
++    @Override
++    public boolean hasPendingTasksToClose() {
++        return !pendingTasksToClose.isEmpty();
++    }
++
+     @Override
+     public void addActiveTasks(final Collection<Task> newTasks) {
+         if (!newTasks.isEmpty()) {
+@@ -193,7 +223,9 @@ class Tasks implements TasksRegistry {
+             throw new IllegalStateException("Attempted to remove a task that is not closed or suspended: " + taskId);
+         }
+ 
+-        if (taskToRemove.isActive()) {
++        if (pendingTasksToClose.contains(taskToRemove)) {
++            pendingTasksToClose.remove(taskToRemove);
++        } else if (taskToRemove.isActive()) {
+             if (activeTasksPerId.remove(taskId) == null) {
+                 throw new IllegalArgumentException("Attempted to remove an active task that is not owned: " + taskId);
+             }
+@@ -203,7 +235,7 @@ class Tasks implements TasksRegistry {
+                 throw new IllegalArgumentException("Attempted to remove a standby task that is not owned: " + taskId);
+             }
+         }
+-        failedTaskIds.remove(taskToRemove.id());
++        failedTaskIds.remove(taskId);
+     }
+ 
+     @Override
+@@ -312,6 +344,11 @@ class Tasks implements TasksRegistry {
+         return Collections.unmodifiableCollection(activeTasksPerId.values());
+     }
+ 
++    @Override
++    public synchronized Collection<Task> standbyTasks() {
++        return Collections.unmodifiableCollection(standbyTasksPerId.values());
++    }
++
+     /**
+      * All tasks returned by any of the getters are read-only and should NOT be modified;
+      * and the returned task could be modified by other threads concurrently
+diff --git a/streams/src/main/java/org/apache/kafka/streams/processor/internals/TasksRegistry.java b/streams/src/main/java/org/apache/kafka/streams/processor/internals/TasksRegistry.java
+index 20bee575eb..9e13d0f8c5 100644
+--- a/streams/src/main/java/org/apache/kafka/streams/processor/internals/TasksRegistry.java
++++ b/streams/src/main/java/org/apache/kafka/streams/processor/internals/TasksRegistry.java
+@@ -39,12 +39,20 @@ public interface TasksRegistry {
+ 
+     Set<Task> drainPendingActiveTasksToInit();
+ 
++    Set<Task> drainPendingStandbyTasksToInit();
++
+     Set<Task> pendingTasksToInit();
+ 
+     void addPendingTasksToInit(final Collection<Task> tasks);
+ 
+     boolean hasPendingTasksToInit();
+ 
++    Set<Task> pendingTasksToClose();
++
++    void addPendingTasksToClose(final Collection<Task> tasks);
++
++    boolean hasPendingTasksToClose();
++
+     void addActiveTasks(final Collection<Task> tasks);
+ 
+     void addStandbyTasks(final Collection<Task> tasks);
+@@ -73,6 +81,8 @@ public interface TasksRegistry {
+ 
+     Collection<Task> activeTasks();
+ 
++    Collection<Task> standbyTasks();
++
+     Set<Task> allTasks();
+ 
+     Set<Task> allNonFailedTasks();

@@ -1,0 +1,174 @@
+diff --git a/streams/src/main/java/org/apache/kafka/streams/processor/internals/TaskManager.java b/streams/src/main/java/org/apache/kafka/streams/processor/internals/TaskManager.java
+index fdc3256bb0..8e6433c009 100644
+--- a/streams/src/main/java/org/apache/kafka/streams/processor/internals/TaskManager.java
++++ b/streams/src/main/java/org/apache/kafka/streams/processor/internals/TaskManager.java
+@@ -1414,10 +1414,20 @@ public class TaskManager {
+         // TODO: change type to `StreamTask`
+         final Set<Task> activeTasks = new TreeSet<>(Comparator.comparing(Task::id));
+         activeTasks.addAll(tasks.activeTasks());
++        // TODO: change type to `StandbyTask`
++        final Set<Task> standbyTasks = new TreeSet<>(Comparator.comparing(Task::id));
++        standbyTasks.addAll(tasks.standbyTasks());
++
++        final Set<Task> pendingActiveTasks = tasks.drainPendingActiveTasksToInit();
++        activeTasks.addAll(pendingActiveTasks);
++        tasks.addPendingTasksToClose(pendingActiveTasks);
++        final Set<Task> pendingStandbyTasks = tasks.drainPendingStandbyTasksToInit();
++        standbyTasks.addAll(pendingStandbyTasks);
++        tasks.addPendingTasksToClose(pendingStandbyTasks);
+ 
+         executeAndMaybeSwallow(
+             clean,
+-            () -> closeAndCleanUpTasks(activeTasks, standbyTaskIterable(), clean),
++            () -> closeAndCleanUpTasks(activeTasks, standbyTasks, clean),
+             e -> firstException.compareAndSet(null, e),
+             e -> log.warn("Ignoring an exception while unlocking remaining task directories.", e)
+         );
+@@ -1523,7 +1533,7 @@ public class TaskManager {
+                                                       final boolean clean,
+                                                       final AtomicReference<RuntimeException> firstException) {
+         if (!clean) {
+-            return activeTaskIterable();
++            return activeTasksToClose;
+         }
+         final Comparator<Task> byId = Comparator.comparing(Task::id);
+         final Set<Task> tasksToCommit = new TreeSet<>(byId);
+@@ -1581,7 +1591,7 @@ public class TaskManager {
+                 }
+             }
+ 
+-            for (final Task task : activeTaskIterable()) {
++            for (final Task task : activeTasksToClose) {
+                 try {
+                     task.postCommit(true);
+                 } catch (final RuntimeException e) {
+@@ -1616,7 +1626,7 @@ public class TaskManager {
+                                                        final boolean clean,
+                                                        final AtomicReference<RuntimeException> firstException) {
+         if (!clean) {
+-            return standbyTaskIterable();
++            return standbyTasksToClose;
+         }
+         final Set<Task> tasksToCloseDirty = new TreeSet<>(Comparator.comparing(Task::id));
+ 
+diff --git a/streams/src/main/java/org/apache/kafka/streams/processor/internals/Tasks.java b/streams/src/main/java/org/apache/kafka/streams/processor/internals/Tasks.java
+index f5d007a591..4af90d181c 100644
+--- a/streams/src/main/java/org/apache/kafka/streams/processor/internals/Tasks.java
++++ b/streams/src/main/java/org/apache/kafka/streams/processor/internals/Tasks.java
+@@ -58,6 +58,7 @@ class Tasks implements TasksRegistry {
+     private final Map<TaskId, Set<TopicPartition>> pendingActiveTasksToCreate = new HashMap<>();
+     private final Map<TaskId, Set<TopicPartition>> pendingStandbyTasksToCreate = new HashMap<>();
+     private final Set<Task> pendingTasksToInit = new HashSet<>();
++    private final Set<Task> pendingTasksToClose = new HashSet<>();
+     private final Set<TaskId> failedTaskIds = new HashSet<>();
+ 
+     // TODO: convert to Stream/StandbyTask when we remove TaskManager#StateMachineTask with mocks
+@@ -124,6 +125,20 @@ class Tasks implements TasksRegistry {
+         return result;
+     }
+ 
++    @Override
++    public Set<Task> drainPendingStandbyTasksToInit() {
++        final Set<Task> result = new HashSet<>();
++        final Iterator<Task> iterator = pendingTasksToInit.iterator();
++        while (iterator.hasNext()) {
++            final Task task = iterator.next();
++            if (!task.isActive()) {
++                result.add(task);
++                iterator.remove();
++            }
++        }
++        return result;
++    }
++
+     @Override
+     public Set<Task> pendingTasksToInit() {
+         return Collections.unmodifiableSet(pendingTasksToInit);
+@@ -139,6 +154,21 @@ class Tasks implements TasksRegistry {
+         return !pendingTasksToInit.isEmpty();
+     }
+ 
++    @Override
++    public Set<Task> pendingTasksToClose() {
++        return Collections.unmodifiableSet(pendingTasksToClose);
++    }
++
++    @Override
++    public void addPendingTasksToClose(final Collection<Task> tasks) {
++        pendingTasksToClose.addAll(tasks);
++    }
++
++    @Override
++    public boolean hasPendingTasksToClose() {
++        return !pendingTasksToClose.isEmpty();
++    }
++
+     @Override
+     public void addActiveTasks(final Collection<Task> newTasks) {
+         if (!newTasks.isEmpty()) {
+@@ -193,7 +223,9 @@ class Tasks implements TasksRegistry {
+             throw new IllegalStateException("Attempted to remove a task that is not closed or suspended: " + taskId);
+         }
+ 
+-        if (taskToRemove.isActive()) {
++        if (pendingTasksToClose.contains(taskToRemove)) {
++            pendingTasksToClose.remove(taskToRemove);
++        } else if (taskToRemove.isActive()) {
+             if (activeTasksPerId.remove(taskId) == null) {
+                 throw new IllegalArgumentException("Attempted to remove an active task that is not owned: " + taskId);
+             }
+@@ -203,7 +235,7 @@ class Tasks implements TasksRegistry {
+                 throw new IllegalArgumentException("Attempted to remove a standby task that is not owned: " + taskId);
+             }
+         }
+-        failedTaskIds.remove(taskToRemove.id());
++        failedTaskIds.remove(taskId);
+     }
+ 
+     @Override
+@@ -301,6 +333,11 @@ class Tasks implements TasksRegistry {
+         return Collections.unmodifiableCollection(activeTasksPerId.values());
+     }
+ 
++    @Override
++    public synchronized Collection<Task> standbyTasks() {
++        return Collections.unmodifiableCollection(standbyTasksPerId.values());
++    }
++
+     /**
+      * All tasks returned by any of the getters are read-only and should NOT be modified;
+      * and the returned task could be modified by other threads concurrently
+diff --git a/streams/src/main/java/org/apache/kafka/streams/processor/internals/TasksRegistry.java b/streams/src/main/java/org/apache/kafka/streams/processor/internals/TasksRegistry.java
+index 09c5a79ae0..6099efb5bc 100644
+--- a/streams/src/main/java/org/apache/kafka/streams/processor/internals/TasksRegistry.java
++++ b/streams/src/main/java/org/apache/kafka/streams/processor/internals/TasksRegistry.java
+@@ -39,12 +39,20 @@ public interface TasksRegistry {
+ 
+     Set<Task> drainPendingActiveTasksToInit();
+ 
++    Set<Task> drainPendingStandbyTasksToInit();
++
+     Set<Task> pendingTasksToInit();
+ 
+     void addPendingTasksToInit(final Collection<Task> tasks);
+ 
+     boolean hasPendingTasksToInit();
+ 
++    Set<Task> pendingTasksToClose();
++
++    void addPendingTasksToClose(final Collection<Task> tasks);
++
++    boolean hasPendingTasksToClose();
++
+     void addActiveTasks(final Collection<Task> tasks);
+ 
+     void addStandbyTasks(final Collection<Task> tasks);
+@@ -71,6 +79,8 @@ public interface TasksRegistry {
+ 
+     Collection<Task> activeTasks();
+ 
++    Collection<Task> standbyTasks();
++
+     Set<Task> allTasks();
+ 
+     Set<Task> allNonFailedTasks();

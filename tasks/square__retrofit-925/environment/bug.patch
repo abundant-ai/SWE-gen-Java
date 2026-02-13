@@ -1,0 +1,436 @@
+diff --git a/retrofit/src/main/java/retrofit/ExecutorCallAdapterFactory.java b/retrofit/src/main/java/retrofit/DefaultCallAdapterFactory.java
+similarity index 76%
+rename from retrofit/src/main/java/retrofit/ExecutorCallAdapterFactory.java
+rename to retrofit/src/main/java/retrofit/DefaultCallAdapterFactory.java
+index 8196101e..a1147cc0 100644
+--- a/retrofit/src/main/java/retrofit/ExecutorCallAdapterFactory.java
++++ b/retrofit/src/main/java/retrofit/DefaultCallAdapterFactory.java
+@@ -16,25 +16,38 @@
+ package retrofit;
+ 
+ import java.io.IOException;
++import java.lang.reflect.ParameterizedType;
+ import java.lang.reflect.Type;
+ import java.util.concurrent.Executor;
+ 
+-final class ExecutorCallAdapterFactory implements CallAdapter.Factory {
++final class DefaultCallAdapterFactory implements CallAdapter.Factory {
+   private final Executor callbackExecutor;
+ 
+-  ExecutorCallAdapterFactory(Executor callbackExecutor) {
++  DefaultCallAdapterFactory(Executor callbackExecutor) {
+     this.callbackExecutor = callbackExecutor;
+   }
+ 
+   @Override public String toString() {
+-    return "ExecutorCallAdapterFactory[" + callbackExecutor + ']';
++    return "Default CallAdapterFactory";
+   }
+ 
+   @Override public CallAdapter<?> get(Type returnType) {
+     if (Utils.getRawType(returnType) != Call.class) {
+       return null;
+     }
+-    final Type responseType = Utils.getCallResponseType(returnType);
++    if (!(returnType instanceof ParameterizedType)) {
++      throw new IllegalArgumentException(
++          "Call return type must be parameterized as Call<Foo> or Call<? extends Foo>");
++    }
++    final Type responseType = Utils.getSingleParameterUpperBound((ParameterizedType) returnType);
++
++    // Ensure the Call response type is not Response, we automatically deliver the Response object.
++    if (Utils.getRawType(responseType) == Response.class) {
++      throw new IllegalArgumentException(
++          "Call<T> cannot use Response as its generic parameter. "
++              + "Specify the response body type only (e.g., Call<TweetResponse>).");
++    }
++
+     return new CallAdapter<Object>() {
+       @Override public Type responseType() {
+         return responseType;
+@@ -67,7 +80,6 @@ final class ExecutorCallAdapterFactory implements CallAdapter.Factory {
+       delegate.cancel();
+     }
+ 
+-    @SuppressWarnings("CloneDoesntCallSuperClone") // Performing deep clone.
+     @Override public Call<T> clone() {
+       return new ExecutorCallbackCall<>(callbackExecutor, delegate.clone());
+     }
+diff --git a/retrofit/src/main/java/retrofit/Platform.java b/retrofit/src/main/java/retrofit/Platform.java
+index 4f694322..bd292c48 100644
+--- a/retrofit/src/main/java/retrofit/Platform.java
++++ b/retrofit/src/main/java/retrofit/Platform.java
+@@ -19,7 +19,6 @@ import android.os.Build;
+ import android.os.Handler;
+ import android.os.Looper;
+ import com.squareup.okhttp.OkHttpClient;
+-import java.lang.reflect.Type;
+ import java.util.concurrent.Executor;
+ import java.util.concurrent.TimeUnit;
+ 
+@@ -42,11 +41,8 @@ class Platform {
+     return new Platform();
+   }
+ 
+-  CallAdapter.Factory defaultCallAdapterFactory(Executor callbackExecutor) {
+-    if (callbackExecutor != null) {
+-      return new ExecutorCallAdapterFactory(callbackExecutor);
+-    }
+-    return new NothingCallAdapterFactory();
++  CallAdapter.Factory defaultCallAdapterFactory() {
++    return new DefaultCallAdapterFactory(new Utils.SynchronousExecutor());
+   }
+ 
+   OkHttpClient defaultClient() {
+@@ -59,11 +55,8 @@ class Platform {
+ 
+   /** Provides sane defaults for operation on Android. */
+   static class Android extends Platform {
+-    CallAdapter.Factory defaultCallAdapterFactory(Executor callbackExecutor) {
+-      if (callbackExecutor == null) {
+-        callbackExecutor = new MainThreadExecutor();
+-      }
+-      return new ExecutorCallAdapterFactory(callbackExecutor);
++    CallAdapter.Factory defaultCallAdapterFactory() {
++      return new DefaultCallAdapterFactory(new MainThreadExecutor());
+     }
+ 
+     static class MainThreadExecutor implements Executor {
+@@ -72,40 +65,6 @@ class Platform {
+       @Override public void execute(Runnable r) {
+         handler.post(r);
+       }
+-
+-      @Override public String toString() {
+-        return "MainThreadExecutor";
+-      }
+-    }
+-  }
+-
+-  static final class NothingCallAdapterFactory implements CallAdapter.Factory {
+-    @Override public CallAdapter<?> get(Type returnType) {
+-      if (Utils.getRawType(returnType) != Call.class) {
+-        return null;
+-      }
+-      Type responseType = Utils.getCallResponseType(returnType);
+-      return new NothingCallAdapter<>(responseType);
+-    }
+-
+-    @Override public String toString() {
+-      return "Default";
+-    }
+-
+-    static final class NothingCallAdapter<T> implements CallAdapter<T> {
+-      private final Type responseType;
+-
+-      NothingCallAdapter(Type responseType) {
+-        this.responseType = responseType;
+-      }
+-
+-      @Override public Type responseType() {
+-        return responseType;
+-      }
+-
+-      @Override public Call<T> adapt(Call<T> call) {
+-        return call;
+-      }
+     }
+   }
+ }
+diff --git a/retrofit/src/main/java/retrofit/Retrofit.java b/retrofit/src/main/java/retrofit/Retrofit.java
+index 55eb0a1b..d0d0589c 100644
+--- a/retrofit/src/main/java/retrofit/Retrofit.java
++++ b/retrofit/src/main/java/retrofit/Retrofit.java
+@@ -24,7 +24,6 @@ import java.lang.reflect.Method;
+ import java.lang.reflect.Proxy;
+ import java.util.LinkedHashMap;
+ import java.util.Map;
+-import java.util.concurrent.Executor;
+ import retrofit.http.HTTP;
+ import retrofit.http.Header;
+ 
+@@ -92,15 +91,13 @@ public final class Retrofit {
+   private final Endpoint endpoint;
+   private final Converter.Factory converterFactory;
+   private final CallAdapter.Factory adapterFactory;
+-  private final Executor callbackExecutor;
+ 
+   private Retrofit(OkHttpClient client, Endpoint endpoint, Converter.Factory converterFactory,
+-      CallAdapter.Factory adapterFactory, Executor callbackExecutor) {
++      CallAdapter.Factory adapterFactory) {
+     this.client = client;
+     this.endpoint = endpoint;
+     this.converterFactory = converterFactory;
+     this.adapterFactory = adapterFactory;
+-    this.callbackExecutor = callbackExecutor;
+   }
+ 
+   /** Create an implementation of the API defined by the {@code service} interface. */
+@@ -122,12 +119,14 @@ public final class Retrofit {
+   };
+ 
+   MethodHandler<?> loadMethodHandler(Method method) {
++    Map<Method, MethodHandler<?>> cache = methodHandlerCache;
++
+     MethodHandler<?> handler;
+-    synchronized (methodHandlerCache) {
+-      handler = methodHandlerCache.get(method);
++    synchronized (cache) {
++      handler = cache.get(method);
+       if (handler == null) {
+         handler = MethodHandler.create(method, client, endpoint, adapterFactory, converterFactory);
+-        methodHandlerCache.put(method, handler);
++        cache.put(method, handler);
+       }
+     }
+     return handler;
+@@ -154,10 +153,6 @@ public final class Retrofit {
+     return adapterFactory;
+   }
+ 
+-  public Executor callbackExecutor() {
+-    return callbackExecutor;
+-  }
+-
+   /**
+    * Build a new {@link Retrofit}.
+    * <p>
+@@ -169,7 +164,6 @@ public final class Retrofit {
+     private Endpoint endpoint;
+     private Converter.Factory converterFactory;
+     private CallAdapter.Factory adapterFactory;
+-    private Executor callbackExecutor;
+ 
+     /** The HTTP client used for requests. */
+     public Builder client(OkHttpClient client) {
+@@ -217,15 +211,6 @@ public final class Retrofit {
+       return this;
+     }
+ 
+-    /**
+-     * The executor on which {@link Callback} methods are invoked when returning {@link Call} from
+-     * your service method.
+-     */
+-    public Builder callbackExecutor(Executor callbackExecutor) {
+-      this.callbackExecutor = checkNotNull(callbackExecutor, "callbackExecutor == null");
+-      return this;
+-    }
+-
+     /** Create the {@link Retrofit} instances. */
+     public Retrofit build() {
+       if (endpoint == null) {
+@@ -237,10 +222,10 @@ public final class Retrofit {
+         client = Platform.get().defaultClient();
+       }
+       if (adapterFactory == null) {
+-        adapterFactory = Platform.get().defaultCallAdapterFactory(callbackExecutor);
++        adapterFactory = Platform.get().defaultCallAdapterFactory();
+       }
+ 
+-      return new Retrofit(client, endpoint, converterFactory, adapterFactory, callbackExecutor);
++      return new Retrofit(client, endpoint, converterFactory, adapterFactory);
+     }
+   }
+ }
+diff --git a/retrofit/src/main/java/retrofit/Utils.java b/retrofit/src/main/java/retrofit/Utils.java
+index d44e89fe..42038b67 100644
+--- a/retrofit/src/main/java/retrofit/Utils.java
++++ b/retrofit/src/main/java/retrofit/Utils.java
+@@ -28,6 +28,7 @@ import java.lang.reflect.Type;
+ import java.lang.reflect.TypeVariable;
+ import java.lang.reflect.WildcardType;
+ import java.util.Arrays;
++import java.util.concurrent.Executor;
+ import okio.Buffer;
+ import okio.BufferedSource;
+ import okio.Source;
+@@ -160,20 +161,10 @@ final class Utils {
+         + method.getName());
+   }
+ 
+-  static Type getCallResponseType(Type returnType) {
+-    if (!(returnType instanceof ParameterizedType)) {
+-      throw new IllegalArgumentException(
+-          "Call return type must be parameterized as Call<Foo> or Call<? extends Foo>");
+-    }
+-    final Type responseType = getSingleParameterUpperBound((ParameterizedType) returnType);
+-
+-    // Ensure the Call response type is not Response, we automatically deliver the Response object.
+-    if (getRawType(responseType) == retrofit.Response.class) {
+-      throw new IllegalArgumentException(
+-          "Call<T> cannot use Response as its generic parameter. "
+-              + "Specify the response body type only (e.g., Call<TweetResponse>).");
++  static class SynchronousExecutor implements Executor {
++    @Override public void execute(Runnable runnable) {
++      runnable.run();
+     }
+-    return responseType;
+   }
+ 
+   private Utils() {
+diff --git a/retrofit/src/test/java/retrofit/ExecutorCallAdapterFactoryTest.java b/retrofit/src/test/java/retrofit/DefaultCallAdapterFactoryTest.java
+similarity index 94%
+rename from retrofit/src/test/java/retrofit/ExecutorCallAdapterFactoryTest.java
+rename to retrofit/src/test/java/retrofit/DefaultCallAdapterFactoryTest.java
+index 6c95f888..9e5c96fd 100644
+--- a/retrofit/src/test/java/retrofit/ExecutorCallAdapterFactoryTest.java
++++ b/retrofit/src/test/java/retrofit/DefaultCallAdapterFactoryTest.java
+@@ -31,14 +31,10 @@ import static org.mockito.Mockito.verify;
+ import static org.mockito.Mockito.verifyNoMoreInteractions;
+ 
+ @SuppressWarnings("unchecked")
+-public final class ExecutorCallAdapterFactoryTest {
++public final class DefaultCallAdapterFactoryTest {
+   private final Callback<String> callback = mock(Callback.class);
+-  private final Executor callbackExecutor = spy(new Executor() {
+-    @Override public void execute(Runnable runnable) {
+-      runnable.run();
+-    }
+-  });
+-  private final CallAdapter.Factory factory = new ExecutorCallAdapterFactory(callbackExecutor);
++  private final Executor callbackExecutor = spy(new Utils.SynchronousExecutor());
++  private final CallAdapter.Factory factory = new DefaultCallAdapterFactory(callbackExecutor);
+ 
+   @Test public void rawTypeThrows() {
+     try {
+diff --git a/retrofit/src/test/java/retrofit/RetrofitTest.java b/retrofit/src/test/java/retrofit/RetrofitTest.java
+index 44785be6..ef303971 100644
+--- a/retrofit/src/test/java/retrofit/RetrofitTest.java
++++ b/retrofit/src/test/java/retrofit/RetrofitTest.java
+@@ -14,10 +14,7 @@ import java.lang.reflect.Type;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Set;
+-import java.util.concurrent.CountDownLatch;
+-import java.util.concurrent.Executor;
+ import java.util.concurrent.Future;
+-import java.util.concurrent.TimeUnit;
+ import java.util.concurrent.atomic.AtomicBoolean;
+ import org.junit.Rule;
+ import org.junit.Test;
+@@ -25,15 +22,9 @@ import retrofit.http.Body;
+ import retrofit.http.GET;
+ import retrofit.http.POST;
+ 
+-import static com.squareup.okhttp.mockwebserver.SocketPolicy.DISCONNECT_AT_START;
+ import static org.assertj.core.api.Assertions.assertThat;
+-import static org.junit.Assert.assertTrue;
+ import static org.junit.Assert.fail;
+-import static org.mockito.Matchers.any;
+ import static org.mockito.Mockito.mock;
+-import static org.mockito.Mockito.spy;
+-import static org.mockito.Mockito.verify;
+-import static org.mockito.Mockito.verifyNoMoreInteractions;
+ 
+ public final class RetrofitTest {
+   @Rule public final MockWebServerRule server = new MockWebServerRule();
+@@ -178,7 +169,7 @@ public final class RetrofitTest {
+       example.method();
+       fail();
+     } catch (IllegalArgumentException e) {
+-      assertThat(e).hasMessage("Call adapter factory 'Default' was unable to"
++      assertThat(e).hasMessage("Call adapter factory 'Default CallAdapterFactory' was unable to"
+               + " handle return type java.util.concurrent.Future<java.lang.String>\n"
+               + "    for method FutureMethod.method");
+     }
+@@ -446,7 +437,7 @@ public final class RetrofitTest {
+     Retrofit retrofit = new Retrofit.Builder()
+         .endpoint("http://example.com/")
+         .build();
+-    assertThat(retrofit.callAdapterFactory()).isNotNull();
++    assertThat(retrofit.callAdapterFactory()).isInstanceOf(DefaultCallAdapterFactory.class);
+   }
+ 
+   @Test public void callAdapterFactoryPropagated() {
+@@ -457,91 +448,4 @@ public final class RetrofitTest {
+         .build();
+     assertThat(retrofit.callAdapterFactory()).isSameAs(factory);
+   }
+-
+-  @Test public void callbackExecutorNullThrows() {
+-    try {
+-      new Retrofit.Builder().callbackExecutor(null);
+-      fail();
+-    } catch (NullPointerException e) {
+-      assertThat(e).hasMessage("callbackExecutor == null");
+-    }
+-  }
+-
+-  @Test public void callbackExecutorNoDefault() {
+-    Retrofit retrofit = new Retrofit.Builder()
+-        .endpoint("http://example.com/")
+-        .build();
+-    assertThat(retrofit.callbackExecutor()).isNull();
+-  }
+-
+-  @Test public void callbackExecutorPropagated() {
+-    Executor executor = mock(Executor.class);
+-    Retrofit retrofit = new Retrofit.Builder()
+-        .endpoint("http://example.com/")
+-        .callbackExecutor(executor)
+-        .build();
+-    assertThat(retrofit.callbackExecutor()).isSameAs(executor);
+-  }
+-
+-  @Test public void callbackExecutorUsedForSuccess() throws InterruptedException {
+-    Executor executor = spy(new Executor() {
+-      @Override public void execute(Runnable command) {
+-        command.run();
+-      }
+-    });
+-    Retrofit retrofit = new Retrofit.Builder()
+-        .endpoint(server.getUrl("/").toString())
+-        .callbackExecutor(executor)
+-        .build();
+-    CallMethod service = retrofit.create(CallMethod.class);
+-    Call<ResponseBody> call = service.allowed();
+-
+-    server.enqueue(new MockResponse());
+-
+-    final CountDownLatch latch = new CountDownLatch(1);
+-    call.enqueue(new Callback<ResponseBody>() {
+-      @Override public void success(Response<ResponseBody> response) {
+-        latch.countDown();
+-      }
+-
+-      @Override public void failure(Throwable t) {
+-        t.printStackTrace();
+-      }
+-    });
+-    assertTrue(latch.await(2, TimeUnit.SECONDS));
+-
+-    verify(executor).execute(any(Runnable.class));
+-    verifyNoMoreInteractions(executor);
+-  }
+-
+-  @Test public void callbackExecutorUsedForFailure() throws InterruptedException {
+-    Executor executor = spy(new Executor() {
+-      @Override public void execute(Runnable command) {
+-        command.run();
+-      }
+-    });
+-    Retrofit retrofit = new Retrofit.Builder()
+-        .endpoint(server.getUrl("/").toString())
+-        .callbackExecutor(executor)
+-        .build();
+-    CallMethod service = retrofit.create(CallMethod.class);
+-    Call<ResponseBody> call = service.allowed();
+-
+-    server.enqueue(new MockResponse().setSocketPolicy(DISCONNECT_AT_START));
+-
+-    final CountDownLatch latch = new CountDownLatch(1);
+-    call.enqueue(new Callback<ResponseBody>() {
+-      @Override public void success(Response<ResponseBody> response) {
+-        throw new AssertionError();
+-      }
+-
+-      @Override public void failure(Throwable t) {
+-        latch.countDown();
+-      }
+-    });
+-    assertTrue(latch.await(2, TimeUnit.SECONDS));
+-
+-    verify(executor).execute(any(Runnable.class));
+-    verifyNoMoreInteractions(executor);
+-  }
+ }

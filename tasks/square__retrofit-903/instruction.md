@@ -1,0 +1,9 @@
+Retrofit fails to handle successful HTTP responses with an empty response body when a non-raw type is expected. In Retrofit 1.8.0, if an endpoint sometimes returns a body and sometimes returns an empty body (e.g., HTTP 200 with Content-Length: 0), calling the API can trigger conversion on an empty InputStream. With JacksonConverter this results in a JsonMappingException because there is no content to parse.
+
+Reproduction example: define a service method like `@GET("/") Call<MyModel> getModel();` and enqueue/receive a 200 response with no body. Executing the call should not attempt to deserialize empty content. Instead, the call should succeed and return a `Response<MyModel>` whose `body()` is null.
+
+Currently, the empty body is passed to the configured `Converter` which tries to read it and throws (e.g., Jackson `JsonMappingException`). Additionally, when response logging is enabled, the response-body logging path must not crash (it can currently throw a `NullPointerException` if the body is treated as null too late or if logging assumes a non-null body).
+
+Implement proper empty-body detection before invoking the converter. Empty should include cases where there is a response body object but it has zero length. Once detected, Retrofit should treat it as “no content” and return null for the converted body without invoking the converter, while still allowing response logging to function without throwing.
+
+This should work consistently for synchronous and asynchronous execution via `Call<T>`, and it must not break handling of `Call<ResponseBody>` (raw body) or streaming responses annotated with `@Streaming` where the caller expects to manage the body directly.

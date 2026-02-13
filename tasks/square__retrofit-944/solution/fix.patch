@@ -1,0 +1,910 @@
+diff --git a/pom.xml b/pom.xml
+index 649318e4..51f82032 100644
+--- a/pom.xml
++++ b/pom.xml
+@@ -36,7 +36,7 @@
+     <module>retrofit</module>
+     <module>retrofit-adapters</module>
+     <module>retrofit-converters</module>
+-    <!--<module>retrofit-mock</module>-->
++    <module>retrofit-mock</module>
+     <module>samples</module>
+   </modules>
+ 
+diff --git a/retrofit-mock/pom.xml b/retrofit-mock/pom.xml
+index 83c3a836..ca7e9fe0 100644
+--- a/retrofit-mock/pom.xml
++++ b/retrofit-mock/pom.xml
+@@ -35,10 +35,5 @@
+       <artifactId>mockito-core</artifactId>
+       <scope>test</scope>
+     </dependency>
+-    <dependency>
+-      <groupId>com.google.guava</groupId>
+-      <artifactId>guava</artifactId>
+-      <scope>test</scope>
+-    </dependency>
+   </dependencies>
+ </project>
+diff --git a/retrofit-mock/src/main/java/retrofit/MockCall.java b/retrofit-mock/src/main/java/retrofit/MockCall.java
+new file mode 100644
+index 00000000..9eed1df7
+--- /dev/null
++++ b/retrofit-mock/src/main/java/retrofit/MockCall.java
+@@ -0,0 +1,157 @@
++/*
++ * Copyright (C) 2015 Square, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package retrofit;
++
++import java.io.IOException;
++import java.io.InterruptedIOException;
++import java.util.concurrent.Callable;
++import java.util.concurrent.CancellationException;
++import java.util.concurrent.ExecutionException;
++import java.util.concurrent.Executor;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Future;
++
++final class MockCall<T> implements Call<T> {
++  private final MockRetrofit mockRetrofit;
++  private final ExecutorService backgroundExecutor;
++  private final Executor callbackExecutor;
++  private final Response<T> response;
++  private final IOException failure;
++  private final boolean isFailure;
++
++  private volatile Future<?> task;
++  private volatile boolean canceled;
++  private volatile boolean executed;
++
++  MockCall(MockRetrofit mockRetrofit, ExecutorService backgroundExecutor, Executor callbackExecutor,
++      Response<T> response, IOException failure) {
++    if (callbackExecutor == null) {
++      callbackExecutor = new Executor() {
++        @Override public void execute(Runnable command) {
++          command.run();
++        }
++      };
++    }
++    this.mockRetrofit = mockRetrofit;
++    this.backgroundExecutor = backgroundExecutor;
++    this.callbackExecutor = callbackExecutor;
++    this.response = response;
++    this.failure = failure;
++    this.isFailure = failure != null;
++  }
++
++  @SuppressWarnings("CloneDoesntCallSuperClone") // We are a final type & this saves clearing state.
++  @Override public Call<T> clone() {
++    return new MockCall<>(mockRetrofit, backgroundExecutor, callbackExecutor, response, failure);
++  }
++
++  private Response<T> getResponse() throws IOException, InterruptedException {
++    if (mockRetrofit.calculateIsFailure() || isFailure) {
++      Thread.sleep(mockRetrofit.calculateDelayForError());
++      throw isFailure ? failure : new IOException("Mock exception");
++    }
++    Thread.sleep(mockRetrofit.calculateDelayForCall());
++    return response;
++  }
++
++  @Override public void enqueue(final Callback<T> callback) {
++    synchronized (this) {
++      if (executed) throw new IllegalStateException("Already executed");
++      executed = true;
++    }
++    task = backgroundExecutor.submit(new Runnable() {
++      private void callFailure(final Throwable throwable) {
++        callbackExecutor.execute(new Runnable() {
++          @Override public void run() {
++            try {
++              callback.onFailure(throwable);
++            } catch (Throwable t) {
++              Thread thread = Thread.currentThread();
++              thread.getUncaughtExceptionHandler().uncaughtException(thread, t);
++            }
++          }
++        });
++      }
++
++      private void callSuccess(final Response<T> response) {
++        callbackExecutor.execute(new Runnable() {
++          @Override public void run() {
++            try {
++              callback.onResponse(response);
++            } catch (Throwable t) {
++              Thread thread = Thread.currentThread();
++              thread.getUncaughtExceptionHandler().uncaughtException(thread, t);
++            }
++          }
++        });
++      }
++
++      @Override public void run() {
++        Response<T> response;
++        try {
++          response = getResponse();
++        } catch (IOException e) {
++          callFailure(e);
++          return;
++        } catch (InterruptedException e) {
++          callFailure(new InterruptedIOException("canceled"));
++          return;
++        }
++        callSuccess(response);
++      }
++    });
++  }
++
++  @Override public Response<T> execute() throws IOException {
++    synchronized (this) {
++      if (executed) throw new IllegalStateException("Already executed");
++      executed = true;
++    }
++    if (canceled) {
++      throw new InterruptedIOException("canceled");
++    }
++
++    Future<Response<T>> task = backgroundExecutor.submit(new Callable<Response<T>>() {
++      @Override public Response<T> call() throws Exception {
++        return getResponse();
++      }
++    });
++    this.task = task;
++
++    try {
++      return task.get();
++    } catch (CancellationException | InterruptedException e) {
++      throw new InterruptedIOException("canceled");
++    } catch (ExecutionException e) {
++      Throwable cause = e.getCause();
++      if (cause instanceof RuntimeException) {
++        throw (RuntimeException) cause;
++      }
++      if (cause instanceof IOException) {
++        throw (IOException) cause;
++      }
++      throw new IllegalStateException(cause);
++    }
++  }
++
++  @Override public void cancel() {
++    canceled = true;
++    Future<?> task = this.task;
++    if (task != null) {
++      task.cancel(true);
++    }
++  }
++}
+diff --git a/retrofit-mock/src/main/java/retrofit/MockHttpException.java b/retrofit-mock/src/main/java/retrofit/MockHttpException.java
+deleted file mode 100644
+index 34eaea45..00000000
+--- a/retrofit-mock/src/main/java/retrofit/MockHttpException.java
++++ /dev/null
+@@ -1,114 +0,0 @@
+-// Copyright 2013 Square, Inc.
+-package retrofit;
+-
+-import com.squareup.okhttp.Headers;
+-import com.squareup.okhttp.Protocol;
+-import com.squareup.okhttp.Request;
+-import com.squareup.okhttp.Response;
+-import retrofit.converter.Converter;
+-
+-import static java.net.HttpURLConnection.HTTP_BAD_REQUEST;
+-import static java.net.HttpURLConnection.HTTP_FORBIDDEN;
+-import static java.net.HttpURLConnection.HTTP_INTERNAL_ERROR;
+-import static java.net.HttpURLConnection.HTTP_MOVED_PERM;
+-import static java.net.HttpURLConnection.HTTP_MOVED_TEMP;
+-import static java.net.HttpURLConnection.HTTP_NOT_FOUND;
+-import static java.net.HttpURLConnection.HTTP_UNAUTHORIZED;
+-
+-/**
+- * An exception used to trigger the simulation of an HTTP error for mock services.
+- *
+- * @see MockRetrofit
+- */
+-public class MockHttpException extends RuntimeException {
+-  /** Create a new {@link MockHttpException} for HTTP 301 Moved Permanently. */
+-  public static MockHttpException newMovedPermanentely(String location, Object responseBody) {
+-    if (location == null || "".equals(location.trim())) {
+-      throw new IllegalArgumentException("Location must not be blank.");
+-    }
+-    return new MockHttpException(HTTP_MOVED_PERM, "Moved Permanently", responseBody)
+-        .withHeader("Location", location);
+-  }
+-
+-  /** Create a new {@link MockHttpException} for HTTP 302 Moved Temporarily. */
+-  public static MockHttpException newMovedTemporarily(String location, Object responseBody) {
+-    if (location == null || "".equals(location.trim())) {
+-      throw new IllegalArgumentException("Location must not be blank.");
+-    }
+-    return new MockHttpException(HTTP_MOVED_TEMP, "Moved Temporarily", responseBody)
+-        .withHeader("Location", location);
+-  }
+-
+-  /** Create a new {@link MockHttpException} for HTTP 400 Bad Request. */
+-  public static MockHttpException newBadRequest(Object responseBody) {
+-    return new MockHttpException(HTTP_BAD_REQUEST, "Bad Request", responseBody);
+-  }
+-
+-  /** Create a new {@link MockHttpException} for HTTP 401 Unauthorized. */
+-  public static MockHttpException newUnauthorized(Object responseBody) {
+-    return new MockHttpException(HTTP_UNAUTHORIZED, "Unauthorized", responseBody);
+-  }
+-
+-  /** Create a new {@link MockHttpException} for HTTP 403 Forbidden. */
+-  public static MockHttpException newForbidden(Object responseBody) {
+-    return new MockHttpException(HTTP_FORBIDDEN, "Forbidded", responseBody);
+-  }
+-
+-  /** Create a new {@link MockHttpException} for HTTP 404 Not Found. */
+-  public static MockHttpException newNotFound(Object responseBody) {
+-    return new MockHttpException(HTTP_NOT_FOUND, "Not Found", responseBody);
+-  }
+-
+-  /** Create a new {@link MockHttpException} for HTTP 500 Internal Server Error. */
+-  public static MockHttpException newInternalError(Object responseBody) {
+-    return new MockHttpException(HTTP_INTERNAL_ERROR, "Internal Server Error", responseBody);
+-  }
+-
+-  final int code;
+-  final String reason;
+-  final Object responseBody;
+-  final Headers.Builder headers = new Headers.Builder();
+-
+-  /**
+-   * Create a new HTTP exception.
+-   *
+-   * @param code HTTP status code to trigger. Must be 300 or higher.
+-   * @param reason HTTP status reason message.
+-   * @param responseBody Object to use as the contents of the response body.
+-   */
+-  public MockHttpException(int code, String reason, Object responseBody) {
+-    super("HTTP " + code + " " + reason);
+-    if (code < 300 || code > 599) {
+-      throw new IllegalArgumentException("Unsupported HTTP error code: " + code);
+-    }
+-    if (reason == null || "".equals(reason.trim())) {
+-      throw new IllegalArgumentException("Reason must not be blank.");
+-    }
+-    this.code = code;
+-    this.reason = reason;
+-    this.responseBody = responseBody;
+-  }
+-
+-  /** Add a header to the response. */
+-  public MockHttpException withHeader(String name, String value) {
+-    if (name == null || "".equals(name.trim())) {
+-      throw new IllegalArgumentException("Header name must not be blank.");
+-    }
+-    if (value == null || "".equals(value.trim())) {
+-      throw new IllegalArgumentException("Header value must not be blank.");
+-    }
+-    headers.add(name, value);
+-    return this;
+-  }
+-
+-  Response toResponse(Request request, Converter converter) {
+-    return new Response.Builder()
+-        .code(code)
+-        .message(reason)
+-        .headers(headers.build())
+-        .body(new MockResponseBody(converter, responseBody))
+-        .protocol(Protocol.HTTP_1_1)
+-        .request(request)
+-        .build();
+-  }
+-}
+diff --git a/retrofit-mock/src/main/java/retrofit/MockResponseBody.java b/retrofit-mock/src/main/java/retrofit/MockResponseBody.java
+deleted file mode 100644
+index 03f1194e..00000000
+--- a/retrofit-mock/src/main/java/retrofit/MockResponseBody.java
++++ /dev/null
+@@ -1,46 +0,0 @@
+-// Copyright 2013 Square, Inc.
+-package retrofit;
+-
+-import com.squareup.okhttp.MediaType;
+-import com.squareup.okhttp.ResponseBody;
+-import java.io.IOException;
+-import okio.Buffer;
+-import okio.BufferedSource;
+-import retrofit.converter.Converter;
+-
+-class MockResponseBody extends ResponseBody {
+-  private final Converter converter;
+-  private final Object body;
+-
+-  private byte[] bytes;
+-
+-  MockResponseBody(Converter converter, Object body) {
+-    this.converter = converter;
+-    this.body = body;
+-  }
+-
+-  @Override public MediaType contentType() {
+-    return MediaType.parse("application/unknown");
+-  }
+-
+-  @Override public long contentLength() {
+-    try {
+-      initBytes();
+-    } catch (IOException e) {
+-      throw new RuntimeException(e);
+-    }
+-    return bytes.length;
+-  }
+-
+-  @Override public BufferedSource source() {
+-    return new Buffer().write(bytes);
+-  }
+-
+-  private synchronized void initBytes() throws IOException {
+-    if (bytes == null) {
+-      Buffer buffer = new Buffer();
+-      converter.toBody(body, body.getClass()).writeTo(buffer);
+-      bytes = buffer.readByteArray();
+-    }
+-  }
+-}
+diff --git a/retrofit-mock/src/main/java/retrofit/MockRestAdapter.java b/retrofit-mock/src/main/java/retrofit/MockRestAdapter.java
+deleted file mode 100644
+index c06a7653..00000000
+--- a/retrofit-mock/src/main/java/retrofit/MockRestAdapter.java
++++ /dev/null
+@@ -1,353 +0,0 @@
+-// Copyright 2013 Square, Inc.
+-package retrofit;
+-
+-import com.squareup.okhttp.Request;
+-import com.squareup.okhttp.Response;
+-import java.io.IOException;
+-import java.lang.reflect.InvocationHandler;
+-import java.lang.reflect.InvocationTargetException;
+-import java.lang.reflect.Method;
+-import java.lang.reflect.Proxy;
+-import java.util.Random;
+-import java.util.concurrent.Executor;
+-import java.util.concurrent.TimeUnit;
+-
+-import static retrofit.RetrofitError.unexpectedError;
+-
+-/**
+- * Wraps mock implementations of API interfaces so that they exhibit the delay and error
+- * characteristics of a real network.
+- * <p>
+- * Because APIs are defined as interfaces, versions of the API that use mock data can be created by
+- * simply implementing the API interface on a class. These mock implementations execute
+- * synchronously which is a large deviation from the behavior of those backed by an API call over
+- * the network. By wrapping the mock instances using this class, the interface will still use mock
+- * data but exhibit the delays and errors that a real network would face.
+- * <p>
+- * Create an API interface and a mock implementation of it.
+- * <pre>
+- *   public interface UserService {
+- *     &#64;GET("/user/{id}")
+- *     User getUser(@Path("id") String userId);
+- *   }
+- *   public class MockUserService implements UserService {
+- *     &#64;Override public User getUser(String userId) {
+- *       return new User("Jake");
+- *     }
+- *   }
+- * </pre>
+- * Given a {@link RestAdapter} an instance of this class can be created by calling {@link #from}.
+- * <pre>
+- *   MockRetrofit mockRetrofit = MockRetrofit.from(restAdapter);
+- * </pre>
+- * Instances of this class should be used as a singleton so that the behavior of every mock service
+- * is consistent.
+- * <p>
+- * Rather than using the {@code MockUserService} directly, pass it through
+- * {@link #create(Class, Object) the create method}.
+- * <pre>
+- *   UserService service = mockRetrofit.create(UserService.class, new MockUserService());
+- * </pre>
+- * The returned {@code UserService} instance will now behave like it is happening over the network
+- * while allowing the mock implementation to be written synchronously.
+- * <p>
+- * HTTP errors can be simulated in your mock services by throwing an instance of
+- * {@link MockHttpException}. This should be done for both synchronous and asynchronous methods.
+- * Do not call the {@link Callback#failure(RetrofitError) failure()} method of a callback.
+- */
+-public final class MockRetrofit {
+-  private static final int DEFAULT_DELAY_MS = 2000; // Network calls will take 2 seconds.
+-  private static final int DEFAULT_VARIANCE_PCT = 40; // Network delay varies by ±40%.
+-  private static final int DEFAULT_ERROR_PCT = 3; // 3% of network calls will fail.
+-  private static final int ERROR_DELAY_FACTOR = 3; // Network errors will be scaled by this value.
+-
+-  /**
+-   * Create a new {@link MockRetrofit} which will act as a factory for mock services. Some of
+-   * the configuration of the supplied {@link RestAdapter} will be used generating mock behavior.
+-   */
+-  public static MockRetrofit from(RestAdapter restAdapter, Executor executor) {
+-    return new MockRetrofit(restAdapter, executor);
+-  }
+-
+-  private final RestAdapter restAdapter;
+-  private final Executor executor;
+-  final Random random = new Random();
+-
+-  private int delayMs = DEFAULT_DELAY_MS;
+-  private int variancePct = DEFAULT_VARIANCE_PCT;
+-  private int errorPct = DEFAULT_ERROR_PCT;
+-
+-  private MockRetrofit(RestAdapter restAdapter, Executor executor) {
+-    this.restAdapter = restAdapter;
+-    this.executor = executor;
+-  }
+-
+-  /** Set the network round trip delay, in milliseconds. */
+-  public void setDelay(long delayMs) {
+-    if (delayMs < 0) {
+-      throw new IllegalArgumentException("Delay must be positive value.");
+-    }
+-    if (delayMs > Integer.MAX_VALUE) {
+-      throw new IllegalArgumentException("Delay value too large. Max: " + Integer.MAX_VALUE);
+-    }
+-    this.delayMs = (int) delayMs;
+-  }
+-
+-  /** The network round trip delay, in milliseconds */
+-  public long getDelay() {
+-    return delayMs;
+-  }
+-
+-  /** Set the plus-or-minus variance percentage of the network round trip delay. */
+-  public void setVariancePercentage(int variancePct) {
+-    if (variancePct < 0 || variancePct > 100) {
+-      throw new IllegalArgumentException("Variance percentage must be between 0 and 100.");
+-    }
+-    this.variancePct = variancePct;
+-  }
+-
+-  /** The plus-or-minus variance percentage of the network round trip delay. */
+-  public int getVariancePercentage() {
+-    return variancePct;
+-  }
+-
+-  /** Set the percentage of calls to {@link #calculateIsFailure()} that return {@code true}. */
+-  public void setErrorPercentage(int errorPct) {
+-    if (errorPct < 0 || errorPct > 100) {
+-      throw new IllegalArgumentException("Error percentage must be between 0 and 100.");
+-    }
+-    this.errorPct = errorPct;
+-  }
+-
+-  /** The percentage of calls to {@link #calculateIsFailure()} that return {@code true}. */
+-  public int getErrorPercentage() {
+-    return errorPct;
+-  }
+-
+-  /**
+-   * Randomly determine whether this call should result in a network failure.
+-   * <p>
+-   * This method is exposed for implementing other, non-Retrofit services which exhibit similar
+-   * network behavior. Retrofit services automatically will exhibit network behavior when wrapped
+-   * using {@link #create(Class, Object)}.
+-   */
+-  public boolean calculateIsFailure() {
+-    int randomValue = random.nextInt(100) + 1;
+-    return randomValue <= errorPct;
+-  }
+-
+-  /**
+-   * Get the delay (in milliseconds) that should be used for triggering a network error.
+-   * <p>
+-   * Because we are triggering an error, use a random delay between 0 and three times the normal
+-   * network delay to simulate a flaky connection failing anywhere from quickly to slowly.
+-   * <p>
+-   * This method is exposed for implementing other, non-Retrofit services which exhibit similar
+-   * network behavior. Retrofit services automatically will exhibit network behavior when wrapped
+-   * using {@link #create(Class, Object)}.
+-   */
+-  public int calculateDelayForError() {
+-    if (delayMs == 0) return 0;
+-
+-    return random.nextInt(delayMs * ERROR_DELAY_FACTOR);
+-  }
+-
+-  /**
+-   * Get the delay (in milliseconds) that should be used for delaying a network call response.
+-   * <p>
+-   * This method is exposed for implementing other, non-Retrofit services which exhibit similar
+-   * network behavior. Retrofit services automatically will exhibit network behavior when wrapped
+-   * using {@link #create(Class, Object)}.
+-   */
+-  public int calculateDelayForCall() {
+-    float errorPercent = variancePct / 100f; // e.g., 20 / 100f == 0.2f
+-    float lowerBound = 1f - errorPercent; // 0.2f --> 0.8f
+-    float upperBound = 1f + errorPercent; // 0.2f --> 1.2f
+-    float bound = upperBound - lowerBound; // 1.2f - 0.8f == 0.4f
+-    float delayPercent = (random.nextFloat() * bound) + lowerBound; // 0.8 + (rnd * 0.4)
+-    return (int) (delayMs * delayPercent);
+-  }
+-
+-  /**
+-   * Wrap the supplied mock implementation of a service so that it exhibits the delay and error
+-   * characteristics of a real network.
+-   *
+-   * @see #setDelay(long)
+-   * @see #setVariancePercentage(int)
+-   * @see #setErrorPercentage(int)
+-   */
+-  @SuppressWarnings("unchecked")
+-  public <T> T create(Class<T> service, T mockService) {
+-    Utils.validateServiceClass(service);
+-    return (T) Proxy.newProxyInstance(service.getClassLoader(), new Class<?>[] { service },
+-        new MockHandler(service, mockService));
+-  }
+-
+-  private class MockHandler implements InvocationHandler {
+-    private final Object mockService;
+-
+-    public MockHandler(Object mockService, T service) {
+-      this.mockService = mockService;
+-    }
+-
+-    @Override public Object invoke(Object proxy, Method method, final Object[] args)
+-        throws Throwable {
+-      // If the method is a method from Object then defer to normal invocation.
+-      if (method.getDeclaringClass() == Object.class) {
+-        return method.invoke(this, args);
+-      }
+-
+-      // Load or create the details cache for the current method.
+-      final MethodInfo methodInfo = RestAdapter.getMethodInfo(methodInfoCache, method);
+-      final Request request = buildRequest(methodInfo, args);
+-
+-      if (methodInfo.executionType == MethodInfo.ExecutionType.SYNC) {
+-        try {
+-          return invokeSync(methodInfo, args, request);
+-        } catch (RetrofitError error) {
+-          Throwable newError = restAdapter.errorHandler.handleError(error);
+-          if (newError == null) {
+-            throw new IllegalStateException("Error handler returned null for wrapped exception.",
+-                error);
+-          }
+-          throw newError;
+-        }
+-      }
+-
+-      executor.execute(new Runnable() {
+-        @Override public void run() {
+-          invokeAsync(methodInfo, args, request);
+-        }
+-      });
+-      return null; // Asynchronous methods should have return type of void.
+-    }
+-
+-    private Request buildRequest(MethodInfo methodInfo, Object[] args) throws Throwable {
+-      // Begin building a normal request.
+-      String apiUrl = restAdapter.baseUrl.url();
+-      RequestBuilder requestBuilder = new RequestBuilder(apiUrl, methodInfo, restAdapter.converter);
+-      requestBuilder.setArguments(args);
+-      return requestBuilder.build();
+-    }
+-
+-    private Object invokeSync(MethodInfo methodInfo, Object[] args, Request request)
+-        throws Throwable {
+-      String url = request.urlString();
+-
+-      if (calculateIsFailure()) {
+-        sleep(calculateDelayForError());
+-        IOException exception = new IOException("Mock network error!");
+-        throw RetrofitError.networkFailure(url, exception);
+-      }
+-
+-      int callDelay = calculateDelayForCall();
+-      long beforeNanos = System.nanoTime();
+-      try {
+-        Object returnValue = methodInfo.method.invoke(mockService, args);
+-
+-        // Sleep for whatever amount of time is left to satisfy the network delay, if any.
+-        long tookMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - beforeNanos);
+-        sleep(callDelay - tookMs);
+-
+-        return returnValue;
+-      } catch (InvocationTargetException e) {
+-        Throwable innerEx = e.getCause();
+-        if (!(innerEx instanceof MockHttpException)) {
+-          throw innerEx;
+-        }
+-        MockHttpException httpEx = (MockHttpException) innerEx;
+-        Response response = httpEx.toResponse(request, restAdapter.converter);
+-
+-        // Sleep for whatever amount of time is left to satisfy the network delay, if any.
+-        long tookMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - beforeNanos);
+-        sleep(callDelay - tookMs);
+-
+-        throw new MockHttpRetrofitError(httpEx.reason, url, response, httpEx.responseBody,
+-            methodInfo.responseType);
+-      }
+-    }
+-
+-    private void invokeAsync(final MethodInfo methodInfo, final Object[] args,
+-        final Request request) {
+-      final String url = request.urlString();
+-      final Callback callback = (Callback) args[args.length - 1];
+-
+-      if (calculateIsFailure()) {
+-        sleep(calculateDelayForError());
+-        IOException exception = new IOException("Mock network error!");
+-        RetrofitError error = RetrofitError.networkFailure(url, exception);
+-        Throwable cause = restAdapter.errorHandler.handleError(error);
+-        final RetrofitError e = cause == error ? error : unexpectedError(error.getUrl(), cause);
+-        restAdapter.callbackExecutor.execute(new Runnable() {
+-          @Override public void run() {
+-            callback.failure(e);
+-          }
+-        });
+-        return;
+-      }
+-
+-      final int callDelay = calculateDelayForCall();
+-      sleep(callDelay);
+-
+-      restAdapter.callbackExecutor.execute(new Runnable() {
+-        @Override public void run() {
+-          try {
+-            methodInfo.method.invoke(mockService, args);
+-          } catch (Throwable throwable) {
+-            final Throwable innerEx = throwable.getCause();
+-            if (!(innerEx instanceof MockHttpException)) {
+-              if (innerEx instanceof RuntimeException) {
+-                throw (RuntimeException) innerEx;
+-              }
+-              throw new RuntimeException(innerEx);
+-            }
+-
+-            MockHttpException httpEx = (MockHttpException) innerEx;
+-            Response response = httpEx.toResponse(request, restAdapter.converter);
+-
+-            RetrofitError error = new MockHttpRetrofitError(httpEx.getMessage(), url, response,
+-                httpEx.responseBody, methodInfo.responseType);
+-            Throwable cause = restAdapter.errorHandler.handleError(error);
+-            final RetrofitError e = cause == error ? error : unexpectedError(error.getUrl(), cause);
+-            callback.failure(e);
+-          }
+-        }
+-      });
+-    }
+-  }
+-
+-  /**
+-   * Waits a given number of milliseconds (of uptimeMillis) before returning. Similar to {@link
+-   * Thread#sleep(long)}, but does not throw {@link InterruptedException}; {@link
+-   * Thread#interrupt()} events are deferred until the next interruptible operation.  Does not
+-   * return until at least the specified number of milliseconds has elapsed.
+-   *
+-   * @param ms to sleep before returning, in milliseconds of uptime.
+-   */
+-  private static void sleep(long ms) {
+-    // This implementation is modified from Android's SystemClock#sleep.
+-
+-    long start = uptimeMillis();
+-    long duration = ms;
+-    boolean interrupted = false;
+-    while (duration > 0) {
+-      try {
+-        Thread.sleep(duration);
+-      } catch (InterruptedException e) {
+-        interrupted = true;
+-      }
+-      duration = start + ms - uptimeMillis();
+-    }
+-
+-    if (interrupted) {
+-      // Important: we don't want to quietly eat an interrupt() event,
+-      // so we make sure to re-interrupt the thread so that the next
+-      // call to Thread.sleep() or Object.wait() will be interrupted.
+-      Thread.currentThread().interrupt();
+-    }
+-  }
+-
+-  private static long uptimeMillis() {
+-    return System.nanoTime() / 1000000L;
+-  }
+-}
+diff --git a/retrofit-mock/src/main/java/retrofit/MockRetrofit.java b/retrofit-mock/src/main/java/retrofit/MockRetrofit.java
+new file mode 100644
+index 00000000..75453d1e
+--- /dev/null
++++ b/retrofit-mock/src/main/java/retrofit/MockRetrofit.java
+@@ -0,0 +1,182 @@
++/*
++ * Copyright (C) 2013 Square, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package retrofit;
++
++import java.io.IOException;
++import java.util.Random;
++import java.util.concurrent.Executor;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.TimeUnit;
++
++import static java.util.concurrent.TimeUnit.MILLISECONDS;
++
++/**
++ * Creates {@link Call} instances which simulate the delay and error characteristics of a real
++ * network.
++ * <p>
++ * Because APIs are defined as interfaces, versions of the API that use mock data can be created by
++ * simply implementing the API interface on a class. These mock implementations execute
++ * synchronously which is a large deviation from the behavior of those backed by an API call over
++ * the network. By using the {@code Call} instances created using this class, the interface will
++ * still use mock data but exhibit the delays and errors of a real network.
++ * <p>
++ * Example:
++ * <pre>
++ * public interface UserService {
++ *   &#64;GET("/user/{id}")
++ *   Call&lt;User> getUser(@Path("id") String userId);
++ * }
++ *
++ * public class MockUserService implements UserService {
++ *   private final MockRetrofit mock = // ...
++ *
++ *   &#64;Override public Call&lt;User> getUser(String userId) {
++ *     return mock.newSuccessCall(new User("Jake"));
++ *   }
++ * }
++ * </pre>
++ */
++public final class MockRetrofit {
++  private static final int DEFAULT_DELAY_MS = 2000; // Network calls will take 2 seconds.
++  private static final int DEFAULT_VARIANCE_PCT = 40; // Network delay varies by ±40%.
++  private static final int DEFAULT_ERROR_PCT = 3; // 3% of network calls will fail.
++  private static final int DEFAULT_ERROR_DELAY_FACTOR = 3; // Errors will be scaled by this value.
++
++  /**
++   * Create an instance with a normal {@link Retrofit} instance and an executor service on which
++   * the simulated delays will be created. Instances of this class should be re-used so that the
++   * behavior of every mock service is consistent.
++   */
++  public static MockRetrofit from(Retrofit restAdapter, ExecutorService backgroundExecutor) {
++    return new MockRetrofit(restAdapter, backgroundExecutor);
++  }
++
++  private final ExecutorService backgroundExecutor;
++  private final Executor callbackExecutor;
++
++  final Random random = new Random();
++
++  private volatile int delayMs = DEFAULT_DELAY_MS;
++  private volatile int variancePercent = DEFAULT_VARIANCE_PCT;
++  private volatile int errorPercent = DEFAULT_ERROR_PCT;
++
++  private MockRetrofit(Retrofit retrofit, ExecutorService backgroundExecutor) {
++    this.backgroundExecutor = backgroundExecutor;
++    this.callbackExecutor = retrofit.callbackExecutor();
++  }
++
++  /** Create a call which succeeds with {@code body} in its response. */
++  public <T> Call<T> newSuccessCall(T body) {
++    return newSuccessCall(Response.fakeSuccess(body));
++  }
++
++  /** Create a call which succeeds with {@code response}. */
++  public <T> Call<T> newSuccessCall(Response<T> response) {
++    return new MockCall<>(this, backgroundExecutor, callbackExecutor, response, null);
++  }
++
++  /** Create a call which fails with {@code e}.  */
++  public <T> Call<T> newFailureCall(IOException e) {
++    return new MockCall<>(this, backgroundExecutor, callbackExecutor, null, e);
++  }
++
++  /** Set the network round trip delay. */
++  public void setDelay(long amount, TimeUnit unit) {
++    if (amount < 0) {
++      throw new IllegalArgumentException("Amount must be positive value.");
++    }
++    long delayMs = unit.toMillis(amount);
++    if (delayMs > Integer.MAX_VALUE) {
++      throw new IllegalArgumentException("Delay value too large. Max: " + Integer.MAX_VALUE);
++    }
++    this.delayMs = (int) delayMs;
++  }
++
++  /** The network round trip delay. */
++  public long delay(TimeUnit unit) {
++    return MILLISECONDS.convert(delayMs, unit);
++  }
++
++  /** Set the plus-or-minus variance percentage of the network round trip delay. */
++  public void setVariancePercent(int variancePct) {
++    if (variancePct < 0 || variancePct > 100) {
++      throw new IllegalArgumentException("Variance percentage must be between 0 and 100.");
++    }
++    this.variancePercent = variancePct;
++  }
++
++  /** The plus-or-minus variance percentage of the network round trip delay. */
++  public int variancePercent() {
++    return variancePercent;
++  }
++
++  /** Set the percentage of calls to {@link #calculateIsFailure()} that return {@code true}. */
++  public void setErrorPercent(int errorPct) {
++    if (errorPct < 0 || errorPct > 100) {
++      throw new IllegalArgumentException("Error percentage must be between 0 and 100.");
++    }
++    this.errorPercent = errorPct;
++  }
++
++  /** The percentage of calls to {@link #calculateIsFailure()} that return {@code true}. */
++  public int errorPercent() {
++    return errorPercent;
++  }
++
++  /**
++   * Randomly determine whether this call should result in a network failure.
++   * <p>
++   * This method is exposed for implementing other, non-Retrofit services which exhibit similar
++   * network behavior. Retrofit services automatically will exhibit network behavior when wrapped
++   * using {@link #newSuccessCall} or {@link #newFailureCall}.
++   */
++  public boolean calculateIsFailure() {
++    int randomValue = random.nextInt(100);
++    return randomValue < errorPercent;
++  }
++
++  /**
++   * Get the delay (in milliseconds) that should be used for triggering a network error.
++   * <p>
++   * Because we are triggering an error, use a random delay between 0 and three times the normal
++   * network delay to simulate a flaky connection failing anywhere from quickly to slowly.
++   * <p>
++   * This method is exposed for implementing other, non-Retrofit services which exhibit similar
++   * network behavior. Retrofit services automatically will exhibit network behavior when wrapped
++   * using {@link #newSuccessCall} or {@link #newFailureCall}.
++   */
++  public int calculateDelayForError() {
++    if (delayMs == 0) return 0;
++
++    return random.nextInt(delayMs * DEFAULT_ERROR_DELAY_FACTOR);
++  }
++
++  /**
++   * Get the delay (in milliseconds) that should be used for delaying a network call response.
++   * <p>
++   * This method is exposed for implementing other, non-Retrofit services which exhibit similar
++   * network behavior. Retrofit services automatically will exhibit network behavior when wrapped
++   * using {@link #newSuccessCall} or {@link #newFailureCall}.
++   */
++  public int calculateDelayForCall() {
++    float delta = variancePercent / 100f; // e.g., 20 / 100f == 0.2f
++    float lowerBound = 1f - delta; // 0.2f --> 0.8f
++    float upperBound = 1f + delta; // 0.2f --> 1.2f
++    float bound = upperBound - lowerBound; // 1.2f - 0.8f == 0.4f
++    float delayPercent = (random.nextFloat() * bound) + lowerBound; // 0.8 + (rnd * 0.4)
++    return (int) (delayMs * delayPercent);
++  }
++}

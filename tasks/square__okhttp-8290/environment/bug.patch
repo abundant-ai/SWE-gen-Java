@@ -1,0 +1,1840 @@
+diff --git a/okhttp-testing-support/src/main/kotlin/okhttp3/TestValueFactory.kt b/okhttp-testing-support/src/main/kotlin/okhttp3/TestValueFactory.kt
+index adaf9b994..bbc348fa8 100644
+--- a/okhttp-testing-support/src/main/kotlin/okhttp3/TestValueFactory.kt
++++ b/okhttp-testing-support/src/main/kotlin/okhttp3/TestValueFactory.kt
+@@ -31,7 +31,6 @@ import javax.net.SocketFactory
+ import javax.net.ssl.HostnameVerifier
+ import javax.net.ssl.HttpsURLConnection
+ import javax.net.ssl.SSLSocketFactory
+-import kotlin.concurrent.withLock
+ import okhttp3.internal.RecordingOkAuthenticator
+ import okhttp3.internal.concurrent.TaskFaker
+ import okhttp3.internal.concurrent.TaskRunner
+@@ -94,7 +93,7 @@ class TestValueFactory : Closeable {
+         socket = Socket(),
+         idleAtNs = idleAtNanos,
+       )
+-    result.lock.withLock { pool.put(result) }
++    synchronized(result) { pool.put(result) }
+     return result
+   }
+ 
+diff --git a/okhttp/src/main/kotlin/okhttp3/Dispatcher.kt b/okhttp/src/main/kotlin/okhttp3/Dispatcher.kt
+index 0494446a6..e869053c1 100644
+--- a/okhttp/src/main/kotlin/okhttp3/Dispatcher.kt
++++ b/okhttp/src/main/kotlin/okhttp3/Dispatcher.kt
+@@ -22,9 +22,7 @@ import java.util.concurrent.ExecutorService
+ import java.util.concurrent.SynchronousQueue
+ import java.util.concurrent.ThreadPoolExecutor
+ import java.util.concurrent.TimeUnit
+-import java.util.concurrent.locks.ReentrantLock
+-import kotlin.concurrent.withLock
+-import okhttp3.internal.assertNotHeld
++import okhttp3.internal.assertThreadDoesntHoldLock
+ import okhttp3.internal.connection.RealCall
+ import okhttp3.internal.connection.RealCall.AsyncCall
+ import okhttp3.internal.okHttpName
+@@ -38,8 +36,6 @@ import okhttp3.internal.threadFactory
+  * concurrently.
+  */
+ class Dispatcher() {
+-  internal val lock: ReentrantLock = ReentrantLock()
+-
+   /**
+    * The maximum number of requests to execute concurrently. Above this requests queue in memory,
+    * waiting for the running calls to complete.
+@@ -47,11 +43,10 @@ class Dispatcher() {
+    * If more than [maxRequests] requests are in flight when this is invoked, those requests will
+    * remain in flight.
+    */
+-  var maxRequests = 64
+-    get() = lock.withLock { field }
++  @get:Synchronized var maxRequests = 64
+     set(maxRequests) {
+       require(maxRequests >= 1) { "max < 1: $maxRequests" }
+-      lock.withLock {
++      synchronized(this) {
+         field = maxRequests
+       }
+       promoteAndExecute()
+@@ -67,11 +62,10 @@ class Dispatcher() {
+    *
+    * WebSocket connections to hosts **do not** count against this limit.
+    */
+-  var maxRequestsPerHost = 5
+-    get() = lock.withLock { field }
++  @get:Synchronized var maxRequestsPerHost = 5
+     set(maxRequestsPerHost) {
+       require(maxRequestsPerHost >= 1) { "max < 1: $maxRequestsPerHost" }
+-      lock.withLock {
++      synchronized(this) {
+         field = maxRequestsPerHost
+       }
+       promoteAndExecute()
+@@ -88,31 +82,29 @@ class Dispatcher() {
+    * This means that if you are doing synchronous calls the network layer will not truly be idle
+    * until every returned [Response] has been closed.
+    */
++  @set:Synchronized
++  @get:Synchronized
+   var idleCallback: Runnable? = null
+-    get() = lock.withLock { field }
+-    set(value) {
+-      lock.withLock { field = value }
+-    }
+ 
+   private var executorServiceOrNull: ExecutorService? = null
+ 
++  @get:Synchronized
+   @get:JvmName("executorService")
+   val executorService: ExecutorService
+-    get() =
+-      lock.withLock {
+-        if (executorServiceOrNull == null) {
+-          executorServiceOrNull =
+-            ThreadPoolExecutor(
+-              0,
+-              Int.MAX_VALUE,
+-              60,
+-              TimeUnit.SECONDS,
+-              SynchronousQueue(),
+-              threadFactory("$okHttpName Dispatcher", false),
+-            )
+-        }
+-        return executorServiceOrNull!!
++    get() {
++      if (executorServiceOrNull == null) {
++        executorServiceOrNull =
++          ThreadPoolExecutor(
++            0,
++            Int.MAX_VALUE,
++            60,
++            TimeUnit.SECONDS,
++            SynchronousQueue(),
++            threadFactory("$okHttpName Dispatcher", false),
++          )
+       }
++      return executorServiceOrNull!!
++    }
+ 
+   /** Ready async calls in the order they'll be run. */
+   private val readyAsyncCalls = ArrayDeque<AsyncCall>()
+@@ -128,7 +120,7 @@ class Dispatcher() {
+   }
+ 
+   internal fun enqueue(call: AsyncCall) {
+-    lock.withLock {
++    synchronized(this) {
+       readyAsyncCalls.add(call)
+ 
+       // Mutate the AsyncCall so that it shares the AtomicInteger of an existing running call to
+@@ -155,17 +147,15 @@ class Dispatcher() {
+    * Cancel all calls currently enqueued or executing. Includes calls executed both
+    * [synchronously][Call.execute] and [asynchronously][Call.enqueue].
+    */
+-  fun cancelAll() {
+-    lock.withLock {
+-      for (call in readyAsyncCalls) {
+-        call.call.cancel()
+-      }
+-      for (call in runningAsyncCalls) {
+-        call.call.cancel()
+-      }
+-      for (call in runningSyncCalls) {
+-        call.cancel()
+-      }
++  @Synchronized fun cancelAll() {
++    for (call in readyAsyncCalls) {
++      call.call.cancel()
++    }
++    for (call in runningAsyncCalls) {
++      call.call.cancel()
++    }
++    for (call in runningSyncCalls) {
++      call.cancel()
+     }
+   }
+ 
+@@ -177,11 +167,11 @@ class Dispatcher() {
+    * @return true if the dispatcher is currently running calls.
+    */
+   private fun promoteAndExecute(): Boolean {
+-    lock.assertNotHeld()
++    this.assertThreadDoesntHoldLock()
+ 
+     val executableCalls = mutableListOf<AsyncCall>()
+     val isRunning: Boolean
+-    lock.withLock {
++    synchronized(this) {
+       val i = readyAsyncCalls.iterator()
+       while (i.hasNext()) {
+         val asyncCall = i.next()
+diff --git a/okhttp/src/main/kotlin/okhttp3/internal/connection/ConnectPlan.kt b/okhttp/src/main/kotlin/okhttp3/internal/connection/ConnectPlan.kt
+index b4b5133e0..a5c31f9cf 100644
+--- a/okhttp/src/main/kotlin/okhttp3/internal/connection/ConnectPlan.kt
++++ b/okhttp/src/main/kotlin/okhttp3/internal/connection/ConnectPlan.kt
+@@ -26,7 +26,6 @@ import java.security.cert.X509Certificate
+ import java.util.concurrent.TimeUnit
+ import javax.net.ssl.SSLPeerUnverifiedException
+ import javax.net.ssl.SSLSocket
+-import kotlin.concurrent.withLock
+ import okhttp3.CertificatePinner
+ import okhttp3.ConnectionSpec
+ import okhttp3.Handshake
+@@ -504,7 +503,7 @@ class ConnectPlan(
+     val pooled3 = routePlanner.planReusePooledConnection(this, routes)
+     if (pooled3 != null) return pooled3.connection
+ 
+-    connection.lock.withLock {
++    synchronized(connection) {
+       connectionPool.put(connection)
+       user.acquireConnectionNoEvents(connection)
+     }
+diff --git a/okhttp/src/main/kotlin/okhttp3/internal/connection/RealCall.kt b/okhttp/src/main/kotlin/okhttp3/internal/connection/RealCall.kt
+index 20e55f744..2f7be64ba 100644
+--- a/okhttp/src/main/kotlin/okhttp3/internal/connection/RealCall.kt
++++ b/okhttp/src/main/kotlin/okhttp3/internal/connection/RealCall.kt
+@@ -25,8 +25,6 @@ import java.util.concurrent.RejectedExecutionException
+ import java.util.concurrent.TimeUnit.MILLISECONDS
+ import java.util.concurrent.atomic.AtomicBoolean
+ import java.util.concurrent.atomic.AtomicInteger
+-import java.util.concurrent.locks.ReentrantLock
+-import kotlin.concurrent.withLock
+ import okhttp3.Call
+ import okhttp3.Callback
+ import okhttp3.EventListener
+@@ -34,9 +32,8 @@ import okhttp3.Interceptor
+ import okhttp3.OkHttpClient
+ import okhttp3.Request
+ import okhttp3.Response
+-import okhttp3.internal.assertHeld
+-import okhttp3.internal.assertNotHeld
+ import okhttp3.internal.assertThreadDoesntHoldLock
++import okhttp3.internal.assertThreadHoldsLock
+ import okhttp3.internal.cache.CacheInterceptor
+ import okhttp3.internal.closeQuietly
+ import okhttp3.internal.http.BridgeInterceptor
+@@ -63,8 +60,6 @@ class RealCall(
+   val originalRequest: Request,
+   val forWebSocket: Boolean,
+ ) : Call, Cloneable {
+-  internal val lock: ReentrantLock = ReentrantLock()
+-
+   private val connectionPool: RealConnectionPool = client.connectionPool.delegate
+ 
+   internal val eventListener: EventListener = client.eventListenerFactory.create(this)
+@@ -100,7 +95,7 @@ class RealCall(
+   internal var interceptorScopedExchange: Exchange? = null
+     private set
+ 
+-  // These properties are guarded by lock. They are typically only accessed by the thread executing
++  // These properties are guarded by this. They are typically only accessed by the thread executing
+   // the call, but they may be accessed by other threads for duplex requests.
+ 
+   /** True if this call still has a request body open. */
+@@ -236,7 +231,7 @@ class RealCall(
+   ) {
+     check(interceptorScopedExchange == null)
+ 
+-    lock.withLock {
++    synchronized(this) {
+       check(!responseBodyOpen) {
+         "cannot make a new request because the previous response is still open: " +
+           "please call response.close()"
+@@ -270,7 +265,7 @@ class RealCall(
+ 
+   /** Finds a new or pooled connection to carry a forthcoming request and response. */
+   internal fun initExchange(chain: RealInterceptorChain): Exchange {
+-    lock.withLock {
++    synchronized(this) {
+       check(expectMoreExchanges) { "released" }
+       check(!responseBodyOpen)
+       check(!requestBodyOpen)
+@@ -282,7 +277,7 @@ class RealCall(
+     val result = Exchange(this, eventListener, exchangeFinder, codec)
+     this.interceptorScopedExchange = result
+     this.exchange = result
+-    lock.withLock {
++    synchronized(this) {
+       this.requestBodyOpen = true
+       this.responseBodyOpen = true
+     }
+@@ -292,7 +287,7 @@ class RealCall(
+   }
+ 
+   fun acquireConnectionNoEvents(connection: RealConnection) {
+-    connection.lock.assertHeld()
++    connection.assertThreadHoldsLock()
+ 
+     check(this.connection == null)
+     this.connection = connection
+@@ -317,7 +312,7 @@ class RealCall(
+ 
+     var bothStreamsDone = false
+     var callDone = false
+-    lock.withLock {
++    synchronized(this) {
+       if (requestDone && requestBodyOpen || responseDone && responseBodyOpen) {
+         if (requestDone) requestBodyOpen = false
+         if (responseDone) responseBodyOpen = false
+@@ -340,7 +335,7 @@ class RealCall(
+ 
+   internal fun noMoreExchanges(e: IOException?): IOException? {
+     var callDone = false
+-    lock.withLock {
++    synchronized(this) {
+       if (expectMoreExchanges) {
+         expectMoreExchanges = false
+         callDone = !requestBodyOpen && !responseBodyOpen
+@@ -367,13 +362,13 @@ class RealCall(
+    * additional context. Otherwise [e] is returned as-is.
+    */
+   private fun <E : IOException?> callDone(e: E): E {
+-    lock.assertNotHeld()
++    assertThreadDoesntHoldLock()
+ 
+     val connection = this.connection
+     if (connection != null) {
+-      connection.lock.assertNotHeld()
++      connection.assertThreadDoesntHoldLock()
+       val toClose: Socket? =
+-        connection.lock.withLock {
++        synchronized(connection) {
+           // Sets this.connection to null.
+           releaseConnectionNoEvents()
+         }
+@@ -404,7 +399,7 @@ class RealCall(
+    */
+   internal fun releaseConnectionNoEvents(): Socket? {
+     val connection = this.connection!!
+-    connection.lock.assertHeld()
++    connection.assertThreadHoldsLock()
+ 
+     val calls = connection.calls
+     val index = calls.indexOfFirst { it.get() == this@RealCall }
+@@ -448,7 +443,7 @@ class RealCall(
+    *     This is usually due to either an exception or a retry.
+    */
+   internal fun exitNetworkInterceptorExchange(closeExchange: Boolean) {
+-    lock.withLock {
++    synchronized(this) {
+       check(expectMoreExchanges) { "released" }
+     }
+ 
+diff --git a/okhttp/src/main/kotlin/okhttp3/internal/connection/RealConnection.kt b/okhttp/src/main/kotlin/okhttp3/internal/connection/RealConnection.kt
+index abcbb90da..f379a4e29 100644
+--- a/okhttp/src/main/kotlin/okhttp3/internal/connection/RealConnection.kt
++++ b/okhttp/src/main/kotlin/okhttp3/internal/connection/RealConnection.kt
+@@ -23,10 +23,8 @@ import java.net.Socket
+ import java.net.SocketException
+ import java.security.cert.X509Certificate
+ import java.util.concurrent.TimeUnit.MILLISECONDS
+-import java.util.concurrent.locks.ReentrantLock
+ import javax.net.ssl.SSLPeerUnverifiedException
+ import javax.net.ssl.SSLSocket
+-import kotlin.concurrent.withLock
+ import okhttp3.Address
+ import okhttp3.Connection
+ import okhttp3.ConnectionListener
+@@ -35,8 +33,8 @@ import okhttp3.HttpUrl
+ import okhttp3.OkHttpClient
+ import okhttp3.Protocol
+ import okhttp3.Route
+-import okhttp3.internal.assertHeld
+-import okhttp3.internal.assertNotHeld
++import okhttp3.internal.assertThreadDoesntHoldLock
++import okhttp3.internal.assertThreadHoldsLock
+ import okhttp3.internal.closeQuietly
+ import okhttp3.internal.concurrent.TaskRunner
+ import okhttp3.internal.http.ExchangeCodec
+@@ -82,9 +80,7 @@ class RealConnection(
+ ) : Http2Connection.Listener(), Connection, ExchangeCodec.Carrier {
+   private var http2Connection: Http2Connection? = null
+ 
+-  internal val lock: ReentrantLock = ReentrantLock()
+-
+-  // These properties are guarded by lock.
++  // These properties are guarded by this.
+ 
+   /**
+    * If true, no new exchanges can be created on this connection. It is necessary to set this to
+@@ -133,23 +129,19 @@ class RealConnection(
+ 
+   /** Prevent further exchanges from being created on this connection. */
+   override fun noNewExchanges() {
+-    lock.withLock {
++    synchronized(this) {
+       noNewExchanges = true
+     }
+     connectionListener.noNewExchanges(this)
+   }
+ 
+   /** Prevent this connection from being used for hosts other than the one in [route]. */
+-  internal fun noCoalescedConnections() {
+-    lock.withLock {
+-      noCoalescedConnections = true
+-    }
++  @Synchronized internal fun noCoalescedConnections() {
++    noCoalescedConnections = true
+   }
+ 
+-  internal fun incrementSuccessCount() {
+-    lock.withLock {
+-      successCount++
+-    }
++  @Synchronized internal fun incrementSuccessCount() {
++    successCount++
+   }
+ 
+   @Throws(IOException::class)
+@@ -187,7 +179,7 @@ class RealConnection(
+     address: Address,
+     routes: List<Route>?,
+   ): Boolean {
+-    lock.assertHeld()
++    assertThreadHoldsLock()
+ 
+     // If this connection is not accepting new exchanges, we're done.
+     if (calls.size >= allocationLimit || noNewExchanges) return false
+@@ -240,7 +232,7 @@ class RealConnection(
+   }
+ 
+   private fun supportsUrl(url: HttpUrl): Boolean {
+-    lock.assertHeld()
++    assertThreadHoldsLock()
+ 
+     val routeUrl = route.address.url
+ 
+@@ -316,7 +308,7 @@ class RealConnection(
+ 
+   /** Returns true if this connection is ready to host new streams. */
+   fun isHealthy(doExtensiveChecks: Boolean): Boolean {
+-    lock.assertNotHeld()
++    assertThreadDoesntHoldLock()
+ 
+     val nowNs = System.nanoTime()
+ 
+@@ -334,7 +326,7 @@ class RealConnection(
+       return http2Connection.isHealthy(nowNs)
+     }
+ 
+-    val idleDurationNs = lock.withLock { nowNs - idleAtNs }
++    val idleDurationNs = synchronized(this) { nowNs - idleAtNs }
+     if (idleDurationNs >= IDLE_CONNECTION_HEALTHY_NS && doExtensiveChecks) {
+       return socket.isHealthy(source)
+     }
+@@ -349,21 +341,19 @@ class RealConnection(
+   }
+ 
+   /** When settings are received, adjust the allocation limit. */
+-  override fun onSettings(
++  @Synchronized override fun onSettings(
+     connection: Http2Connection,
+     settings: Settings,
+   ) {
+-    lock.withLock {
+-      val oldLimit = allocationLimit
+-      allocationLimit = settings.getMaxConcurrentStreams()
+-
+-      if (allocationLimit < oldLimit) {
+-        // We might need new connections to keep policies satisfied
+-        connectionPool.scheduleOpener(route.address)
+-      } else if (allocationLimit > oldLimit) {
+-        // We might no longer need some connections
+-        connectionPool.scheduleCloser()
+-      }
++    val oldLimit = allocationLimit
++    allocationLimit = settings.getMaxConcurrentStreams()
++
++    if (allocationLimit < oldLimit) {
++      // We might need new connections to keep policies satisfied
++      connectionPool.scheduleOpener(route.address)
++    } else if (allocationLimit > oldLimit) {
++      // We might no longer need some connections
++      connectionPool.scheduleCloser()
+     }
+   }
+ 
+@@ -397,7 +387,7 @@ class RealConnection(
+     e: IOException?,
+   ) {
+     var noNewExchangesEvent = false
+-    lock.withLock {
++    synchronized(this) {
+       if (e is StreamResetException) {
+         when {
+           e.errorCode == ErrorCode.REFUSED_STREAM -> {
+diff --git a/okhttp/src/main/kotlin/okhttp3/internal/connection/RealConnectionPool.kt b/okhttp/src/main/kotlin/okhttp3/internal/connection/RealConnectionPool.kt
+index b154ea493..c4d376c92 100644
+--- a/okhttp/src/main/kotlin/okhttp3/internal/connection/RealConnectionPool.kt
++++ b/okhttp/src/main/kotlin/okhttp3/internal/connection/RealConnectionPool.kt
+@@ -21,12 +21,11 @@ import java.util.concurrent.ConcurrentLinkedQueue
+ import java.util.concurrent.ThreadLocalRandom
+ import java.util.concurrent.TimeUnit
+ import java.util.concurrent.atomic.AtomicReferenceFieldUpdater
+-import kotlin.concurrent.withLock
+ import okhttp3.Address
+ import okhttp3.ConnectionListener
+ import okhttp3.ConnectionPool
+ import okhttp3.Route
+-import okhttp3.internal.assertHeld
++import okhttp3.internal.assertThreadHoldsLock
+ import okhttp3.internal.closeQuietly
+ import okhttp3.internal.concurrent.Task
+ import okhttp3.internal.concurrent.TaskQueue
+@@ -81,7 +80,7 @@ class RealConnectionPool(
+ 
+   fun idleConnectionCount(): Int {
+     return connections.count {
+-      it.lock.withLock { it.calls.isEmpty() }
++      synchronized(it) { it.calls.isEmpty() }
+     }
+   }
+ 
+@@ -111,7 +110,7 @@ class RealConnectionPool(
+     for (connection in connections) {
+       // In the first synchronized block, acquire the connection if it can satisfy this call.
+       val acquired =
+-        connection.lock.withLock {
++        synchronized(connection) {
+           when {
+             requireMultiplexed && !connection.isMultiplexed -> false
+             !connection.isEligible(address, routes) -> false
+@@ -130,7 +129,7 @@ class RealConnectionPool(
+       // the hook to close this connection if it's no longer in use.
+       val noNewExchangesEvent: Boolean
+       val toClose: Socket? =
+-        connection.lock.withLock {
++        synchronized(connection) {
+           noNewExchangesEvent = !connection.noNewExchanges
+           connection.noNewExchanges = true
+           connectionUser.releaseConnectionNoEvents()
+@@ -146,7 +145,7 @@ class RealConnectionPool(
+   }
+ 
+   fun put(connection: RealConnection) {
+-    connection.lock.assertHeld()
++    connection.assertThreadHoldsLock()
+ 
+     connections.add(connection)
+ //    connection.queueEvent { connectionListener.connectEnd(connection) }
+@@ -158,7 +157,7 @@ class RealConnectionPool(
+    * removed from the pool and should be closed.
+    */
+   fun connectionBecameIdle(connection: RealConnection): Boolean {
+-    connection.lock.assertHeld()
++    connection.assertThreadHoldsLock()
+ 
+     return if (connection.noNewExchanges || maxIdleConnections == 0) {
+       connection.noNewExchanges = true
+@@ -177,13 +176,13 @@ class RealConnectionPool(
+     while (i.hasNext()) {
+       val connection = i.next()
+       val socketToClose =
+-        connection.lock.withLock {
++        synchronized(connection) {
+           if (connection.calls.isEmpty()) {
+             i.remove()
+             connection.noNewExchanges = true
+-            return@withLock connection.socket()
++            return@synchronized connection.socket()
+           } else {
+-            return@withLock null
++            return@synchronized null
+           }
+         }
+       if (socketToClose != null) {
+@@ -215,7 +214,7 @@ class RealConnectionPool(
+     }
+     for (connection in connections) {
+       val addressState = addressStates[connection.route.address] ?: continue
+-      connection.lock.withLock {
++      synchronized(connection) {
+         addressState.concurrentCallCapacity += connection.allocationLimit
+       }
+     }
+@@ -238,11 +237,11 @@ class RealConnectionPool(
+     var inUseConnectionCount = 0
+     var evictableConnectionCount = 0
+     for (connection in connections) {
+-      connection.lock.withLock {
++      synchronized(connection) {
+         // If the connection is in use, keep searching.
+         if (pruneAndGetAllocationCount(connection, now) > 0) {
+           inUseConnectionCount++
+-          return@withLock
++          return@synchronized
+         }
+ 
+         val idleAtNs = connection.idleAtNs
+@@ -286,7 +285,7 @@ class RealConnectionPool(
+     when {
+       toEvict != null -> {
+         // We've chosen a connection to evict. Confirm it's still okay to be evicted, then close it.
+-        toEvict.lock.withLock {
++        synchronized(toEvict) {
+           if (toEvict.calls.isNotEmpty()) return 0L // No longer idle.
+           if (toEvict.idleAtNs != toEvictIdleAtNs) return 0L // No longer oldest.
+           toEvict.noNewExchanges = true
+@@ -337,7 +336,7 @@ class RealConnectionPool(
+     connection: RealConnection,
+     now: Long,
+   ): Int {
+-    connection.lock.assertHeld()
++    connection.assertThreadHoldsLock()
+ 
+     val references = connection.calls
+     var i = 0
+@@ -416,7 +415,7 @@ class RealConnectionPool(
+     var concurrentCallCapacity = 0
+     for (connection in connections) {
+       if (state.address != connection.route.address) continue
+-      connection.lock.withLock {
++      synchronized(connection) {
+         concurrentCallCapacity += connection.allocationLimit
+       }
+ 
+@@ -431,7 +430,7 @@ class RealConnectionPool(
+       // RealRoutePlanner will add the connection to the pool itself, other RoutePlanners may not
+       // TODO: make all RoutePlanners consistent in this behavior
+       if (connection !in connections) {
+-        connection.lock.withLock { put(connection) }
++        synchronized(connection) { put(connection) }
+       }
+ 
+       return 0L // run again immediately to create more connections if needed
+diff --git a/okhttp/src/main/kotlin/okhttp3/internal/connection/RealRoutePlanner.kt b/okhttp/src/main/kotlin/okhttp3/internal/connection/RealRoutePlanner.kt
+index e87b12908..3684a19da 100644
+--- a/okhttp/src/main/kotlin/okhttp3/internal/connection/RealRoutePlanner.kt
++++ b/okhttp/src/main/kotlin/okhttp3/internal/connection/RealRoutePlanner.kt
+@@ -19,7 +19,6 @@ import java.io.IOException
+ import java.net.HttpURLConnection
+ import java.net.Socket
+ import java.net.UnknownServiceException
+-import kotlin.concurrent.withLock
+ import okhttp3.Address
+ import okhttp3.ConnectionSpec
+ import okhttp3.HttpUrl
+@@ -95,7 +94,7 @@ class RealRoutePlanner(
+     val healthy = candidate.isHealthy(connectionUser.doExtensiveHealthChecks())
+     var noNewExchangesEvent = false
+     val toClose: Socket? =
+-      candidate.lock.withLock {
++      synchronized(candidate) {
+         when {
+           !healthy -> {
+             noNewExchangesEvent = !candidate.noNewExchanges
+@@ -320,7 +319,7 @@ class RealRoutePlanner(
+    * connections.
+    */
+   private fun retryRoute(connection: RealConnection): Route? {
+-    return connection.lock.withLock {
++    return synchronized(connection) {
+       when {
+         connection.routeFailureCount != 0 -> null
+ 
+diff --git a/okhttp/src/main/kotlin/okhttp3/internal/http2/Http2Connection.kt b/okhttp/src/main/kotlin/okhttp3/internal/http2/Http2Connection.kt
+index 5505a46d1..686568d3d 100644
+--- a/okhttp/src/main/kotlin/okhttp3/internal/http2/Http2Connection.kt
++++ b/okhttp/src/main/kotlin/okhttp3/internal/http2/Http2Connection.kt
+@@ -20,9 +20,6 @@ import java.io.IOException
+ import java.io.InterruptedIOException
+ import java.net.Socket
+ import java.util.concurrent.TimeUnit
+-import java.util.concurrent.locks.Condition
+-import java.util.concurrent.locks.ReentrantLock
+-import kotlin.concurrent.withLock
+ import okhttp3.internal.EMPTY_BYTE_ARRAY
+ import okhttp3.internal.EMPTY_HEADERS
+ import okhttp3.internal.assertThreadDoesntHoldLock
+@@ -32,11 +29,13 @@ import okhttp3.internal.http2.ErrorCode.REFUSED_STREAM
+ import okhttp3.internal.http2.Settings.Companion.DEFAULT_INITIAL_WINDOW_SIZE
+ import okhttp3.internal.http2.flowcontrol.WindowCounter
+ import okhttp3.internal.ignoreIoExceptions
++import okhttp3.internal.notifyAll
+ import okhttp3.internal.okHttpName
+ import okhttp3.internal.peerName
+ import okhttp3.internal.platform.Platform
+ import okhttp3.internal.platform.Platform.Companion.INFO
+ import okhttp3.internal.toHeaders
++import okhttp3.internal.wait
+ import okio.Buffer
+ import okio.BufferedSink
+ import okio.BufferedSource
+@@ -55,10 +54,7 @@ import okio.source
+  */
+ @Suppress("NAME_SHADOWING")
+ class Http2Connection internal constructor(builder: Builder) : Closeable {
+-  internal val lock: ReentrantLock = ReentrantLock()
+-  internal val condition: Condition = lock.newCondition()
+-
+-  // Internal state of this connection is guarded by 'lock'. No blocking operations may be
++  // Internal state of this connection is guarded by 'this'. No blocking operations may be
+   // performed while holding this lock!
+   //
+   // Socket writes are guarded by frameWriter.
+@@ -153,12 +149,12 @@ class Http2Connection internal constructor(builder: Builder) : Closeable {
+       val pingIntervalNanos = TimeUnit.MILLISECONDS.toNanos(builder.pingIntervalMillis.toLong())
+       writerQueue.schedule("$connectionName ping", pingIntervalNanos) {
+         val failDueToMissingPong =
+-          lock.withLock {
++          synchronized(this@Http2Connection) {
+             if (intervalPongsReceived < intervalPingsSent) {
+-              return@withLock true
++              return@synchronized true
+             } else {
+               intervalPingsSent++
+-              return@withLock false
++              return@synchronized false
+             }
+           }
+         if (failDueToMissingPong) {
+@@ -175,31 +171,30 @@ class Http2Connection internal constructor(builder: Builder) : Closeable {
+   /**
+    * Returns the number of [open streams][Http2Stream.isOpen] on this connection.
+    */
+-  fun openStreamCount(): Int = lock.withLock { streams.size }
++  @Synchronized
++  fun openStreamCount(): Int = streams.size
+ 
+-  fun getStream(id: Int): Http2Stream? = lock.withLock { streams[id] }
++  @Synchronized
++  fun getStream(id: Int): Http2Stream? = streams[id]
+ 
++  @Synchronized
+   internal fun removeStream(streamId: Int): Http2Stream? {
+-    lock.withLock {
+-      val stream = streams.remove(streamId)
++    val stream = streams.remove(streamId)
+ 
+-      // The removed stream may be blocked on a connection-wide window update.
+-      condition.signalAll()
++    // The removed stream may be blocked on a connection-wide window update.
++    notifyAll()
+ 
+-      return stream
+-    }
++    return stream
+   }
+ 
+-  internal fun updateConnectionFlowControl(read: Long) {
+-    lock.withLock {
+-      readBytes.update(total = read)
+-      val readBytesToAcknowledge = readBytes.unacknowledged
+-      if (readBytesToAcknowledge >= okHttpSettings.initialWindowSize / 2) {
+-        writeWindowUpdateLater(0, readBytesToAcknowledge)
+-        readBytes.update(acknowledged = readBytesToAcknowledge)
+-      }
+-      flowControlListener.receivingConnectionWindowChanged(readBytes)
++  @Synchronized internal fun updateConnectionFlowControl(read: Long) {
++    readBytes.update(total = read)
++    val readBytesToAcknowledge = readBytes.unacknowledged
++    if (readBytesToAcknowledge >= okHttpSettings.initialWindowSize / 2) {
++      writeWindowUpdateLater(0, readBytesToAcknowledge)
++      readBytes.update(acknowledged = readBytesToAcknowledge)
+     }
++    flowControlListener.receivingConnectionWindowChanged(readBytes)
+   }
+ 
+   /**
+@@ -245,8 +240,8 @@ class Http2Connection internal constructor(builder: Builder) : Closeable {
+     val stream: Http2Stream
+     val streamId: Int
+ 
+-    writer.lock.withLock {
+-      lock.withLock {
++    synchronized(writer) {
++      synchronized(this) {
+         if (nextStreamId > Int.MAX_VALUE / 2) {
+           shutdown(REFUSED_STREAM)
+         }
+@@ -316,7 +311,7 @@ class Http2Connection internal constructor(builder: Builder) : Closeable {
+     var byteCount = byteCount
+     while (byteCount > 0L) {
+       var toWrite: Int
+-      lock.withLock {
++      synchronized(this@Http2Connection) {
+         try {
+           while (writeBytesTotal >= writeBytesMaximum) {
+             // Before blocking, confirm that the stream we're writing is still open. It's possible
+@@ -324,7 +319,7 @@ class Http2Connection internal constructor(builder: Builder) : Closeable {
+             if (!streams.containsKey(streamId)) {
+               throw IOException("stream closed")
+             }
+-            condition.await() // Wait until we receive a WINDOW_UPDATE.
++            this@Http2Connection.wait() // Wait until we receive a WINDOW_UPDATE.
+           }
+         } catch (e: InterruptedException) {
+           Thread.currentThread().interrupt() // Retain interrupted status.
+@@ -397,7 +392,7 @@ class Http2Connection internal constructor(builder: Builder) : Closeable {
+   /** For testing: sends a ping to be awaited with [awaitPong]. */
+   @Throws(InterruptedException::class)
+   fun writePing() {
+-    lock.withLock {
++    synchronized(this) {
+       awaitPingsSent++
+     }
+ 
+@@ -406,12 +401,11 @@ class Http2Connection internal constructor(builder: Builder) : Closeable {
+   }
+ 
+   /** For testing: awaits a pong. */
++  @Synchronized
+   @Throws(InterruptedException::class)
+   fun awaitPong() {
+-    lock.withLock {
+-      while (awaitPongsReceived < awaitPingsSent) {
+-        condition.await()
+-      }
++    while (awaitPongsReceived < awaitPingsSent) {
++      wait()
+     }
+   }
+ 
+@@ -427,9 +421,9 @@ class Http2Connection internal constructor(builder: Builder) : Closeable {
+    */
+   @Throws(IOException::class)
+   fun shutdown(statusCode: ErrorCode) {
+-    writer.lock.withLock {
++    synchronized(writer) {
+       val lastGoodStreamId: Int
+-      lock.withLock {
++      synchronized(this) {
+         if (isShutdown) {
+           return
+         }
+@@ -462,7 +456,7 @@ class Http2Connection internal constructor(builder: Builder) : Closeable {
+     }
+ 
+     var streamsToClose: Array<Http2Stream>? = null
+-    lock.withLock {
++    synchronized(this) {
+       if (streams.isNotEmpty()) {
+         streamsToClose = streams.values.toTypedArray()
+         streams.clear()
+@@ -522,8 +516,8 @@ class Http2Connection internal constructor(builder: Builder) : Closeable {
+   /** Merges [settings] into this peer's settings and sends them to the remote peer. */
+   @Throws(IOException::class)
+   fun setSettings(settings: Settings) {
+-    writer.lock.withLock {
+-      lock.withLock {
++    synchronized(writer) {
++      synchronized(this) {
+         if (isShutdown) {
+           throw ConnectionShutdownException()
+         }
+@@ -533,15 +527,14 @@ class Http2Connection internal constructor(builder: Builder) : Closeable {
+     }
+   }
+ 
++  @Synchronized
+   fun isHealthy(nowNs: Long): Boolean {
+-    lock.withLock {
+-      if (isShutdown) return false
++    if (isShutdown) return false
+ 
+-      // A degraded pong is overdue.
+-      if (degradedPongsReceived < degradedPingsSent && nowNs >= degradedPongDeadlineNs) return false
++    // A degraded pong is overdue.
++    if (degradedPongsReceived < degradedPingsSent && nowNs >= degradedPongDeadlineNs) return false
+ 
+-      return true
+-    }
++    return true
+   }
+ 
+   /**
+@@ -560,7 +553,7 @@ class Http2Connection internal constructor(builder: Builder) : Closeable {
+    * The deadline is currently hardcoded. We may make this configurable in the future!
+    */
+   internal fun sendDegradedPingLater() {
+-    lock.withLock {
++    synchronized(this) {
+       if (degradedPongsReceived < degradedPingsSent) return // Already awaiting a degraded pong.
+       degradedPingsSent++
+       degradedPongDeadlineNs = System.nanoTime() + DEGRADED_PONG_TIMEOUT_NS
+@@ -689,7 +682,7 @@ class Http2Connection internal constructor(builder: Builder) : Closeable {
+         return
+       }
+       val stream: Http2Stream?
+-      lock.withLock {
++      synchronized(this@Http2Connection) {
+         stream = getStream(streamId)
+ 
+         if (stream == null) {
+@@ -768,8 +761,8 @@ class Http2Connection internal constructor(builder: Builder) : Closeable {
+       var delta: Long
+       var streamsToNotify: Array<Http2Stream>?
+       var newPeerSettings: Settings
+-      writer.lock.withLock {
+-        lock.withLock {
++      synchronized(writer) {
++        synchronized(this@Http2Connection) {
+           val previousPeerSettings = peerSettings
+           newPeerSettings =
+             if (clearPrevious) {
+@@ -803,7 +796,7 @@ class Http2Connection internal constructor(builder: Builder) : Closeable {
+       }
+       if (streamsToNotify != null) {
+         for (stream in streamsToNotify!!) {
+-          stream.lock.withLock {
++          synchronized(stream) {
+             stream.addBytesToWriteWindow(delta)
+           }
+         }
+@@ -820,7 +813,7 @@ class Http2Connection internal constructor(builder: Builder) : Closeable {
+       payload2: Int,
+     ) {
+       if (ack) {
+-        lock.withLock {
++        synchronized(this@Http2Connection) {
+           when (payload1) {
+             INTERVAL_PING -> {
+               intervalPongsReceived++
+@@ -830,7 +823,7 @@ class Http2Connection internal constructor(builder: Builder) : Closeable {
+             }
+             AWAIT_PING -> {
+               awaitPongsReceived++
+-              condition.signalAll()
++              this@Http2Connection.notifyAll()
+             }
+             else -> {
+               // Ignore an unexpected pong.
+@@ -856,7 +849,7 @@ class Http2Connection internal constructor(builder: Builder) : Closeable {
+ 
+       // Copy the streams first. We don't want to hold a lock when we call receiveRstStream().
+       val streamsCopy: Array<Http2Stream>
+-      lock.withLock {
++      synchronized(this@Http2Connection) {
+         streamsCopy = streams.values.toTypedArray()
+         isShutdown = true
+       }
+@@ -875,14 +868,14 @@ class Http2Connection internal constructor(builder: Builder) : Closeable {
+       windowSizeIncrement: Long,
+     ) {
+       if (streamId == 0) {
+-        lock.withLock {
++        synchronized(this@Http2Connection) {
+           writeBytesMaximum += windowSizeIncrement
+-          condition.signalAll()
++          this@Http2Connection.notifyAll()
+         }
+       } else {
+         val stream = getStream(streamId)
+         if (stream != null) {
+-          stream.lock.withLock {
++          synchronized(stream) {
+             stream.addBytesToWriteWindow(windowSizeIncrement)
+           }
+         }
+@@ -925,7 +918,7 @@ class Http2Connection internal constructor(builder: Builder) : Closeable {
+     streamId: Int,
+     requestHeaders: List<Header>,
+   ) {
+-    lock.withLock {
++    synchronized(this) {
+       if (streamId in currentPushRequests) {
+         writeSynResetLater(streamId, ErrorCode.PROTOCOL_ERROR)
+         return
+@@ -937,7 +930,7 @@ class Http2Connection internal constructor(builder: Builder) : Closeable {
+       ignoreIoExceptions {
+         if (cancel) {
+           writer.rstStream(streamId, ErrorCode.CANCEL)
+-          lock.withLock {
++          synchronized(this@Http2Connection) {
+             currentPushRequests.remove(streamId)
+           }
+         }
+@@ -955,7 +948,7 @@ class Http2Connection internal constructor(builder: Builder) : Closeable {
+       ignoreIoExceptions {
+         if (cancel) writer.rstStream(streamId, ErrorCode.CANCEL)
+         if (cancel || inFinished) {
+-          lock.withLock {
++          synchronized(this@Http2Connection) {
+             currentPushRequests.remove(streamId)
+           }
+         }
+@@ -982,7 +975,7 @@ class Http2Connection internal constructor(builder: Builder) : Closeable {
+         val cancel = pushObserver.onData(streamId, buffer, byteCount, inFinished)
+         if (cancel) writer.rstStream(streamId, ErrorCode.CANCEL)
+         if (cancel || inFinished) {
+-          lock.withLock {
++          synchronized(this@Http2Connection) {
+             currentPushRequests.remove(streamId)
+           }
+         }
+@@ -996,7 +989,7 @@ class Http2Connection internal constructor(builder: Builder) : Closeable {
+   ) {
+     pushQueue.execute("$connectionName[$streamId] onReset") {
+       pushObserver.onReset(streamId, errorCode)
+-      lock.withLock {
++      synchronized(this@Http2Connection) {
+         currentPushRequests.remove(streamId)
+       }
+     }
+diff --git a/okhttp/src/main/kotlin/okhttp3/internal/http2/Http2Stream.kt b/okhttp/src/main/kotlin/okhttp3/internal/http2/Http2Stream.kt
+index 32a419561..dd1fa1e49 100644
+--- a/okhttp/src/main/kotlin/okhttp3/internal/http2/Http2Stream.kt
++++ b/okhttp/src/main/kotlin/okhttp3/internal/http2/Http2Stream.kt
+@@ -20,14 +20,13 @@ import java.io.IOException
+ import java.io.InterruptedIOException
+ import java.net.SocketTimeoutException
+ import java.util.ArrayDeque
+-import java.util.concurrent.locks.Condition
+-import java.util.concurrent.locks.ReentrantLock
+-import kotlin.concurrent.withLock
+ import okhttp3.Headers
+ import okhttp3.internal.EMPTY_HEADERS
+-import okhttp3.internal.assertNotHeld
++import okhttp3.internal.assertThreadDoesntHoldLock
+ import okhttp3.internal.http2.flowcontrol.WindowCounter
++import okhttp3.internal.notifyAll
+ import okhttp3.internal.toHeaderList
++import okhttp3.internal.wait
+ import okio.AsyncTimeout
+ import okio.Buffer
+ import okio.BufferedSource
+@@ -44,10 +43,7 @@ class Http2Stream internal constructor(
+   inFinished: Boolean,
+   headers: Headers?,
+ ) {
+-  internal val lock: ReentrantLock = ReentrantLock()
+-  val condition: Condition = lock.newCondition()
+-
+-  // Internal state is guarded by lock. No long-running or potentially blocking operations are
++  // Internal state is guarded by this. No long-running or potentially blocking operations are
+   // performed while the lock is held.
+ 
+   /** The bytes consumed and acknowledged by the stream. */
+@@ -86,8 +82,7 @@ class Http2Stream internal constructor(
+    * If there are multiple reasons to abnormally close this stream (such as both peers closing it
+    * near-simultaneously) then this is the first reason known to this peer.
+    */
+-  internal var errorCode: ErrorCode? = null
+-    get() = lock.withLock { field }
++  @get:Synchronized internal var errorCode: ErrorCode? = null
+ 
+   /** The exception that explains [errorCode]. Null if no exception was provided. */
+   internal var errorException: IOException? = null
+@@ -111,19 +106,17 @@ class Http2Stream internal constructor(
+    * not open. This is because input data is buffered.
+    */
+   val isOpen: Boolean
+-    get() {
+-      lock.withLock {
+-        if (errorCode != null) {
+-          return false
+-        }
+-        if ((source.finished || source.closed) &&
+-          (sink.finished || sink.closed) &&
+-          hasResponseHeaders
+-        ) {
+-          return false
+-        }
+-        return true
++    @Synchronized get() {
++      if (errorCode != null) {
++        return false
++      }
++      if ((source.finished || source.closed) &&
++        (sink.finished || sink.closed) &&
++        hasResponseHeaders
++      ) {
++        return false
+       }
++      return true
+     }
+ 
+   /** Returns true if this stream was created by this peer. */
+@@ -142,44 +135,42 @@ class Http2Stream internal constructor(
+    *     This is true after a `Expect-Continue` request, false for duplex requests, and false for
+    *     all other requests.
+    */
++  @Synchronized
+   @Throws(IOException::class)
+   fun takeHeaders(callerIsIdle: Boolean = false): Headers {
+-    lock.withLock {
+-      while (headersQueue.isEmpty() && errorCode == null) {
+-        val doReadTimeout = callerIsIdle || doReadTimeout()
++    while (headersQueue.isEmpty() && errorCode == null) {
++      val doReadTimeout = callerIsIdle || doReadTimeout()
++      if (doReadTimeout) {
++        readTimeout.enter()
++      }
++      try {
++        waitForIo()
++      } finally {
+         if (doReadTimeout) {
+-          readTimeout.enter()
++          readTimeout.exitAndThrowIfTimedOut()
+         }
+-        try {
+-          waitForIo()
+-        } finally {
+-          if (doReadTimeout) {
+-            readTimeout.exitAndThrowIfTimedOut()
+-          }
+-        }
+-      }
+-      if (headersQueue.isNotEmpty()) {
+-        return headersQueue.removeFirst()
+       }
+-      throw errorException ?: StreamResetException(errorCode!!)
+     }
++    if (headersQueue.isNotEmpty()) {
++      return headersQueue.removeFirst()
++    }
++    throw errorException ?: StreamResetException(errorCode!!)
+   }
+ 
+   /**
+    * Returns the trailers. It is only safe to call this once the source stream has been completely
+    * exhausted.
+    */
++  @Synchronized
+   @Throws(IOException::class)
+   fun trailers(): Headers {
+-    lock.withLock {
+-      if (source.finished && source.receiveBuffer.exhausted() && source.readBuffer.exhausted()) {
+-        return source.trailers ?: EMPTY_HEADERS
+-      }
+-      if (errorCode != null) {
+-        throw errorException ?: StreamResetException(errorCode!!)
+-      }
+-      throw IllegalStateException("too early; can't read the trailers yet")
++    if (source.finished && source.receiveBuffer.exhausted() && source.readBuffer.exhausted()) {
++      return source.trailers ?: EMPTY_HEADERS
++    }
++    if (errorCode != null) {
++      throw errorException ?: StreamResetException(errorCode!!)
+     }
++    throw IllegalStateException("too early; can't read the trailers yet")
+   }
+ 
+   /**
+@@ -196,21 +187,21 @@ class Http2Stream internal constructor(
+     outFinished: Boolean,
+     flushHeaders: Boolean,
+   ) {
+-    lock.assertNotHeld()
++    this@Http2Stream.assertThreadDoesntHoldLock()
+ 
+     var flushHeaders = flushHeaders
+-    lock.withLock {
++    synchronized(this) {
+       this.hasResponseHeaders = true
+       if (outFinished) {
+         this.sink.finished = true
+-        condition.signalAll() // Because doReadTimeout() may have changed.
++        this@Http2Stream.notifyAll() // Because doReadTimeout() may have changed.
+       }
+     }
+ 
+     // Only DATA frames are subject to flow-control. Transmit the HEADER frame if the connection
+     // flow-control window is fully depleted.
+     if (!flushHeaders) {
+-      lock.withLock {
++      synchronized(connection) {
+         flushHeaders = (connection.writeBytesTotal >= connection.writeBytesMaximum)
+       }
+     }
+@@ -223,7 +214,7 @@ class Http2Stream internal constructor(
+   }
+ 
+   fun enqueueTrailers(trailers: Headers) {
+-    lock.withLock {
++    synchronized(this) {
+       check(!sink.finished) { "already finished" }
+       require(trailers.size != 0) { "trailers.size() == 0" }
+       this.sink.trailers = trailers
+@@ -244,7 +235,7 @@ class Http2Stream internal constructor(
+    *     not yet been sent.
+    */
+   fun getSink(): Sink {
+-    lock.withLock {
++    synchronized(this) {
+       check(hasResponseHeaders || isLocallyInitiated) {
+         "reply before requesting the sink"
+       }
+@@ -282,15 +273,15 @@ class Http2Stream internal constructor(
+     errorCode: ErrorCode,
+     errorException: IOException?,
+   ): Boolean {
+-    lock.assertNotHeld()
++    this.assertThreadDoesntHoldLock()
+ 
+-    lock.withLock {
++    synchronized(this) {
+       if (this.errorCode != null) {
+         return false
+       }
+       this.errorCode = errorCode
+       this.errorException = errorException
+-      condition.signalAll()
++      notifyAll()
+       if (source.finished && sink.finished) {
+         return false
+       }
+@@ -304,7 +295,7 @@ class Http2Stream internal constructor(
+     source: BufferedSource,
+     length: Int,
+   ) {
+-    lock.assertNotHeld()
++    this@Http2Stream.assertThreadDoesntHoldLock()
+ 
+     this.source.receive(source, length.toLong())
+   }
+@@ -314,10 +305,10 @@ class Http2Stream internal constructor(
+     headers: Headers,
+     inFinished: Boolean,
+   ) {
+-    lock.assertNotHeld()
++    this@Http2Stream.assertThreadDoesntHoldLock()
+ 
+     val open: Boolean
+-    lock.withLock {
++    synchronized(this) {
+       if (!hasResponseHeaders ||
+         headers[Header.RESPONSE_STATUS_UTF8] != null ||
+         headers[Header.TARGET_METHOD_UTF8] != null
+@@ -331,19 +322,17 @@ class Http2Stream internal constructor(
+         this.source.finished = true
+       }
+       open = isOpen
+-      condition.signalAll()
++      notifyAll()
+     }
+     if (!open) {
+       connection.removeStream(id)
+     }
+   }
+ 
+-  fun receiveRstStream(errorCode: ErrorCode) {
+-    lock.withLock {
+-      if (this.errorCode == null) {
+-        this.errorCode = errorCode
+-        condition.signalAll()
+-      }
++  @Synchronized fun receiveRstStream(errorCode: ErrorCode) {
++    if (this.errorCode == null) {
++      this.errorCode = errorCode
++      notifyAll()
+     }
+   }
+ 
+@@ -400,7 +389,7 @@ class Http2Stream internal constructor(
+ 
+         // 1. Decide what to do in a synchronized block.
+ 
+-        lock.withLock {
++        synchronized(this@Http2Stream) {
+           val doReadTimeout = doReadTimeout()
+           if (doReadTimeout) {
+             readTimeout.enter()
+@@ -463,7 +452,7 @@ class Http2Stream internal constructor(
+     }
+ 
+     private fun updateConnectionFlowControl(read: Long) {
+-      lock.assertNotHeld()
++      this@Http2Stream.assertThreadDoesntHoldLock()
+ 
+       connection.updateConnectionFlowControl(read)
+     }
+@@ -477,14 +466,14 @@ class Http2Stream internal constructor(
+       source: BufferedSource,
+       byteCount: Long,
+     ) {
+-      lock.assertNotHeld()
++      this@Http2Stream.assertThreadDoesntHoldLock()
+ 
+       var remainingByteCount = byteCount
+ 
+       while (remainingByteCount > 0L) {
+         val finished: Boolean
+         val flowControlError: Boolean
+-        lock.withLock {
++        synchronized(this@Http2Stream) {
+           finished = this.finished
+           flowControlError = remainingByteCount + readBuffer.size > maxByteCount
+         }
+@@ -510,14 +499,14 @@ class Http2Stream internal constructor(
+         // Move the received data to the read buffer to the reader can read it. If this source has
+         // been closed since this read began we must discard the incoming data and tell the
+         // connection we've done so.
+-        lock.withLock {
++        synchronized(this@Http2Stream) {
+           if (closed) {
+             receiveBuffer.clear()
+           } else {
+             val wasEmpty = readBuffer.size == 0L
+             readBuffer.writeAll(receiveBuffer)
+             if (wasEmpty) {
+-              condition.signalAll()
++              this@Http2Stream.notifyAll()
+             }
+           }
+         }
+@@ -538,11 +527,11 @@ class Http2Stream internal constructor(
+     @Throws(IOException::class)
+     override fun close() {
+       val bytesDiscarded: Long
+-      lock.withLock {
++      synchronized(this@Http2Stream) {
+         closed = true
+         bytesDiscarded = readBuffer.size
+         readBuffer.clear()
+-        condition.signalAll() // TODO(jwilson): Unnecessary?
++        this@Http2Stream.notifyAll() // TODO(jwilson): Unnecessary?
+       }
+       if (bytesDiscarded > 0L) {
+         updateConnectionFlowControl(bytesDiscarded)
+@@ -553,11 +542,11 @@ class Http2Stream internal constructor(
+ 
+   @Throws(IOException::class)
+   internal fun cancelStreamIfNecessary() {
+-    lock.assertNotHeld()
++    this@Http2Stream.assertThreadDoesntHoldLock()
+ 
+     val open: Boolean
+     val cancel: Boolean
+-    lock.withLock {
++    synchronized(this) {
+       cancel = !source.finished && source.closed && (sink.finished || sink.closed)
+       open = isOpen
+     }
+@@ -592,7 +581,7 @@ class Http2Stream internal constructor(
+       source: Buffer,
+       byteCount: Long,
+     ) {
+-      lock.assertNotHeld()
++      this@Http2Stream.assertThreadDoesntHoldLock()
+ 
+       sendBuffer.write(source, byteCount)
+       while (sendBuffer.size >= EMIT_BUFFER_SIZE) {
+@@ -608,7 +597,7 @@ class Http2Stream internal constructor(
+     private fun emitFrame(outFinishedOnLastFrame: Boolean) {
+       val toWrite: Long
+       val outFinished: Boolean
+-      lock.withLock {
++      synchronized(this@Http2Stream) {
+         writeTimeout.enter()
+         try {
+           while (writeBytesTotal >= writeBytesMaximum &&
+@@ -638,9 +627,9 @@ class Http2Stream internal constructor(
+ 
+     @Throws(IOException::class)
+     override fun flush() {
+-      lock.assertNotHeld()
++      this@Http2Stream.assertThreadDoesntHoldLock()
+ 
+-      lock.withLock {
++      synchronized(this@Http2Stream) {
+         checkOutNotClosed()
+       }
+       // TODO(jwilson): flush the connection?!
+@@ -654,10 +643,10 @@ class Http2Stream internal constructor(
+ 
+     @Throws(IOException::class)
+     override fun close() {
+-      lock.assertNotHeld()
++      this@Http2Stream.assertThreadDoesntHoldLock()
+ 
+       val outFinished: Boolean
+-      lock.withLock {
++      synchronized(this@Http2Stream) {
+         if (closed) return
+         outFinished = errorCode == null
+       }
+@@ -686,9 +675,9 @@ class Http2Stream internal constructor(
+           }
+         }
+       }
+-      lock.withLock {
++      synchronized(this@Http2Stream) {
+         closed = true
+-        condition.signalAll() // Because doReadTimeout() may have changed.
++        this@Http2Stream.notifyAll() // Because doReadTimeout() may have changed.
+       }
+       connection.flush()
+       cancelStreamIfNecessary()
+@@ -703,7 +692,7 @@ class Http2Stream internal constructor(
+   fun addBytesToWriteWindow(delta: Long) {
+     writeBytesMaximum += delta
+     if (delta > 0L) {
+-      condition.signalAll()
++      this@Http2Stream.notifyAll()
+     }
+   }
+ 
+@@ -723,7 +712,7 @@ class Http2Stream internal constructor(
+   @Throws(InterruptedIOException::class)
+   internal fun waitForIo() {
+     try {
+-      condition.await()
++      wait()
+     } catch (_: InterruptedException) {
+       Thread.currentThread().interrupt() // Retain interrupted status.
+       throw InterruptedIOException()
+diff --git a/okhttp/src/main/kotlin/okhttp3/internal/http2/Http2Writer.kt b/okhttp/src/main/kotlin/okhttp3/internal/http2/Http2Writer.kt
+index 496757427..ff72536e9 100644
+--- a/okhttp/src/main/kotlin/okhttp3/internal/http2/Http2Writer.kt
++++ b/okhttp/src/main/kotlin/okhttp3/internal/http2/Http2Writer.kt
+@@ -17,10 +17,8 @@ package okhttp3.internal.http2
+ 
+ import java.io.Closeable
+ import java.io.IOException
+-import java.util.concurrent.locks.ReentrantLock
+ import java.util.logging.Level.FINE
+ import java.util.logging.Logger
+-import kotlin.concurrent.withLock
+ import okhttp3.internal.format
+ import okhttp3.internal.http2.Http2.CONNECTION_PREFACE
+ import okhttp3.internal.http2.Http2.FLAG_ACK
+@@ -49,43 +47,39 @@ class Http2Writer(
+   private val sink: BufferedSink,
+   private val client: Boolean,
+ ) : Closeable {
+-  internal val lock: ReentrantLock = ReentrantLock()
+-
+   private val hpackBuffer: Buffer = Buffer()
+   private var maxFrameSize: Int = INITIAL_MAX_FRAME_SIZE
+   private var closed: Boolean = false
+   val hpackWriter: Hpack.Writer = Hpack.Writer(out = hpackBuffer)
+ 
++  @Synchronized
+   @Throws(IOException::class)
+   fun connectionPreface() {
+-    lock.withLock {
+-      if (closed) throw IOException("closed")
+-      if (!client) return // Nothing to write; servers don't send connection headers!
+-      if (logger.isLoggable(FINE)) {
+-        logger.fine(format(">> CONNECTION ${CONNECTION_PREFACE.hex()}"))
+-      }
+-      sink.write(CONNECTION_PREFACE)
+-      sink.flush()
++    if (closed) throw IOException("closed")
++    if (!client) return // Nothing to write; servers don't send connection headers!
++    if (logger.isLoggable(FINE)) {
++      logger.fine(format(">> CONNECTION ${CONNECTION_PREFACE.hex()}"))
+     }
++    sink.write(CONNECTION_PREFACE)
++    sink.flush()
+   }
+ 
+   /** Applies `peerSettings` and then sends a settings ACK. */
++  @Synchronized
+   @Throws(IOException::class)
+   fun applyAndAckSettings(peerSettings: Settings) {
+-    lock.withLock {
+-      if (closed) throw IOException("closed")
+-      this.maxFrameSize = peerSettings.getMaxFrameSize(maxFrameSize)
+-      if (peerSettings.headerTableSize != -1) {
+-        hpackWriter.resizeHeaderTable(peerSettings.headerTableSize)
+-      }
+-      frameHeader(
+-        streamId = 0,
+-        length = 0,
+-        type = TYPE_SETTINGS,
+-        flags = FLAG_ACK,
+-      )
+-      sink.flush()
++    if (closed) throw IOException("closed")
++    this.maxFrameSize = peerSettings.getMaxFrameSize(maxFrameSize)
++    if (peerSettings.headerTableSize != -1) {
++      hpackWriter.resizeHeaderTable(peerSettings.headerTableSize)
+     }
++    frameHeader(
++      streamId = 0,
++      length = 0,
++      type = TYPE_SETTINGS,
++      flags = FLAG_ACK,
++    )
++    sink.flush()
+   }
+ 
+   /**
+@@ -100,57 +94,54 @@ class Http2Writer(
+    * @param promisedStreamId server-initiated stream ID.  Must be an even number.
+    * @param requestHeaders minimally includes `:method`, `:scheme`, `:authority`, and `:path`.
+    */
++  @Synchronized
+   @Throws(IOException::class)
+   fun pushPromise(
+     streamId: Int,
+     promisedStreamId: Int,
+     requestHeaders: List<Header>,
+   ) {
+-    lock.withLock {
+-      if (closed) throw IOException("closed")
+-      hpackWriter.writeHeaders(requestHeaders)
++    if (closed) throw IOException("closed")
++    hpackWriter.writeHeaders(requestHeaders)
+ 
+-      val byteCount = hpackBuffer.size
+-      val length = minOf(maxFrameSize - 4L, byteCount).toInt()
+-      frameHeader(
+-        streamId = streamId,
+-        length = length + 4,
+-        type = TYPE_PUSH_PROMISE,
+-        flags = if (byteCount == length.toLong()) FLAG_END_HEADERS else 0,
+-      )
+-      sink.writeInt(promisedStreamId and 0x7fffffff)
+-      sink.write(hpackBuffer, length.toLong())
++    val byteCount = hpackBuffer.size
++    val length = minOf(maxFrameSize - 4L, byteCount).toInt()
++    frameHeader(
++      streamId = streamId,
++      length = length + 4,
++      type = TYPE_PUSH_PROMISE,
++      flags = if (byteCount == length.toLong()) FLAG_END_HEADERS else 0,
++    )
++    sink.writeInt(promisedStreamId and 0x7fffffff)
++    sink.write(hpackBuffer, length.toLong())
+ 
+-      if (byteCount > length) writeContinuationFrames(streamId, byteCount - length)
+-    }
++    if (byteCount > length) writeContinuationFrames(streamId, byteCount - length)
+   }
+ 
++  @Synchronized
+   @Throws(IOException::class)
+   fun flush() {
+-    lock.withLock {
+-      if (closed) throw IOException("closed")
+-      sink.flush()
+-    }
++    if (closed) throw IOException("closed")
++    sink.flush()
+   }
+ 
++  @Synchronized
+   @Throws(IOException::class)
+   fun rstStream(
+     streamId: Int,
+     errorCode: ErrorCode,
+   ) {
+-    lock.withLock {
+-      if (closed) throw IOException("closed")
+-      require(errorCode.httpCode != -1)
++    if (closed) throw IOException("closed")
++    require(errorCode.httpCode != -1)
+ 
+-      frameHeader(
+-        streamId = streamId,
+-        length = 4,
+-        type = TYPE_RST_STREAM,
+-        flags = FLAG_NONE,
+-      )
+-      sink.writeInt(errorCode.httpCode)
+-      sink.flush()
+-    }
++    frameHeader(
++      streamId = streamId,
++      length = 4,
++      type = TYPE_RST_STREAM,
++      flags = FLAG_NONE,
++    )
++    sink.writeInt(errorCode.httpCode)
++    sink.flush()
+   }
+ 
+   /** The maximum size of bytes that may be sent in a single call to [data]. */
+@@ -163,6 +154,7 @@ class Http2Writer(
+    * @param source the buffer to draw bytes from. May be null if byteCount is 0.
+    * @param byteCount must be between 0 and the minimum of `source.length` and [maxDataLength].
+    */
++  @Synchronized
+   @Throws(IOException::class)
+   fun data(
+     outFinished: Boolean,
+@@ -170,12 +162,10 @@ class Http2Writer(
+     source: Buffer?,
+     byteCount: Int,
+   ) {
+-    lock.withLock {
+-      if (closed) throw IOException("closed")
+-      var flags = FLAG_NONE
+-      if (outFinished) flags = flags or FLAG_END_STREAM
+-      dataFrame(streamId, flags, source, byteCount)
+-    }
++    if (closed) throw IOException("closed")
++    var flags = FLAG_NONE
++    if (outFinished) flags = flags or FLAG_END_STREAM
++    dataFrame(streamId, flags, source, byteCount)
+   }
+ 
+   @Throws(IOException::class)
+@@ -197,53 +187,51 @@ class Http2Writer(
+   }
+ 
+   /** Write okhttp's settings to the peer. */
++  @Synchronized
+   @Throws(IOException::class)
+   fun settings(settings: Settings) {
+-    lock.withLock {
+-      if (closed) throw IOException("closed")
+-      frameHeader(
+-        streamId = 0,
+-        length = settings.size() * 6,
+-        type = TYPE_SETTINGS,
+-        flags = FLAG_NONE,
+-      )
+-      for (i in 0 until Settings.COUNT) {
+-        if (!settings.isSet(i)) continue
+-        val id =
+-          when (i) {
+-            4 -> 3 // SETTINGS_MAX_CONCURRENT_STREAMS renumbered.
+-            7 -> 4 // SETTINGS_INITIAL_WINDOW_SIZE renumbered.
+-            else -> i
+-          }
+-        sink.writeShort(id)
+-        sink.writeInt(settings[i])
+-      }
+-      sink.flush()
++    if (closed) throw IOException("closed")
++    frameHeader(
++      streamId = 0,
++      length = settings.size() * 6,
++      type = TYPE_SETTINGS,
++      flags = FLAG_NONE,
++    )
++    for (i in 0 until Settings.COUNT) {
++      if (!settings.isSet(i)) continue
++      val id =
++        when (i) {
++          4 -> 3 // SETTINGS_MAX_CONCURRENT_STREAMS renumbered.
++          7 -> 4 // SETTINGS_INITIAL_WINDOW_SIZE renumbered.
++          else -> i
++        }
++      sink.writeShort(id)
++      sink.writeInt(settings[i])
+     }
++    sink.flush()
+   }
+ 
+   /**
+    * Send a connection-level ping to the peer. `ack` indicates this is a reply. The data in
+    * `payload1` and `payload2` opaque binary, and there are no rules on the content.
+    */
++  @Synchronized
+   @Throws(IOException::class)
+   fun ping(
+     ack: Boolean,
+     payload1: Int,
+     payload2: Int,
+   ) {
+-    lock.withLock {
+-      if (closed) throw IOException("closed")
+-      frameHeader(
+-        streamId = 0,
+-        length = 8,
+-        type = TYPE_PING,
+-        flags = if (ack) FLAG_ACK else FLAG_NONE,
+-      )
+-      sink.writeInt(payload1)
+-      sink.writeInt(payload2)
+-      sink.flush()
+-    }
++    if (closed) throw IOException("closed")
++    frameHeader(
++      streamId = 0,
++      length = 8,
++      type = TYPE_PING,
++      flags = if (ack) FLAG_ACK else FLAG_NONE,
++    )
++    sink.writeInt(payload1)
++    sink.writeInt(payload2)
++    sink.flush()
+   }
+ 
+   /**
+@@ -254,63 +242,61 @@ class Http2Writer(
+    * @param errorCode reason for closing the connection.
+    * @param debugData only valid for HTTP/2; opaque debug data to send.
+    */
++  @Synchronized
+   @Throws(IOException::class)
+   fun goAway(
+     lastGoodStreamId: Int,
+     errorCode: ErrorCode,
+     debugData: ByteArray,
+   ) {
+-    lock.withLock {
+-      if (closed) throw IOException("closed")
+-      require(errorCode.httpCode != -1) { "errorCode.httpCode == -1" }
+-      frameHeader(
+-        streamId = 0,
+-        length = 8 + debugData.size,
+-        type = TYPE_GOAWAY,
+-        flags = FLAG_NONE,
+-      )
+-      sink.writeInt(lastGoodStreamId)
+-      sink.writeInt(errorCode.httpCode)
+-      if (debugData.isNotEmpty()) {
+-        sink.write(debugData)
+-      }
+-      sink.flush()
++    if (closed) throw IOException("closed")
++    require(errorCode.httpCode != -1) { "errorCode.httpCode == -1" }
++    frameHeader(
++      streamId = 0,
++      length = 8 + debugData.size,
++      type = TYPE_GOAWAY,
++      flags = FLAG_NONE,
++    )
++    sink.writeInt(lastGoodStreamId)
++    sink.writeInt(errorCode.httpCode)
++    if (debugData.isNotEmpty()) {
++      sink.write(debugData)
+     }
++    sink.flush()
+   }
+ 
+   /**
+    * Inform peer that an additional `windowSizeIncrement` bytes can be sent on `streamId`, or the
+    * connection if `streamId` is zero.
+    */
++  @Synchronized
+   @Throws(IOException::class)
+   fun windowUpdate(
+     streamId: Int,
+     windowSizeIncrement: Long,
+   ) {
+-    lock.withLock {
+-      if (closed) throw IOException("closed")
+-      require(windowSizeIncrement != 0L && windowSizeIncrement <= 0x7fffffffL) {
+-        "windowSizeIncrement == 0 || windowSizeIncrement > 0x7fffffffL: $windowSizeIncrement"
+-      }
+-      if (logger.isLoggable(FINE)) {
+-        logger.fine(
+-          frameLogWindowUpdate(
+-            inbound = false,
+-            streamId = streamId,
+-            length = 4,
+-            windowSizeIncrement = windowSizeIncrement,
+-          ),
+-        )
+-      }
+-      frameHeader(
+-        streamId = streamId,
+-        length = 4,
+-        type = TYPE_WINDOW_UPDATE,
+-        flags = FLAG_NONE,
++    if (closed) throw IOException("closed")
++    require(windowSizeIncrement != 0L && windowSizeIncrement <= 0x7fffffffL) {
++      "windowSizeIncrement == 0 || windowSizeIncrement > 0x7fffffffL: $windowSizeIncrement"
++    }
++    if (logger.isLoggable(FINE)) {
++      logger.fine(
++        frameLogWindowUpdate(
++          inbound = false,
++          streamId = streamId,
++          length = 4,
++          windowSizeIncrement = windowSizeIncrement,
++        ),
+       )
+-      sink.writeInt(windowSizeIncrement.toInt())
+-      sink.flush()
+     }
++    frameHeader(
++      streamId = streamId,
++      length = 4,
++      type = TYPE_WINDOW_UPDATE,
++      flags = FLAG_NONE,
++    )
++    sink.writeInt(windowSizeIncrement.toInt())
++    sink.flush()
+   }
+ 
+   @Throws(IOException::class)
+@@ -331,12 +317,11 @@ class Http2Writer(
+     sink.writeInt(streamId and 0x7fffffff)
+   }
+ 
++  @Synchronized
+   @Throws(IOException::class)
+   override fun close() {
+-    lock.withLock {
+-      closed = true
+-      sink.close()
+-    }
++    closed = true
++    sink.close()
+   }
+ 
+   @Throws(IOException::class)
+@@ -358,30 +343,29 @@ class Http2Writer(
+     }
+   }
+ 
++  @Synchronized
+   @Throws(IOException::class)
+   fun headers(
+     outFinished: Boolean,
+     streamId: Int,
+     headerBlock: List<Header>,
+   ) {
+-    lock.withLock {
+-      if (closed) throw IOException("closed")
+-      hpackWriter.writeHeaders(headerBlock)
++    if (closed) throw IOException("closed")
++    hpackWriter.writeHeaders(headerBlock)
+ 
+-      val byteCount = hpackBuffer.size
+-      val length = minOf(maxFrameSize.toLong(), byteCount)
+-      var flags = if (byteCount == length) FLAG_END_HEADERS else 0
+-      if (outFinished) flags = flags or FLAG_END_STREAM
+-      frameHeader(
+-        streamId = streamId,
+-        length = length.toInt(),
+-        type = TYPE_HEADERS,
+-        flags = flags,
+-      )
+-      sink.write(hpackBuffer, length)
++    val byteCount = hpackBuffer.size
++    val length = minOf(maxFrameSize.toLong(), byteCount)
++    var flags = if (byteCount == length) FLAG_END_HEADERS else 0
++    if (outFinished) flags = flags or FLAG_END_STREAM
++    frameHeader(
++      streamId = streamId,
++      length = length.toInt(),
++      type = TYPE_HEADERS,
++      flags = flags,
++    )
++    sink.write(hpackBuffer, length)
+ 
+-      if (byteCount > length) writeContinuationFrames(streamId, byteCount - length)
+-    }
++    if (byteCount > length) writeContinuationFrames(streamId, byteCount - length)
+   }
+ 
+   companion object {
+diff --git a/okhttp/src/test/java/okhttp3/internal/connection/ConnectionPoolTest.kt b/okhttp/src/test/java/okhttp3/internal/connection/ConnectionPoolTest.kt
+index 8e58158d6..240816047 100644
+--- a/okhttp/src/test/java/okhttp3/internal/connection/ConnectionPoolTest.kt
++++ b/okhttp/src/test/java/okhttp3/internal/connection/ConnectionPoolTest.kt
+@@ -21,7 +21,6 @@ import assertk.assertions.isEqualTo
+ import assertk.assertions.isFalse
+ import assertk.assertions.isNotEmpty
+ import assertk.assertions.isTrue
+-import kotlin.concurrent.withLock
+ import okhttp3.Address
+ import okhttp3.ConnectionPool
+ import okhttp3.FakeRoutePlanner
+@@ -97,7 +96,7 @@ class ConnectionPoolTest {
+         .build()
+     val call = client.newCall(Request(addressA.url)) as RealCall
+     call.enterNetworkInterceptorExchange(call.request(), true, factory.newChain(call))
+-    c1.lock.withLock { call.acquireConnectionNoEvents(c1) }
++    synchronized(c1) { call.acquireConnectionNoEvents(c1) }
+ 
+     // Running at time 50, the pool returns that nothing can be evicted until time 150.
+     assertThat(pool.closeConnections(50L)).isEqualTo(100L)
+@@ -343,6 +342,6 @@ class ConnectionPoolTest {
+         .build()
+     val call = client.newCall(Request(connection.route().address.url)) as RealCall
+     call.enterNetworkInterceptorExchange(call.request(), true, factory.newChain(call))
+-    connection.lock.withLock { call.acquireConnectionNoEvents(connection) }
++    synchronized(connection) { call.acquireConnectionNoEvents(connection) }
+   }
+ }

@@ -1,0 +1,732 @@
+diff --git a/mockwebserver/src/main/kotlin/mockwebserver3/MockWebServer.kt b/mockwebserver/src/main/kotlin/mockwebserver3/MockWebServer.kt
+index 46556c4f9..ece98492d 100644
+--- a/mockwebserver/src/main/kotlin/mockwebserver3/MockWebServer.kt
++++ b/mockwebserver/src/main/kotlin/mockwebserver3/MockWebServer.kt
+@@ -56,12 +56,12 @@ import mockwebserver3.SocketEffect.ShutdownConnection
+ import mockwebserver3.SocketEffect.Stall
+ import mockwebserver3.internal.DEFAULT_REQUEST_LINE_HTTP_1
+ import mockwebserver3.internal.DEFAULT_REQUEST_LINE_HTTP_2
+-import mockwebserver3.internal.MockWebServerSocket
+ import mockwebserver3.internal.RecordedRequest
+ import mockwebserver3.internal.RequestLine
+ import mockwebserver3.internal.ThrottledSink
+ import mockwebserver3.internal.TriggerSink
+ import mockwebserver3.internal.decodeRequestLine
++import mockwebserver3.internal.sleepWhileOpen
+ import okhttp3.Headers
+ import okhttp3.Headers.Companion.headersOf
+ import okhttp3.HttpUrl
+@@ -89,7 +89,10 @@ import okio.BufferedSource
+ import okio.ByteString
+ import okio.Sink
+ import okio.Timeout
++import okio.asOkioSocket
+ import okio.buffer
++import okio.sink
++import okio.source
+ 
+ /**
+  * A scriptable web server. Callers supply canned responses and the server replays them upon request
+@@ -389,7 +392,7 @@ public class MockWebServer : Closeable {
+         dispatchBookkeepingRequest(
+           connectionIndex = nextConnectionIndex++,
+           exchangeIndex = 0,
+-          socket = MockWebServerSocket(socket),
++          socket = socket,
+         )
+         socket.close()
+       } else {
+@@ -446,33 +449,33 @@ public class MockWebServer : Closeable {
+       if (!processTunnelRequests()) return
+ 
+       val protocol: Protocol
+-      val socket: MockWebServerSocket
++      val socket: Socket
+       when {
+         sslSocketFactory != null -> {
+           if (firstExchangePeek.failHandshake) {
+             dispatchBookkeepingRequest(
+               connectionIndex = connectionIndex,
+               exchangeIndex = nextExchangeIndex++,
+-              socket = MockWebServerSocket(raw),
++              socket = raw,
+             )
+             processHandshakeFailure(raw)
+             return
+           }
+-          val sslSocket =
++          socket =
+             sslSocketFactory!!.createSocket(
+               raw,
+               raw.inetAddress.hostAddress,
+               raw.port,
+               true,
+-            ) as SSLSocket
+-          socket = MockWebServerSocket(sslSocket)
++            )
++          val sslSocket = socket as SSLSocket
+           sslSocket.useClientMode = false
+           if (clientAuth == CLIENT_AUTH_REQUIRED) {
+             sslSocket.needClientAuth = true
+           } else if (clientAuth == CLIENT_AUTH_REQUESTED) {
+             sslSocket.wantClientAuth = true
+           }
+-          openClientSockets.add(sslSocket)
++          openClientSockets.add(socket)
+ 
+           if (protocolNegotiationEnabled) {
+             Platform.get().configureTlsExtensions(sslSocket, null, protocols)
+@@ -499,7 +502,7 @@ public class MockWebServer : Closeable {
+               Protocol.H2_PRIOR_KNOWLEDGE in protocols -> Protocol.H2_PRIOR_KNOWLEDGE
+               else -> Protocol.HTTP_1_1
+             }
+-          socket = MockWebServerSocket(raw)
++          socket = raw
+         }
+       }
+ 
+@@ -517,18 +520,21 @@ public class MockWebServer : Closeable {
+         val connection =
+           Http2Connection
+             .Builder(false, taskRunner)
+-            .socket(socket.javaNetSocket)
++            .socket(socket)
+             .listener(http2SocketHandler)
+             .build()
+         connection.start()
+         openConnections.add(connection)
+-        openClientSockets.remove(socket.javaNetSocket)
++        openClientSockets.remove(socket)
+         return
+       } else if (protocol !== Protocol.HTTP_1_1) {
+         throw AssertionError()
+       }
+ 
+-      while (processOneRequest(socket)) {
++      val source = socket.source().buffer()
++      val sink = socket.sink().buffer()
++
++      while (processOneRequest(socket, source, sink)) {
+       }
+ 
+       if (nextExchangeIndex == 0) {
+@@ -538,7 +544,7 @@ public class MockWebServer : Closeable {
+       }
+ 
+       socket.close()
+-      openClientSockets.remove(socket.javaNetSocket)
++      openClientSockets.remove(socket)
+     }
+ 
+     /**
+@@ -549,9 +555,10 @@ public class MockWebServer : Closeable {
+     private fun processTunnelRequests(): Boolean {
+       if (!dispatcher.peek().inTunnel) return true // No tunnel requests.
+ 
+-      val socket = MockWebServerSocket(raw)
++      val source = raw.source().buffer()
++      val sink = raw.sink().buffer()
+       while (true) {
+-        val socketStillGood = processOneRequest(socket)
++        val socketStillGood = processOneRequest(raw, source, sink)
+ 
+         // Clean up after the last exchange on a socket.
+         if (!socketStillGood) {
+@@ -569,17 +576,16 @@ public class MockWebServer : Closeable {
+      * on the socket.
+      */
+     @Throws(IOException::class, InterruptedException::class)
+-    private fun processOneRequest(socket: MockWebServerSocket): Boolean {
+-      if (socket.source.exhausted()) {
++    private fun processOneRequest(
++      socket: Socket,
++      source: BufferedSource,
++      sink: BufferedSink,
++    ): Boolean {
++      if (source.exhausted()) {
+         return false // No more requests on this socket.
+       }
+ 
+-      val request =
+-        readRequest(
+-          socket = socket,
+-          connectionIndex = connectionIndex,
+-          exchangeIndex = nextExchangeIndex++,
+-        )
++      val request = readRequest(socket, source, sink, connectionIndex, nextExchangeIndex++)
+       atomicRequestCount.incrementAndGet()
+       requestQueue.add(request)
+ 
+@@ -602,13 +608,13 @@ public class MockWebServer : Closeable {
+         val responseWantsSocket = response.socketHandler != null
+         val responseWantsWebSocket = response.webSocketListener != null
+         if (requestWantsWebSocket && responseWantsWebSocket) {
+-          handleWebSocketUpgrade(socket, request, response)
++          handleWebSocketUpgrade(socket, source, sink, request, response)
+           reuseSocket = false
+         } else if (requestWantsSocket && responseWantsSocket) {
+-          writeHttpResponse(socket, response)
++          writeHttpResponse(socket, sink, response)
+           reuseSocket = false
+         } else {
+-          writeHttpResponse(socket, response)
++          writeHttpResponse(socket, sink, response)
+         }
+ 
+         if (logger.isLoggable(Level.FINE)) {
+@@ -655,7 +661,7 @@ public class MockWebServer : Closeable {
+   private fun dispatchBookkeepingRequest(
+     connectionIndex: Int,
+     exchangeIndex: Int,
+-    socket: MockWebServerSocket,
++    socket: Socket,
+     requestLine: RequestLine = DEFAULT_REQUEST_LINE_HTTP_1,
+   ) {
+     val request =
+@@ -677,7 +683,9 @@ public class MockWebServer : Closeable {
+   /** @param exchangeIndex the index of this request on this connection.*/
+   @Throws(IOException::class)
+   private fun readRequest(
+-    socket: MockWebServerSocket,
++    socket: Socket,
++    source: BufferedSource,
++    sink: BufferedSink,
+     connectionIndex: Int,
+     exchangeIndex: Int,
+   ): RecordedRequest {
+@@ -691,14 +699,14 @@ public class MockWebServer : Closeable {
+     var failure: IOException? = null
+ 
+     try {
+-      val requestLineString = socket.source.readUtf8LineStrict()
++      val requestLineString = source.readUtf8LineStrict()
+       if (requestLineString.isEmpty()) {
+         throw ProtocolException("no request because the stream is exhausted")
+       }
+       request = decodeRequestLine(requestLineString)
+ 
+       while (true) {
+-        val header = socket.source.readUtf8LineStrict()
++        val header = source.readUtf8LineStrict()
+         if (header.isEmpty()) {
+           break
+         }
+@@ -716,7 +724,7 @@ public class MockWebServer : Closeable {
+ 
+       val peek = dispatcher.peek()
+       for (response in peek.informationalResponses) {
+-        writeHttpResponse(socket, response)
++        writeHttpResponse(socket, sink, response)
+       }
+ 
+       val requestBodySink =
+@@ -735,25 +743,21 @@ public class MockWebServer : Closeable {
+ 
+           contentLength != -1L -> {
+             hasBody = contentLength > 0L || HttpMethod.permitsRequestBody(request.method)
+-            requestBodySink.write(socket.source, contentLength)
++            requestBodySink.write(source, contentLength)
+           }
+ 
+           chunked -> {
+             chunkSizes = mutableListOf()
+             hasBody = true
+             while (true) {
+-              val chunkSize =
+-                socket.source
+-                  .readUtf8LineStrict()
+-                  .trim()
+-                  .toInt(16)
++              val chunkSize = source.readUtf8LineStrict().trim().toInt(16)
+               if (chunkSize == 0) {
+-                readEmptyLine(socket.source)
++                readEmptyLine(source)
+                 break
+               }
+               chunkSizes.add(chunkSize)
+-              requestBodySink.write(socket.source, chunkSize.toLong())
+-              readEmptyLine(socket.source)
++              requestBodySink.write(source, chunkSize.toLong())
++              readEmptyLine(source)
+             }
+           }
+ 
+@@ -789,7 +793,9 @@ public class MockWebServer : Closeable {
+ 
+   @Throws(IOException::class)
+   private fun handleWebSocketUpgrade(
+-    socket: MockWebServerSocket,
++    socket: Socket,
++    source: BufferedSource,
++    sink: BufferedSink,
+     request: RecordedRequest,
+     response: MockResponse,
+   ) {
+@@ -799,7 +805,7 @@ public class MockWebServer : Closeable {
+         .newBuilder()
+         .setHeader("Sec-WebSocket-Accept", WebSocketProtocol.acceptHeader(key!!))
+         .build()
+-    writeHttpResponse(socket, webSocketResponse)
++    writeHttpResponse(socket, sink, webSocketResponse)
+ 
+     // Adapt the request and response into our Request and Response domain model.
+     val scheme = if (request.handshake != null) "https" else "http"
+@@ -822,7 +828,7 @@ public class MockWebServer : Closeable {
+ 
+     val connectionClose = CountDownLatch(1)
+     val streams =
+-      object : RealWebSocket.Streams(false, socket.source, socket.sink) {
++      object : RealWebSocket.Streams(false, source, sink) {
+         override fun close() = connectionClose.countDown()
+ 
+         override fun cancel() {
+@@ -849,30 +855,31 @@ public class MockWebServer : Closeable {
+       // Even if messages are no longer being read we need to wait for the connection close signal.
+       connectionClose.await()
+     } finally {
+-      socket.source.closeQuietly()
++      source.closeQuietly()
+     }
+   }
+ 
+   @Throws(IOException::class)
+   private fun writeHttpResponse(
+-    socket: MockWebServerSocket,
++    socket: Socket,
++    sink: BufferedSink,
+     response: MockResponse,
+   ) {
+     socket.sleepWhileOpen(response.headersDelayNanos)
+-    socket.sink.writeUtf8(response.status)
+-    socket.sink.writeUtf8("\r\n")
++    sink.writeUtf8(response.status)
++    sink.writeUtf8("\r\n")
+ 
+-    writeHeaders(socket.sink, response.headers)
++    writeHeaders(sink, response.headers)
+ 
+     if (response.socketHandler != null) {
+-      response.socketHandler.handle(socket)
++      response.socketHandler.handle(socket.asOkioSocket())
+       return
+     }
+ 
+     val body = response.body ?: return
+     socket.sleepWhileOpen(response.bodyDelayNanos)
+     val responseBodySink =
+-      socket.sink
++      sink
+         .withThrottlingAndSocketEffect(
+           policy = response,
+           socketEffect = response.onResponseBody,
+@@ -884,7 +891,7 @@ public class MockWebServer : Closeable {
+ 
+     socket.sleepWhileOpen(response.trailersDelayNanos)
+     if ("chunked".equals(response.headers["Transfer-Encoding"], ignoreCase = true)) {
+-      writeHeaders(socket.sink, response.trailers)
++      writeHeaders(sink, response.trailers)
+     }
+   }
+ 
+@@ -908,7 +915,7 @@ public class MockWebServer : Closeable {
+     policy: MockResponse,
+     socketEffect: SocketEffect?,
+     expectedByteCount: Long,
+-    socket: MockWebServerSocket,
++    socket: Socket,
+     stream: Http2Stream? = null,
+   ): Sink {
+     var result: Sink = this
+@@ -945,7 +952,7 @@ public class MockWebServer : Closeable {
+   /** Returns true if processing this exchange is complete. */
+   private fun handleSocketEffect(
+     effect: SocketEffect?,
+-    socket: MockWebServerSocket,
++    socket: Socket,
+     stream: Http2Stream? = null,
+   ): Boolean {
+     if (effect == null) return false
+@@ -1036,7 +1043,7 @@ public class MockWebServer : Closeable {
+   /** Processes HTTP requests layered over HTTP/2. */
+   private inner class Http2SocketHandler(
+     private val connectionIndex: Int,
+-    private val socket: MockWebServerSocket,
++    private val socket: Socket,
+     private val protocol: Protocol,
+   ) : Http2Connection.Listener() {
+     private val nextExchangeIndex = AtomicInteger()
+diff --git a/mockwebserver/src/main/kotlin/mockwebserver3/internal/MockWebServerSocket.kt b/mockwebserver/src/main/kotlin/mockwebserver3/internal/MockWebServerSocket.kt
+deleted file mode 100644
+index 3df964c7d..000000000
+--- a/mockwebserver/src/main/kotlin/mockwebserver3/internal/MockWebServerSocket.kt
++++ /dev/null
+@@ -1,99 +0,0 @@
+-/*
+- * Copyright (C) 2025 Square, Inc.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-package mockwebserver3.internal
+-
+-import java.io.Closeable
+-import java.io.InterruptedIOException
+-import java.net.InetAddress
+-import java.net.Socket
+-import javax.net.ssl.SSLSocket
+-import okhttp3.Handshake
+-import okhttp3.Handshake.Companion.handshake
+-import okhttp3.internal.platform.Platform
+-import okio.BufferedSink
+-import okio.BufferedSource
+-import okio.asOkioSocket
+-import okio.buffer
+-
+-/**
+- * Adapts a [java.net.Socket] to MockWebServer's needs.
+- *
+- * Note that [asOkioSocket] returns a socket that closes the underlying [java.net.Socket] when both
+- * of its component streams are closed. This class takes advantage of that.
+- */
+-internal class MockWebServerSocket(
+-  val javaNetSocket: Socket,
+-) : Closeable,
+-  okio.Socket {
+-  private val delegate = javaNetSocket.asOkioSocket()
+-
+-  override val source: BufferedSource = delegate.source.buffer()
+-  override val sink: BufferedSink = delegate.sink.buffer()
+-
+-  val localAddress: InetAddress
+-    get() = javaNetSocket.localAddress
+-
+-  val localPort: Int
+-    get() = javaNetSocket.localPort
+-
+-  val scheme: String
+-    get() =
+-      when (javaNetSocket) {
+-        is SSLSocket -> "https"
+-        else -> "http"
+-      }
+-
+-  val handshake: Handshake?
+-    get() = (javaNetSocket as? SSLSocket)?.session?.handshake()
+-
+-  val handshakeServerNames: List<String>
+-    get() =
+-      (javaNetSocket as? SSLSocket)
+-        ?.let { Platform.Companion.get().getHandshakeServerNames(it) }
+-        ?: listOf()
+-
+-  fun shutdownInput() {
+-    javaNetSocket.shutdownInput()
+-  }
+-
+-  fun shutdownOutput() {
+-    javaNetSocket.shutdownOutput()
+-  }
+-
+-  /** Sleeps [nanos], throwing if the socket is closed before that period has elapsed. */
+-  fun sleepWhileOpen(nanos: Long) {
+-    var ms = nanos / 1_000_000L
+-    val ns = nanos - (ms * 1_000_000L)
+-
+-    while (ms > 100) {
+-      Thread.sleep(100)
+-      if (javaNetSocket.isClosed) throw InterruptedIOException("socket closed")
+-      ms -= 100L
+-    }
+-
+-    if (ms > 0L || ns > 0) {
+-      Thread.sleep(ms, ns.toInt())
+-    }
+-  }
+-
+-  override fun cancel() {
+-    delegate.cancel()
+-  }
+-
+-  override fun close() {
+-    javaNetSocket.close()
+-  }
+-}
+diff --git a/mockwebserver/src/main/kotlin/mockwebserver3/internal/RecordedRequestFactory.kt b/mockwebserver/src/main/kotlin/mockwebserver3/internal/RecordedRequestFactory.kt
+index 8ae6aefa4..578c1f054 100644
+--- a/mockwebserver/src/main/kotlin/mockwebserver3/internal/RecordedRequestFactory.kt
++++ b/mockwebserver/src/main/kotlin/mockwebserver3/internal/RecordedRequestFactory.kt
+@@ -18,11 +18,16 @@ package mockwebserver3.internal
+ import java.io.IOException
+ import java.net.Inet6Address
+ import java.net.ProtocolException
++import java.net.Socket
++import javax.net.ssl.SSLSocket
+ import mockwebserver3.RecordedRequest
++import okhttp3.Handshake
++import okhttp3.Handshake.Companion.handshake
+ import okhttp3.Headers
+ import okhttp3.HttpUrl
+ import okhttp3.HttpUrl.Companion.toHttpUrl
+ import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
++import okhttp3.internal.platform.Platform
+ import okio.ByteString
+ 
+ internal fun RecordedRequest(
+@@ -33,9 +38,23 @@ internal fun RecordedRequest(
+   body: ByteString?,
+   connectionIndex: Int,
+   exchangeIndex: Int,
+-  socket: MockWebServerSocket,
++  socket: Socket,
+   failure: IOException? = null,
+ ): RecordedRequest {
++  val handshake: Handshake?
++  val handshakeServerNames: List<String>
++  if (socket is SSLSocket) {
++    try {
++      handshake = socket.session.handshake()
++      handshakeServerNames = Platform.get().getHandshakeServerNames(socket)
++    } catch (e: IOException) {
++      throw IllegalArgumentException(e)
++    }
++  } else {
++    handshake = null
++    handshakeServerNames = listOf()
++  }
++
+   val requestUrl =
+     when (requestLine.method) {
+       "CONNECT" -> "${socket.scheme}://${requestLine.target}/".toHttpUrlOrNull()
+@@ -47,8 +66,8 @@ internal fun RecordedRequest(
+   return RecordedRequest(
+     connectionIndex = connectionIndex,
+     exchangeIndex = exchangeIndex,
+-    handshake = socket.handshake,
+-    handshakeServerNames = socket.handshakeServerNames,
++    handshake = handshake,
++    handshakeServerNames = handshakeServerNames,
+     method = requestLine.method,
+     target = requestLine.target,
+     version = requestLine.version,
+@@ -101,8 +120,15 @@ internal val DEFAULT_REQUEST_LINE_HTTP_2 =
+     version = "HTTP/2",
+   )
+ 
++private val Socket.scheme: String
++  get() =
++    when (this) {
++      is SSLSocket -> "https"
++      else -> "http"
++    }
++
+ private fun requestUrl(
+-  socket: MockWebServerSocket,
++  socket: Socket,
+   requestLine: RequestLine,
+   headers: Headers,
+ ): HttpUrl {
+diff --git a/mockwebserver/src/main/kotlin/mockwebserver3/internal/SleepNanos.kt b/mockwebserver/src/main/kotlin/mockwebserver3/internal/SleepNanos.kt
+new file mode 100644
+index 000000000..a68d11a50
+--- /dev/null
++++ b/mockwebserver/src/main/kotlin/mockwebserver3/internal/SleepNanos.kt
+@@ -0,0 +1,36 @@
++/*
++ * Copyright (c) 2022 Block, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ *
++ */
++package mockwebserver3.internal
++
++import java.io.InterruptedIOException
++import java.net.Socket
++
++/** Sleeps [nanos], throwing if the socket is closed before that period has elapsed. */
++internal fun Socket.sleepWhileOpen(nanos: Long) {
++  var ms = nanos / 1_000_000L
++  val ns = nanos - (ms * 1_000_000L)
++
++  while (ms > 100) {
++    Thread.sleep(100)
++    if (isClosed) throw InterruptedIOException("socket closed")
++    ms -= 100L
++  }
++
++  if (ms > 0L || ns > 0) {
++    Thread.sleep(ms, ns.toInt())
++  }
++}
+diff --git a/mockwebserver/src/main/kotlin/mockwebserver3/internal/ThrottledSink.kt b/mockwebserver/src/main/kotlin/mockwebserver3/internal/ThrottledSink.kt
+index d19a4e8e0..5b55e3c56 100644
+--- a/mockwebserver/src/main/kotlin/mockwebserver3/internal/ThrottledSink.kt
++++ b/mockwebserver/src/main/kotlin/mockwebserver3/internal/ThrottledSink.kt
+@@ -16,6 +16,7 @@
+  */
+ package mockwebserver3.internal
+ 
++import java.net.Socket
+ import okio.Buffer
+ import okio.Sink
+ 
+@@ -24,7 +25,7 @@ import okio.Sink
+  * this permits any interval to be used.
+  */
+ internal class ThrottledSink(
+-  private val socket: MockWebServerSocket,
++  private val socket: Socket,
+   private val delegate: Sink,
+   private val bytesPerPeriod: Long,
+   private val periodDelayNanos: Long,
+diff --git a/mockwebserver/src/test/java/mockwebserver3/RecordedRequestTest.kt b/mockwebserver/src/test/java/mockwebserver3/RecordedRequestTest.kt
+index 961bc2110..71748e3d4 100644
+--- a/mockwebserver/src/test/java/mockwebserver3/RecordedRequestTest.kt
++++ b/mockwebserver/src/test/java/mockwebserver3/RecordedRequestTest.kt
+@@ -21,7 +21,6 @@ import assertk.assertions.isEqualTo
+ import java.net.InetAddress
+ import java.net.Socket
+ import mockwebserver3.internal.DEFAULT_REQUEST_LINE_HTTP_1
+-import mockwebserver3.internal.MockWebServerSocket
+ import mockwebserver3.internal.RecordedRequest
+ import mockwebserver3.internal.decodeRequestLine
+ import okhttp3.Headers
+@@ -36,11 +35,9 @@ class RecordedRequestTest {
+ 
+   @Test fun testIPv4() {
+     val socket =
+-      MockWebServerSocket(
+-        FakeSocket(
+-          localAddress = InetAddress.getByAddress("127.0.0.1", byteArrayOf(127, 0, 0, 1)),
+-          localPort = 80,
+-        ),
++      FakeSocket(
++        localAddress = InetAddress.getByAddress("127.0.0.1", byteArrayOf(127, 0, 0, 1)),
++        localPort = 80,
+       )
+     val request = RecordedRequest(DEFAULT_REQUEST_LINE_HTTP_1, headers, emptyList(), 0, ByteString.EMPTY, 0, 0, socket)
+     assertThat(request.url.toString()).isEqualTo("http://127.0.0.1/")
+@@ -48,11 +45,9 @@ class RecordedRequestTest {
+ 
+   @Test fun testAuthorityForm() {
+     val socket =
+-      MockWebServerSocket(
+-        FakeSocket(
+-          localAddress = InetAddress.getByAddress("127.0.0.1", byteArrayOf(127, 0, 0, 1)),
+-          localPort = 80,
+-        ),
++      FakeSocket(
++        localAddress = InetAddress.getByAddress("127.0.0.1", byteArrayOf(127, 0, 0, 1)),
++        localPort = 80,
+       )
+     val requestLine = decodeRequestLine("CONNECT example.com:8080 HTTP/1.1")
+     val request = RecordedRequest(requestLine, headers, emptyList(), 0, ByteString.EMPTY, 0, 0, socket)
+@@ -62,11 +57,9 @@ class RecordedRequestTest {
+ 
+   @Test fun testAbsoluteForm() {
+     val socket =
+-      MockWebServerSocket(
+-        FakeSocket(
+-          localAddress = InetAddress.getByAddress("127.0.0.1", byteArrayOf(127, 0, 0, 1)),
+-          localPort = 80,
+-        ),
++      FakeSocket(
++        localAddress = InetAddress.getByAddress("127.0.0.1", byteArrayOf(127, 0, 0, 1)),
++        localPort = 80,
+       )
+     val requestLine = decodeRequestLine("GET http://example.com:8080/index.html HTTP/1.1")
+     val request = RecordedRequest(requestLine, headers, emptyList(), 0, ByteString.EMPTY, 0, 0, socket)
+@@ -76,11 +69,9 @@ class RecordedRequestTest {
+ 
+   @Test fun testAsteriskForm() {
+     val socket =
+-      MockWebServerSocket(
+-        FakeSocket(
+-          localAddress = InetAddress.getByAddress("127.0.0.1", byteArrayOf(127, 0, 0, 1)),
+-          localPort = 80,
+-        ),
++      FakeSocket(
++        localAddress = InetAddress.getByAddress("127.0.0.1", byteArrayOf(127, 0, 0, 1)),
++        localPort = 80,
+       )
+     val requestLine = decodeRequestLine("OPTIONS * HTTP/1.1")
+     val request =
+@@ -100,15 +91,13 @@ class RecordedRequestTest {
+ 
+   @Test fun testIpv6() {
+     val socket =
+-      MockWebServerSocket(
+-        FakeSocket(
+-          localAddress =
+-            InetAddress.getByAddress(
+-              "::1",
+-              byteArrayOf(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1),
+-            ),
+-          localPort = 80,
+-        ),
++      FakeSocket(
++        localAddress =
++          InetAddress.getByAddress(
++            "::1",
++            byteArrayOf(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1),
++          ),
++        localPort = 80,
+       )
+     val request = RecordedRequest(DEFAULT_REQUEST_LINE_HTTP_1, headers, emptyList(), 0, ByteString.EMPTY, 0, 0, socket)
+     assertThat(request.url.toString()).isEqualTo("http://[::1]/")
+@@ -116,11 +105,9 @@ class RecordedRequestTest {
+ 
+   @Test fun testUsesLocal() {
+     val socket =
+-      MockWebServerSocket(
+-        FakeSocket(
+-          localAddress = InetAddress.getByAddress("127.0.0.1", byteArrayOf(127, 0, 0, 1)),
+-          localPort = 80,
+-        ),
++      FakeSocket(
++        localAddress = InetAddress.getByAddress("127.0.0.1", byteArrayOf(127, 0, 0, 1)),
++        localPort = 80,
+       )
+     val request = RecordedRequest(DEFAULT_REQUEST_LINE_HTTP_1, headers, emptyList(), 0, ByteString.EMPTY, 0, 0, socket)
+     assertThat(request.url.toString()).isEqualTo("http://127.0.0.1/")
+@@ -129,15 +116,13 @@ class RecordedRequestTest {
+   @Test fun testHostname() {
+     val headers = headersOf("Host", "host-from-header.com")
+     val socket =
+-      MockWebServerSocket(
+-        FakeSocket(
+-          localAddress =
+-            InetAddress.getByAddress(
+-              "host-from-address.com",
+-              byteArrayOf(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1),
+-            ),
+-          localPort = 80,
+-        ),
++      FakeSocket(
++        localAddress =
++          InetAddress.getByAddress(
++            "host-from-address.com",
++            byteArrayOf(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1),
++          ),
++        localPort = 80,
+       )
+     val request = RecordedRequest(DEFAULT_REQUEST_LINE_HTTP_1, headers, emptyList(), 0, ByteString.EMPTY, 0, 0, socket)
+     assertThat(request.url.toString()).isEqualTo("http://host-from-header.com/")

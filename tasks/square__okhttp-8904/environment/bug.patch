@@ -1,0 +1,153 @@
+diff --git a/okhttp/src/commonJvmAndroid/kotlin/okhttp3/Response.kt b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/Response.kt
+index 2b708e8c2..615a00416 100644
+--- a/okhttp/src/commonJvmAndroid/kotlin/okhttp3/Response.kt
++++ b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/Response.kt
+@@ -28,6 +28,7 @@ import okhttp3.internal.connection.Exchange
+ import okhttp3.internal.http.HTTP_PERM_REDIRECT
+ import okhttp3.internal.http.HTTP_TEMP_REDIRECT
+ import okhttp3.internal.http.parseChallenges
++import okhttp3.internal.skipAll
+ import okio.Buffer
+ 
+ /**
+@@ -190,7 +191,13 @@ class Response internal constructor(
+    *     dropped.
+    */
+   @Throws(IOException::class)
+-  fun trailers(): Headers = trailersSource.get()
++  fun trailers(): Headers {
++    val source = body.source()
++    if (source.isOpen) {
++      source.skipAll()
++    }
++    return trailersSource.get()
++  }
+ 
+   /**
+    * Peeks up to [byteCount] bytes from the response body and returns them as a new response
+@@ -471,6 +478,7 @@ class Response internal constructor(
+ 
+     internal fun initExchange(exchange: Exchange) {
+       this.exchange = exchange
++      this.trailersSource = TrailersSource { exchange.trailers() }
+     }
+ 
+     open fun build(): Response {
+diff --git a/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/http/CallServerInterceptor.kt b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/http/CallServerInterceptor.kt
+index e2520ef1d..d3b35d7e8 100644
+--- a/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/http/CallServerInterceptor.kt
++++ b/okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/http/CallServerInterceptor.kt
+@@ -21,7 +21,6 @@ import okhttp3.Interceptor
+ import okhttp3.Response
+ import okhttp3.internal.connection.Exchange
+ import okhttp3.internal.http2.ConnectionShutdownException
+-import okhttp3.internal.skipAll
+ import okhttp3.internal.stripBody
+ import okio.buffer
+ 
+@@ -130,17 +129,10 @@ class CallServerInterceptor(
+           // Connection is upgrading, but we need to ensure interceptors see a non-null response body.
+           response.stripBody()
+         } else {
+-          val responseBody = exchange.openResponseBody(response)
+           response
+             .newBuilder()
+-            .body(responseBody)
+-            .trailers {
+-              val source = responseBody.source()
+-              if (source.isOpen) {
+-                source.skipAll()
+-              }
+-              exchange.trailers()
+-            }.build()
++            .body(exchange.openResponseBody(response))
++            .build()
+         }
+       if ("close".equals(response.request.header("Connection"), ignoreCase = true) ||
+         "close".equals(response.header("Connection"), ignoreCase = true)
+diff --git a/okhttp/src/jvmTest/kotlin/okhttp3/TrailersTest.kt b/okhttp/src/jvmTest/kotlin/okhttp3/TrailersTest.kt
+index 3a0e302b4..76140182e 100644
+--- a/okhttp/src/jvmTest/kotlin/okhttp3/TrailersTest.kt
++++ b/okhttp/src/jvmTest/kotlin/okhttp3/TrailersTest.kt
+@@ -35,10 +35,7 @@ import mockwebserver3.SocketEffect.CloseSocket
+ import mockwebserver3.SocketEffect.ShutdownConnection
+ import mockwebserver3.junit5.StartStop
+ import okhttp3.Headers.Companion.headersOf
+-import okhttp3.HttpUrl.Companion.toHttpUrl
+-import okhttp3.ResponseBody.Companion.toResponseBody
+ import okhttp3.testing.PlatformRule
+-import okio.BufferedSource
+ import okio.IOException
+ import okio.Path.Companion.toPath
+ import okio.fakefilesystem.FakeFileSystem
+@@ -422,70 +419,6 @@ open class TrailersTest {
+     }
+   }
+ 
+-  @Test
+-  fun bufferResponseBodyAndReadTrailersHttp1() {
+-    bufferResponseBodyAndReadTrailers(Protocol.HTTP_1_1)
+-  }
+-
+-  @Test
+-  fun bufferResponseBodyAndReadTrailersHttp2() {
+-    bufferResponseBodyAndReadTrailers(Protocol.HTTP_2)
+-  }
+-
+-  private fun bufferResponseBodyAndReadTrailers(protocol: Protocol) {
+-    enableProtocol(protocol)
+-
+-    server.enqueue(
+-      MockResponse
+-        .Builder()
+-        .trailers(headersOf("t1", "v1"))
+-        .body(protocol, "Hello")
+-        .build(),
+-    )
+-
+-    val call = client.newCall(Request(server.url("/")))
+-    call.execute().use { originalResponse ->
+-      val responseBodyData = originalResponse.body.byteString()
+-      val responseTrailers = originalResponse.trailers()
+-      assertThat(responseTrailers).isEqualTo(headersOf("t1", "v1"))
+-
+-      val rewrittenResponse =
+-        originalResponse
+-          .newBuilder()
+-          .body(responseBodyData.toResponseBody())
+-          .build()
+-      assertThat(rewrittenResponse.body.string()).isEqualTo("Hello")
+-      assertThat(rewrittenResponse.trailers()).isEqualTo(headersOf("t1", "v1"))
+-    }
+-  }
+-
+-  /**
+-   * We had a bug where a custom `ResponseBody` interacted poorly with `Response.trailers()`.
+-   * Confirm custom trailers can be read without even accessing the response body.
+-   */
+-  @Test
+-  fun customTrailersDoNotUseResponseBody() {
+-    val response =
+-      Response
+-        .Builder()
+-        .request(Request(url = "https://example.com".toHttpUrl()))
+-        .protocol(Protocol.HTTP_1_1)
+-        .code(200)
+-        .message("OK")
+-        .body(
+-          object : ResponseBody() {
+-            override fun contentType(): MediaType? = null
+-
+-            override fun contentLength(): Long = -1L
+-
+-            override fun source(): BufferedSource = error("unexpected call")
+-          },
+-        ).trailers { headersOf("t1", "v1") }
+-        .build()
+-
+-    assertThat(response.trailers()).isEqualTo(headersOf("t1", "v1"))
+-  }
+-
+   private fun MockResponse.Builder.body(
+     protocol: Protocol,
+     body: String,
