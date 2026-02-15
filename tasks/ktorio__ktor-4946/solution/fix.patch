@@ -1,0 +1,93 @@
+diff --git a/ktor-server/ktor-server-plugins/ktor-server-auth/common/src/io/ktor/server/auth/AuthenticationInterceptors.kt b/ktor-server/ktor-server-plugins/ktor-server-auth/common/src/io/ktor/server/auth/AuthenticationInterceptors.kt
+index ec90cba4d..1fe9c2ceb 100644
+--- a/ktor-server/ktor-server-plugins/ktor-server-auth/common/src/io/ktor/server/auth/AuthenticationInterceptors.kt
++++ b/ktor-server/ktor-server-plugins/ktor-server-auth/common/src/io/ktor/server/auth/AuthenticationInterceptors.kt
+@@ -4,6 +4,7 @@
+ 
+ package io.ktor.server.auth
+ 
++import io.ktor.http.Parameters
+ import io.ktor.server.application.*
+ import io.ktor.server.request.*
+ import io.ktor.server.response.*
+@@ -11,7 +12,9 @@ import io.ktor.server.routing.*
+ import io.ktor.util.*
+ import io.ktor.util.logging.*
+ import io.ktor.util.pipeline.*
++import io.ktor.util.reflect.typeInfo
+ import io.ktor.utils.io.*
++import kotlinx.io.readByteArray
+ 
+ internal val LOGGER = KtorSimpleLogger("io.ktor.server.auth.Authentication")
+ 
+@@ -69,6 +72,31 @@ public val AuthenticationInterceptors: RouteScopedPlugin<RouteAuthenticationConf
+         .findProviders(providers) { it == AuthenticationStrategy.Optional } -
+         requiredProviders - firstSuccessfulProviders
+ 
++    // To cache the request body which can be consumed by the OAuth2 callback handler
++    on(ReceiveBytes) { call, body ->
++        var newBody: Any = body
++
++        if (call.attributes.contains(cacheOAuthFormReceiveKey) && call.receiveType == typeInfo<Parameters>()) {
++            if (body is ByteReadChannel) {
++                try {
++                    val array = body.readRemaining().readByteArray()
++                    call.attributes.put(formCacheKey, array)
++                    newBody = ByteReadChannel(array)
++                } finally {
++                    call.attributes.remove(cacheOAuthFormReceiveKey)
++                }
++            }
++        } else {
++            val cache = call.attributes.getOrNull(formCacheKey)
++
++            if (cache != null) {
++                newBody = ByteReadChannel(cache)
++            }
++        }
++
++        newBody
++    }
++
+     on(AuthenticationHook) { call ->
+         if (call.isHandled) return@on
+ 
+@@ -128,6 +156,22 @@ public val AuthenticationInterceptors: RouteScopedPlugin<RouteAuthenticationConf
+     }
+ }
+ 
++internal val cacheOAuthFormReceiveKey = AttributeKey<Unit>("OauthFormReceiveKey")
++
++private val formCacheKey = AttributeKey<ByteArray>("AuthFormCacheKey")
++
++private object ReceiveBytes : Hook<suspend (ApplicationCall, Any) -> Any> {
++    override fun install(
++        pipeline: ApplicationCallPipeline,
++        handler: suspend (ApplicationCall, Any) -> Any
++    ) {
++        pipeline.receivePipeline.intercept(ApplicationReceivePipeline.Before) {
++            val body = handler(call, it)
++            proceedWith(body)
++        }
++    }
++}
++
+ private suspend fun AuthenticationContext.executeChallenges(call: ApplicationCall) {
+     val challenges = challenge.challenges
+ 
+diff --git a/ktor-server/ktor-server-plugins/ktor-server-auth/common/src/io/ktor/server/auth/OAuth2.kt b/ktor-server/ktor-server-plugins/ktor-server-auth/common/src/io/ktor/server/auth/OAuth2.kt
+index ca035a9e4..c54b2b3d0 100644
+--- a/ktor-server/ktor-server-plugins/ktor-server-auth/common/src/io/ktor/server/auth/OAuth2.kt
++++ b/ktor-server/ktor-server-plugins/ktor-server-auth/common/src/io/ktor/server/auth/OAuth2.kt
+@@ -26,7 +26,10 @@ private val Logger: Logger = KtorSimpleLogger("io.ktor.auth.oauth")
+ 
+ internal suspend fun ApplicationCall.oauth2HandleCallback(): OAuthCallback? {
+     val params = when (request.contentType()) {
+-        ContentType.Application.FormUrlEncoded -> receiveParameters()
++        ContentType.Application.FormUrlEncoded -> {
++            attributes.put(cacheOAuthFormReceiveKey, Unit)
++            receiveParameters()
++        }
+         else -> parameters
+     }
+     val code = params[OAuth2RequestParameters.Code]

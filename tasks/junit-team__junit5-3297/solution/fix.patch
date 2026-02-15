@@ -1,0 +1,104 @@
+diff --git a/documentation/src/docs/asciidoc/release-notes/release-notes-5.10.0-M1.adoc b/documentation/src/docs/asciidoc/release-notes/release-notes-5.10.0-M1.adoc
+index 8c73d6d54..b5160bd25 100644
+--- a/documentation/src/docs/asciidoc/release-notes/release-notes-5.10.0-M1.adoc
++++ b/documentation/src/docs/asciidoc/release-notes/release-notes-5.10.0-M1.adoc
+@@ -74,6 +74,10 @@ repository on GitHub.
+ 
+ ==== Bug Fixes
+ 
++* The extensions supporting `@MethodSource`, `@EnabledIf`, and `@DisabledIf` now load
++  classes by fully-qualified class name using the `ClassLoader` obtained from the test
++  class when possible. This allows classes to be resolved with custom `ClassLoader`
++  arrangements (such as OSGi).
+ * When converting an argument for a `@ParameterizedTest` method from a fully-qualified
+   class name (`String`) to a `Class`, the `ClassLoader` of the class in which the
+   `@ParameterizedTest` method is declared is now used to resolve the `Class` instead of
+diff --git a/junit-jupiter-api/src/main/java/org/junit/jupiter/api/condition/MethodBasedCondition.java b/junit-jupiter-api/src/main/java/org/junit/jupiter/api/condition/MethodBasedCondition.java
+index 403304792..cbe7e4b0e 100644
+--- a/junit-jupiter-api/src/main/java/org/junit/jupiter/api/condition/MethodBasedCondition.java
++++ b/junit-jupiter-api/src/main/java/org/junit/jupiter/api/condition/MethodBasedCondition.java
+@@ -25,6 +25,7 @@ import org.junit.jupiter.api.extension.ConditionEvaluationResult;
+ import org.junit.jupiter.api.extension.ExecutionCondition;
+ import org.junit.jupiter.api.extension.ExtensionContext;
+ import org.junit.platform.commons.JUnitException;
++import org.junit.platform.commons.util.ClassLoaderUtils;
+ import org.junit.platform.commons.util.Preconditions;
+ import org.junit.platform.commons.util.ReflectionUtils;
+ import org.junit.platform.commons.util.StringUtils;
+@@ -56,14 +57,20 @@ abstract class MethodBasedCondition<A extends Annotation> implements ExecutionCo
+ 				.orElseGet(this::enabledByDefault);
+ 	}
+ 
+-	private Method getConditionMethod(String fullyQualifiedMethodName, ExtensionContext context) {
++	// package-private for testing
++	Method getConditionMethod(String fullyQualifiedMethodName, ExtensionContext context) {
++		Class<?> testClass = context.getRequiredTestClass();
+ 		if (!fullyQualifiedMethodName.contains("#")) {
+-			return findMethod(context.getRequiredTestClass(), fullyQualifiedMethodName);
++			return findMethod(testClass, fullyQualifiedMethodName);
+ 		}
+ 		String[] methodParts = ReflectionUtils.parseFullyQualifiedMethodName(fullyQualifiedMethodName);
+ 		String className = methodParts[0];
+ 		String methodName = methodParts[1];
+-		Class<?> clazz = ReflectionUtils.tryToLoadClass(className).getOrThrow(
++		ClassLoader classLoader = testClass.getClassLoader();
++		if (classLoader == null) {
++			classLoader = ClassLoaderUtils.getDefaultClassLoader();
++		}
++		Class<?> clazz = ReflectionUtils.tryToLoadClass(className, classLoader).getOrThrow(
+ 			cause -> new JUnitException(format("Could not load class [%s]", className), cause));
+ 		return findMethod(clazz, methodName);
+ 	}
+diff --git a/junit-jupiter-params/src/main/java/org/junit/jupiter/params/provider/MethodArgumentsProvider.java b/junit-jupiter-params/src/main/java/org/junit/jupiter/params/provider/MethodArgumentsProvider.java
+index ddcb16b5c..ec0e5a3b4 100644
+--- a/junit-jupiter-params/src/main/java/org/junit/jupiter/params/provider/MethodArgumentsProvider.java
++++ b/junit-jupiter-params/src/main/java/org/junit/jupiter/params/provider/MethodArgumentsProvider.java
+@@ -28,6 +28,7 @@ import org.junit.jupiter.api.TestTemplate;
+ import org.junit.jupiter.api.extension.ExtensionContext;
+ import org.junit.platform.commons.JUnitException;
+ import org.junit.platform.commons.PreconditionViolationException;
++import org.junit.platform.commons.util.ClassLoaderUtils;
+ import org.junit.platform.commons.util.CollectionUtils;
+ import org.junit.platform.commons.util.Preconditions;
+ import org.junit.platform.commons.util.ReflectionUtils;
+@@ -73,7 +74,7 @@ class MethodArgumentsProvider extends AnnotationBasedArgumentsProvider<MethodSou
+ 		}
+ 
+ 		// Find factory method using fully-qualified name.
+-		Method factoryMethod = findFactoryMethodByFullyQualifiedName(testMethod, factoryMethodName);
++		Method factoryMethod = findFactoryMethodByFullyQualifiedName(testClass, testMethod, factoryMethodName);
+ 
+ 		// Ensure factory method has a valid return type and is not a test method.
+ 		Preconditions.condition(isFactoryMethod.test(factoryMethod), () -> format(
+@@ -103,12 +104,18 @@ class MethodArgumentsProvider extends AnnotationBasedArgumentsProvider<MethodSou
+ 		return true;
+ 	}
+ 
+-	private static Method findFactoryMethodByFullyQualifiedName(Method testMethod, String fullyQualifiedMethodName) {
++	// package-private for testing
++	static Method findFactoryMethodByFullyQualifiedName(Class<?> testClass, Method testMethod,
++			String fullyQualifiedMethodName) {
+ 		String[] methodParts = ReflectionUtils.parseFullyQualifiedMethodName(fullyQualifiedMethodName);
+ 		String className = methodParts[0];
+ 		String methodName = methodParts[1];
+ 		String methodParameters = methodParts[2];
+-		Class<?> clazz = loadRequiredClass(className);
++		ClassLoader classLoader = testClass.getClassLoader();
++		if (classLoader == null) {
++			classLoader = ClassLoaderUtils.getDefaultClassLoader();
++		}
++		Class<?> clazz = loadRequiredClass(className, classLoader);
+ 
+ 		// Attempt to find an exact match first.
+ 		Method factoryMethod = ReflectionUtils.findMethod(clazz, methodName, methodParameters).orElse(null);
+@@ -170,8 +177,8 @@ class MethodArgumentsProvider extends AnnotationBasedArgumentsProvider<MethodSou
+ 				|| isAnnotated(candidate, TestFactory.class);
+ 	}
+ 
+-	private static Class<?> loadRequiredClass(String className) {
+-		return ReflectionUtils.tryToLoadClass(className).getOrThrow(
++	private static Class<?> loadRequiredClass(String className, ClassLoader classLoader) {
++		return ReflectionUtils.tryToLoadClass(className, classLoader).getOrThrow(
+ 			cause -> new JUnitException(format("Could not load class [%s]", className), cause));
+ 	}
+ 

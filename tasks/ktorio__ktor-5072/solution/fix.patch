@@ -1,0 +1,267 @@
+diff --git a/ktor-client/ktor-client-core/common/src/io/ktor/client/plugins/sse/DefaultClientSSESession.kt b/ktor-client/ktor-client-core/common/src/io/ktor/client/plugins/sse/DefaultClientSSESession.kt
+index 22c23d003..d80d82085 100644
+--- a/ktor-client/ktor-client-core/common/src/io/ktor/client/plugins/sse/DefaultClientSSESession.kt
++++ b/ktor-client/ktor-client-core/common/src/io/ktor/client/plugins/sse/DefaultClientSSESession.kt
+@@ -4,10 +4,12 @@
+ 
+ package io.ktor.client.plugins.sse
+ 
++import io.ktor.client.network.sockets.SocketTimeoutException
+ import io.ktor.client.request.*
+ import io.ktor.http.*
+ import io.ktor.sse.*
+ import io.ktor.util.logging.*
++import io.ktor.util.rootCause
+ import io.ktor.utils.io.*
+ import io.ktor.utils.io.CancellationException
+ import kotlinx.coroutines.*
+@@ -147,7 +149,12 @@ public class DefaultClientSSESession(
+     private suspend fun ByteReadChannel.tryParseEvent(): ServerSentEvent? =
+         try {
+             parseEvent()
+-        } catch (_: ClosedByteChannelException) {
++        } catch (cause: ClosedByteChannelException) {
++            val rootCause = cause.rootCause
++            if (rootCause is SocketTimeoutException) {
++                throw rootCause
++            }
++
+             // this is expected when the server disconnects
+             null
+         }
+diff --git a/ktor-client/ktor-client-core/common/src/io/ktor/client/plugins/sse/SSEConfig.kt b/ktor-client/ktor-client-core/common/src/io/ktor/client/plugins/sse/SSEConfig.kt
+index 1b3706f38..7662f3964 100644
+--- a/ktor-client/ktor-client-core/common/src/io/ktor/client/plugins/sse/SSEConfig.kt
++++ b/ktor-client/ktor-client-core/common/src/io/ktor/client/plugins/sse/SSEConfig.kt
+@@ -20,8 +20,6 @@ public class SSEConfig {
+      * The reconnection time. If the connection to the server is lost,
+      * the client will wait for the specified time before attempting to reconnect.
+      *
+-     * Note: this parameter is not supported for some engines.
+-     *
+      * [Report a problem](https://ktor.io/feedback/?fqname=io.ktor.client.plugins.sse.SSEConfig.reconnectionTime)
+      */
+     public var reconnectionTime: Duration = 3000.milliseconds
+diff --git a/ktor-client/ktor-client-okhttp/build.gradle.kts b/ktor-client/ktor-client-okhttp/build.gradle.kts
+index c35ae0135..4bde8c70a 100644
+--- a/ktor-client/ktor-client-okhttp/build.gradle.kts
++++ b/ktor-client/ktor-client-okhttp/build.gradle.kts
+@@ -12,7 +12,6 @@ kotlin {
+         jvmMain.dependencies {
+             api(projects.ktorClientCore)
+             api(libs.okhttp)
+-            api(libs.okhttp.sse)
+             api(libs.okio)
+         }
+         jvmTest.dependencies {
+diff --git a/ktor-client/ktor-client-okhttp/jvm/src/io/ktor/client/engine/okhttp/OkHttpEngine.kt b/ktor-client/ktor-client-okhttp/jvm/src/io/ktor/client/engine/okhttp/OkHttpEngine.kt
+index ee49324c3..c18fff1ab 100644
+--- a/ktor-client/ktor-client-okhttp/jvm/src/io/ktor/client/engine/okhttp/OkHttpEngine.kt
++++ b/ktor-client/ktor-client-okhttp/jvm/src/io/ktor/client/engine/okhttp/OkHttpEngine.kt
+@@ -65,8 +65,7 @@ public class OkHttpEngine(override val config: OkHttpConfig) : HttpClientEngineB
+             ?: error("OkHttpClient can't be constructed because HttpTimeout plugin is not installed")
+ 
+         return when {
+-            data.isUpgradeRequest() -> executeWebSocketRequest(requestEngine, engineRequest, callContext)
+-            data.isSseRequest() -> executeServerSendEventsRequest(requestEngine, engineRequest, callContext)
++            data.isUpgradeRequest() -> executeWebSocketRequest(requestEngine, engineRequest, callContext, data)
+             else -> executeHttpRequest(requestEngine, engineRequest, callContext, data)
+         }
+     }
+@@ -79,7 +78,8 @@ public class OkHttpEngine(override val config: OkHttpConfig) : HttpClientEngineB
+     private suspend fun executeWebSocketRequest(
+         engine: OkHttpClient,
+         engineRequest: Request,
+-        callContext: CoroutineContext
++        callContext: CoroutineContext,
++        requestData: HttpRequestData,
+     ): HttpResponseData {
+         val requestTime = GMTDate()
+         val session = OkHttpWebsocketSession(
+@@ -90,23 +90,7 @@ public class OkHttpEngine(override val config: OkHttpConfig) : HttpClientEngineB
+         ).apply { start() }
+ 
+         val originResponse = session.originResponse.await()
+-        return buildResponseData(originResponse, requestTime, session, callContext)
+-    }
+-
+-    private suspend fun executeServerSendEventsRequest(
+-        engine: OkHttpClient,
+-        engineRequest: Request,
+-        callContext: CoroutineContext
+-    ): HttpResponseData {
+-        val requestTime = GMTDate()
+-        val session = OkHttpSSESession(
+-            engine,
+-            engineRequest,
+-            callContext
+-        )
+-
+-        val originResponse = session.originResponse.await()
+-        return buildResponseData(originResponse, requestTime, session, callContext)
++        return buildResponseData(originResponse, requestTime, session, callContext, requestData)
+     }
+ 
+     private suspend fun executeHttpRequest(
+@@ -122,20 +106,29 @@ public class OkHttpEngine(override val config: OkHttpConfig) : HttpClientEngineB
+         callContext.job.invokeOnCompletion { body.close() }
+ 
+         val responseContent = body.source().toChannel(callContext, requestData)
+-        return buildResponseData(response, requestTime, responseContent, callContext)
++        return buildResponseData(response, requestTime, responseContent, callContext, requestData)
+     }
+ 
+     private fun buildResponseData(
+         response: Response,
+         requestTime: GMTDate,
+         body: Any,
+-        callContext: CoroutineContext
++        callContext: CoroutineContext,
++        requestData: HttpRequestData
+     ): HttpResponseData {
+         val status = HttpStatusCode(response.code, response.message)
+         val version = response.protocol.fromOkHttp()
+         val headers = response.headers.fromOkHttp()
++        val responseBody: Any = when (body) {
++            is ByteReadChannel ->
++                requestData.attributes
++                    .getOrNull(ResponseAdapterAttributeKey)
++                    ?.adapt(requestData, status, headers, body, requestData.body, callContext)
++                    ?: body
++            else -> body
++        }
+ 
+-        return HttpResponseData(status, requestTime, headers, version, body, callContext)
++        return HttpResponseData(status, requestTime, headers, version, responseBody, callContext)
+     }
+ 
+     private companion object {
+diff --git a/ktor-client/ktor-client-okhttp/jvm/src/io/ktor/client/engine/okhttp/OkHttpSSESession.kt b/ktor-client/ktor-client-okhttp/jvm/src/io/ktor/client/engine/okhttp/OkHttpSSESession.kt
+deleted file mode 100644
+index d2d9973f7..000000000
+--- a/ktor-client/ktor-client-okhttp/jvm/src/io/ktor/client/engine/okhttp/OkHttpSSESession.kt
++++ /dev/null
+@@ -1,123 +0,0 @@
+-/*
+- * Copyright 2014-2024 JetBrains s.r.o and contributors. Use of this source code is governed by the Apache 2.0 license.
+- */
+-
+-package io.ktor.client.engine.okhttp
+-
+-import io.ktor.client.plugins.sse.*
+-import io.ktor.http.*
+-import io.ktor.sse.*
+-import io.ktor.utils.io.InternalAPI
+-import kotlinx.coroutines.*
+-import kotlinx.coroutines.channels.Channel
+-import kotlinx.coroutines.channels.onFailure
+-import kotlinx.coroutines.channels.trySendBlocking
+-import kotlinx.coroutines.flow.Flow
+-import kotlinx.coroutines.flow.consumeAsFlow
+-import kotlinx.coroutines.flow.onCompletion
+-import okhttp3.OkHttpClient
+-import okhttp3.Request
+-import okhttp3.Response
+-import okhttp3.sse.EventSource
+-import okhttp3.sse.EventSourceListener
+-import okhttp3.sse.EventSources
+-import kotlin.coroutines.CoroutineContext
+-
+-internal class OkHttpSSESession private constructor(
+-    factory: EventSource.Factory,
+-    engineRequest: Request,
+-    override val coroutineContext: CoroutineContext,
+-) : SSESession, EventSourceListener() {
+-
+-    constructor(
+-        engine: OkHttpClient,
+-        engineRequest: Request,
+-        callContext: CoroutineContext,
+-    ) : this(
+-        factory = EventSources.createFactory(engine),
+-        engineRequest = engineRequest,
+-        coroutineContext = callContext + Job() + CoroutineName("OkHttpSSESession"),
+-    )
+-
+-    @InternalAPI
+-    override fun bodyBuffer(): ByteArray = ByteArray(0)
+-
+-    private val serverSentEventsSource = factory.newEventSource(engineRequest, this)
+-
+-    internal val originResponse: CompletableDeferred<Response> = CompletableDeferred()
+-
+-    private val _incoming = Channel<ServerSentEvent>(8)
+-
+-    override val incoming: Flow<ServerSentEvent> = _incoming.consumeAsFlow()
+-        .onCompletion { cause ->
+-            // Use onCompletion operator to handle CancellationExceptions which occur in downstream flow.
+-            if (cause is CancellationException) close(cause = null)
+-        }
+-
+-    init {
+-        coroutineContext.job.invokeOnCompletion {
+-            close(cause = null)
+-        }
+-    }
+-
+-    override fun onOpen(eventSource: EventSource, response: Response) {
+-        originResponse.complete(response)
+-    }
+-
+-    override fun onEvent(eventSource: EventSource, id: String?, type: String?, data: String) {
+-        _incoming.trySendBlocking(ServerSentEvent(data, type, id))
+-            .onFailure { if (it is CancellationException) throw it }
+-    }
+-
+-    override fun onFailure(eventSource: EventSource, t: Throwable?, response: Response?) {
+-        val statusCode = response?.code
+-        val contentType = response?.headers?.get(HttpHeaders.ContentType)
+-
+-        if (response != null &&
+-            (statusCode != HttpStatusCode.OK.value || contentType != ContentType.Text.EventStream.toString())
+-        ) {
+-            originResponse.complete(response)
+-            close(cause = null)
+-        } else {
+-            val error = t?.let {
+-                SSEClientException(
+-                    message = "Exception during OkHttpSSESession: ${it.message}",
+-                    cause = it
+-                )
+-            } ?: mapException(response)
+-            originResponse.completeExceptionally(error)
+-            close(cause = error)
+-        }
+-    }
+-
+-    override fun onClosed(eventSource: EventSource) {
+-        close(cause = null)
+-    }
+-
+-    private fun close(cause: Throwable?) {
+-        _incoming.close(cause)
+-        serverSentEventsSource.cancel()
+-        // Cancel context last so 'invokeOnCompletion' doesn't override 'cause' for closing '_incoming'.
+-        coroutineContext.cancel()
+-    }
+-
+-    private fun mapException(response: Response?): SSEClientException {
+-        fun unexpectedError() = SSEClientException(message = "Unexpected error occurred in OkHttpSSESession")
+-
+-        return when {
+-            response == null -> unexpectedError()
+-
+-            response.code != HttpStatusCode.OK.value ->
+-                SSEClientException(message = "Expected status code ${HttpStatusCode.OK.value} but was ${response.code}")
+-
+-            response.headers[HttpHeaders.ContentType]
+-                ?.let { ContentType.parse(it) }?.withoutParameters() != ContentType.Text.EventStream ->
+-                @Suppress("ktlint:standard:max-line-length")
+-                SSEClientException(
+-                    message = "Content type must be ${ContentType.Text.EventStream} but was ${response.headers[HttpHeaders.ContentType]}"
+-                )
+-
+-            else -> unexpectedError()
+-        }
+-    }
+-}

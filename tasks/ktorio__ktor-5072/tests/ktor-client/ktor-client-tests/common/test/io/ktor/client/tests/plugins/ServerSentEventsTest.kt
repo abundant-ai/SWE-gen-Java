@@ -1,0 +1,969 @@
+/*
+ * Copyright 2014-2025 JetBrains s.r.o and contributors. Use of this source code is governed by the Apache 2.0 license.
+ */
+
+package io.ktor.client.tests.plugins
+
+import io.ktor.client.*
+import io.ktor.client.plugins.*
+import io.ktor.client.plugins.auth.*
+import io.ktor.client.plugins.auth.providers.*
+import io.ktor.client.plugins.logging.*
+import io.ktor.client.plugins.sse.*
+import io.ktor.client.request.*
+import io.ktor.client.statement.*
+import io.ktor.client.test.base.*
+import io.ktor.http.*
+import io.ktor.http.content.*
+import io.ktor.sse.*
+import io.ktor.utils.io.*
+import io.ktor.utils.io.charsets.*
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.collectIndexed
+import kotlinx.coroutines.flow.single
+import kotlinx.coroutines.flow.take
+import kotlinx.coroutines.flow.toList
+import kotlinx.coroutines.test.runTest
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.serializer
+import kotlin.coroutines.CoroutineContext
+import kotlin.coroutines.resume
+import kotlin.coroutines.suspendCoroutine
+import kotlin.test.*
+import kotlin.time.Duration.Companion.milliseconds
+
+class ServerSentEventsTest : ClientLoader() {
+
+    @Test
+    fun testExceptionIfSseIsNotInstalled() = runTest {
+        val client = HttpClient()
+        assertFailsWith<IllegalStateException> {
+            client.serverSentEventsSession {}
+        }.apply {
+            assertContains(message!!, SSE.key.name)
+        }
+        assertFailsWith<IllegalStateException> {
+            client.serverSentEvents {}
+        }.apply {
+            assertContains(message!!, SSE.key.name)
+        }
+    }
+
+    @Test
+    fun normalRequestsWorkWithSSEInstalled() = clientTests {
+        config {
+            install(SSE)
+        }
+
+        test { client ->
+            client.post("$TEST_SERVER/content/echo") {
+                setBody("Hello")
+            }.apply {
+                assertEquals("Hello", bodyAsText())
+            }
+        }
+    }
+
+    @Test
+    fun testSseSession() = clientTests {
+        config {
+            install(SSE)
+        }
+
+        test { client ->
+            val session = client.serverSentEventsSession("$TEST_SERVER/sse/hello")
+            session.incoming.single().apply {
+                assertEquals("0", id)
+                assertEquals("hello 0", event)
+                val lines = data?.lines() ?: emptyList()
+                assertEquals(2, lines.size)
+                assertEquals("hello", lines[0])
+                assertEquals("from server", lines[1])
+            }
+            session.cancel()
+        }
+    }
+
+    @Test
+    fun testParallelSseSessions() = clientTests {
+        config {
+            install(SSE)
+        }
+
+        test { client ->
+            coroutineScope {
+                launch {
+                    val session = client.serverSentEventsSession("$TEST_SERVER/sse/hello?times=100")
+                    var size = 0
+                    session.incoming.collectIndexed { i, it ->
+                        assertEquals("$i", it.id)
+                        assertEquals("hello $i", it.event)
+                        val lines = it.data?.lines() ?: emptyList()
+                        assertEquals(2, lines.size)
+                        assertEquals("hello", lines[0])
+                        assertEquals("from server", lines[1])
+                        size++
+                    }
+                    assertEquals(100, size)
+                    session.cancel()
+                }
+                launch {
+                    val session = client.serverSentEventsSession("$TEST_SERVER/sse/hello?times=50")
+                    var size = 0
+                    session.incoming.collectIndexed { i, it ->
+                        assertEquals("$i", it.id)
+                        assertEquals("hello $i", it.event)
+                        val lines = it.data?.lines() ?: emptyList()
+                        assertEquals(2, lines.size)
+                        assertEquals("hello", lines[0])
+                        assertEquals("from server", lines[1])
+                        size++
+                    }
+                    assertEquals(50, size)
+                    session.cancel()
+                }
+            }
+        }
+    }
+
+    @Test
+    fun testCancelSseSession() = clientTests {
+        config {
+            install(SSE)
+        }
+
+        test { client ->
+            coroutineScope {
+                val started = Job()
+                val session = client.serverSentEventsSession("$TEST_SERVER/sse/hello?times=20&interval=100")
+                val readJob = launch {
+                    try {
+                        session.incoming.collect {
+                            started.complete()
+                        }
+                    } finally {
+                        withContext(NonCancellable) {
+                            started.join()
+                            assertFalse(session.isActive)
+                        }
+                    }
+                }
+                started.join()
+                readJob.cancelAndJoin()
+                assertFalse(session.isActive)
+            }
+        }
+    }
+
+    @Test
+    fun testSseSessionUnknownHostError() = clientTests {
+        config {
+            install(SSE)
+        }
+
+        test { client ->
+            assertFailsWith<SSEClientException> {
+                client.serverSentEventsSession("http://unknown_host")
+            }.apply {
+                assertNotNull(cause)
+            }
+        }
+    }
+
+    @Test
+    fun testExceptionDuringSSESession() = clientTests {
+        config {
+            install(SSE)
+        }
+
+        test { client ->
+            assertFailsWith<SSEClientException> {
+                client.serverSentEvents("$TEST_SERVER/sse/hello") { error("error") }
+            }.apply {
+                assertTrue { cause is IllegalStateException }
+                assertEquals("error", message)
+                assertEquals(HttpStatusCode.OK, response?.status)
+            }
+        }
+    }
+
+    @Test
+    fun testCancellationExceptionSse() = clientTests {
+        config {
+            install(SSE)
+        }
+
+        test { client ->
+            coroutineScope {
+                val job: Job
+                suspendCoroutine { cont ->
+                    job = launch {
+                        client.serverSentEvents("$TEST_SERVER/sse/hello") {
+                            cont.resume(Unit)
+                            awaitCancellation()
+                        }
+                    }
+                }
+                job.cancelAndJoin()
+            }
+        }
+    }
+
+    @Test
+    fun testNoCommentsByDefault() = clientTests {
+        config {
+            install(SSE)
+        }
+
+        test { client ->
+            client.serverSentEvents("$TEST_SERVER/sse/comments?times=50") {
+                var size = 0
+                incoming.collectIndexed { i, it ->
+                    assertEquals("${i * 2 + 1}", it.data)
+                    size++
+                }
+                assertEquals(50, size)
+            }
+        }
+    }
+
+    @Test
+    fun testShowComments() = clientTests {
+        config {
+            install(SSE) {
+                showCommentEvents()
+            }
+        }
+
+        test { client ->
+            client.serverSentEvents("$TEST_SERVER/sse/comments?times=50") {
+                var size = 0
+                incoming.collectIndexed { i, it ->
+                    if (i % 2 == 0) {
+                        assertEquals("$i", it.comments)
+                    } else {
+                        assertEquals("$i", it.data)
+                    }
+                    size++
+                }
+                assertEquals(100, size)
+            }
+        }
+    }
+
+    @Test
+    fun testDifferentConfigs() = clientTests {
+        config {
+            install(SSE) {
+                showCommentEvents()
+            }
+        }
+
+        test { client ->
+            client.serverSentEvents("$TEST_SERVER/sse/comments?times=50", showCommentEvents = false) {
+                var size = 0
+                incoming.collectIndexed { i, it ->
+                    assertEquals("${2 * i + 1}", it.data)
+                    size++
+                }
+                assertEquals(50, size)
+            }
+
+            client.serverSentEvents("$TEST_SERVER/sse/comments?times=50") {
+                var size = 0
+                incoming.collectIndexed { i, it ->
+                    if (i % 2 == 0) {
+                        assertEquals("$i", it.comments)
+                    } else {
+                        assertEquals("$i", it.data)
+                    }
+                    size++
+                }
+                assertEquals(100, size)
+            }
+        }
+    }
+
+    @Test
+    fun testRequestTimeoutIsNotApplied() = clientTests {
+        config {
+            install(SSE)
+
+            install(HttpTimeout) {
+                requestTimeoutMillis = 10
+            }
+        }
+
+        test { client ->
+            client.sse("$TEST_SERVER/sse/hello?delay=20") {
+                val result = incoming.single()
+                assertEquals("hello 0", result.event)
+            }
+        }
+    }
+
+    @Test
+    fun testWithAuthPlugin() = clientTests {
+        config {
+            install(Auth) {
+                bearer {
+                    refreshTokens { BearerTokens("valid", "refresh") }
+                    loadTokens { BearerTokens("invalid", "refresh") }
+                    realm = "TestServer"
+                }
+            }
+
+            install(SSE)
+        }
+
+        test { client ->
+            client.sse("$TEST_SERVER/sse/auth") {
+                val result = incoming.single()
+                assertEquals("hello after refresh", result.data)
+            }
+        }
+    }
+
+    @Test
+    fun testSseExceptionWhenResponseStatusIsNot200() = clientTests {
+        config {
+            install(SSE)
+        }
+
+        test { client ->
+            assertFailsWith<SSEClientException> {
+                client.sse("$TEST_SERVER/sse/404") {}
+            }.apply {
+                assertEquals(HttpStatusCode.NotFound, response?.status)
+                assertEquals("Expected status code 200 but was 404", message)
+            }
+        }
+    }
+
+    @Test
+    fun testSseExceptionWhenResponseContentTypeNotRight() = clientTests {
+        config {
+            install(SSE)
+        }
+
+        test { client ->
+            assertFailsWith<SSEClientException> {
+                client.sse("$TEST_SERVER/sse/content-type-text-plain") {}
+            }.apply {
+                assertEquals(HttpStatusCode.OK, response?.status)
+                assertEquals(ContentType.Text.Plain, response?.contentType())
+                assertEquals("Expected Content-Type text/event-stream but was text/plain", message)
+            }
+        }
+    }
+
+    @Test
+    fun testContentTypeWithCharset() = clientTests {
+        config {
+            install(SSE)
+        }
+
+        test { client ->
+            client.sse("$TEST_SERVER/sse/content_type_with_charset") {
+                assertEquals(ContentType.Text.EventStream.withCharset(Charsets.UTF_8), call.response.contentType())
+
+                incoming.single().apply {
+                    assertEquals("0", id)
+                    assertEquals("hello 0", event)
+                    val lines = data?.lines() ?: emptyList()
+                    assertEquals(2, lines.size)
+                    assertEquals("hello", lines[0])
+                    assertEquals("from server", lines[1])
+                }
+            }
+        }
+    }
+
+    @Test
+    fun testRequestBody() = clientTests {
+        config {
+            install(SSE)
+        }
+
+        val body = "hello"
+        val contentType = ContentType.Text.Plain
+        test { client ->
+            client.sse({
+                method = HttpMethod.Post
+                url("$TEST_SERVER/sse/echo")
+                setBody(body)
+                contentType(contentType)
+            }) {
+                assertEquals(contentType, call.request.contentType()?.withoutParameters())
+                assertEquals(body, incoming.single().data)
+            }
+        }
+    }
+
+    @Test
+    fun testErrorForProtocolUpgradeRequestBody() = clientTests {
+        config {
+            install(SSE)
+        }
+
+        val body = object : OutgoingContent.ProtocolUpgrade() {
+
+            override suspend fun upgrade(
+                input: ByteReadChannel,
+                output: ByteWriteChannel,
+                engineContext: CoroutineContext,
+                userContext: CoroutineContext
+            ): Job {
+                output.flushAndClose()
+                return Job()
+            }
+        }
+        test { client ->
+            assertFailsWith<SSEClientException> {
+                client.sse({
+                    method = HttpMethod.Post
+                    url("$TEST_SERVER/sse/echo")
+                    setBody(body)
+                }) {}
+            }.apply {
+                assertTrue { message!!.contains("Failed to write body") }
+            }
+        }
+    }
+
+    @Test
+    fun testPostRequest() = clientTests {
+        config {
+            install(SSE)
+        }
+
+        test { client ->
+            client.sse({
+                url("$TEST_SERVER/sse")
+                method = HttpMethod.Post
+            }) {
+                incoming.single().apply {
+                    assertEquals("Hello", data)
+                }
+            }
+        }
+    }
+
+    @Test
+    fun testSseWithLogging() = clientTests {
+        config {
+            install(SSE)
+            install(Logging) {
+                level = LogLevel.ALL
+            }
+        }
+
+        test { client ->
+            client.sse({
+                url("$TEST_SERVER/sse")
+                method = HttpMethod.Post
+            }) {
+                incoming.single().apply {
+                    assertEquals("Hello", data)
+                }
+            }
+        }
+    }
+
+    class Person(val name: String)
+    class Data(val value: String)
+
+    @Test
+    fun testDeserializer() = clientTests {
+        config {
+            install(SSE)
+        }
+
+        test { client ->
+            val count = 10
+            var size = 0
+            client.sse(
+                {
+                    url("$TEST_SERVER/sse/person")
+                    parameter("times", count)
+                },
+                deserialize = { _, it -> Person(it) }
+            ) {
+                incoming.collectIndexed { i, event ->
+                    val person = deserialize<Person>(event)
+                    assertEquals("Name $i", person?.name)
+                    assertEquals("$i", event.id)
+                    size++
+                }
+            }
+            assertEquals(count, size)
+        }
+    }
+
+    @Test
+    fun testExceptionIfWrongDeserializerProvided() = clientTests {
+        config {
+            install(SSE)
+        }
+
+        test { client ->
+            assertFailsWith<SSEClientException> {
+                client.sse({ url("$TEST_SERVER/sse/person") }, { _, it -> Data(it) }) {
+                    incoming.single().apply {
+                        val data = deserialize<Person>(data)
+                        assertEquals("Name 0", data?.name)
+                    }
+                }
+            }
+        }
+    }
+
+    class Person1(val name: String)
+    class Person2(val middleName: String)
+
+    @Test
+    fun testDifferentDeserializers() = clientTests {
+        config {
+            install(SSE)
+        }
+
+        test { client ->
+            client.sse({ url("$TEST_SERVER/sse/person") }, deserialize = { _, str -> Person1(str) }) {
+                incoming.single().apply {
+                    assertEquals("Name 0", deserialize<Person1>(data)?.name)
+                }
+            }
+            client.sse({ url("$TEST_SERVER/sse/person") }, deserialize = { _, str -> Person2(str) }) {
+                incoming.single().apply {
+                    assertEquals("Name 0", deserialize<Person2>(data)?.middleName)
+                }
+            }
+        }
+    }
+
+    @Serializable
+    data class Customer(val id: Int, val firstName: String, val lastName: String)
+
+    @Serializable
+    data class Product(val name: String, val price: Int)
+
+    @Test
+    fun testJsonDeserializer() = clientTests {
+        config {
+            install(SSE)
+        }
+
+        test { client ->
+            client.sse({
+                url("$TEST_SERVER/sse/json")
+            }, deserialize = { typeInfo, jsonString ->
+                val serializer = Json.serializersModule.serializer(typeInfo.kotlinType!!)
+                Json.decodeFromString(serializer, jsonString) ?: Exception()
+            }) {
+                var firstIsCustomer = true
+                incoming.collect { event: TypedServerSentEvent<String> ->
+                    if (firstIsCustomer) {
+                        val customer = deserialize<Customer>(event.data)
+                        assertEquals(1, customer?.id)
+                        assertEquals("Jet", customer?.firstName)
+                        assertEquals("Brains", customer?.lastName)
+                        firstIsCustomer = false
+                    } else {
+                        val product = deserialize<Product>(event.data)
+                        assertEquals("Milk", product?.name)
+                        assertEquals(100, product?.price)
+                        cancel()
+                    }
+                }
+            }
+        }
+    }
+
+    @Test
+    fun testReconnection() = clientTests {
+        config {
+            install(SSE) {
+                maxReconnectionAttempts = 1
+                reconnectionTime = 100.milliseconds
+            }
+        }
+
+        test { client ->
+            val events = mutableListOf<ServerSentEvent>()
+
+            client.sse("$TEST_SERVER/sse/reconnection?count=5") {
+                incoming.take(10).collect {
+                    events.add(it)
+                }
+            }
+
+            events.forEachIndexed { index, event ->
+                assertEquals(index + 1, event.id?.toInt())
+            }
+        }
+    }
+
+    @Test
+    fun testClientExceptionDuringSSESession() = clientTests {
+        config {
+            install(SSE) {
+                maxReconnectionAttempts = 1
+            }
+        }
+
+        test { client ->
+            val events = mutableListOf<ServerSentEvent>()
+            var count = 0
+
+            assertFailsWith<IllegalStateException> {
+                client.sse("$TEST_SERVER/sse/reconnection?count=5", reconnectionTime = 10.milliseconds) {
+                    incoming.collect {
+                        events.add(it)
+                        count++
+
+                        if (count == 7) {
+                            throw IllegalStateException("Client exception")
+                        }
+                    }
+                }
+            }
+
+            assertTrue(events.size == 7)
+            events.forEachIndexed { index, event ->
+                assertEquals(index + 1, event.id?.toInt())
+            }
+        }
+    }
+
+    @Test
+    fun testServerExceptionDuringSSESession() = clientTests {
+        config {
+            install(SSE) {
+                reconnectionTime = 100.milliseconds
+                maxReconnectionAttempts = 1
+            }
+        }
+
+        test { client ->
+            val events = mutableListOf<ServerSentEvent>()
+
+            assertFailsWith<SSEClientException> {
+                client.sse("$TEST_SERVER/sse/exception-on-reconnection?count=5") {
+                    incoming.collect {
+                        events.add(it)
+                    }
+                }
+            }.apply {
+                assertEquals("Expected status code 200 but was 500", message)
+            }
+
+            assertEquals(5, events.size)
+            events.forEachIndexed { index, event ->
+                assertEquals("$index", event.id)
+            }
+        }
+    }
+
+    @Test
+    fun testSeveralReconnections() = clientTests {
+        config {
+            install(SSE) {
+                maxReconnectionAttempts = 2
+            }
+        }
+
+        test { client ->
+            val events = mutableListOf<ServerSentEvent>()
+            var count = 0
+
+            client.sse("$TEST_SERVER/sse/reconnection?count=5", reconnectionTime = 10.milliseconds) {
+                incoming.collect {
+                    events.add(it)
+                    count++
+                    if (count == 15) {
+                        cancel()
+                    }
+                }
+            }
+
+            assertEquals(15, events.size)
+            events.forEachIndexed { index, event ->
+                assertEquals(index + 1, event.id?.toInt())
+            }
+        }
+    }
+
+    @Test
+    fun testMaxRetries() = clientTests {
+        config {
+            install(SSE) {
+                reconnectionTime = 10.milliseconds
+                maxReconnectionAttempts = 4
+            }
+        }
+
+        test { client ->
+            val events = mutableListOf<ServerSentEvent>()
+            var count = 0
+
+            client.sse("$TEST_SERVER/sse/exception-on-reconnection?count=5&count-of-reconnections=4") {
+                incoming.collect {
+                    events.add(it)
+                    count++
+                    if (count == 10) {
+                        cancel()
+                    }
+                }
+            }
+
+            assertEquals(10, events.size)
+            events.forEachIndexed { index, event ->
+                assertEquals(index % 5, event.id?.toInt())
+            }
+        }
+    }
+
+    @Test
+    fun testNoContent() = clientTests {
+        config {
+            install(SSE) {
+                maxReconnectionAttempts = 1
+                reconnectionTime = 0.milliseconds
+            }
+        }
+
+        test { client ->
+            client.sse("$TEST_SERVER/sse/no-content") {
+                assertEquals(HttpStatusCode.NoContent, call.response.status)
+                assertEquals(0, incoming.toList().size)
+            }
+
+            val events = mutableListOf<ServerSentEvent>()
+            client.sse("$TEST_SERVER/sse/no-content-after-reconnection?count=10") {
+                incoming.collect {
+                    events.add(it)
+                }
+            }
+            assertEquals(10, events.size)
+            events.forEachIndexed { index, event ->
+                assertEquals(index, event.id?.toInt())
+            }
+        }
+    }
+
+    @Test
+    fun testNoContentStream() = clientTests {
+        config {
+            install(SSE)
+        }
+
+        test { client ->
+            client.sse("$TEST_SERVER/sse/no-events") {
+                assertEquals(HttpStatusCode.OK, call.response.status)
+                assertEquals(0, incoming.toList().size)
+            }
+        }
+    }
+
+    @Test
+    fun `test response body with BufferPolicy-All`() = clientTests {
+        config {
+            install(SSE) {
+                bufferPolicy = SSEBufferPolicy.All
+            }
+        }
+
+        val expected = listOf(
+            "event: hello 0",
+            "data: hello",
+            "data: from server",
+            "id: 0",
+            ""
+        ).joinToString("\r\n")
+
+        test { client ->
+            try {
+                client.sse("$TEST_SERVER/sse/hello") {
+                    incoming.collect { it }
+                    throw IllegalStateException("exception")
+                }
+            } catch (e: SSEClientException) {
+                checkBody(expected, e.response?.bodyAsText())
+            }
+        }
+    }
+
+    @Test
+    fun `test local BufferPolicy wins`() = clientTests {
+        config {
+            install(SSE) {
+                bufferPolicy = SSEBufferPolicy.All
+            }
+        }
+
+        test { client ->
+            try {
+                client.sse(urlString = "$TEST_SERVER/sse/hello", {
+                    bufferPolicy(SSEBufferPolicy.Off)
+                }) {
+                    incoming.collect { it }
+                    throw IllegalStateException("exception")
+                }
+            } catch (e: SSEClientException) {
+                assertTrue { e.response!!.bodyAsText().isEmpty() }
+            }
+        }
+    }
+
+    @Test
+    fun `test response body with BufferPolicy-LastLines`() = clientTests {
+        config {
+            install(SSE)
+        }
+
+        val expected = listOf(
+            "event: hello 0",
+            "data: hello",
+            "data: from server",
+            "id: 0",
+            ""
+        ).joinToString("\r\n")
+
+        val count = 3
+        test { client ->
+            try {
+                client.sse(
+                    urlString = "$TEST_SERVER/sse/hello",
+                    {
+                        bufferPolicy(SSEBufferPolicy.LastLines(count))
+                    }
+                ) {
+                    incoming.collect { it }
+                    throw IllegalStateException("exception")
+                }
+            } catch (e: SSEClientException) {
+                checkBody(expected, e.response?.bodyAsText(), count)
+            }
+        }
+    }
+
+    @Test
+    fun `test response body with BufferPolicy-LastEvent`() = clientTests {
+        config {
+            install(SSE)
+        }
+
+        val expected = listOf(
+            "event: hello 99",
+            "data: hello",
+            "data: from server",
+            "id: 99",
+            ""
+        ).joinToString("\r\n")
+
+        test { client ->
+            try {
+                client.sse(
+                    urlString = "$TEST_SERVER/sse/hello?times=100",
+                    {
+                        bufferPolicy(SSEBufferPolicy.LastEvent)
+                    }
+                ) {
+                    incoming.collect { it }
+                    throw IllegalStateException("exception")
+                }
+            } catch (e: SSEClientException) {
+                checkBody(expected, e.response?.bodyAsText())
+            }
+        }
+    }
+
+    @Test
+    fun `test response body with BufferPolicy-LastEvents`() = clientTests {
+        config {
+            install(SSE)
+        }
+
+        test { client ->
+            try {
+                client.sse(
+                    urlString = "$TEST_SERVER/sse/hello?times=100",
+                    {
+                        bufferPolicy(SSEBufferPolicy.LastEvents(2))
+                    }
+                ) {
+                    incoming.collect { it }
+                    throw IllegalStateException("exception")
+                }
+            } catch (e: SSEClientException) {
+                val expected = listOf(
+                    "event: hello 98",
+                    "data: hello",
+                    "data: from server",
+                    "id: 98",
+                    "",
+                    "event: hello 99",
+                    "data: hello",
+                    "data: from server",
+                    "id: 99",
+                    ""
+                ).joinToString("\r\n")
+                checkBody(expected, e.response?.bodyAsText())
+            }
+        }
+    }
+
+    @Test
+    fun `test body contains only proceeded data`() = clientTests {
+        config {
+            install(SSE)
+        }
+
+        test { client ->
+            try {
+                client.sse(urlString = "$TEST_SERVER/sse/hello", {
+                    bufferPolicy(SSEBufferPolicy.All)
+                }) {
+                    throw IllegalStateException("exception")
+                }
+            } catch (e: SSEClientException) {
+                assertTrue { e.response!!.bodyAsText().isEmpty() }
+            }
+        }
+    }
+
+    @Test
+    fun `test full response body in exception on non-200 status`() = clientTests {
+        config {
+            install(SSE)
+        }
+
+        test { client ->
+            try {
+                client.sse(urlString = "$TEST_SERVER/sse/error", { bufferPolicy(SSEBufferPolicy.All) }) { }
+            } catch (e: SSEClientException) {
+                assertEquals("Expected status code 200 but was 500", e.message)
+                assertEquals(e.response!!.bodyAsText(), "Server error")
+            }
+        }
+    }
+
+    private fun checkBody(expected: String, actual: String?, count: Int? = null) {
+        assertNotNull(actual)
+        val expectedLines = expected.split("\r\n").let { lines ->
+            count?.let { lines.takeLast(count) } ?: lines
+        }
+        val actualLines = actual.split("\r\n").let { lines ->
+            count?.let { lines.takeLast(count) } ?: lines
+        }
+        assertEquals(
+            expectedLines.size,
+            actualLines.size,
+            "Number of lines differs, expected ${expectedLines.size}, actual ${actualLines.size}"
+        )
+        expectedLines.forEachIndexed { index, line ->
+            assertEquals(line, actualLines[index], "Line #$index differs")
+        }
+    }
+}

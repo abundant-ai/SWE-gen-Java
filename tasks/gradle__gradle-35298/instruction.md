@@ -1,0 +1,11 @@
+Kotlin declarative DSL parsing currently relies on a workaround for Kotlin script parsing: it wraps the file content in a synthetic class (or otherwise treats the input as non-script code) to make `KotlinLightParser` produce a usable AST. With Kotlin 2.2.20, `KotlinLightParser` introduces an `isScript` parameter, and the workaround should no longer be used.
+
+The problem is that the declarative DSL parser does not correctly use the new `isScript` capability and/or still applies the wrapping workaround, which results in incorrect parsing metadata and node structure for Kotlin-script-like inputs. This can show up as wrong source ranges (indexes and line/column spans), missing or mis-typed nodes in the produced lightweight AST, and downstream failures in higher-level parsing features (imports, function calls, access chains, literals, and document overlay/resolution pipelines that depend on consistent parse trees).
+
+Update the parsing implementation so that when parsing declarative DSL script content, `KotlinLightParser` is invoked with the correct script mode (`isScript = true`) and the previous wrapping workaround is removed. The produced parse results must preserve accurate source positions and structure for typical DSL constructs, including:
+
+- Import statements like `import a.b.c`, `import a.b.MyData`, and `import MyOtherData`, producing `Import` nodes with correct name parts and correct index and line/column ranges.
+- Function invocations such as `f(x = y)`, `f(1)`, `f()`, and chained calls like `f.g.h.i.j.k(test)`, producing the expected `FunctionCall` structure, including receivers for access chains and correctly typed arguments (named vs positional).
+- The parsed document must remain compatible with later analysis/resolution steps used to build resolved documents and to overlay/merge documents (e.g., combining properties and merging configuring block content) without changing semantics.
+
+After the change, calling the existing parsing entry point used by `ParseTestUtil.parse(...)` should return the same logical AST as before (imports, function calls, access chains, etc.) but without relying on synthetic wrapping, and with correct source indices/line-column spans matching the original input text.

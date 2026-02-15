@@ -1,0 +1,416 @@
+diff --git a/documentation/src/docs/asciidoc/release-notes/release-notes-5.9.0-M1.adoc b/documentation/src/docs/asciidoc/release-notes/release-notes-5.9.0-M1.adoc
+index 77131a10f..a29044682 100644
+--- a/documentation/src/docs/asciidoc/release-notes/release-notes-5.9.0-M1.adoc
++++ b/documentation/src/docs/asciidoc/release-notes/release-notes-5.9.0-M1.adoc
+@@ -31,6 +31,8 @@ on GitHub.
+   resolution time a fully running set of dependencies is calculated, avoiding the need for
+   these to be manually specified.
+ * JUnit Platform Standalone Console JAR now also includes the JUnit Platform Suite Engine.
++* New `failIfNoTests` attribute added to `@Suite`. This will fail the suite if
++  no tests were discovered.
+ 
+ [[release-notes-5.9.0-M1-junit-jupiter]]
+ === JUnit Jupiter
+diff --git a/junit-platform-launcher/src/main/java/org/junit/platform/launcher/core/CompositeEngineExecutionListener.java b/junit-platform-launcher/src/main/java/org/junit/platform/launcher/core/CompositeEngineExecutionListener.java
+new file mode 100644
+index 000000000..c99a44f57
+--- /dev/null
++++ b/junit-platform-launcher/src/main/java/org/junit/platform/launcher/core/CompositeEngineExecutionListener.java
+@@ -0,0 +1,81 @@
++/*
++ * Copyright 2015-2022 the original author or authors.
++ *
++ * All rights reserved. This program and the accompanying materials are
++ * made available under the terms of the Eclipse Public License v2.0 which
++ * accompanies this distribution and is available at
++ *
++ * https://www.eclipse.org/legal/epl-v20.html
++ */
++
++package org.junit.platform.launcher.core;
++
++import java.util.ArrayList;
++import java.util.List;
++import java.util.function.Consumer;
++import java.util.function.Supplier;
++
++import org.junit.platform.commons.logging.Logger;
++import org.junit.platform.commons.logging.LoggerFactory;
++import org.junit.platform.commons.util.UnrecoverableExceptions;
++import org.junit.platform.engine.EngineExecutionListener;
++import org.junit.platform.engine.TestDescriptor;
++import org.junit.platform.engine.TestExecutionResult;
++import org.junit.platform.engine.reporting.ReportEntry;
++
++class CompositeEngineExecutionListener implements EngineExecutionListener {
++
++	private static final Logger logger = LoggerFactory.getLogger(CompositeEngineExecutionListener.class);
++
++	private final List<EngineExecutionListener> engineExecutionListeners;
++
++	CompositeEngineExecutionListener(List<EngineExecutionListener> engineExecutionListeners) {
++		this.engineExecutionListeners = new ArrayList<>(engineExecutionListeners);
++	}
++
++	@Override
++	public void dynamicTestRegistered(TestDescriptor testDescriptor) {
++		notifyEach(engineExecutionListeners, listener -> listener.dynamicTestRegistered(testDescriptor),
++			() -> "dynamicTestRegistered(" + testDescriptor + ")");
++	}
++
++	@Override
++	public void executionSkipped(TestDescriptor testDescriptor, String reason) {
++		notifyEach(engineExecutionListeners, listener -> listener.executionSkipped(testDescriptor, reason),
++			() -> "executionSkipped(" + testDescriptor + ", " + reason + ")");
++	}
++
++	@Override
++	public void executionStarted(TestDescriptor testDescriptor) {
++		notifyEach(engineExecutionListeners, listener -> listener.executionStarted(testDescriptor),
++			() -> "executionStarted(" + testDescriptor + ")");
++	}
++
++	@Override
++	public void executionFinished(TestDescriptor testDescriptor, TestExecutionResult testExecutionResult) {
++		notifyEach(engineExecutionListeners,
++			listener -> listener.executionFinished(testDescriptor, testExecutionResult),
++			() -> "executionFinished(" + testDescriptor + ", " + testExecutionResult + ")");
++	}
++
++	@Override
++	public void reportingEntryPublished(TestDescriptor testDescriptor, ReportEntry entry) {
++		notifyEach(engineExecutionListeners, listener -> listener.reportingEntryPublished(testDescriptor, entry),
++			() -> "reportingEntryPublished(" + testDescriptor + ", " + entry + ")");
++	}
++
++	private static <T extends EngineExecutionListener> void notifyEach(List<T> listeners, Consumer<T> consumer,
++			Supplier<String> description) {
++		listeners.forEach(listener -> {
++			try {
++				consumer.accept(listener);
++			}
++			catch (Throwable throwable) {
++				UnrecoverableExceptions.rethrowIfUnrecoverable(throwable);
++				logger.warn(throwable,
++					() -> String.format("EngineExecutionListener [%s] threw exception for method: %s",
++						listener.getClass().getName(), description.get()));
++			}
++		});
++	}
++}
+diff --git a/junit-platform-launcher/src/main/java/org/junit/platform/launcher/core/EngineExecutionOrchestrator.java b/junit-platform-launcher/src/main/java/org/junit/platform/launcher/core/EngineExecutionOrchestrator.java
+index 5402a3f4b..011db2f3c 100644
+--- a/junit-platform-launcher/src/main/java/org/junit/platform/launcher/core/EngineExecutionOrchestrator.java
++++ b/junit-platform-launcher/src/main/java/org/junit/platform/launcher/core/EngineExecutionOrchestrator.java
+@@ -10,7 +10,9 @@
+ 
+ package org.junit.platform.launcher.core;
+ 
++import static java.util.Objects.requireNonNull;
+ import static org.apiguardian.api.API.Status.INTERNAL;
++import static org.junit.platform.launcher.core.ListenerRegistry.forEngineExecutionListeners;
+ 
+ import java.util.Optional;
+ import java.util.function.Consumer;
+@@ -25,6 +27,7 @@ import org.junit.platform.engine.TestDescriptor;
+ import org.junit.platform.engine.TestEngine;
+ import org.junit.platform.engine.TestExecutionResult;
+ import org.junit.platform.launcher.TestExecutionListener;
++import org.junit.platform.launcher.TestPlan;
+ 
+ /**
+  * Orchestrates test execution using the configured test engines.
+@@ -45,15 +48,47 @@ public class EngineExecutionOrchestrator {
+ 	}
+ 
+ 	void execute(InternalTestPlan internalTestPlan, TestExecutionListener... listeners) {
++		ConfigurationParameters configurationParameters = internalTestPlan.getConfigurationParameters();
++		ListenerRegistry<TestExecutionListener> testExecutionListenerListeners = buildListenerRegistryForExecution(
++			listeners);
++		withInterceptedStreams(configurationParameters, testExecutionListenerListeners,
++			testExecutionListener -> execute(internalTestPlan, EngineExecutionListener.NOOP, testExecutionListener));
++	}
++
++	/**
++	 * Executes tests for the supplied {@linkplain LauncherDiscoveryResult
++	 * discoveryResult} and notifies the supplied {@linkplain
++	 * EngineExecutionListener engineExecutionListener} and
++	 * {@linkplain TestExecutionListener testExecutionListener} of execution
++	 * events.
++	 */
++	@API(status = INTERNAL, since = "1.9", consumers = { "org.junit.platform.suite.engine" })
++	public void execute(LauncherDiscoveryResult discoveryResult, EngineExecutionListener engineExecutionListener,
++			TestExecutionListener testExecutionListener) {
++		requireNonNull(discoveryResult);
++		requireNonNull(engineExecutionListener);
++		requireNonNull(testExecutionListener);
++
++		InternalTestPlan internalTestPlan = InternalTestPlan.from(discoveryResult);
++		execute(internalTestPlan, engineExecutionListener, testExecutionListener);
++	}
++
++	private void execute(InternalTestPlan internalTestPlan, EngineExecutionListener parentEngineExecutionListener,
++			TestExecutionListener testExecutionListener) {
+ 		internalTestPlan.markStarted();
++
++		// Do not directly pass the internal test plan to test execution listeners.
++		// Hyrum's Law indicates that someone will eventually come to depend on it.
++		TestPlan testPlan = internalTestPlan.getDelegate();
+ 		LauncherDiscoveryResult discoveryResult = internalTestPlan.getDiscoveryResult();
+-		ConfigurationParameters configurationParameters = discoveryResult.getConfigurationParameters();
+-		ListenerRegistry<TestExecutionListener> listenerRegistry = buildListenerRegistryForExecution(listeners);
+-		withInterceptedStreams(configurationParameters, listenerRegistry, testExecutionListener -> {
+-			testExecutionListener.testPlanExecutionStarted(internalTestPlan);
+-			execute(discoveryResult, new ExecutionListenerAdapter(internalTestPlan, testExecutionListener));
+-			testExecutionListener.testPlanExecutionFinished(internalTestPlan);
+-		});
++
++		ListenerRegistry<EngineExecutionListener> engineExecutionListenerRegistry = forEngineExecutionListeners();
++		engineExecutionListenerRegistry.add(new ExecutionListenerAdapter(testPlan, testExecutionListener));
++		engineExecutionListenerRegistry.add(parentEngineExecutionListener);
++
++		testExecutionListener.testPlanExecutionStarted(testPlan);
++		execute(discoveryResult, engineExecutionListenerRegistry.getCompositeListener());
++		testExecutionListener.testPlanExecutionFinished(testPlan);
+ 	}
+ 
+ 	private void withInterceptedStreams(ConfigurationParameters configurationParameters,
+@@ -76,16 +111,21 @@ public class EngineExecutionOrchestrator {
+ 	 * discovery results} and notifies the supplied {@linkplain
+ 	 * EngineExecutionListener listener} of execution events.
+ 	 */
+-	public void execute(LauncherDiscoveryResult discoveryResult, EngineExecutionListener listener) {
++	@API(status = INTERNAL, since = "1.7", consumers = { "org.junit.platform.testkit" })
++	public void execute(LauncherDiscoveryResult discoveryResult, EngineExecutionListener engineExecutionListener) {
++		requireNonNull(discoveryResult);
++		requireNonNull(engineExecutionListener);
++
+ 		for (TestEngine testEngine : discoveryResult.getTestEngines()) {
+ 			TestDescriptor engineDescriptor = discoveryResult.getEngineTestDescriptor(testEngine);
+ 			if (engineDescriptor instanceof EngineDiscoveryErrorDescriptor) {
+-				listener.executionStarted(engineDescriptor);
+-				listener.executionFinished(engineDescriptor,
++				engineExecutionListener.executionStarted(engineDescriptor);
++				engineExecutionListener.executionFinished(engineDescriptor,
+ 					TestExecutionResult.failed(((EngineDiscoveryErrorDescriptor) engineDescriptor).getCause()));
+ 			}
+ 			else {
+-				execute(engineDescriptor, listener, discoveryResult.getConfigurationParameters(), testEngine);
++				execute(engineDescriptor, engineExecutionListener, discoveryResult.getConfigurationParameters(),
++					testEngine);
+ 			}
+ 		}
+ 	}
+diff --git a/junit-platform-launcher/src/main/java/org/junit/platform/launcher/core/ExecutionListenerAdapter.java b/junit-platform-launcher/src/main/java/org/junit/platform/launcher/core/ExecutionListenerAdapter.java
+index 86c89aed8..f739dfcfe 100644
+--- a/junit-platform-launcher/src/main/java/org/junit/platform/launcher/core/ExecutionListenerAdapter.java
++++ b/junit-platform-launcher/src/main/java/org/junit/platform/launcher/core/ExecutionListenerAdapter.java
+@@ -26,10 +26,10 @@ import org.junit.platform.launcher.TestPlan;
+  */
+ class ExecutionListenerAdapter implements EngineExecutionListener {
+ 
+-	private final InternalTestPlan testPlan;
++	private final TestPlan testPlan;
+ 	private final TestExecutionListener testExecutionListener;
+ 
+-	ExecutionListenerAdapter(InternalTestPlan testPlan, TestExecutionListener testExecutionListener) {
++	ExecutionListenerAdapter(TestPlan testPlan, TestExecutionListener testExecutionListener) {
+ 		this.testPlan = testPlan;
+ 		this.testExecutionListener = testExecutionListener;
+ 	}
+diff --git a/junit-platform-launcher/src/main/java/org/junit/platform/launcher/core/InternalTestPlan.java b/junit-platform-launcher/src/main/java/org/junit/platform/launcher/core/InternalTestPlan.java
+index a435164d5..836669b8c 100644
+--- a/junit-platform-launcher/src/main/java/org/junit/platform/launcher/core/InternalTestPlan.java
++++ b/junit-platform-launcher/src/main/java/org/junit/platform/launcher/core/InternalTestPlan.java
+@@ -50,6 +50,10 @@ class InternalTestPlan extends TestPlan {
+ 		return discoveryResult;
+ 	}
+ 
++	public TestPlan getDelegate() {
++		return delegate;
++	}
++
+ 	@Override
+ 	@SuppressWarnings("deprecation")
+ 	public void add(TestIdentifier testIdentifier) {
+diff --git a/junit-platform-launcher/src/main/java/org/junit/platform/launcher/core/ListenerRegistry.java b/junit-platform-launcher/src/main/java/org/junit/platform/launcher/core/ListenerRegistry.java
+index 3a0e220b6..bcc30d678 100644
+--- a/junit-platform-launcher/src/main/java/org/junit/platform/launcher/core/ListenerRegistry.java
++++ b/junit-platform-launcher/src/main/java/org/junit/platform/launcher/core/ListenerRegistry.java
+@@ -18,6 +18,7 @@ import java.util.List;
+ import java.util.function.Function;
+ 
+ import org.junit.platform.commons.util.Preconditions;
++import org.junit.platform.engine.EngineExecutionListener;
+ import org.junit.platform.launcher.LauncherDiscoveryListener;
+ import org.junit.platform.launcher.LauncherSessionListener;
+ import org.junit.platform.launcher.TestExecutionListener;
+@@ -40,6 +41,10 @@ class ListenerRegistry<T> {
+ 		return create(CompositeTestExecutionListener::new);
+ 	}
+ 
++	static ListenerRegistry<EngineExecutionListener> forEngineExecutionListeners() {
++		return create(CompositeEngineExecutionListener::new);
++	}
++
+ 	static <T> ListenerRegistry<T> create(Function<List<T>, T> compositeListenerFactory) {
+ 		return new ListenerRegistry<>(compositeListenerFactory);
+ 	}
+diff --git a/junit-platform-launcher/src/main/java/org/junit/platform/launcher/listeners/SummaryGeneratingListener.java b/junit-platform-launcher/src/main/java/org/junit/platform/launcher/listeners/SummaryGeneratingListener.java
+index 55d9f5e8e..e32db1ceb 100644
+--- a/junit-platform-launcher/src/main/java/org/junit/platform/launcher/listeners/SummaryGeneratingListener.java
++++ b/junit-platform-launcher/src/main/java/org/junit/platform/launcher/listeners/SummaryGeneratingListener.java
+@@ -35,6 +35,10 @@ public class SummaryGeneratingListener implements TestExecutionListener {
+ 	private TestPlan testPlan;
+ 	private MutableTestExecutionSummary summary;
+ 
++	public SummaryGeneratingListener() {
++
++	}
++
+ 	/**
+ 	 * Get the summary generated by this listener.
+ 	 */
+diff --git a/junit-platform-suite-api/src/main/java/org/junit/platform/suite/api/Suite.java b/junit-platform-suite-api/src/main/java/org/junit/platform/suite/api/Suite.java
+index ebcbd5293..5df5c0892 100644
+--- a/junit-platform-suite-api/src/main/java/org/junit/platform/suite/api/Suite.java
++++ b/junit-platform-suite-api/src/main/java/org/junit/platform/suite/api/Suite.java
+@@ -73,4 +73,13 @@ import org.junit.platform.commons.annotation.Testable;
+ @API(status = Status.EXPERIMENTAL, since = "1.8")
+ @Testable
+ public @interface Suite {
++
++	/**
++	 * Fail suite if no tests were discovered.
++	 *
++	 * @since 1.9
++	 */
++	@API(status = Status.EXPERIMENTAL, since = "1.9")
++	boolean failIfNoTests() default true;
++
+ }
+diff --git a/junit-platform-suite-engine/src/main/java/org/junit/platform/suite/engine/SuiteLauncher.java b/junit-platform-suite-engine/src/main/java/org/junit/platform/suite/engine/SuiteLauncher.java
+index 84f85a8e3..7be8d7970 100644
+--- a/junit-platform-suite-engine/src/main/java/org/junit/platform/suite/engine/SuiteLauncher.java
++++ b/junit-platform-suite-engine/src/main/java/org/junit/platform/suite/engine/SuiteLauncher.java
+@@ -25,6 +25,8 @@ import org.junit.platform.launcher.core.EngineDiscoveryOrchestrator.Phase;
+ import org.junit.platform.launcher.core.EngineExecutionOrchestrator;
+ import org.junit.platform.launcher.core.LauncherDiscoveryResult;
+ import org.junit.platform.launcher.core.ServiceLoaderTestEngineRegistry;
++import org.junit.platform.launcher.listeners.SummaryGeneratingListener;
++import org.junit.platform.launcher.listeners.TestExecutionSummary;
+ 
+ /**
+  * @since 1.8
+@@ -55,8 +57,11 @@ class SuiteLauncher {
+ 		return discoveryOrchestrator.discover(discoveryRequest, Phase.DISCOVERY, parentId);
+ 	}
+ 
+-	void execute(LauncherDiscoveryResult discoveryResult, EngineExecutionListener listener) {
+-		executionOrchestrator.execute(discoveryResult, listener);
++	TestExecutionSummary execute(LauncherDiscoveryResult discoveryResult,
++			EngineExecutionListener parentEngineExecutionListener) {
++		SummaryGeneratingListener listener = new SummaryGeneratingListener();
++		executionOrchestrator.execute(discoveryResult, parentEngineExecutionListener, listener);
++		return listener.getSummary();
+ 	}
+ 
+ }
+diff --git a/junit-platform-suite-engine/src/main/java/org/junit/platform/suite/engine/SuiteTestDescriptor.java b/junit-platform-suite-engine/src/main/java/org/junit/platform/suite/engine/SuiteTestDescriptor.java
+index 88e382d23..a41318dbd 100644
+--- a/junit-platform-suite-engine/src/main/java/org/junit/platform/suite/engine/SuiteTestDescriptor.java
++++ b/junit-platform-suite-engine/src/main/java/org/junit/platform/suite/engine/SuiteTestDescriptor.java
+@@ -13,11 +13,11 @@ package org.junit.platform.suite.engine;
+ import static java.util.function.Function.identity;
+ import static java.util.stream.Collectors.counting;
+ import static java.util.stream.Collectors.groupingBy;
++import static org.junit.platform.commons.util.AnnotationUtils.findAnnotation;
+ import static org.junit.platform.suite.commons.SuiteLauncherDiscoveryRequestBuilder.request;
+ 
+ import java.util.function.Supplier;
+ 
+-import org.junit.platform.commons.util.AnnotationUtils;
+ import org.junit.platform.commons.util.Preconditions;
+ import org.junit.platform.commons.util.StringUtils;
+ import org.junit.platform.engine.ConfigurationParameters;
+@@ -31,6 +31,8 @@ import org.junit.platform.engine.support.descriptor.AbstractTestDescriptor;
+ import org.junit.platform.engine.support.descriptor.ClassSource;
+ import org.junit.platform.launcher.LauncherDiscoveryRequest;
+ import org.junit.platform.launcher.core.LauncherDiscoveryResult;
++import org.junit.platform.launcher.listeners.TestExecutionSummary;
++import org.junit.platform.suite.api.Suite;
+ import org.junit.platform.suite.api.SuiteDisplayName;
+ import org.junit.platform.suite.commons.SuiteLauncherDiscoveryRequestBuilder;
+ 
+@@ -50,6 +52,8 @@ final class SuiteTestDescriptor extends AbstractTestDescriptor {
+ 
+ 	private final SuiteLauncherDiscoveryRequestBuilder discoveryRequestBuilder = request();
+ 	private final ConfigurationParameters configurationParameters;
++	private final Boolean failIfNoTests;
++	private final Class<?> suiteClass;
+ 
+ 	private LauncherDiscoveryResult launcherDiscoveryResult;
+ 	private SuiteLauncher launcher;
+@@ -57,6 +61,8 @@ final class SuiteTestDescriptor extends AbstractTestDescriptor {
+ 	SuiteTestDescriptor(UniqueId id, Class<?> suiteClass, ConfigurationParameters configurationParameters) {
+ 		super(requireNoCycles(id), getSuiteDisplayName(suiteClass), ClassSource.from(suiteClass));
+ 		this.configurationParameters = configurationParameters;
++		this.failIfNoTests = getFailIfNoTests(suiteClass);
++		this.suiteClass = suiteClass;
+ 	}
+ 
+ 	private static UniqueId requireNoCycles(UniqueId id) {
+@@ -75,6 +81,14 @@ final class SuiteTestDescriptor extends AbstractTestDescriptor {
+ 		return id;
+ 	}
+ 
++	private static Boolean getFailIfNoTests(Class<?> suiteClass) {
++		// @formatter:off
++		return findAnnotation(suiteClass, Suite.class)
++				.map(Suite::failIfNoTests)
++				.orElseThrow(() -> new IllegalStateException(String.format("Suite [%s] was not annotated with @Suite", suiteClass.getName())));
++		// @formatter:on
++	}
++
+ 	SuiteTestDescriptor addDiscoveryRequestFrom(Class<?> suiteClass) {
+ 		Preconditions.condition(launcherDiscoveryResult == null,
+ 			"discovery request can not be modified after discovery");
+@@ -118,17 +132,33 @@ final class SuiteTestDescriptor extends AbstractTestDescriptor {
+ 
+ 	private static String getSuiteDisplayName(Class<?> testClass) {
+ 		// @formatter:off
+-		return AnnotationUtils.findAnnotation(testClass, SuiteDisplayName.class)
++		return findAnnotation(testClass, SuiteDisplayName.class)
+ 				.map(SuiteDisplayName::value)
+ 				.filter(StringUtils::isNotBlank)
+ 				.orElse(testClass.getSimpleName());
+ 		// @formatter:on
+ 	}
+ 
+-	void execute(EngineExecutionListener listener) {
+-		listener.executionStarted(this);
+-		launcher.execute(launcherDiscoveryResult, listener);
+-		listener.executionFinished(this, TestExecutionResult.successful());
++	void execute(EngineExecutionListener parentEngineExecutionListener) {
++		parentEngineExecutionListener.executionStarted(this);
++		LauncherDiscoveryResult discoveryResult = this.launcherDiscoveryResult;
++		TestExecutionSummary summary = launcher.execute(discoveryResult, parentEngineExecutionListener);
++		parentEngineExecutionListener.executionFinished(this, computeTestExecutionResult(summary));
++	}
++
++	private TestExecutionResult computeTestExecutionResult(TestExecutionSummary summary) {
++		if (failIfNoTests && summary.getTestsFoundCount() == 0) {
++			return TestExecutionResult.failed(new SuiteDidNotDiscoverAnyTests(suiteClass));
++		}
++		return TestExecutionResult.successful();
++	}
++
++	@Override
++	public boolean mayRegisterTests() {
++		// While a suite will not register new tests after discovery, we pretend
++		// it does. This allows the suite to fail if not tests were discovered.
++		// If not, the empty suite would be pruned.
++		return true;
+ 	}
+ 
+ }

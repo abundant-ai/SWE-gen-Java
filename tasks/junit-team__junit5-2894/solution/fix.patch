@@ -1,0 +1,331 @@
+diff --git a/documentation/src/docs/asciidoc/release-notes/release-notes-5.9.0-RC1.adoc b/documentation/src/docs/asciidoc/release-notes/release-notes-5.9.0-RC1.adoc
+index 48704cea8..60664173d 100644
+--- a/documentation/src/docs/asciidoc/release-notes/release-notes-5.9.0-RC1.adoc
++++ b/documentation/src/docs/asciidoc/release-notes/release-notes-5.9.0-RC1.adoc
+@@ -54,6 +54,8 @@ on GitHub.
+   property `junit.jupiter.execution.timeout.thread.mode.default`, `SAME_THREAD` that
+   executes the test code in the same thread as the calling code, and `SEPARATE_THREAD`
+   which executes it in a separate thread.
++* Support for enabling/disabling tests based on the system's hardware architecture via new
++  `architectures` attributes on `@EnabledOnOs` and `@DisabledOnOs`.
+ 
+ 
+ [[release-notes-5.9.0-RC1-junit-vintage]]
+diff --git a/documentation/src/docs/asciidoc/user-guide/writing-tests.adoc b/documentation/src/docs/asciidoc/user-guide/writing-tests.adoc
+index b630cde79..2099006c9 100644
+--- a/documentation/src/docs/asciidoc/user-guide/writing-tests.adoc
++++ b/documentation/src/docs/asciidoc/user-guide/writing-tests.adoc
+@@ -418,17 +418,26 @@ the `org.junit.jupiter.api.condition` package.
+ ====
+ 
+ [[writing-tests-conditional-execution-os]]
+-==== Operating System Conditions
++==== Operating System and Architecture Conditions
+ 
+-A container or test may be enabled or disabled on a particular operating system via the
+-`{EnabledOnOs}` and `{DisabledOnOs}` annotations.
++A container or test may be enabled or disabled on a particular operating system,
++architecture, or combination of both via the `{EnabledOnOs}` and `{DisabledOnOs}`
++annotations.
+ 
+ [[writing-tests-conditional-execution-os-demo]]
+ [source,java,indent=0]
++.Conditional execution based on operating system
+ ----
+ include::{testDir}/example/ConditionalTestExecutionDemo.java[tags=user_guide_os]
+ ----
+ 
++[[writing-tests-conditional-execution-architectures-demo]]
++[source,java,indent=0]
++.Conditional execution based on architecture
++----
++include::{testDir}/example/ConditionalTestExecutionDemo.java[tags=user_guide_architecture]
++----
++
+ [[writing-tests-conditional-execution-jre]]
+ ==== Java Runtime Environment Conditions
+ 
+diff --git a/junit-jupiter-api/src/main/java/org/junit/jupiter/api/condition/AbstractOsBasedExecutionCondition.java b/junit-jupiter-api/src/main/java/org/junit/jupiter/api/condition/AbstractOsBasedExecutionCondition.java
+new file mode 100644
+index 000000000..014623805
+--- /dev/null
++++ b/junit-jupiter-api/src/main/java/org/junit/jupiter/api/condition/AbstractOsBasedExecutionCondition.java
+@@ -0,0 +1,74 @@
++/*
++ * Copyright 2015-2022 the original author or authors.
++ *
++ * All rights reserved. This program and the accompanying materials are
++ * made available under the terms of the Eclipse Public License v2.0 which
++ * accompanies this distribution and is available at
++ *
++ * https://www.eclipse.org/legal/epl-v20.html
++ */
++
++package org.junit.jupiter.api.condition;
++
++import static org.junit.jupiter.api.extension.ConditionEvaluationResult.enabled;
++import static org.junit.platform.commons.util.AnnotationUtils.findAnnotation;
++
++import java.lang.annotation.Annotation;
++
++import org.junit.jupiter.api.extension.ConditionEvaluationResult;
++import org.junit.jupiter.api.extension.ExecutionCondition;
++import org.junit.jupiter.api.extension.ExtensionContext;
++
++/**
++ * Base class for OS-based {@link ExecutionCondition} implementations.
++ *
++ * @since 5.9
++ */
++abstract class AbstractOsBasedExecutionCondition<A extends Annotation> implements ExecutionCondition {
++	private final Class<A> annotationType;
++
++	AbstractOsBasedExecutionCondition(Class<A> annotationType) {
++		this.annotationType = annotationType;
++	}
++
++	@Override
++	public ConditionEvaluationResult evaluateExecutionCondition(ExtensionContext context) {
++		return findAnnotation(context.getElement(), annotationType) //
++				.map(this::evaluateExecutionCondition) //
++				.orElseGet(this::enabledByDefault);
++	}
++
++	abstract ConditionEvaluationResult evaluateExecutionCondition(A annotation);
++
++	protected String createReason(boolean enabled, boolean osSpecified, boolean archSpecified) {
++		StringBuilder reason = new StringBuilder() //
++				.append(enabled ? "Enabled" : "Disabled") //
++				.append(osSpecified ? " on operating system: " : " on architecture: ");
++
++		if (osSpecified && archSpecified) {
++			reason.append(String.format("%s (%s)", currentOS(), currentArchitecture()));
++		}
++		else if (osSpecified) {
++			reason.append(currentOS());
++		}
++		else {
++			reason.append(currentArchitecture());
++		}
++
++		return reason.toString();
++	}
++
++	private ConditionEvaluationResult enabledByDefault() {
++		String reason = String.format("@%s is not present", annotationType.getSimpleName());
++		return enabled(reason);
++	}
++
++	private String currentOS() {
++		return System.getProperty("os.name");
++	}
++
++	protected String currentArchitecture() {
++		return System.getProperty("os.arch");
++	}
++
++}
+diff --git a/junit-jupiter-api/src/main/java/org/junit/jupiter/api/condition/DisabledOnOs.java b/junit-jupiter-api/src/main/java/org/junit/jupiter/api/condition/DisabledOnOs.java
+index cd894771b..3e4c67799 100644
+--- a/junit-jupiter-api/src/main/java/org/junit/jupiter/api/condition/DisabledOnOs.java
++++ b/junit-jupiter-api/src/main/java/org/junit/jupiter/api/condition/DisabledOnOs.java
+@@ -24,10 +24,15 @@ import org.junit.jupiter.api.extension.ExtendWith;
+ /**
+  * {@code @DisabledOnOs} is used to signal that the annotated test class or
+  * test method is <em>disabled</em> on one or more specified
+- * {@linkplain #value operating systems}.
++ * {@linkplain #value operating systems} or on one or more specified
++ * {@linkplain #architectures architectures}
++ *
++ * <p>If operating systems and architectures are specified, the annotated test
++ * class or test method is disabled if both conditions apply.
+  *
+  * <p>When applied at the class level, all test methods within that class
+- * will be disabled on the same specified operating systems.
++ * will be disabled on the same specified operating systems, architectures, or
++ * the specified combinations of both.
+  *
+  * <p>If a test method is disabled via this annotation, that does not prevent
+  * the test class from being instantiated. Rather, it prevents the execution of
+@@ -77,7 +82,15 @@ public @interface DisabledOnOs {
+ 	 *
+ 	 * @see OS
+ 	 */
+-	OS[] value();
++	OS[] value() default {};
++
++	/**
++	 * Architectures on which the annotated class or method should be disabled.
++	 *
++	 * @since 5.9
++	 */
++	@API(status = STABLE, since = "5.9")
++	String[] architectures() default {};
+ 
+ 	/**
+ 	 * Custom reason to provide if the test or container is disabled.
+diff --git a/junit-jupiter-api/src/main/java/org/junit/jupiter/api/condition/DisabledOnOsCondition.java b/junit-jupiter-api/src/main/java/org/junit/jupiter/api/condition/DisabledOnOsCondition.java
+index f3dd92a58..ba5462070 100644
+--- a/junit-jupiter-api/src/main/java/org/junit/jupiter/api/condition/DisabledOnOsCondition.java
++++ b/junit-jupiter-api/src/main/java/org/junit/jupiter/api/condition/DisabledOnOsCondition.java
+@@ -10,11 +10,9 @@
+ 
+ package org.junit.jupiter.api.condition;
+ 
+-import static org.junit.jupiter.api.condition.EnabledOnOsCondition.DISABLED_ON_CURRENT_OS;
+-import static org.junit.jupiter.api.condition.EnabledOnOsCondition.ENABLED_ON_CURRENT_OS;
+-
+ import java.util.Arrays;
+ 
++import org.junit.jupiter.api.extension.ConditionEvaluationResult;
+ import org.junit.jupiter.api.extension.ExecutionCondition;
+ import org.junit.platform.commons.util.Preconditions;
+ 
+@@ -24,16 +22,42 @@ import org.junit.platform.commons.util.Preconditions;
+  * @since 5.1
+  * @see DisabledOnOs
+  */
+-class DisabledOnOsCondition extends BooleanExecutionCondition<DisabledOnOs> {
++class DisabledOnOsCondition extends AbstractOsBasedExecutionCondition<DisabledOnOs> {
+ 
+ 	DisabledOnOsCondition() {
+-		super(DisabledOnOs.class, ENABLED_ON_CURRENT_OS, DISABLED_ON_CURRENT_OS, DisabledOnOs::disabledReason);
++		super(DisabledOnOs.class);
+ 	}
+ 
+ 	@Override
+-	boolean isEnabled(DisabledOnOs annotation) {
++	ConditionEvaluationResult evaluateExecutionCondition(DisabledOnOs annotation) {
++		boolean osSpecified = annotation.value().length > 0;
++		boolean archSpecified = annotation.architectures().length > 0;
++		Preconditions.condition(osSpecified || archSpecified,
++			"You must declare at least one OS or architecture in @DisabledOnOs");
++
++		boolean enabled = isEnabledBasedOnOs(annotation) || isEnabledBasedOnArchitecture(annotation);
++		String reason = createReason(enabled, osSpecified, archSpecified);
++
++		return enabled ? ConditionEvaluationResult.enabled(reason)
++				: ConditionEvaluationResult.disabled(reason, annotation.disabledReason());
++	}
++
++	private boolean isEnabledBasedOnArchitecture(DisabledOnOs annotation) {
++		String[] architectures = annotation.architectures();
++		if (architectures.length == 0) {
++			return false;
++		}
++
++		String currentArchitecture = currentArchitecture();
++		return Arrays.stream(architectures).noneMatch(currentArchitecture::equalsIgnoreCase);
++	}
++
++	private boolean isEnabledBasedOnOs(DisabledOnOs annotation) {
+ 		OS[] operatingSystems = annotation.value();
+-		Preconditions.condition(operatingSystems.length > 0, "You must declare at least one OS in @DisabledOnOs");
++		if (operatingSystems.length == 0) {
++			return false;
++		}
++
+ 		return Arrays.stream(operatingSystems).noneMatch(OS::isCurrentOs);
+ 	}
+ 
+diff --git a/junit-jupiter-api/src/main/java/org/junit/jupiter/api/condition/EnabledOnOs.java b/junit-jupiter-api/src/main/java/org/junit/jupiter/api/condition/EnabledOnOs.java
+index 691cc9ad6..389d1030d 100644
+--- a/junit-jupiter-api/src/main/java/org/junit/jupiter/api/condition/EnabledOnOs.java
++++ b/junit-jupiter-api/src/main/java/org/junit/jupiter/api/condition/EnabledOnOs.java
+@@ -24,10 +24,15 @@ import org.junit.jupiter.api.extension.ExtendWith;
+ /**
+  * {@code @EnabledOnOs} is used to signal that the annotated test class or
+  * test method is only <em>enabled</em> on one or more specified
+- * {@linkplain #value operating systems}.
++ * {@linkplain #value operating systems} or one or more specified
++ * {@linkplain #architectures architectures}.
++ *
++ * <p>If operating systems and architectures are specified, the annotated test
++ * class or test method is enabled if both conditions apply.
+  *
+  * <p>When applied at the class level, all test methods within that class
+- * will be enabled on the same specified operating systems.
++ * will be enabled on the same specified operating systems, architectures, or
++ * the specified combinations of both.
+  *
+  * <p>If a test method is disabled via this annotation, that does not prevent
+  * the test class from being instantiated. Rather, it prevents the execution of
+@@ -77,7 +82,15 @@ public @interface EnabledOnOs {
+ 	 *
+ 	 * @see OS
+ 	 */
+-	OS[] value();
++	OS[] value() default {};
++
++	/**
++	 * Architectures on which the annotated class or method should be enabled.
++	 *
++	 * @since 5.9
++	 */
++	@API(status = STABLE, since = "5.9")
++	String[] architectures() default {};
+ 
+ 	/**
+ 	 * Custom reason to provide if the test or container is disabled.
+diff --git a/junit-jupiter-api/src/main/java/org/junit/jupiter/api/condition/EnabledOnOsCondition.java b/junit-jupiter-api/src/main/java/org/junit/jupiter/api/condition/EnabledOnOsCondition.java
+index ef6b3c868..5ae5e0081 100644
+--- a/junit-jupiter-api/src/main/java/org/junit/jupiter/api/condition/EnabledOnOsCondition.java
++++ b/junit-jupiter-api/src/main/java/org/junit/jupiter/api/condition/EnabledOnOsCondition.java
+@@ -12,6 +12,7 @@ package org.junit.jupiter.api.condition;
+ 
+ import java.util.Arrays;
+ 
++import org.junit.jupiter.api.extension.ConditionEvaluationResult;
+ import org.junit.jupiter.api.extension.ExecutionCondition;
+ import org.junit.platform.commons.util.Preconditions;
+ 
+@@ -21,20 +22,41 @@ import org.junit.platform.commons.util.Preconditions;
+  * @since 5.1
+  * @see EnabledOnOs
+  */
+-class EnabledOnOsCondition extends BooleanExecutionCondition<EnabledOnOs> {
+-
+-	static final String ENABLED_ON_CURRENT_OS = "Enabled on operating system: " + System.getProperty("os.name");
+-
+-	static final String DISABLED_ON_CURRENT_OS = "Disabled on operating system: " + System.getProperty("os.name");
++class EnabledOnOsCondition extends AbstractOsBasedExecutionCondition<EnabledOnOs> {
+ 
+ 	EnabledOnOsCondition() {
+-		super(EnabledOnOs.class, ENABLED_ON_CURRENT_OS, DISABLED_ON_CURRENT_OS, EnabledOnOs::disabledReason);
++		super(EnabledOnOs.class);
+ 	}
+ 
+ 	@Override
+-	boolean isEnabled(EnabledOnOs annotation) {
++	ConditionEvaluationResult evaluateExecutionCondition(EnabledOnOs annotation) {
++		boolean osSpecified = annotation.value().length > 0;
++		boolean archSpecified = annotation.architectures().length > 0;
++		Preconditions.condition(osSpecified || archSpecified,
++			"You must declare at least one OS or architecture in @EnabledOnOs");
++
++		boolean enabled = isEnabledBasedOnOs(annotation) && isEnabledBasedOnArchitecture(annotation);
++		String reason = createReason(enabled, osSpecified, archSpecified);
++
++		return enabled ? ConditionEvaluationResult.enabled(reason)
++				: ConditionEvaluationResult.disabled(reason, annotation.disabledReason());
++	}
++
++	private boolean isEnabledBasedOnArchitecture(EnabledOnOs annotation) {
++		String[] architectures = annotation.architectures();
++		if (architectures.length == 0) {
++			return true;
++		}
++
++		String currentArchitecture = currentArchitecture();
++		return Arrays.stream(architectures).anyMatch(currentArchitecture::equalsIgnoreCase);
++	}
++
++	private boolean isEnabledBasedOnOs(EnabledOnOs annotation) {
+ 		OS[] operatingSystems = annotation.value();
+-		Preconditions.condition(operatingSystems.length > 0, "You must declare at least one OS in @EnabledOnOs");
++		if (operatingSystems.length == 0) {
++			return true;
++		}
+ 		return Arrays.stream(operatingSystems).anyMatch(OS::isCurrentOs);
+ 	}
+ 

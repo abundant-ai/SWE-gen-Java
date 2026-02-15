@@ -1,0 +1,1346 @@
+diff --git a/platforms/core-configuration/declarative-dsl-core/src/main/kotlin/org/gradle/internal/declarativedsl/parsing/GrammarToTree.kt b/platforms/core-configuration/declarative-dsl-core/src/main/kotlin/org/gradle/internal/declarativedsl/parsing/GrammarToTree.kt
+index 38c1f1f9726..593e597c3b8 100644
+--- a/platforms/core-configuration/declarative-dsl-core/src/main/kotlin/org/gradle/internal/declarativedsl/parsing/GrammarToTree.kt
++++ b/platforms/core-configuration/declarative-dsl-core/src/main/kotlin/org/gradle/internal/declarativedsl/parsing/GrammarToTree.kt
+@@ -36,7 +36,6 @@ import org.gradle.internal.declarativedsl.language.UnsupportedLanguageFeature.In
+ import org.gradle.internal.declarativedsl.parsing.FailureCollectorContext.CheckedResult
+ import org.jetbrains.kotlin.ElementTypeUtils.getOperationSymbol
+ import org.jetbrains.kotlin.ElementTypeUtils.isExpression
+-import org.jetbrains.kotlin.KtNodeTypes
+ import org.jetbrains.kotlin.KtNodeTypes.ANNOTATED_EXPRESSION
+ import org.jetbrains.kotlin.KtNodeTypes.ANNOTATION_ENTRY
+ import org.jetbrains.kotlin.KtNodeTypes.ARRAY_ACCESS_EXPRESSION
+@@ -45,6 +44,8 @@ import org.jetbrains.kotlin.KtNodeTypes.BLOCK
+ import org.jetbrains.kotlin.KtNodeTypes.BOOLEAN_CONSTANT
+ import org.jetbrains.kotlin.KtNodeTypes.CALL_EXPRESSION
+ import org.jetbrains.kotlin.KtNodeTypes.CLASS
++import org.jetbrains.kotlin.KtNodeTypes.CLASS_BODY
++import org.jetbrains.kotlin.KtNodeTypes.CLASS_INITIALIZER
+ import org.jetbrains.kotlin.KtNodeTypes.DOT_QUALIFIED_EXPRESSION
+ import org.jetbrains.kotlin.KtNodeTypes.ESCAPE_STRING_TEMPLATE_ENTRY
+ import org.jetbrains.kotlin.KtNodeTypes.FUN
+@@ -66,7 +67,6 @@ import org.jetbrains.kotlin.KtNodeTypes.PARENTHESIZED
+ import org.jetbrains.kotlin.KtNodeTypes.PREFIX_EXPRESSION
+ import org.jetbrains.kotlin.KtNodeTypes.PROPERTY
+ import org.jetbrains.kotlin.KtNodeTypes.REFERENCE_EXPRESSION
+-import org.jetbrains.kotlin.KtNodeTypes.SCRIPT_INITIALIZER
+ import org.jetbrains.kotlin.KtNodeTypes.SHORT_STRING_TEMPLATE_ENTRY
+ import org.jetbrains.kotlin.KtNodeTypes.STRING_TEMPLATE
+ import org.jetbrains.kotlin.KtNodeTypes.THIS_EXPRESSION
+@@ -90,11 +90,13 @@ import org.jetbrains.kotlin.lexer.KtTokens.DOT
+ import org.jetbrains.kotlin.lexer.KtTokens.EQ
+ import org.jetbrains.kotlin.lexer.KtTokens.IDENTIFIER
+ import org.jetbrains.kotlin.lexer.KtTokens.INTEGER_LITERAL
++import org.jetbrains.kotlin.lexer.KtTokens.LBRACE
+ import org.jetbrains.kotlin.lexer.KtTokens.LPAR
+ import org.jetbrains.kotlin.lexer.KtTokens.MINUS
+ import org.jetbrains.kotlin.lexer.KtTokens.MUL
+ import org.jetbrains.kotlin.lexer.KtTokens.OPEN_QUOTE
+ import org.jetbrains.kotlin.lexer.KtTokens.QUALIFIED_ACCESS
++import org.jetbrains.kotlin.lexer.KtTokens.RBRACE
+ import org.jetbrains.kotlin.lexer.KtTokens.RPAR
+ import org.jetbrains.kotlin.lexer.KtTokens.SAFE_ACCESS
+ import org.jetbrains.kotlin.parsing.hasIllegalUnderscore
+@@ -105,13 +107,14 @@ import org.jetbrains.kotlin.parsing.parseBoolean
+ import org.jetbrains.kotlin.parsing.parseNumericLiteral
+ import org.jetbrains.kotlin.psi.stubs.elements.KtConstantExpressionElementType
+ import org.jetbrains.kotlin.psi.stubs.elements.KtNameReferenceExpressionElementType
+-import org.jetbrains.kotlin.util.getChildren
+ import org.jetbrains.kotlin.utils.doNothing
+ 
+ 
+ class GrammarToTree(
+     private val sourceIdentifier: SourceIdentifier,
+-    private val sourceCode: String
++    private val sourceCode: String,
++    private val sourceOffset: Int,
++    private val suffixLength: Int
+ ) {
+ 
+     inner
+@@ -119,14 +122,14 @@ class GrammarToTree(
+         private
+         val sourceData: MutableMap<LighterASTNode, LightTreeSourceData> = mutableMapOf()
+ 
+-        fun sourceData(node: LighterASTNode): LightTreeSourceData =
++        fun sourceData(node: LighterASTNode, offset: Int = sourceOffset): LightTreeSourceData =
+             sourceData.computeIfAbsent(node) {
+-                it.sourceData(sourceIdentifier, sourceCode)
++                it.sourceData(sourceIdentifier, sourceCode, offset)
+             }
+ 
+         fun rootSourceData(): LightTreeSourceData =
+             sourceData.computeIfAbsent(root) {
+-                LightTreeSourceData(sourceIdentifier, sourceCode, sourceCode.indices)
++                LightTreeSourceData(sourceIdentifier, sourceCode, sourceOffset, sourceOffset..sourceCode.lastIndex - suffixLength)
+             }
+ 
+         fun parsingError(node: LighterASTNode, message: String): ParsingError {
+@@ -156,6 +159,12 @@ class GrammarToTree(
+             val innerSourceData = sourceData(inner)
+             return UnsupportedConstruct(outerSourceData, innerSourceData, feature)
+         }
++
++        fun unsupportedNoOffset(outer: LighterASTNode, inner: LighterASTNode, feature: UnsupportedLanguageFeature): UnsupportedConstruct {
++            val outerSourceData = sourceData(outer, 0)
++            val innerSourceData = sourceData(inner, 0)
++            return UnsupportedConstruct(outerSourceData, innerSourceData, feature)
++        } // TODO: hack, due to script wrapping
+     }
+ 
+     fun script(originalTree: LightTree): LanguageTreeResult {
+@@ -181,7 +190,7 @@ class GrammarToTree(
+     private
+     fun packageHeader(tree: CachingLightTree, node: LighterASTNode): List<FailingResult> =
+         when {
+-            tree.children(node).isNotEmpty() -> listOf(tree.unsupported(node, node, UnsupportedLanguageFeature.PackageHeader))
++            tree.children(node).isNotEmpty() -> listOf(tree.unsupportedNoOffset(node, node, UnsupportedLanguageFeature.PackageHeader))
+             else -> listOf()
+         }
+ 
+@@ -197,8 +206,8 @@ class GrammarToTree(
+                             propertyAccessStatement(tree, it)
+                                 .flatMap { e -> if (e is NamedReference) Element(e) else tree.unsupported(node, InvalidImportValue) }
+                         )
+-                        MUL -> collectingFailure(tree.unsupported(node, it, UnsupportedLanguageFeature.StarImport))
+-                        IMPORT_ALIAS -> collectingFailure(tree.unsupported(node, it, UnsupportedLanguageFeature.RenamingImport))
++                        MUL -> collectingFailure(tree.unsupportedNoOffset(node, it, UnsupportedLanguageFeature.StarImport))
++                        IMPORT_ALIAS -> collectingFailure(tree.unsupportedNoOffset(node, it, UnsupportedLanguageFeature.RenamingImport))
+                     }
+                 }
+ 
+@@ -214,7 +223,7 @@ class GrammarToTree(
+                         }
+ 
+                     val nameParts = checked(content!!).flatten()
+-                    Element(Import(AccessChain(nameParts), tree.sourceData(node)))
++                    Element(Import(AccessChain(nameParts), tree.sourceData(node, offset = 0)))
+                 }
+             }
+         }
+@@ -735,12 +744,19 @@ class GrammarToTree(
+         tree.children(toplevelNode(tree, IMPORT_LIST))
+ 
+     private
+-    fun scriptNodes(tree: LightTree): List<LighterASTNode> =
+-        tree.children(toplevelNode(tree, KtNodeTypes.SCRIPT))
+-            .expectSingleOrNoneOfKind(BLOCK)?.getChildren(tree)
+-            ?.filter(LighterASTNode::isUseful)
+-            ?.flatMap { if (it.tokenType == SCRIPT_INITIALIZER) it.getChildren(tree) else listOf(it) }
+-            .orEmpty()
++    fun scriptNodes(tree: LightTree): List<LighterASTNode> {
++        // the actual script we want to parse is wrapped into a class initializer block, we need to extract it
++
++        val childrenOfWrappingClass = tree.children(toplevelNode(tree, CLASS))
++        val wrappingClassBody = childrenOfWrappingClass.expectSingleOfKind(CLASS_BODY)
++        val childrenOfWrappingClassBody = tree.children(wrappingClassBody)
++        val wrappingClassInitializer = childrenOfWrappingClassBody.expectSingleOfKind(CLASS_INITIALIZER)
++        val childrenOfWrappingClassInitializer = tree.children(wrappingClassInitializer)
++        val wrappingClassInitializerBlock = childrenOfWrappingClassInitializer.expectSingleOfKind(BLOCK)
++        val childrenOfWrappingClassInitializerBlock = tree.children(wrappingClassInitializerBlock)
++
++        return extractBlockContent(childrenOfWrappingClassInitializerBlock)
++    }
+ 
+     private
+     fun toplevelNode(tree: LightTree, parentNode: IElementType): LighterASTNode {
+@@ -749,6 +765,19 @@ class GrammarToTree(
+         return childrenOfRoot.expectSingleOfKind(parentNode)
+     }
+ 
++    private
++    fun extractBlockContent(blockNodes: List<LighterASTNode>): List<LighterASTNode> {
++        check(blockNodes.size >= 2) // first and last nodes are the opening an¡¡d closing braces
++
++        val openBrace = blockNodes.first()
++        openBrace.expectKind(LBRACE)
++
++        val closingBrace = blockNodes.last()
++        closingBrace.expectKind(RBRACE)
++
++        return blockNodes.slice(1..blockNodes.size - 2)
++    }
++
+     private
+     fun FailureCollectorContext.childrenWithParsingErrorCollection(tree: CachingLightTree, node: LighterASTNode): List<LighterASTNode> {
+         val children = tree.children(node)
+diff --git a/platforms/core-configuration/declarative-dsl-core/src/main/kotlin/org/gradle/internal/declarativedsl/parsing/LanguageTreeBuilder.kt b/platforms/core-configuration/declarative-dsl-core/src/main/kotlin/org/gradle/internal/declarativedsl/parsing/LanguageTreeBuilder.kt
+index 22e75b2f8a7..956113ccf49 100644
+--- a/platforms/core-configuration/declarative-dsl-core/src/main/kotlin/org/gradle/internal/declarativedsl/parsing/LanguageTreeBuilder.kt
++++ b/platforms/core-configuration/declarative-dsl-core/src/main/kotlin/org/gradle/internal/declarativedsl/parsing/LanguageTreeBuilder.kt
+@@ -14,6 +14,6 @@ class DefaultLanguageTreeBuilder : LanguageTreeBuilder {
+         parsedLightTree: ParsedLightTree,
+         sourceIdentifier: SourceIdentifier
+     ): LanguageTreeResult =
+-        GrammarToTree(sourceIdentifier, parsedLightTree.code)
++        GrammarToTree(sourceIdentifier, parsedLightTree.wrappedCode, parsedLightTree.originalCodeOffset, parsedLightTree.suffixLength)
+             .script(parsedLightTree.lightTree)
+ }
+diff --git a/platforms/core-configuration/declarative-dsl-core/src/main/kotlin/org/gradle/internal/declarativedsl/parsing/LightTreeUtil.kt b/platforms/core-configuration/declarative-dsl-core/src/main/kotlin/org/gradle/internal/declarativedsl/parsing/LightTreeUtil.kt
+index 65aa5397769..7ea81f87d7c 100644
+--- a/platforms/core-configuration/declarative-dsl-core/src/main/kotlin/org/gradle/internal/declarativedsl/parsing/LightTreeUtil.kt
++++ b/platforms/core-configuration/declarative-dsl-core/src/main/kotlin/org/gradle/internal/declarativedsl/parsing/LightTreeUtil.kt
+@@ -27,11 +27,13 @@ typealias LightTree = FlyweightCapableTreeStructure<LighterASTNode>
+ 
+ fun FlyweightCapableTreeStructure<LighterASTNode>.sourceData(
+     sourceIdentifier: SourceIdentifier,
+-    sourceCode: String
++    sourceCode: String,
++    sourceOffset: Int
+ ) =
+     LightTreeSourceData(
+         sourceIdentifier,
+         sourceCode,
++        sourceOffset,
+         root.range()
+     )
+ 
+@@ -39,16 +41,22 @@ fun FlyweightCapableTreeStructure<LighterASTNode>.sourceData(
+ class LightTreeSourceData(
+     override val sourceIdentifier: SourceIdentifier,
+     private val sourceCode: String,
++    private val sourceOffset: Int,
+     private val nodeRange: IntRange,
+ ) : SourceData {
+ 
+     override fun toString(): String = "LightTreeSourceData(${sourceIdentifier.fileIdentifier}:$nodeRange)"
+ 
+-    override val indexRange: IntRange = nodeRange
++    override val indexRange: IntRange by lazy {
++        val originalRange = nodeRange
++        val first = originalRange.first - sourceOffset
++        val last = originalRange.last - sourceOffset
++        first..last
++    }
+ 
+     private
+     val lineColumnInfo: LineColumnInfo by lazy {
+-        LineColumnInfo.fromIndexRange(sourceCode, indexRange)
++        LineColumnInfo.fromIndexRange(sourceCode, sourceOffset, indexRange)
+     }
+     override
+     val lineRange: IntRange
+@@ -60,12 +68,12 @@ class LightTreeSourceData(
+     val endColumn: Int
+         get() = lineColumnInfo.endColumn
+     override
+-    fun text(): String = sourceCode.substring(indexRange)
++    fun text(): String = sourceCode.substring((indexRange.first + sourceOffset)..(indexRange.last + sourceOffset))
+ 
+     private
+     class LineColumnInfo(val startLine: Int, val startColumn: Int, val endLine: Int, val endColumn: Int) {
+         companion object Factory {
+-            fun fromIndexRange(text: String, indexRange: IntRange): LineColumnInfo {
++            fun fromIndexRange(text: String, offset: Int, offsetRelativeIndexRange: IntRange): LineColumnInfo {
+                 fun String.newLineLength(index: Int): Int =
+                     when (this[index]) {
+                         '\n' -> 1
+@@ -77,28 +85,33 @@ class LightTreeSourceData(
+ 
+                 fun String.isValidIndex(index: Int) = index in indices
+ 
+-                check(text.isValidIndex(indexRange.first) || indexRange.first == text.lastIndex + 1)
+-                check(text.isValidIndex(indexRange.last))
++                check(text.isValidIndex(offset))
++
++                val realStartIndex = offset + offsetRelativeIndexRange.first
++                check(text.isValidIndex(realStartIndex))
++
++                val realEndIndex = offset + offsetRelativeIndexRange.last
++                check(text.isValidIndex(realEndIndex))
+ 
+-                check(indexRange.last - indexRange.first >= -1) // -1 is for empty intervals
++                check(realEndIndex - realStartIndex >= -1) // -1 is for empty intervals
+ 
+                 var startLine = -1
+                 var startColumn = -1
+                 var endLine = -1
+                 var endColumn = -1
+ 
+-                var i = 0
++                var i = offset
+                 var line = 1
+                 var column = 1
+                 while (i < text.length) {
+-                    if (i == indexRange.first) {
++                    if (i == realStartIndex) {
+                         startLine = line
+                         startColumn = column
+                     }
+-                    if (i == indexRange.last) {
++                    if (i == realEndIndex) {
+                         endLine = line
+                         endColumn = column
+-                        if (indexRange.first == indexRange.last + 1) { // might be an empty range, e.g. 20..19
++                        if (realStartIndex == realEndIndex + 1) { // might be an empty range, e.g. 20..19
+                             startLine = line
+                             startColumn = column + 1
+                         }
+@@ -227,12 +240,14 @@ val LighterASTNode.isUseful: Boolean
+ 
+ 
+ internal
+-fun List<LighterASTNode>.expectSingleOfKind(expected: IElementType): LighterASTNode =
+-    this.single { it.isKind(expected) }
++fun LighterASTNode.expectKind(expected: IElementType) {
++    check(isKind(expected))
++}
++
+ 
+ internal
+-fun List<LighterASTNode>.expectSingleOrNoneOfKind(expected: IElementType): LighterASTNode? =
+-    this.singleOrNull { it.isKind(expected) }
++fun List<LighterASTNode>.expectSingleOfKind(expected: IElementType): LighterASTNode =
++    this.single { it.isKind(expected) }
+ 
+ 
+ internal
+@@ -241,8 +256,8 @@ fun LighterASTNode.isKind(expected: IElementType) =
+ 
+ 
+ internal
+-fun LighterASTNode.sourceData(sourceIdentifier: SourceIdentifier, sourceCode: String) =
+-    LightTreeSourceData(sourceIdentifier, sourceCode, this.range())
++fun LighterASTNode.sourceData(sourceIdentifier: SourceIdentifier, sourceCode: String, sourceOffset: Int) =
++    LightTreeSourceData(sourceIdentifier, sourceCode, sourceOffset, this.range())
+ 
+ 
+ private
+diff --git a/platforms/core-configuration/declarative-dsl-core/src/main/kotlin/org/gradle/internal/declarativedsl/parsing/Parser.kt b/platforms/core-configuration/declarative-dsl-core/src/main/kotlin/org/gradle/internal/declarativedsl/parsing/Parser.kt
+index b83f97a59a2..803af55650e 100644
+--- a/platforms/core-configuration/declarative-dsl-core/src/main/kotlin/org/gradle/internal/declarativedsl/parsing/Parser.kt
++++ b/platforms/core-configuration/declarative-dsl-core/src/main/kotlin/org/gradle/internal/declarativedsl/parsing/Parser.kt
+@@ -1,5 +1,6 @@
+ package org.gradle.internal.declarativedsl.parsing
+ 
++import org.gradle.internal.declarativedsl.analysis.interpretationFailure
+ import org.intellij.lang.annotations.Language
+ import org.jetbrains.kotlin.com.intellij.lang.impl.PsiBuilderFactoryImpl
+ import org.jetbrains.kotlin.lexer.KotlinLexer
+@@ -21,14 +22,77 @@ val psiBuilderFactory by lazy {
+ 
+ data class ParsedLightTree(
+     val lightTree: LightTree,
+-    val code: String,
++    val wrappedCode: String,
++    val originalCodeOffset: Int,
++    val suffixLength: Int,
+ )
+ 
+ 
+ fun parse(@Language("dcl") code: String): ParsedLightTree {
++    val (wrappedCode, codeOffset, suffixLength) = wrapScriptIntoClassInitializerBlock(code)
+     val lexer = KotlinLexer()
+     return ParsedLightTree(
+-        KotlinLightParser.parse(psiBuilderFactory.createBuilder(parserDefinition, lexer, code), isScript = true),
+-        code,
++        KotlinLightParser.parse(psiBuilderFactory.createBuilder(parserDefinition, lexer, wrappedCode), isScript = false),
++        wrappedCode,
++        codeOffset,
++        suffixLength
+     )
+ }
++
++
++fun main() {
++    parse(
++        """
++            #!/usr/bin/env kscript
++        a = 1""".trimIndent()
++    ).lightTree.print()
++}
++
++
++private
++fun wrapScriptIntoClassInitializerBlock(@Language("dcl") code: String): Triple<String, Int, Int> {
++    val packageStatements = mutableListOf<String>()
++    val importStatements = mutableListOf<String>()
++    val codeStatements = mutableListOf<String>()
++
++    var isAfterImportLine = false
++
++    code.lines().forEach { line ->
++        when {
++            line.startsWith("import") -> {
++                importStatements.add(line)
++                isAfterImportLine = true
++            }
++
++            line.startsWith("package") -> {
++                packageStatements.add(line)
++                isAfterImportLine = false
++            }
++
++            line.isBlank() -> {
++                if (!isAfterImportLine) codeStatements.add(line)
++            }
++
++            else -> {
++                codeStatements.add(line)
++                isAfterImportLine = false
++            }
++        } // TODO: ugly, brittle hack...
++    }
++
++    if (packageStatements.size > 2) interpretationFailure("Multiple package statements in $code")
++
++    fun addNewlineIfNotBlank(it: String) = when {
++        it.isNotBlank() -> it + "\n"
++        else -> it
++    }
++
++    val packageSection = packageStatements.joinToString("") { addNewlineIfNotBlank(it) }
++    val importSection = importStatements.joinToString("") { addNewlineIfNotBlank(it) }
++    val codeSection = codeStatements.joinToString("") { "$it\n" }
++
++    val prefix = "${packageSection}${importSection}class Script {init {"
++    val suffix = "}}"
++    val codeOffset = prefix.length
++    return Triple("$prefix$codeSection$suffix", codeOffset, suffix.length)
++}
+diff --git a/platforms/core-configuration/declarative-dsl-core/src/test/kotlin/org/gradle/internal/declarativedsl/dom/operations/overlay/DocumentOverlayTest.kt b/platforms/core-configuration/declarative-dsl-core/src/test/kotlin/org/gradle/internal/declarativedsl/dom/operations/overlay/DocumentOverlayTest.kt
+index 09cc4108801..52bc7283102 100644
+--- a/platforms/core-configuration/declarative-dsl-core/src/test/kotlin/org/gradle/internal/declarativedsl/dom/operations/overlay/DocumentOverlayTest.kt
++++ b/platforms/core-configuration/declarative-dsl-core/src/test/kotlin/org/gradle/internal/declarativedsl/dom/operations/overlay/DocumentOverlayTest.kt
+@@ -322,8 +322,8 @@ class DocumentOverlayTest {
+                 * element(unresolved4, [], content.size = 0) -> FromOverlay(documentNode=element(unresolved4, [], content.size = 0))
+             * element(configuring, [], content.size = 7) -> MergedElements(underlayElement=element(configuring, [], content.size = 4), overlayElement=element(configuring, [], content.size = 4))
+                 * element(unresolved2, [], content.size = 0) -> FromUnderlay(documentNode=element(unresolved2, [], content.size = 0))
+-                * error(SyntaxError(parsingError=ParsingError(potentialElementSource=LightTreeSourceData(test:144..150), erroneousSource=LightTreeSourceData(test:144..150), message=Unsupported operation in unary expression: !))) -> FromUnderlay(documentNode=error(SyntaxError(parsingError=ParsingError(potentialElementSource=LightTreeSourceData(test:144..150), erroneousSource=LightTreeSourceData(test:144..150), message=Unsupported operation in unary expression: !))))
+-                * error(SyntaxError(parsingError=ParsingError(potentialElementSource=LightTreeSourceData(test:151..165), erroneousSource=LightTreeSourceData(test:151..165), message=Unexpected tokens (use ';' to separate expressions on the same line)))) -> FromUnderlay(documentNode=error(SyntaxError(parsingError=ParsingError(potentialElementSource=LightTreeSourceData(test:151..165), erroneousSource=LightTreeSourceData(test:151..165), message=Unexpected tokens (use ';' to separate expressions on the same line)))))
++                * error(SyntaxError(parsingError=ParsingError(potentialElementSource=LightTreeSourceData(test:164..170), erroneousSource=LightTreeSourceData(test:164..170), message=Unsupported operation in unary expression: !))) -> FromUnderlay(documentNode=error(SyntaxError(parsingError=ParsingError(potentialElementSource=LightTreeSourceData(test:164..170), erroneousSource=LightTreeSourceData(test:164..170), message=Unsupported operation in unary expression: !))))
++                * error(SyntaxError(parsingError=ParsingError(potentialElementSource=LightTreeSourceData(test:171..185), erroneousSource=LightTreeSourceData(test:171..185), message=Unexpected tokens (use ';' to separate expressions on the same line)))) -> FromUnderlay(documentNode=error(SyntaxError(parsingError=ParsingError(potentialElementSource=LightTreeSourceData(test:171..185), erroneousSource=LightTreeSourceData(test:171..185), message=Unexpected tokens (use ';' to separate expressions on the same line)))))
+                 * property(a, literal(33)) -> MergedProperties(shadowedPropertiesFromUnderlay=[property(a, literal(3))], effectivePropertiesFromUnderlay=[], shadowedPropertiesFromOverlay=[], effectivePropertiesFromOverlay=[property(a, literal(33))])
+                     - literal(33) -> FromOverlay(documentNode=property(a, literal(33)))
+                 * property(b, literal(6)) -> FromOverlay(documentNode=property(b, literal(6)))
+diff --git a/platforms/core-configuration/declarative-dsl-core/src/test/kotlin/org/gradle/internal/declarativedsl/parsing/BasicParsingTest.kt b/platforms/core-configuration/declarative-dsl-core/src/test/kotlin/org/gradle/internal/declarativedsl/parsing/BasicParsingTest.kt
+index 4ea4643e16f..238a077eb90 100644
+--- a/platforms/core-configuration/declarative-dsl-core/src/test/kotlin/org/gradle/internal/declarativedsl/parsing/BasicParsingTest.kt
++++ b/platforms/core-configuration/declarative-dsl-core/src/test/kotlin/org/gradle/internal/declarativedsl/parsing/BasicParsingTest.kt
+@@ -634,8 +634,11 @@ class BasicParsingTest {
+             """
+             import a.b.c
+ 
++            // start of actual script content is here -- imports are counted separately because of the workarounds
++
+             f(x)
+ 
++
+             a = 1
+             """.trimIndent()
+         )
+@@ -644,21 +647,21 @@ class BasicParsingTest {
+             Import [indexes: 0..12, line/column: 1/1..1/13, file: test (
+                 name parts = [a, b, c]
+             )
+-            FunctionCall [indexes: 14..18, line/column: 3/1..3/5, file: test] (
++            FunctionCall [indexes: 104..108, line/column: 3/1..3/5, file: test] (
+                 name = f
+                 args = [
+-                    FunctionArgument.Positional [indexes: 16..17, line/column: 3/3..3/4, file: test] (
+-                        expr = NamedReference [indexes: 16..17, line/column: 3/3..3/4, file: test] (
++                    FunctionArgument.Positional [indexes: 106..107, line/column: 3/3..3/4, file: test] (
++                        expr = NamedReference [indexes: 106..107, line/column: 3/3..3/4, file: test] (
+                             name = x
+                         )
+                     )
+                 ]
+             )
+-            Assignment [indexes: 20..25, line/column: 5/1..5/6, file: test] (
+-                lhs = NamedReference [indexes: 20..21, line/column: 5/1..5/2, file: test] (
++            Assignment [indexes: 111..116, line/column: 6/1..6/6, file: test] (
++                lhs = NamedReference [indexes: 111..112, line/column: 6/1..6/2, file: test] (
+                     name = a
+                 )
+-                rhs = IntLiteral [indexes: 24..25, line/column: 5/5..5/6, file: test] (1)
++                rhs = IntLiteral [indexes: 115..116, line/column: 6/5..6/6, file: test] (1)
+             )
+         """.trimIndent()
+ 
+diff --git a/platforms/core-configuration/declarative-dsl-core/src/test/kotlin/org/gradle/internal/declarativedsl/parsing/ErrorParsingTest.kt b/platforms/core-configuration/declarative-dsl-core/src/test/kotlin/org/gradle/internal/declarativedsl/parsing/ErrorParsingTest.kt
+index 284501d59a1..3eac1bc6cfc 100644
+--- a/platforms/core-configuration/declarative-dsl-core/src/test/kotlin/org/gradle/internal/declarativedsl/parsing/ErrorParsingTest.kt
++++ b/platforms/core-configuration/declarative-dsl-core/src/test/kotlin/org/gradle/internal/declarativedsl/parsing/ErrorParsingTest.kt
+@@ -218,13 +218,18 @@ class ErrorParsingTest {
+             )
+             ErroneousStatement (
+                 ParsingError(
+-                    message = Expecting an element,
+-                    potentialElementSource = indexes: 14..15, line/column: 2/4..2/5, file: test,
+-                    erroneousSource = indexes: 14..15, line/column: 2/4..2/5, file: test
++                    message = Unexpected tokens (use ';' to separate expressions on the same line),
++                    potentialElementSource = indexes: 14..17, line/column: 2/4..2/7, file: test,
++                    erroneousSource = indexes: 14..17, line/column: 2/4..2/7, file: test
+                 )
+             )
+-            IntLiteral [indexes: 16..17, line/column: 2/6..2/7, file: test] (1)
+-        """.trimIndent()
++            ErroneousStatement (
++                ParsingError(
++                    message = Expecting an element,
++                    potentialElementSource = indexes: 17..18, line/column: 2/7..2/8, file: test,
++                    erroneousSource = indexes: 17..18, line/column: 2/7..2/8, file: test
++                )
++            )""".trimIndent()
+         ParseTestUtil.parse(code).assert(expected)
+     }
+ 
+@@ -286,19 +291,22 @@ class ErrorParsingTest {
+ 
+         val expected = """
+             ErroneousStatement (
+-                ParsingError(
+-                    message = Unparsable value argument: "("plugin-id-1) ; kotlin("plugin-id-2")". Expecting ',',
+-                    potentialElementSource = indexes: 6..44, line/column: 1/7..1/45, file: test,
+-                    erroneousSource = indexes: 42..42, line/column: 1/43..1/43, file: test
++                MultipleFailures(
++                    ParsingError(
++                        message = Unparsable value argument: "("plugin-id-1) ; kotlin("plugin-id-2")". Expecting ',',
++                        potentialElementSource = indexes: 6..44, line/column: 1/7..1/45, file: test,
++                        erroneousSource = indexes: 42..42, line/column: 1/43..1/43, file: test
++                    )
++                    ParsingError(
++                        message = Unparsable value argument: "("plugin-id-1) ; kotlin("plugin-id-2")". Expecting ')',
++                        potentialElementSource = indexes: 6..44, line/column: 1/7..1/45, file: test,
++                        erroneousSource = indexes: 44..44, line/column: 1/45..1/45, file: test
++                    )
+                 )
+             )""".trimIndent()
+         ParseTestUtil.parse(code).assert(expected)
+     }
+ 
+-    /**
+-     * The Kotlin Script parser fails to report an error here. It simply produces two top-level expressions for `c 3`.
+-     * This is tracked in https://youtrack.jetbrains.com/issue/KT-81665/
+-     */
+     @Test
+     fun `missing assignment in one of a series of assignments`() {
+         val code = """
+@@ -325,7 +333,13 @@ class ErrorParsingTest {
+             NamedReference [indexes: 12..13, line/column: 3/1..3/2, file: test] (
+                 name = c
+             )
+-            IntLiteral [indexes: 14..15, line/column: 3/3..3/4, file: test] (3)
++            ErroneousStatement (
++                ParsingError(
++                    message = Unexpected tokens (use ';' to separate expressions on the same line),
++                    potentialElementSource = indexes: 14..15, line/column: 3/3..3/4, file: test,
++                    erroneousSource = indexes: 14..15, line/column: 3/3..3/4, file: test
++                )
++            )
+             Assignment [indexes: 16..21, line/column: 4/1..4/6, file: test] (
+                 lhs = NamedReference [indexes: 16..17, line/column: 4/1..4/2, file: test] (
+                     name = d
+@@ -448,7 +462,13 @@ class ErrorParsingTest {
+                     erroneousSource = indexes: 16..16, line/column: 3/4..3/4, file: test
+                 )
+             )
+-            IntLiteral [indexes: 17..18, line/column: 3/5..3/6, file: test] (9)
++            ErroneousStatement (
++                ParsingError(
++                    message = Unexpected tokens (use ';' to separate expressions on the same line),
++                    potentialElementSource = indexes: 17..18, line/column: 3/5..3/6, file: test,
++                    erroneousSource = indexes: 17..18, line/column: 3/5..3/6, file: test
++                )
++            )
+             Assignment [indexes: 19..25, line/column: 4/1..4/7, file: test] (
+                 lhs = NamedReference [indexes: 19..20, line/column: 4/1..4/2, file: test] (
+                     name = d
+@@ -480,7 +500,13 @@ class ErrorParsingTest {
+                     erroneousSource = indexes: 14..15, line/column: 2/9..2/10, file: test
+                 )
+             )
+-            IntLiteral [indexes: 16..17, line/column: 2/11..2/12, file: test] (3)
++            ErroneousStatement (
++                ParsingError(
++                    message = Unexpected tokens (use ';' to separate expressions on the same line),
++                    potentialElementSource = indexes: 16..17, line/column: 2/11..2/12, file: test,
++                    erroneousSource = indexes: 16..17, line/column: 2/11..2/12, file: test
++                )
++            )
+             Assignment [indexes: 18..23, line/column: 3/1..3/6, file: test] (
+                 lhs = NamedReference [indexes: 18..19, line/column: 3/1..3/2, file: test] (
+                     name = d
+@@ -803,203 +829,197 @@ class ErrorParsingTest {
+                 )
+                 rhs = IntLiteral [indexes: 162..163, line/column: 14/7..14/8, file: test] (1)
+             )
+-            Assignment [indexes: 164..174, line/column: 15/1..15/11, file: test] (
+-                lhs = NamedReference [indexes: 164..170, line/column: 15/1..15/7, file: test] (
+-                    name = import
+-                )
+-                rhs = IntLiteral [indexes: 173..174, line/column: 15/10..15/11, file: test] (1)
+-            )
+-            Assignment [indexes: 175..184, line/column: 16/1..16/10, file: test] (
+-                lhs = NamedReference [indexes: 175..180, line/column: 16/1..16/6, file: test] (
++            Assignment [indexes: 164..173, line/column: 15/1..15/10, file: test] (
++                lhs = NamedReference [indexes: 164..169, line/column: 15/1..15/6, file: test] (
+                     name = infix
+                 )
+-                rhs = IntLiteral [indexes: 183..184, line/column: 16/9..16/10, file: test] (1)
++                rhs = IntLiteral [indexes: 172..173, line/column: 15/9..15/10, file: test] (1)
+             )
+-            Assignment [indexes: 185..193, line/column: 17/1..17/9, file: test] (
+-                lhs = NamedReference [indexes: 185..189, line/column: 17/1..17/5, file: test] (
++            Assignment [indexes: 174..182, line/column: 16/1..16/9, file: test] (
++                lhs = NamedReference [indexes: 174..178, line/column: 16/1..16/5, file: test] (
+                     name = init
+                 )
+-                rhs = IntLiteral [indexes: 192..193, line/column: 17/8..17/9, file: test] (1)
++                rhs = IntLiteral [indexes: 181..182, line/column: 16/8..16/9, file: test] (1)
+             )
+-            Assignment [indexes: 194..204, line/column: 18/1..18/11, file: test] (
+-                lhs = NamedReference [indexes: 194..200, line/column: 18/1..18/7, file: test] (
++            Assignment [indexes: 183..193, line/column: 17/1..17/11, file: test] (
++                lhs = NamedReference [indexes: 183..189, line/column: 17/1..17/7, file: test] (
+                     name = inline
+                 )
+-                rhs = IntLiteral [indexes: 203..204, line/column: 18/10..18/11, file: test] (1)
++                rhs = IntLiteral [indexes: 192..193, line/column: 17/10..17/11, file: test] (1)
+             )
+-            Assignment [indexes: 205..214, line/column: 19/1..19/10, file: test] (
+-                lhs = NamedReference [indexes: 205..210, line/column: 19/1..19/6, file: test] (
++            Assignment [indexes: 194..203, line/column: 18/1..18/10, file: test] (
++                lhs = NamedReference [indexes: 194..199, line/column: 18/1..18/6, file: test] (
+                     name = inner
+                 )
+-                rhs = IntLiteral [indexes: 213..214, line/column: 19/9..19/10, file: test] (1)
++                rhs = IntLiteral [indexes: 202..203, line/column: 18/9..18/10, file: test] (1)
+             )
+-            Assignment [indexes: 215..227, line/column: 20/1..20/13, file: test] (
+-                lhs = NamedReference [indexes: 215..223, line/column: 20/1..20/9, file: test] (
++            Assignment [indexes: 204..216, line/column: 19/1..19/13, file: test] (
++                lhs = NamedReference [indexes: 204..212, line/column: 19/1..19/9, file: test] (
+                     name = internal
+                 )
+-                rhs = IntLiteral [indexes: 226..227, line/column: 20/12..20/13, file: test] (1)
++                rhs = IntLiteral [indexes: 215..216, line/column: 19/12..19/13, file: test] (1)
+             )
+-            Assignment [indexes: 228..240, line/column: 21/1..21/13, file: test] (
+-                lhs = NamedReference [indexes: 228..236, line/column: 21/1..21/9, file: test] (
++            Assignment [indexes: 217..229, line/column: 20/1..20/13, file: test] (
++                lhs = NamedReference [indexes: 217..225, line/column: 20/1..20/9, file: test] (
+                     name = lateinit
+                 )
+-                rhs = IntLiteral [indexes: 239..240, line/column: 21/12..21/13, file: test] (1)
++                rhs = IntLiteral [indexes: 228..229, line/column: 20/12..20/13, file: test] (1)
+             )
+-            Assignment [indexes: 241..253, line/column: 22/1..22/13, file: test] (
+-                lhs = NamedReference [indexes: 241..249, line/column: 22/1..22/9, file: test] (
++            Assignment [indexes: 230..242, line/column: 21/1..21/13, file: test] (
++                lhs = NamedReference [indexes: 230..238, line/column: 21/1..21/9, file: test] (
+                     name = noinline
+                 )
+-                rhs = IntLiteral [indexes: 252..253, line/column: 22/12..22/13, file: test] (1)
++                rhs = IntLiteral [indexes: 241..242, line/column: 21/12..21/13, file: test] (1)
+             )
+-            Assignment [indexes: 254..262, line/column: 23/1..23/9, file: test] (
+-                lhs = NamedReference [indexes: 254..258, line/column: 23/1..23/5, file: test] (
++            Assignment [indexes: 243..251, line/column: 22/1..22/9, file: test] (
++                lhs = NamedReference [indexes: 243..247, line/column: 22/1..22/5, file: test] (
+                     name = open
+                 )
+-                rhs = IntLiteral [indexes: 261..262, line/column: 23/8..23/9, file: test] (1)
++                rhs = IntLiteral [indexes: 250..251, line/column: 22/8..22/9, file: test] (1)
+             )
+-            Assignment [indexes: 263..275, line/column: 24/1..24/13, file: test] (
+-                lhs = NamedReference [indexes: 263..271, line/column: 24/1..24/9, file: test] (
++            Assignment [indexes: 252..264, line/column: 23/1..23/13, file: test] (
++                lhs = NamedReference [indexes: 252..260, line/column: 23/1..23/9, file: test] (
+                     name = operator
+                 )
+-                rhs = IntLiteral [indexes: 274..275, line/column: 24/12..24/13, file: test] (1)
++                rhs = IntLiteral [indexes: 263..264, line/column: 23/12..23/13, file: test] (1)
+             )
+-            Assignment [indexes: 276..283, line/column: 25/1..25/8, file: test] (
+-                lhs = NamedReference [indexes: 276..279, line/column: 25/1..25/4, file: test] (
++            Assignment [indexes: 265..272, line/column: 24/1..24/8, file: test] (
++                lhs = NamedReference [indexes: 265..268, line/column: 24/1..24/4, file: test] (
+                     name = out
+                 )
+-                rhs = IntLiteral [indexes: 282..283, line/column: 25/7..25/8, file: test] (1)
++                rhs = IntLiteral [indexes: 271..272, line/column: 24/7..24/8, file: test] (1)
+             )
+-            Assignment [indexes: 284..296, line/column: 26/1..26/13, file: test] (
+-                lhs = NamedReference [indexes: 284..292, line/column: 26/1..26/9, file: test] (
++            Assignment [indexes: 273..285, line/column: 25/1..25/13, file: test] (
++                lhs = NamedReference [indexes: 273..281, line/column: 25/1..25/9, file: test] (
+                     name = override
+                 )
+-                rhs = IntLiteral [indexes: 295..296, line/column: 26/12..26/13, file: test] (1)
++                rhs = IntLiteral [indexes: 284..285, line/column: 25/12..25/13, file: test] (1)
+             )
+-            Assignment [indexes: 297..308, line/column: 27/1..27/12, file: test] (
+-                lhs = NamedReference [indexes: 297..304, line/column: 27/1..27/8, file: test] (
++            Assignment [indexes: 286..297, line/column: 26/1..26/12, file: test] (
++                lhs = NamedReference [indexes: 286..293, line/column: 26/1..26/8, file: test] (
+                     name = private
+                 )
+-                rhs = IntLiteral [indexes: 307..308, line/column: 27/11..27/12, file: test] (1)
++                rhs = IntLiteral [indexes: 296..297, line/column: 26/11..26/12, file: test] (1)
+             )
+-            Assignment [indexes: 309..322, line/column: 28/1..28/14, file: test] (
+-                lhs = NamedReference [indexes: 309..318, line/column: 28/1..28/10, file: test] (
++            Assignment [indexes: 298..311, line/column: 27/1..27/14, file: test] (
++                lhs = NamedReference [indexes: 298..307, line/column: 27/1..27/10, file: test] (
+                     name = protected
+                 )
+-                rhs = IntLiteral [indexes: 321..322, line/column: 28/13..28/14, file: test] (1)
++                rhs = IntLiteral [indexes: 310..311, line/column: 27/13..27/14, file: test] (1)
+             )
+-            Assignment [indexes: 323..333, line/column: 29/1..29/11, file: test] (
+-                lhs = NamedReference [indexes: 323..329, line/column: 29/1..29/7, file: test] (
++            Assignment [indexes: 312..322, line/column: 28/1..28/11, file: test] (
++                lhs = NamedReference [indexes: 312..318, line/column: 28/1..28/7, file: test] (
+                     name = public
+                 )
+-                rhs = IntLiteral [indexes: 332..333, line/column: 29/10..29/11, file: test] (1)
++                rhs = IntLiteral [indexes: 321..322, line/column: 28/10..28/11, file: test] (1)
+             )
+-            Assignment [indexes: 334..345, line/column: 30/1..30/12, file: test] (
+-                lhs = NamedReference [indexes: 334..341, line/column: 30/1..30/8, file: test] (
++            Assignment [indexes: 323..334, line/column: 29/1..29/12, file: test] (
++                lhs = NamedReference [indexes: 323..330, line/column: 29/1..29/8, file: test] (
+                     name = reified
+                 )
+-                rhs = IntLiteral [indexes: 344..345, line/column: 30/11..30/12, file: test] (1)
++                rhs = IntLiteral [indexes: 333..334, line/column: 29/11..29/12, file: test] (1)
+             )
+-            Assignment [indexes: 346..356, line/column: 31/1..31/11, file: test] (
+-                lhs = NamedReference [indexes: 346..352, line/column: 31/1..31/7, file: test] (
++            Assignment [indexes: 335..345, line/column: 30/1..30/11, file: test] (
++                lhs = NamedReference [indexes: 335..341, line/column: 30/1..30/7, file: test] (
+                     name = sealed
+                 )
+-                rhs = IntLiteral [indexes: 355..356, line/column: 31/10..31/11, file: test] (1)
++                rhs = IntLiteral [indexes: 344..345, line/column: 30/10..30/11, file: test] (1)
+             )
+-            Assignment [indexes: 357..368, line/column: 32/1..32/12, file: test] (
+-                lhs = NamedReference [indexes: 357..364, line/column: 32/1..32/8, file: test] (
++            Assignment [indexes: 346..357, line/column: 31/1..31/12, file: test] (
++                lhs = NamedReference [indexes: 346..353, line/column: 31/1..31/8, file: test] (
+                     name = tailrec
+                 )
+-                rhs = IntLiteral [indexes: 367..368, line/column: 32/11..32/12, file: test] (1)
++                rhs = IntLiteral [indexes: 356..357, line/column: 31/11..31/12, file: test] (1)
+             )
+-            Assignment [indexes: 369..376, line/column: 33/1..33/8, file: test] (
+-                lhs = NamedReference [indexes: 369..372, line/column: 33/1..33/4, file: test] (
++            Assignment [indexes: 358..365, line/column: 32/1..32/8, file: test] (
++                lhs = NamedReference [indexes: 358..361, line/column: 32/1..32/4, file: test] (
+                     name = set
+                 )
+-                rhs = IntLiteral [indexes: 375..376, line/column: 33/7..33/8, file: test] (1)
++                rhs = IntLiteral [indexes: 364..365, line/column: 32/7..32/8, file: test] (1)
+             )
+-            Assignment [indexes: 377..387, line/column: 34/1..34/11, file: test] (
+-                lhs = NamedReference [indexes: 377..383, line/column: 34/1..34/7, file: test] (
++            Assignment [indexes: 366..376, line/column: 33/1..33/11, file: test] (
++                lhs = NamedReference [indexes: 366..372, line/column: 33/1..33/7, file: test] (
+                     name = vararg
+                 )
+-                rhs = IntLiteral [indexes: 386..387, line/column: 34/10..34/11, file: test] (1)
++                rhs = IntLiteral [indexes: 375..376, line/column: 33/10..33/11, file: test] (1)
+             )
+-            Assignment [indexes: 388..397, line/column: 35/1..35/10, file: test] (
+-                lhs = NamedReference [indexes: 388..393, line/column: 35/1..35/6, file: test] (
++            Assignment [indexes: 377..386, line/column: 34/1..34/10, file: test] (
++                lhs = NamedReference [indexes: 377..382, line/column: 34/1..34/6, file: test] (
+                     name = where
+                 )
+-                rhs = IntLiteral [indexes: 396..397, line/column: 35/9..35/10, file: test] (1)
++                rhs = IntLiteral [indexes: 385..386, line/column: 34/9..34/10, file: test] (1)
+             )
+-            Assignment [indexes: 398..407, line/column: 36/1..36/10, file: test] (
+-                lhs = NamedReference [indexes: 398..403, line/column: 36/1..36/6, file: test] (
++            Assignment [indexes: 387..396, line/column: 35/1..35/10, file: test] (
++                lhs = NamedReference [indexes: 387..392, line/column: 35/1..35/6, file: test] (
+                     name = field
+                 )
+-                rhs = IntLiteral [indexes: 406..407, line/column: 36/9..36/10, file: test] (1)
++                rhs = IntLiteral [indexes: 395..396, line/column: 35/9..35/10, file: test] (1)
+             )
+-            Assignment [indexes: 408..420, line/column: 37/1..37/13, file: test] (
+-                lhs = NamedReference [indexes: 408..416, line/column: 37/1..37/9, file: test] (
++            Assignment [indexes: 397..409, line/column: 36/1..36/13, file: test] (
++                lhs = NamedReference [indexes: 397..405, line/column: 36/1..36/9, file: test] (
+                     name = property
+                 )
+-                rhs = IntLiteral [indexes: 419..420, line/column: 37/12..37/13, file: test] (1)
++                rhs = IntLiteral [indexes: 408..409, line/column: 36/12..36/13, file: test] (1)
+             )
+-            Assignment [indexes: 421..433, line/column: 38/1..38/13, file: test] (
+-                lhs = NamedReference [indexes: 421..429, line/column: 38/1..38/9, file: test] (
++            Assignment [indexes: 410..422, line/column: 37/1..37/13, file: test] (
++                lhs = NamedReference [indexes: 410..418, line/column: 37/1..37/9, file: test] (
+                     name = receiver
+                 )
+-                rhs = IntLiteral [indexes: 432..433, line/column: 38/12..38/13, file: test] (1)
++                rhs = IntLiteral [indexes: 421..422, line/column: 37/12..37/13, file: test] (1)
+             )
+-            Assignment [indexes: 434..443, line/column: 39/1..39/10, file: test] (
+-                lhs = NamedReference [indexes: 434..439, line/column: 39/1..39/6, file: test] (
++            Assignment [indexes: 423..432, line/column: 38/1..38/10, file: test] (
++                lhs = NamedReference [indexes: 423..428, line/column: 38/1..38/6, file: test] (
+                     name = param
+                 )
+-                rhs = IntLiteral [indexes: 442..443, line/column: 39/9..39/10, file: test] (1)
++                rhs = IntLiteral [indexes: 431..432, line/column: 38/9..38/10, file: test] (1)
+             )
+-            Assignment [indexes: 444..456, line/column: 40/1..40/13, file: test] (
+-                lhs = NamedReference [indexes: 444..452, line/column: 40/1..40/9, file: test] (
++            Assignment [indexes: 433..445, line/column: 39/1..39/13, file: test] (
++                lhs = NamedReference [indexes: 433..441, line/column: 39/1..39/9, file: test] (
+                     name = setparam
+                 )
+-                rhs = IntLiteral [indexes: 455..456, line/column: 40/12..40/13, file: test] (1)
++                rhs = IntLiteral [indexes: 444..445, line/column: 39/12..39/13, file: test] (1)
+             )
+-            Assignment [indexes: 457..469, line/column: 41/1..41/13, file: test] (
+-                lhs = NamedReference [indexes: 457..465, line/column: 41/1..41/9, file: test] (
++            Assignment [indexes: 446..458, line/column: 40/1..40/13, file: test] (
++                lhs = NamedReference [indexes: 446..454, line/column: 40/1..40/9, file: test] (
+                     name = delegate
+                 )
+-                rhs = IntLiteral [indexes: 468..469, line/column: 41/12..41/13, file: test] (1)
++                rhs = IntLiteral [indexes: 457..458, line/column: 40/12..40/13, file: test] (1)
+             )
+-            Assignment [indexes: 470..478, line/column: 42/1..42/9, file: test] (
+-                lhs = NamedReference [indexes: 470..474, line/column: 42/1..42/5, file: test] (
++            Assignment [indexes: 459..467, line/column: 41/1..41/9, file: test] (
++                lhs = NamedReference [indexes: 459..463, line/column: 41/1..41/5, file: test] (
+                     name = file
+                 )
+-                rhs = IntLiteral [indexes: 477..478, line/column: 42/8..42/9, file: test] (1)
++                rhs = IntLiteral [indexes: 466..467, line/column: 41/8..41/9, file: test] (1)
+             )
+-            Assignment [indexes: 479..489, line/column: 43/1..43/11, file: test] (
+-                lhs = NamedReference [indexes: 479..485, line/column: 43/1..43/7, file: test] (
++            Assignment [indexes: 468..478, line/column: 42/1..42/11, file: test] (
++                lhs = NamedReference [indexes: 468..474, line/column: 42/1..42/7, file: test] (
+                     name = expect
+                 )
+-                rhs = IntLiteral [indexes: 488..489, line/column: 43/10..43/11, file: test] (1)
++                rhs = IntLiteral [indexes: 477..478, line/column: 42/10..42/11, file: test] (1)
+             )
+-            Assignment [indexes: 490..500, line/column: 44/1..44/11, file: test] (
+-                lhs = NamedReference [indexes: 490..496, line/column: 44/1..44/7, file: test] (
++            Assignment [indexes: 479..489, line/column: 43/1..43/11, file: test] (
++                lhs = NamedReference [indexes: 479..485, line/column: 43/1..43/7, file: test] (
+                     name = actual
+                 )
+-                rhs = IntLiteral [indexes: 499..500, line/column: 44/10..44/11, file: test] (1)
++                rhs = IntLiteral [indexes: 488..489, line/column: 43/10..43/11, file: test] (1)
+             )
+-            Assignment [indexes: 501..510, line/column: 45/1..45/10, file: test] (
+-                lhs = NamedReference [indexes: 501..506, line/column: 45/1..45/6, file: test] (
++            Assignment [indexes: 490..499, line/column: 44/1..44/10, file: test] (
++                lhs = NamedReference [indexes: 490..495, line/column: 44/1..44/6, file: test] (
+                     name = const
+                 )
+-                rhs = IntLiteral [indexes: 509..510, line/column: 45/9..45/10, file: test] (1)
++                rhs = IntLiteral [indexes: 498..499, line/column: 44/9..44/10, file: test] (1)
+             )
+-            Assignment [indexes: 511..522, line/column: 46/1..46/12, file: test] (
+-                lhs = NamedReference [indexes: 511..518, line/column: 46/1..46/8, file: test] (
++            Assignment [indexes: 500..511, line/column: 45/1..45/12, file: test] (
++                lhs = NamedReference [indexes: 500..507, line/column: 45/1..45/8, file: test] (
+                     name = suspend
+                 )
+-                rhs = IntLiteral [indexes: 521..522, line/column: 46/11..46/12, file: test] (1)
++                rhs = IntLiteral [indexes: 510..511, line/column: 45/11..45/12, file: test] (1)
+             )
+-            Assignment [indexes: 523..532, line/column: 47/1..47/10, file: test] (
+-                lhs = NamedReference [indexes: 523..528, line/column: 47/1..47/6, file: test] (
++            Assignment [indexes: 512..521, line/column: 46/1..46/10, file: test] (
++                lhs = NamedReference [indexes: 512..517, line/column: 46/1..46/6, file: test] (
+                     name = value
+                 )
+-                rhs = IntLiteral [indexes: 531..532, line/column: 47/9..47/10, file: test] (1)
++                rhs = IntLiteral [indexes: 520..521, line/column: 46/9..46/10, file: test] (1)
+             )""".trimIndent()
+         results.assert(expected)
+     }
+diff --git a/platforms/core-configuration/declarative-dsl-core/src/test/kotlin/org/gradle/internal/declarativedsl/parsing/ImportTest.kt b/platforms/core-configuration/declarative-dsl-core/src/test/kotlin/org/gradle/internal/declarativedsl/parsing/ImportTest.kt
+index a931f558858..468b179b703 100644
+--- a/platforms/core-configuration/declarative-dsl-core/src/test/kotlin/org/gradle/internal/declarativedsl/parsing/ImportTest.kt
++++ b/platforms/core-configuration/declarative-dsl-core/src/test/kotlin/org/gradle/internal/declarativedsl/parsing/ImportTest.kt
+@@ -123,5 +123,5 @@ class ImportTest {
+     val sourceIdentifier = SourceIdentifier("test")
+ 
+     private
+-    val mockSourceData = mockNode.sourceData(sourceIdentifier, "")
++    val mockSourceData = mockNode.sourceData(sourceIdentifier, "", 0)
+ }
+diff --git a/platforms/core-configuration/declarative-dsl-core/src/testFixtures/kotlin/org/gradle/internal/declarativedsl/demo/resolve.kt b/platforms/core-configuration/declarative-dsl-core/src/testFixtures/kotlin/org/gradle/internal/declarativedsl/demo/resolve.kt
+index daed7e187af..b5a8df6f4f7 100644
+--- a/platforms/core-configuration/declarative-dsl-core/src/testFixtures/kotlin/org/gradle/internal/declarativedsl/demo/resolve.kt
++++ b/platforms/core-configuration/declarative-dsl-core/src/testFixtures/kotlin/org/gradle/internal/declarativedsl/demo/resolve.kt
+@@ -47,7 +47,7 @@ fun AnalysisSchema.resolve(
+                     "Parsing error: " + failure.message
+                 )
+                 is UnsupportedConstruct -> println(
+-                    failure.languageFeature.toString() + " in " + failure.potentialElementSource.text()
++                    failure.languageFeature.toString() + " in " + parsedTree.wrappedCode.slice(parsedTree.originalCodeOffset..parsedTree.originalCodeOffset + failure.potentialElementSource.indexRange.count())
+                 )
+                 is MultipleFailuresResult -> failure.failures.forEach { printFailures(it) }
+             }
+diff --git a/platforms/ide/ide-plugins/src/main/java/org/gradle/plugins/ide/eclipse/EclipsePlugin.java b/platforms/ide/ide-plugins/src/main/java/org/gradle/plugins/ide/eclipse/EclipsePlugin.java
+index dd25aa63b24..5dd9e806ece 100644
+--- a/platforms/ide/ide-plugins/src/main/java/org/gradle/plugins/ide/eclipse/EclipsePlugin.java
++++ b/platforms/ide/ide-plugins/src/main/java/org/gradle/plugins/ide/eclipse/EclipsePlugin.java
+@@ -147,7 +147,7 @@ public void execute(Task task) {
+     private void configureEclipseProject(final ProjectInternal project, final EclipseModel model) {
+         final EclipseProject projectModel = model.getProject();
+ 
+-        projectModel.setName(uniqueProjectNameProvider.getUniqueName(project));
++        projectModel.setName(uniqueProjectNameProvider.getUniqueName(project.getProjectIdentity()));
+ 
+         final ConventionMapping convention = ((IConventionAware) projectModel).getConventionMapping();
+         convention.map("comment", new Callable<String>() {
+diff --git a/platforms/ide/ide-plugins/src/main/java/org/gradle/plugins/ide/idea/IdeaPlugin.java b/platforms/ide/ide-plugins/src/main/java/org/gradle/plugins/ide/idea/IdeaPlugin.java
+index 8e17adb7cbf..0ebd3489637 100644
+--- a/platforms/ide/ide-plugins/src/main/java/org/gradle/plugins/ide/idea/IdeaPlugin.java
++++ b/platforms/ide/ide-plugins/src/main/java/org/gradle/plugins/ide/idea/IdeaPlugin.java
+@@ -283,7 +283,7 @@ public void execute(GenerateIdeaModule task) {
+         task.configure(IdePluginHelper.withGracefulDegradation());
+         ideaModel.setModule(module);
+ 
+-        final String defaultModuleName = uniqueProjectNameProvider.getUniqueName(project);
++        final String defaultModuleName = uniqueProjectNameProvider.getUniqueName(project.getProjectIdentity());
+         module.setName(defaultModuleName);
+ 
+         ConventionMapping conventionMapping = ((IConventionAware) module).getConventionMapping();
+diff --git a/platforms/ide/ide-plugins/src/main/java/org/gradle/plugins/ide/internal/tooling/EclipseModelBuilder.java b/platforms/ide/ide-plugins/src/main/java/org/gradle/plugins/ide/internal/tooling/EclipseModelBuilder.java
+index 83d22283ee0..15a854453d1 100644
+--- a/platforms/ide/ide-plugins/src/main/java/org/gradle/plugins/ide/internal/tooling/EclipseModelBuilder.java
++++ b/platforms/ide/ide-plugins/src/main/java/org/gradle/plugins/ide/internal/tooling/EclipseModelBuilder.java
+@@ -164,7 +164,7 @@ private void deduplicateProjectNames(ProjectInternal root) {
+         for (Project project : root.getAllprojects()) {
+             EclipseModel eclipseModel = project.getExtensions().findByType(EclipseModel.class);
+             if (eclipseModel != null) {
+-                eclipseModel.getProject().setName(uniqueProjectNameProvider.getUniqueName(project));
++                eclipseModel.getProject().setName(uniqueProjectNameProvider.getUniqueName(((ProjectInternal) project).getProjectIdentity()));
+             }
+         }
+     }
+diff --git a/platforms/ide/ide-plugins/src/test/groovy/org/gradle/plugins/ide/internal/tooling/eclipse/EclipseModelBuilderDependenciesTest.groovy b/platforms/ide/ide-plugins/src/test/groovy/org/gradle/plugins/ide/internal/tooling/eclipse/EclipseModelBuilderDependenciesTest.groovy
+index 25951ecfa77..b7d58e9a503 100644
+--- a/platforms/ide/ide-plugins/src/test/groovy/org/gradle/plugins/ide/internal/tooling/eclipse/EclipseModelBuilderDependenciesTest.groovy
++++ b/platforms/ide/ide-plugins/src/test/groovy/org/gradle/plugins/ide/internal/tooling/eclipse/EclipseModelBuilderDependenciesTest.groovy
+@@ -17,6 +17,7 @@
+ package org.gradle.plugins.ide.internal.tooling.eclipse
+ 
+ import org.gradle.api.Project
++import org.gradle.api.internal.project.ProjectIdentity
+ import org.gradle.api.plugins.JavaPlugin
+ import org.gradle.jvm.tasks.Jar
+ import org.gradle.plugins.ide.eclipse.EclipsePlugin
+@@ -202,7 +203,7 @@ class EclipseModelBuilderDependenciesTest extends AbstractProjectBuilderSpec {
+     private def createEclipseModelBuilder() {
+         def gradleProjectBuilder = new GradleProjectBuilder()
+         def uniqueProjectNameProvider = Stub(EclipseModelAwareUniqueProjectNameProvider) {
+-            getUniqueName(_ as Project) >> { Project p -> p.name }
++            getUniqueName(_ as ProjectIdentity) >> { ProjectIdentity p -> p.projectName }
+         }
+         new EclipseModelBuilder(gradleProjectBuilder, uniqueProjectNameProvider)
+     }
+diff --git a/platforms/ide/ide-plugins/src/test/groovy/org/gradle/plugins/ide/internal/tooling/eclipse/EclipseModelBuilderTest.groovy b/platforms/ide/ide-plugins/src/test/groovy/org/gradle/plugins/ide/internal/tooling/eclipse/EclipseModelBuilderTest.groovy
+index 29347432e22..b138c3996f0 100644
+--- a/platforms/ide/ide-plugins/src/test/groovy/org/gradle/plugins/ide/internal/tooling/eclipse/EclipseModelBuilderTest.groovy
++++ b/platforms/ide/ide-plugins/src/test/groovy/org/gradle/plugins/ide/internal/tooling/eclipse/EclipseModelBuilderTest.groovy
+@@ -18,6 +18,7 @@ package org.gradle.plugins.ide.internal.tooling.eclipse
+ 
+ import org.gradle.api.JavaVersion
+ import org.gradle.api.Project
++import org.gradle.api.internal.project.ProjectIdentity
+ import org.gradle.api.plugins.GroovyBasePlugin
+ import org.gradle.api.plugins.GroovyPlugin
+ import org.gradle.api.plugins.JavaBasePlugin
+@@ -312,7 +313,7 @@ class EclipseModelBuilderTest extends AbstractProjectBuilderSpec {
+     private def createEclipseModelBuilder() {
+         def gradleProjectBuilder = new GradleProjectBuilder()
+         def uniqueProjectNameProvider = Stub(EclipseModelAwareUniqueProjectNameProvider) {
+-            getUniqueName(_ as Project) >> { Project p -> p.getName() }
++            getUniqueName(_ as ProjectIdentity) >> { ProjectIdentity p -> p.projectName }
+         }
+         new EclipseModelBuilder(gradleProjectBuilder, uniqueProjectNameProvider)
+     }
+diff --git a/platforms/ide/ide/src/main/java/org/gradle/plugins/ide/internal/configurer/AbstractUniqueProjectNameProvider.java b/platforms/ide/ide/src/main/java/org/gradle/plugins/ide/internal/configurer/AbstractUniqueProjectNameProvider.java
+new file mode 100644
+index 00000000000..9a92e71f4f2
+--- /dev/null
++++ b/platforms/ide/ide/src/main/java/org/gradle/plugins/ide/internal/configurer/AbstractUniqueProjectNameProvider.java
+@@ -0,0 +1,53 @@
++/*
++ * Copyright 2025 the original author or authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.gradle.plugins.ide.internal.configurer;
++
++import org.gradle.api.internal.project.ProjectIdentity;
++import org.gradle.api.internal.project.ProjectState;
++import org.gradle.api.internal.project.ProjectStateRegistry;
++import org.gradle.util.Path;
++import org.jspecify.annotations.Nullable;
++
++public abstract class AbstractUniqueProjectNameProvider implements UniqueProjectNameProvider {
++
++    protected final ProjectStateRegistry projectRegistry;
++
++    protected AbstractUniqueProjectNameProvider(ProjectStateRegistry projectRegistry) {
++        this.projectRegistry = projectRegistry;
++    }
++
++    /**
++     * Finds the "parent" project based on the build-tree path of the current project.
++     * <p>
++     * This is different from looking up the {@link ProjectState#getBuildParent() parent project} inside a given build,
++     * because a root project of a build does not have a parent. In the context of project hiearachy shown in the IDE, however,
++     * we are looking for the "parent" project based on the build-tree path.
++     * This means that the <b>"parent" project might belong to a different build.</b>
++     */
++    @Nullable
++    protected ProjectIdentity findParentInBuildTree(ProjectIdentity projectIdentity) {
++        Path parentInBuildTreePath = projectIdentity.getBuildTreePath().getParent();
++        if (parentInBuildTreePath == null) {
++            return null;
++        }
++        ProjectState parentInBuildTree = projectRegistry.findProjectState(parentInBuildTreePath);
++        if (parentInBuildTree == null) {
++            return null;
++        }
++        return parentInBuildTree.getIdentity();
++    }
++}
+diff --git a/platforms/ide/ide/src/main/java/org/gradle/plugins/ide/internal/configurer/DefaultUniqueProjectNameProvider.java b/platforms/ide/ide/src/main/java/org/gradle/plugins/ide/internal/configurer/DefaultUniqueProjectNameProvider.java
+index 84633911b0d..0177e3c6690 100644
+--- a/platforms/ide/ide/src/main/java/org/gradle/plugins/ide/internal/configurer/DefaultUniqueProjectNameProvider.java
++++ b/platforms/ide/ide/src/main/java/org/gradle/plugins/ide/internal/configurer/DefaultUniqueProjectNameProvider.java
+@@ -15,53 +15,58 @@
+  */
+ package org.gradle.plugins.ide.internal.configurer;
+ 
+-import org.gradle.api.Project;
++import org.gradle.api.internal.project.ProjectIdentity;
+ import org.gradle.api.internal.project.ProjectState;
+ import org.gradle.api.internal.project.ProjectStateRegistry;
++import org.jspecify.annotations.Nullable;
+ 
++import java.util.List;
+ import java.util.Map;
+ 
+-public class DefaultUniqueProjectNameProvider implements UniqueProjectNameProvider {
+-    private final ProjectStateRegistry projectRegistry;
+-    private Map<ProjectState, String> deduplicated;
++import static java.util.stream.Collectors.toList;
++
++public class DefaultUniqueProjectNameProvider extends AbstractUniqueProjectNameProvider {
++
++    @Nullable
++    private Map<ProjectIdentity, String> deduplicated;
+ 
+     public DefaultUniqueProjectNameProvider(ProjectStateRegistry projectRegistry) {
+-        this.projectRegistry = projectRegistry;
++        super(projectRegistry);
+     }
+ 
+     @Override
+-    public String getUniqueName(Project project) {
+-        ProjectState projectState = projectRegistry.stateFor(project);
+-        String uniqueName = getDeduplicatedNames().get(projectState);
+-        if (uniqueName != null) {
+-            return uniqueName;
+-        }
+-        return project.getName();
++    public String getUniqueName(ProjectIdentity projectIdentity) {
++        String uniqueName = getDeduplicatedNames().get(projectIdentity);
++        return uniqueName != null ? uniqueName : projectIdentity.getProjectName();
+     }
+ 
+-    private synchronized Map<ProjectState, String> getDeduplicatedNames() {
++    private synchronized Map<ProjectIdentity, String> getDeduplicatedNames() {
+         if (deduplicated == null) {
+-            HierarchicalElementDeduplicator<ProjectState> deduplicator = new HierarchicalElementDeduplicator<ProjectState>(new ProjectPathDeduplicationAdapter());
+-            this.deduplicated = deduplicator.deduplicate(projectRegistry.getAllProjects());
++            HierarchicalElementDeduplicator<ProjectIdentity> deduplicator = new HierarchicalElementDeduplicator<>(new ProjectPathDeduplicationAdapter());
++            List<ProjectIdentity> allProjects = projectRegistry.getAllProjects().stream()
++                .map(ProjectState::getIdentity)
++                .collect(toList());
++            this.deduplicated = deduplicator.deduplicate(allProjects);
+         }
+         return deduplicated;
+     }
+ 
+-    private static class ProjectPathDeduplicationAdapter implements HierarchicalElementAdapter<ProjectState> {
++    private class ProjectPathDeduplicationAdapter implements HierarchicalElementAdapter<ProjectIdentity> {
+         @Override
+-        public String getName(ProjectState element) {
+-            return element.getName();
++        public String getName(ProjectIdentity element) {
++            return element.getProjectName();
+         }
+ 
+         @Override
+-        public String getIdentityName(ProjectState element) {
+-            String identityName = element.getIdentityPath().getName();
+-            return identityName != null ? identityName : element.getName();
++        public String getIdentityName(ProjectIdentity element) {
++            String identityName = element.getBuildTreePath().getName();
++            return identityName != null ? identityName : element.getProjectName();
+         }
+ 
+         @Override
+-        public ProjectState getParent(ProjectState element) {
+-            return element.getParent();
++        @Nullable
++        public ProjectIdentity getParent(ProjectIdentity element) {
++            return findParentInBuildTree(element);
+         }
+     }
+ }
+diff --git a/platforms/ide/ide/src/main/java/org/gradle/plugins/ide/internal/configurer/EclipseModelAwareUniqueProjectNameProvider.java b/platforms/ide/ide/src/main/java/org/gradle/plugins/ide/internal/configurer/EclipseModelAwareUniqueProjectNameProvider.java
+index b2f1e1e9172..de9f076322e 100644
+--- a/platforms/ide/ide/src/main/java/org/gradle/plugins/ide/internal/configurer/EclipseModelAwareUniqueProjectNameProvider.java
++++ b/platforms/ide/ide/src/main/java/org/gradle/plugins/ide/internal/configurer/EclipseModelAwareUniqueProjectNameProvider.java
+@@ -15,10 +15,11 @@
+  */
+ package org.gradle.plugins.ide.internal.configurer;
+ 
+-import org.gradle.api.Project;
++import org.gradle.api.internal.project.ProjectIdentity;
+ import org.gradle.api.internal.project.ProjectState;
+ import org.gradle.api.internal.project.ProjectStateRegistry;
+ import org.gradle.plugins.ide.eclipse.model.EclipseModel;
++import org.jspecify.annotations.Nullable;
+ 
+ import java.util.ArrayList;
+ import java.util.Collections;
+@@ -27,14 +28,17 @@
+ import java.util.Map;
+ import java.util.stream.Collectors;
+ 
+-public class EclipseModelAwareUniqueProjectNameProvider implements UniqueProjectNameProvider {
+-    private final ProjectStateRegistry projectRegistry;
+-    private Map<ProjectState, String> deduplicated;
++import static java.util.stream.Collectors.toMap;
++
++public class EclipseModelAwareUniqueProjectNameProvider extends AbstractUniqueProjectNameProvider {
++
++    @Nullable
++    private Map<ProjectIdentity, String> deduplicated;
+     private List<ProjectStateWrapper> reservedNames = Collections.emptyList();
+-    private Map<ProjectState, ProjectStateWrapper> projectToInformationMap = Collections.emptyMap();
++    private Map<ProjectIdentity, ProjectStateWrapper> projectToInformationMap = Collections.emptyMap();
+ 
+     public EclipseModelAwareUniqueProjectNameProvider(ProjectStateRegistry projectRegistry) {
+-        this.projectRegistry = projectRegistry;
++        super(projectRegistry);
+     }
+ 
+     public synchronized void setReservedProjectNames(List<String> reservedNames) {
+@@ -43,35 +47,27 @@ public synchronized void setReservedProjectNames(List<String> reservedNames) {
+     }
+ 
+     @Override
+-    public String getUniqueName(Project project) {
+-        ProjectState state = projectRegistry.stateFor(project);
+-        String uniqueName = getDeduplicatedNames().get(state);
++    public String getUniqueName(ProjectIdentity projectIdentity) {
++        String uniqueName = getDeduplicatedNames().get(projectIdentity);
+         if (uniqueName != null) {
+             return uniqueName;
+         }
+ 
+         // ProjectStateWrapper might contain the configured eclipse project name
+-        ProjectStateWrapper information = projectToInformationMap.get(state);
++        ProjectStateWrapper information = projectToInformationMap.get(projectIdentity);
+         if (information != null) {
+             return information.name;
+         }
+-        return state.getName();
++        return projectIdentity.getProjectName();
+     }
+ 
+-    private synchronized Map<ProjectState, String> getDeduplicatedNames() {
++    private synchronized Map<ProjectIdentity, String> getDeduplicatedNames() {
+         if (deduplicated == null) {
+ 
+             projectToInformationMap = new HashMap<>();
+             for (ProjectState state : projectRegistry.getAllProjects()) {
+-                // try to get the name from EclipseProject.name
+-                state.getOwner().ensureProjectsConfigured();
+-                EclipseModel model = state.getMutableModel().getExtensions().findByType(EclipseModel.class);
+-                if (model != null && model.getProject().getName() != null) {
+-                    projectToInformationMap.put(state, new ProjectStateWrapper(model.getProject().getName(), state, state.getParent()));
+-                    continue;
+-                }
+-                // fallback: take the name from the ProjectState
+-                projectToInformationMap.put(state, new ProjectStateWrapper(state.getName(), state, state.getParent()));
++                String projectNameForEclipse = getName(state);
++                projectToInformationMap.put(state.getIdentity(), new ProjectStateWrapper(projectNameForEclipse, state));
+             }
+ 
+             HierarchicalElementDeduplicator<ProjectStateWrapper> deduplicator = new HierarchicalElementDeduplicator<>(new ProjectPathDeduplicationAdapter(projectToInformationMap));
+@@ -80,31 +76,43 @@ private synchronized Map<ProjectState, String> getDeduplicatedNames() {
+             allElements.addAll(projectToInformationMap.values());
+ 
+             this.deduplicated = deduplicator.deduplicate(allElements).entrySet().stream()
+-                .collect(Collectors.toMap(e -> e.getKey().project, Map.Entry::getValue));
++                .collect(toMap(e -> e.getKey().project.getIdentity(), Map.Entry::getValue));
+         }
+         return deduplicated;
+     }
+ 
++    private static String getName(ProjectState state) {
++        // try to get the name from EclipseProject.name
++        state.getOwner().ensureProjectsConfigured();
++
++        EclipseModel model = state.getMutableModel().getExtensions().findByType(EclipseModel.class);
++        if (model != null && model.getProject().getName() != null) {
++            return model.getProject().getName();
++        }
++
++        // fallback: take the name from the ProjectState
++        return state.getName();
++    }
++
+     private static class ProjectStateWrapper {
+         private final String name;
++        @Nullable
+         private final ProjectState project;
+-        private final ProjectState parent;
+ 
+-        public ProjectStateWrapper(String name, ProjectState project, ProjectState parent) {
++        public ProjectStateWrapper(String name, @Nullable ProjectState project) {
+             this.name = name;
+             this.project = project;
+-            this.parent = parent;
+         }
+ 
+         public ProjectStateWrapper(String name) {
+-            this(name, null, null);
++            this(name, null);
+         }
+     }
+ 
+-    private static class ProjectPathDeduplicationAdapter implements HierarchicalElementAdapter<ProjectStateWrapper> {
+-        private final Map<ProjectState, ProjectStateWrapper> projectToInformationMap;
++    private class ProjectPathDeduplicationAdapter implements HierarchicalElementAdapter<ProjectStateWrapper> {
++        private final Map<ProjectIdentity, ProjectStateWrapper> projectToInformationMap;
+ 
+-        public ProjectPathDeduplicationAdapter(Map<ProjectState, ProjectStateWrapper> projectToInformationMap) {
++        public ProjectPathDeduplicationAdapter(Map<ProjectIdentity, ProjectStateWrapper> projectToInformationMap) {
+             this.projectToInformationMap = projectToInformationMap;
+         }
+ 
+@@ -119,8 +127,14 @@ public String getIdentityName(ProjectStateWrapper element) {
+         }
+ 
+         @Override
++        @Nullable
+         public ProjectStateWrapper getParent(ProjectStateWrapper element) {
+-            return projectToInformationMap.get(element.parent);
++            if (element.project == null) {
++                return null;
++            }
++
++            ProjectIdentity parentInBuildTree = findParentInBuildTree(element.project.getIdentity());
++            return parentInBuildTree == null ? null : projectToInformationMap.get(parentInBuildTree);
+         }
+     }
+ 
+diff --git a/platforms/ide/ide/src/main/java/org/gradle/plugins/ide/internal/configurer/HierarchicalElementAdapter.java b/platforms/ide/ide/src/main/java/org/gradle/plugins/ide/internal/configurer/HierarchicalElementAdapter.java
+index 3218022b030..a664c0441e4 100644
+--- a/platforms/ide/ide/src/main/java/org/gradle/plugins/ide/internal/configurer/HierarchicalElementAdapter.java
++++ b/platforms/ide/ide/src/main/java/org/gradle/plugins/ide/internal/configurer/HierarchicalElementAdapter.java
+@@ -16,6 +16,8 @@
+ 
+ package org.gradle.plugins.ide.internal.configurer;
+ 
++import org.jspecify.annotations.Nullable;
++
+ /**
+  * Adapts any type of element to the generic {@link HierarchicalElementDeduplicator}.
+  *
+@@ -47,5 +49,6 @@
+      * @param element the child element, cannot be null
+      * @return the parent element, may be null
+      */
++    @Nullable
+     T getParent(T element);
+ }
+diff --git a/platforms/ide/ide/src/main/java/org/gradle/plugins/ide/internal/configurer/UniqueProjectNameProvider.java b/platforms/ide/ide/src/main/java/org/gradle/plugins/ide/internal/configurer/UniqueProjectNameProvider.java
+index dbe492b99e2..46bdc197709 100644
+--- a/platforms/ide/ide/src/main/java/org/gradle/plugins/ide/internal/configurer/UniqueProjectNameProvider.java
++++ b/platforms/ide/ide/src/main/java/org/gradle/plugins/ide/internal/configurer/UniqueProjectNameProvider.java
+@@ -15,11 +15,11 @@
+  */
+ package org.gradle.plugins.ide.internal.configurer;
+ 
+-import org.gradle.api.Project;
++import org.gradle.api.internal.project.ProjectIdentity;
+ import org.gradle.internal.service.scopes.Scope;
+ import org.gradle.internal.service.scopes.ServiceScope;
+ 
+ @ServiceScope(Scope.Build.class)
+ public interface UniqueProjectNameProvider {
+-    String getUniqueName(Project project);
++    String getUniqueName(ProjectIdentity projectIdentity);
+ }
+diff --git a/platforms/ide/ide/src/main/java/org/gradle/plugins/ide/internal/configurer/package-info.java b/platforms/ide/ide/src/main/java/org/gradle/plugins/ide/internal/configurer/package-info.java
+new file mode 100644
+index 00000000000..255b7846b40
+--- /dev/null
++++ b/platforms/ide/ide/src/main/java/org/gradle/plugins/ide/internal/configurer/package-info.java
+@@ -0,0 +1,18 @@
++/*
++ * Copyright 2025 the original author or authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++@org.jspecify.annotations.NullMarked
++package org.gradle.plugins.ide.internal.configurer;
+diff --git a/testing/architecture-test/src/changes/archunit-store/internal-api-nullability.txt b/testing/architecture-test/src/changes/archunit-store/internal-api-nullability.txt
+index 285dc8bdff5..f929af46ac5 100644
+--- a/testing/architecture-test/src/changes/archunit-store/internal-api-nullability.txt
++++ b/testing/architecture-test/src/changes/archunit-store/internal-api-nullability.txt
+@@ -3415,15 +3415,6 @@ Class <org.gradle.plugins.ide.internal.IdeArtifactStore> is not annotated (direc
+ Class <org.gradle.plugins.ide.internal.IdePlugin> is not annotated (directly or via its package) with @org.jspecify.annotations.NullMarked in (IdePlugin.java:0)
+ Class <org.gradle.plugins.ide.internal.IdeProjectMetadata> is not annotated (directly or via its package) with @org.jspecify.annotations.NullMarked in (IdeProjectMetadata.java:0)
+ Class <org.gradle.plugins.ide.internal.IdeServices> is not annotated (directly or via its package) with @org.jspecify.annotations.NullMarked in (IdeServices.java:0)
+-Class <org.gradle.plugins.ide.internal.configurer.DefaultUniqueProjectNameProvider$ProjectPathDeduplicationAdapter> is not annotated (directly or via its package) with @org.jspecify.annotations.NullMarked in (DefaultUniqueProjectNameProvider.java:0)
+-Class <org.gradle.plugins.ide.internal.configurer.DefaultUniqueProjectNameProvider> is not annotated (directly or via its package) with @org.jspecify.annotations.NullMarked in (DefaultUniqueProjectNameProvider.java:0)
+-Class <org.gradle.plugins.ide.internal.configurer.EclipseModelAwareUniqueProjectNameProvider$ProjectPathDeduplicationAdapter> is not annotated (directly or via its package) with @org.jspecify.annotations.NullMarked in (EclipseModelAwareUniqueProjectNameProvider.java:0)
+-Class <org.gradle.plugins.ide.internal.configurer.EclipseModelAwareUniqueProjectNameProvider$ProjectStateWrapper> is not annotated (directly or via its package) with @org.jspecify.annotations.NullMarked in (EclipseModelAwareUniqueProjectNameProvider.java:0)
+-Class <org.gradle.plugins.ide.internal.configurer.EclipseModelAwareUniqueProjectNameProvider> is not annotated (directly or via its package) with @org.jspecify.annotations.NullMarked in (EclipseModelAwareUniqueProjectNameProvider.java:0)
+-Class <org.gradle.plugins.ide.internal.configurer.HierarchicalElementAdapter> is not annotated (directly or via its package) with @org.jspecify.annotations.NullMarked in (HierarchicalElementAdapter.java:0)
+-Class <org.gradle.plugins.ide.internal.configurer.HierarchicalElementDeduplicator$StatefulDeduplicator> is not annotated (directly or via its package) with @org.jspecify.annotations.NullMarked in (HierarchicalElementDeduplicator.java:0)
+-Class <org.gradle.plugins.ide.internal.configurer.HierarchicalElementDeduplicator> is not annotated (directly or via its package) with @org.jspecify.annotations.NullMarked in (HierarchicalElementDeduplicator.java:0)
+-Class <org.gradle.plugins.ide.internal.configurer.UniqueProjectNameProvider> is not annotated (directly or via its package) with @org.jspecify.annotations.NullMarked in (UniqueProjectNameProvider.java:0)
+ Class <org.gradle.plugins.ide.internal.generator.AbstractPersistableConfigurationObject> is not annotated (directly or via its package) with @org.jspecify.annotations.NullMarked in (AbstractPersistableConfigurationObject.java:0)
+ Class <org.gradle.plugins.ide.internal.generator.PropertiesPersistableConfigurationObject> is not annotated (directly or via its package) with @org.jspecify.annotations.NullMarked in (PropertiesPersistableConfigurationObject.java:0)
+ Class <org.gradle.plugins.ide.internal.generator.PropertyListPersistableConfigurationObject> is not annotated (directly or via its package) with @org.jspecify.annotations.NullMarked in (PropertyListPersistableConfigurationObject.java:0)

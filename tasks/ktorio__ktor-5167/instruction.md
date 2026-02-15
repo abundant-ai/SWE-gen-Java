@@ -1,0 +1,7 @@
+The WebRTC Client module currently publishes several Kotlin Multiplatform targets (for example: jvm, desktop native, tvOS, and other non-iOS Apple/native variants) even though there is no actual WebRTC client implementation for those targets. This leads to confusing behavior for users: the artifacts exist and appear supported, but attempting to use the WebRTC client on those targets either provides no usable API/implementation or fails at runtime/link time depending on the platform.
+
+Update the WebRTC Client’s multiplatform configuration so that only targets that have real client support are published/available to consumers. Redundant targets that do not have a WebRTC client should no longer be produced as published artifacts.
+
+Expected behavior: when users browse/consume the WebRTC Client artifacts, only genuinely supported platforms are present, and users cannot accidentally depend on a published target that has no working WebRTC client. Build/publishing verification should reflect the reduced target set, and any platform-availability checks should align with the new list.
+
+Actual behavior: redundant targets are currently published and discoverable, despite lacking client implementations, which misleads consumers into thinking those platforms are supported.

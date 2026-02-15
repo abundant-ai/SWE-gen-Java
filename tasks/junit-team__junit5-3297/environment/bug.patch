@@ -1,0 +1,292 @@
+diff --git a/documentation/src/docs/asciidoc/release-notes/release-notes-5.10.0-M1.adoc b/documentation/src/docs/asciidoc/release-notes/release-notes-5.10.0-M1.adoc
+index b5160bd25..8c73d6d54 100644
+--- a/documentation/src/docs/asciidoc/release-notes/release-notes-5.10.0-M1.adoc
++++ b/documentation/src/docs/asciidoc/release-notes/release-notes-5.10.0-M1.adoc
+@@ -74,10 +74,6 @@ repository on GitHub.
+ 
+ ==== Bug Fixes
+ 
+-* The extensions supporting `@MethodSource`, `@EnabledIf`, and `@DisabledIf` now load
+-  classes by fully-qualified class name using the `ClassLoader` obtained from the test
+-  class when possible. This allows classes to be resolved with custom `ClassLoader`
+-  arrangements (such as OSGi).
+ * When converting an argument for a `@ParameterizedTest` method from a fully-qualified
+   class name (`String`) to a `Class`, the `ClassLoader` of the class in which the
+   `@ParameterizedTest` method is declared is now used to resolve the `Class` instead of
+diff --git a/junit-jupiter-api/src/main/java/org/junit/jupiter/api/condition/MethodBasedCondition.java b/junit-jupiter-api/src/main/java/org/junit/jupiter/api/condition/MethodBasedCondition.java
+index cbe7e4b0e..403304792 100644
+--- a/junit-jupiter-api/src/main/java/org/junit/jupiter/api/condition/MethodBasedCondition.java
++++ b/junit-jupiter-api/src/main/java/org/junit/jupiter/api/condition/MethodBasedCondition.java
+@@ -25,7 +25,6 @@ import org.junit.jupiter.api.extension.ConditionEvaluationResult;
+ import org.junit.jupiter.api.extension.ExecutionCondition;
+ import org.junit.jupiter.api.extension.ExtensionContext;
+ import org.junit.platform.commons.JUnitException;
+-import org.junit.platform.commons.util.ClassLoaderUtils;
+ import org.junit.platform.commons.util.Preconditions;
+ import org.junit.platform.commons.util.ReflectionUtils;
+ import org.junit.platform.commons.util.StringUtils;
+@@ -57,20 +56,14 @@ abstract class MethodBasedCondition<A extends Annotation> implements ExecutionCo
+ 				.orElseGet(this::enabledByDefault);
+ 	}
+ 
+-	// package-private for testing
+-	Method getConditionMethod(String fullyQualifiedMethodName, ExtensionContext context) {
+-		Class<?> testClass = context.getRequiredTestClass();
++	private Method getConditionMethod(String fullyQualifiedMethodName, ExtensionContext context) {
+ 		if (!fullyQualifiedMethodName.contains("#")) {
+-			return findMethod(testClass, fullyQualifiedMethodName);
++			return findMethod(context.getRequiredTestClass(), fullyQualifiedMethodName);
+ 		}
+ 		String[] methodParts = ReflectionUtils.parseFullyQualifiedMethodName(fullyQualifiedMethodName);
+ 		String className = methodParts[0];
+ 		String methodName = methodParts[1];
+-		ClassLoader classLoader = testClass.getClassLoader();
+-		if (classLoader == null) {
+-			classLoader = ClassLoaderUtils.getDefaultClassLoader();
+-		}
+-		Class<?> clazz = ReflectionUtils.tryToLoadClass(className, classLoader).getOrThrow(
++		Class<?> clazz = ReflectionUtils.tryToLoadClass(className).getOrThrow(
+ 			cause -> new JUnitException(format("Could not load class [%s]", className), cause));
+ 		return findMethod(clazz, methodName);
+ 	}
+diff --git a/junit-jupiter-engine/src/test/java/org/junit/jupiter/api/condition/DisabledIfConditionClassLoaderTests.java b/junit-jupiter-engine/src/test/java/org/junit/jupiter/api/condition/DisabledIfConditionClassLoaderTests.java
+deleted file mode 100644
+index 0e2ebac8a..000000000
+--- a/junit-jupiter-engine/src/test/java/org/junit/jupiter/api/condition/DisabledIfConditionClassLoaderTests.java
++++ /dev/null
+@@ -1,66 +0,0 @@
+-/*
+- * Copyright 2015-2023 the original author or authors.
+- *
+- * All rights reserved. This program and the accompanying materials are
+- * made available under the terms of the Eclipse Public License v2.0 which
+- * accompanies this distribution and is available at
+- *
+- * https://www.eclipse.org/legal/epl-v20.html
+- */
+-
+-package org.junit.jupiter.api.condition;
+-
+-import static org.assertj.core.api.Assertions.assertThat;
+-import static org.mockito.Mockito.doReturn;
+-import static org.mockito.Mockito.mock;
+-import static org.mockito.Mockito.when;
+-
+-import java.lang.reflect.Method;
+-import java.util.Optional;
+-
+-import org.junit.jupiter.api.Test;
+-import org.junit.jupiter.api.extension.ConditionEvaluationResult;
+-import org.junit.jupiter.api.extension.ExtensionContext;
+-import org.junit.platform.commons.test.TestClassLoader;
+-import org.junit.platform.commons.util.ReflectionUtils;
+-
+-/**
+- * Tests for {@link DisabledIfCondition} using custom {@link ClassLoader} arrangements.
+- *
+- * @since 5.10
+- */
+-public class DisabledIfConditionClassLoaderTests {
+-
+-	@Test
+-	// No need to introduce a "disabled" version of this test, since it would simply be the
+-	// logical inverse of this method and would therefore not provide any further benefit.
+-	void enabledWithStaticMethodInTypeFromDifferentClassLoader() throws Exception {
+-		try (var testClassLoader = TestClassLoader.forClasses(getClass(), StaticConditionMethods.class)) {
+-			var testClass = testClassLoader.loadClass(getClass().getName());
+-			assertThat(testClass.getClassLoader()).isSameAs(testClassLoader);
+-
+-			ExtensionContext context = mock();
+-			Method annotatedMethod = ReflectionUtils.findMethod(getClass(), "enabledMethod").get();
+-			when(context.getElement()).thenReturn(Optional.of(annotatedMethod));
+-			doReturn(testClass).when(context).getRequiredTestClass();
+-
+-			DisabledIfCondition condition = new DisabledIfCondition();
+-			ConditionEvaluationResult result = condition.evaluateExecutionCondition(context);
+-			assertThat(result).isNotNull();
+-			assertThat(result.isDisabled()).isFalse();
+-
+-			Method conditionMethod = condition.getConditionMethod(
+-				"org.junit.jupiter.api.condition.StaticConditionMethods#returnsFalse", context);
+-			assertThat(conditionMethod).isNotNull();
+-			Class<?> declaringClass = conditionMethod.getDeclaringClass();
+-			assertThat(declaringClass.getClassLoader()).isSameAs(testClassLoader);
+-			assertThat(declaringClass.getName()).isEqualTo(StaticConditionMethods.class.getName());
+-			assertThat(declaringClass).isNotEqualTo(StaticConditionMethods.class);
+-		}
+-	}
+-
+-	@DisabledIf("org.junit.jupiter.api.condition.StaticConditionMethods#returnsFalse")
+-	private void enabledMethod() {
+-	}
+-
+-}
+diff --git a/junit-jupiter-engine/src/test/java/org/junit/jupiter/api/condition/EnabledIfConditionClassLoaderTests.java b/junit-jupiter-engine/src/test/java/org/junit/jupiter/api/condition/EnabledIfConditionClassLoaderTests.java
+deleted file mode 100644
+index 3c07ce9bc..000000000
+--- a/junit-jupiter-engine/src/test/java/org/junit/jupiter/api/condition/EnabledIfConditionClassLoaderTests.java
++++ /dev/null
+@@ -1,66 +0,0 @@
+-/*
+- * Copyright 2015-2023 the original author or authors.
+- *
+- * All rights reserved. This program and the accompanying materials are
+- * made available under the terms of the Eclipse Public License v2.0 which
+- * accompanies this distribution and is available at
+- *
+- * https://www.eclipse.org/legal/epl-v20.html
+- */
+-
+-package org.junit.jupiter.api.condition;
+-
+-import static org.assertj.core.api.Assertions.assertThat;
+-import static org.mockito.Mockito.doReturn;
+-import static org.mockito.Mockito.mock;
+-import static org.mockito.Mockito.when;
+-
+-import java.lang.reflect.Method;
+-import java.util.Optional;
+-
+-import org.junit.jupiter.api.Test;
+-import org.junit.jupiter.api.extension.ConditionEvaluationResult;
+-import org.junit.jupiter.api.extension.ExtensionContext;
+-import org.junit.platform.commons.test.TestClassLoader;
+-import org.junit.platform.commons.util.ReflectionUtils;
+-
+-/**
+- * Tests for {@link EnabledIfCondition} using custom {@link ClassLoader} arrangements.
+- *
+- * @since 5.10
+- */
+-public class EnabledIfConditionClassLoaderTests {
+-
+-	@Test
+-	// No need to introduce a "disabled" version of this test, since it would simply be the
+-	// logical inverse of this method and would therefore not provide any further benefit.
+-	void enabledWithStaticMethodInTypeFromDifferentClassLoader() throws Exception {
+-		try (var testClassLoader = TestClassLoader.forClasses(getClass(), StaticConditionMethods.class)) {
+-			var testClass = testClassLoader.loadClass(getClass().getName());
+-			assertThat(testClass.getClassLoader()).isSameAs(testClassLoader);
+-
+-			ExtensionContext context = mock();
+-			Method annotatedMethod = ReflectionUtils.findMethod(getClass(), "enabledMethod").get();
+-			when(context.getElement()).thenReturn(Optional.of(annotatedMethod));
+-			doReturn(testClass).when(context).getRequiredTestClass();
+-
+-			EnabledIfCondition condition = new EnabledIfCondition();
+-			ConditionEvaluationResult result = condition.evaluateExecutionCondition(context);
+-			assertThat(result).isNotNull();
+-			assertThat(result.isDisabled()).isFalse();
+-
+-			Method conditionMethod = condition.getConditionMethod(
+-				"org.junit.jupiter.api.condition.StaticConditionMethods#returnsTrue", context);
+-			assertThat(conditionMethod).isNotNull();
+-			Class<?> declaringClass = conditionMethod.getDeclaringClass();
+-			assertThat(declaringClass.getClassLoader()).isSameAs(testClassLoader);
+-			assertThat(declaringClass.getName()).isEqualTo(StaticConditionMethods.class.getName());
+-			assertThat(declaringClass).isNotEqualTo(StaticConditionMethods.class);
+-		}
+-	}
+-
+-	@EnabledIf("org.junit.jupiter.api.condition.StaticConditionMethods#returnsTrue")
+-	private void enabledMethod() {
+-	}
+-
+-}
+diff --git a/junit-jupiter-params/src/main/java/org/junit/jupiter/params/provider/MethodArgumentsProvider.java b/junit-jupiter-params/src/main/java/org/junit/jupiter/params/provider/MethodArgumentsProvider.java
+index ec0e5a3b4..ddcb16b5c 100644
+--- a/junit-jupiter-params/src/main/java/org/junit/jupiter/params/provider/MethodArgumentsProvider.java
++++ b/junit-jupiter-params/src/main/java/org/junit/jupiter/params/provider/MethodArgumentsProvider.java
+@@ -28,7 +28,6 @@ import org.junit.jupiter.api.TestTemplate;
+ import org.junit.jupiter.api.extension.ExtensionContext;
+ import org.junit.platform.commons.JUnitException;
+ import org.junit.platform.commons.PreconditionViolationException;
+-import org.junit.platform.commons.util.ClassLoaderUtils;
+ import org.junit.platform.commons.util.CollectionUtils;
+ import org.junit.platform.commons.util.Preconditions;
+ import org.junit.platform.commons.util.ReflectionUtils;
+@@ -74,7 +73,7 @@ class MethodArgumentsProvider extends AnnotationBasedArgumentsProvider<MethodSou
+ 		}
+ 
+ 		// Find factory method using fully-qualified name.
+-		Method factoryMethod = findFactoryMethodByFullyQualifiedName(testClass, testMethod, factoryMethodName);
++		Method factoryMethod = findFactoryMethodByFullyQualifiedName(testMethod, factoryMethodName);
+ 
+ 		// Ensure factory method has a valid return type and is not a test method.
+ 		Preconditions.condition(isFactoryMethod.test(factoryMethod), () -> format(
+@@ -104,18 +103,12 @@ class MethodArgumentsProvider extends AnnotationBasedArgumentsProvider<MethodSou
+ 		return true;
+ 	}
+ 
+-	// package-private for testing
+-	static Method findFactoryMethodByFullyQualifiedName(Class<?> testClass, Method testMethod,
+-			String fullyQualifiedMethodName) {
++	private static Method findFactoryMethodByFullyQualifiedName(Method testMethod, String fullyQualifiedMethodName) {
+ 		String[] methodParts = ReflectionUtils.parseFullyQualifiedMethodName(fullyQualifiedMethodName);
+ 		String className = methodParts[0];
+ 		String methodName = methodParts[1];
+ 		String methodParameters = methodParts[2];
+-		ClassLoader classLoader = testClass.getClassLoader();
+-		if (classLoader == null) {
+-			classLoader = ClassLoaderUtils.getDefaultClassLoader();
+-		}
+-		Class<?> clazz = loadRequiredClass(className, classLoader);
++		Class<?> clazz = loadRequiredClass(className);
+ 
+ 		// Attempt to find an exact match first.
+ 		Method factoryMethod = ReflectionUtils.findMethod(clazz, methodName, methodParameters).orElse(null);
+@@ -177,8 +170,8 @@ class MethodArgumentsProvider extends AnnotationBasedArgumentsProvider<MethodSou
+ 				|| isAnnotated(candidate, TestFactory.class);
+ 	}
+ 
+-	private static Class<?> loadRequiredClass(String className, ClassLoader classLoader) {
+-		return ReflectionUtils.tryToLoadClass(className, classLoader).getOrThrow(
++	private static Class<?> loadRequiredClass(String className) {
++		return ReflectionUtils.tryToLoadClass(className).getOrThrow(
+ 			cause -> new JUnitException(format("Could not load class [%s]", className), cause));
+ 	}
+ 
+diff --git a/junit-jupiter-params/src/test/java/org/junit/jupiter/params/provider/MethodArgumentsProviderTests.java b/junit-jupiter-params/src/test/java/org/junit/jupiter/params/provider/MethodArgumentsProviderTests.java
+index 08959e1a8..0188bb90a 100644
+--- a/junit-jupiter-params/src/test/java/org/junit/jupiter/params/provider/MethodArgumentsProviderTests.java
++++ b/junit-jupiter-params/src/test/java/org/junit/jupiter/params/provider/MethodArgumentsProviderTests.java
+@@ -41,7 +41,6 @@ import org.junit.jupiter.engine.extension.MutableExtensionRegistry;
+ import org.junit.jupiter.params.ParameterizedTest;
+ import org.junit.platform.commons.JUnitException;
+ import org.junit.platform.commons.PreconditionViolationException;
+-import org.junit.platform.commons.test.TestClassLoader;
+ import org.junit.platform.commons.util.ReflectionUtils;
+ 
+ /**
+@@ -238,31 +237,6 @@ class MethodArgumentsProviderTests {
+ 		assertThat(arguments).containsExactly(array("string1"), array("string2"));
+ 	}
+ 
+-	@Test
+-	void providesArgumentsUsingExternalFactoryMethodInTypeFromDifferentClassLoader() throws Exception {
+-		try (var testClassLoader = TestClassLoader.forClasses(TestCase.class, ExternalFactoryMethods.class)) {
+-			var testClass = testClassLoader.loadClass(TestCase.class.getName());
+-			var testMethod = ReflectionUtils.findMethod(testClass, "test").get();
+-			var fullyQualifiedMethodName = ExternalFactoryMethods.class.getName() + "#stringsProvider";
+-
+-			assertThat(testClass.getClassLoader()).isSameAs(testClassLoader);
+-
+-			var arguments = provideArguments(testClass, false, fullyQualifiedMethodName);
+-			assertThat(arguments).containsExactly(array("string1"), array("string2"));
+-
+-			var factoryMethod = MethodArgumentsProvider.findFactoryMethodByFullyQualifiedName(testClass, testMethod,
+-				fullyQualifiedMethodName);
+-			assertThat(factoryMethod).isNotNull();
+-			assertThat(factoryMethod.getName()).isEqualTo("stringsProvider");
+-			assertThat(factoryMethod.getParameterTypes()).isEmpty();
+-
+-			var declaringClass = factoryMethod.getDeclaringClass();
+-			assertThat(declaringClass.getName()).isEqualTo(ExternalFactoryMethods.class.getName());
+-			assertThat(declaringClass).isNotEqualTo(ExternalFactoryMethods.class);
+-			assertThat(declaringClass.getClassLoader()).isSameAs(testClassLoader);
+-		}
+-	}
+-
+ 	@Test
+ 	void providesArgumentsUsingExternalFactoryMethodWithParentheses() {
+ 		var arguments = provideArguments(ExternalFactoryMethods.class.getName() + "#stringsProvider()");

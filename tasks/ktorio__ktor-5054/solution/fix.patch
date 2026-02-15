@@ -1,0 +1,637 @@
+diff --git a/ktor-http/common/src/io/ktor/http/content/Versions.kt b/ktor-http/common/src/io/ktor/http/content/Versions.kt
+index bb5db9824..1a4333f13 100644
+--- a/ktor-http/common/src/io/ktor/http/content/Versions.kt
++++ b/ktor-http/common/src/io/ktor/http/content/Versions.kt
+@@ -165,7 +165,6 @@ public fun EntityTagVersion(spec: String): EntityTagVersion {
+  *
+  * It never handles `If-None-Match: *`  as it is related to non-etag logic (for example, Last modified checks).
+  *
+- *
+  * [Report a problem](https://ktor.io/feedback/?fqname=io.ktor.http.content.EntityTagVersion)
+  *
+  * @param etag - entity tag, for example file's content hash
+@@ -175,13 +174,17 @@ public fun EntityTagVersion(spec: String): EntityTagVersion {
+  * [VersionCheckResult.PRECONDITION_FAILED] for failed If-Match
+  */
+ public data class EntityTagVersion(val etag: String, val weak: Boolean) : Version {
+-    private val normalized: String = when {
++    private val opaque: String = when {
+         etag == "*" -> etag
+         etag.startsWith("\"") -> etag
+         else -> etag.quote()
+     }
+ 
++    private val normalized: String = if (weak) "W/$opaque" else opaque
++
+     init {
++        require(!(weak && etag == STAR.etag)) { "Entity tag '*' could not be weak." }
++
+         for (index in etag.indices) {
+             val ch = etag[index]
+             if (ch <= ' ' || ch == '\"') {
+@@ -212,19 +215,27 @@ public data class EntityTagVersion(val etag: String, val weak: Boolean) : Versio
+      * [Report a problem](https://ktor.io/feedback/?fqname=io.ktor.http.content.EntityTagVersion.match)
+      */
+     public fun match(other: EntityTagVersion): Boolean {
++        if (weak || other.weak) return false
++        return weakMatch(other)
++    }
++
++    /**
++     * Checks whether two entity-tags match (weak).
++     */
++    private fun weakMatch(other: EntityTagVersion): Boolean {
+         if (this == STAR || other == STAR) return true
+-        return normalized == other.normalized
++        return opaque == other.opaque
+     }
+ 
+     /**
+-     * Specifies `If-None-Match` logic using the [match] function.
++     * Specifies `If-None-Match` logic.
+      *
+      * [Report a problem](https://ktor.io/feedback/?fqname=io.ktor.http.content.EntityTagVersion.noneMatch)
+      */
+     public fun noneMatch(givenNoneMatchEtags: List<EntityTagVersion>): VersionCheckResult {
+         if (STAR in givenNoneMatchEtags) return VersionCheckResult.OK
+ 
+-        if (givenNoneMatchEtags.any { match(it) }) {
++        if (givenNoneMatchEtags.any { weakMatch(it) }) {
+             return VersionCheckResult.NOT_MODIFIED
+         }
+ 
+diff --git a/ktor-server/ktor-server-core/api/ktor-server-core.api b/ktor-server/ktor-server-core/api/ktor-server-core.api
+index 7021a0bdb..0ad8ea8f2 100644
+--- a/ktor-server/ktor-server-core/api/ktor-server-core.api
++++ b/ktor-server/ktor-server-core/api/ktor-server-core.api
+@@ -809,6 +809,15 @@ public final class io/ktor/server/http/content/DefaultTransformKt {
+ 	public static final fun transformDefaultContent (Lio/ktor/server/application/ApplicationCall;Ljava/lang/Object;)Lio/ktor/http/content/OutgoingContent;
+ }
+ 
++public abstract interface class io/ktor/server/http/content/ETagProvider {
++	public static final field Companion Lio/ktor/server/http/content/ETagProvider$Companion;
++	public abstract fun provide (Ljava/lang/Object;)Lio/ktor/http/content/EntityTagVersion;
++}
++
++public final class io/ktor/server/http/content/ETagProvider$Companion {
++	public final fun getStrongSha256 ()Lio/ktor/server/http/content/ETagProvider;
++}
++
+ public abstract interface class io/ktor/server/http/content/FileSystemPaths {
+ 	public static final field Companion Lio/ktor/server/http/content/FileSystemPaths$Companion;
+ 	public abstract fun getPath (Ljava/lang/String;[Ljava/lang/String;)Ljava/nio/file/Path;
+@@ -900,9 +909,11 @@ public final class io/ktor/server/http/content/StaticContentConfig {
+ 	public final fun contentType (Lkotlin/jvm/functions/Function1;)V
+ 	public final fun default (Ljava/lang/String;)V
+ 	public final fun enableAutoHeadResponse ()V
++	public final fun etag (Lio/ktor/server/http/content/ETagProvider;)V
+ 	public final fun exclude (Lkotlin/jvm/functions/Function1;)V
+ 	public final fun extensions ([Ljava/lang/String;)V
+ 	public final fun fallback (Lkotlin/jvm/functions/Function3;)V
++	public final fun lastModified (Lkotlin/jvm/functions/Function1;)V
+ 	public final fun modify (Lkotlin/jvm/functions/Function3;)V
+ 	public final fun preCompressed ([Lio/ktor/server/http/content/CompressedFileType;)V
+ }
+diff --git a/ktor-server/ktor-server-core/jvm/src/io/ktor/server/http/content/ETagProvider.kt b/ktor-server/ktor-server-core/jvm/src/io/ktor/server/http/content/ETagProvider.kt
+new file mode 100644
+index 000000000..b92083d75
+--- /dev/null
++++ b/ktor-server/ktor-server-core/jvm/src/io/ktor/server/http/content/ETagProvider.kt
+@@ -0,0 +1,129 @@
++/*
++ * Copyright 2014-2025 JetBrains s.r.o and contributors. Use of this source code is governed by the Apache 2.0 license.
++ */
++
++package io.ktor.server.http.content
++
++import io.ktor.http.content.*
++import io.ktor.util.logging.*
++import kotlinx.io.IOException
++import java.io.File
++import java.io.InputStream
++import java.net.URL
++import java.nio.file.Files
++import java.nio.file.Path
++import java.nio.file.attribute.BasicFileAttributes
++import java.security.MessageDigest
++import java.util.concurrent.ConcurrentHashMap
++import kotlin.io.inputStream
++import kotlin.use
++
++private val LOGGER = KtorSimpleLogger("io.ktor.server.http.content.ETagProvider")
++
++/**
++ * Built‑in strategies for generating [io.ktor.http.HttpHeaders.ETag] for static content.
++ *
++ * Note: for this functionality to work, you need to install the [ConditionalHeaders] plugin.
++ *
++ * Usage:
++ * ```
++ * install(ConditionalHeaders)
++ *
++ * routing {
++ *   staticFiles("/assets", File("assets")) {
++ *     etag(ETagProvider.StrongSha256)
++ *   }
++ * }
++ * ```
++ *
++ * [Report a problem](https://ktor.io/feedback/?fqname=io.ktor.server.http.content.ETagProvider)
++ */
++public fun interface ETagProvider {
++
++    /**
++     * Provides an [EntityTagVersion] for the given resource or `null` if it cannot be provided.
++     */
++    public fun provide(resource: Any): EntityTagVersion?
++
++    public companion object {
++
++        private val etagCache by lazy { ConcurrentHashMap<String, EntityTagVersion>() }
++
++        /**
++         * Strong ETag provider based on SHA‑256 of the actual bytes of the resource.
++         * On I/O failures no ETag is produced
++         * Note: for this functionality to work, you need to install the [ConditionalHeaders] plugin.
++         *
++         * [Report a problem](https://ktor.io/feedback/?fqname=io.ktor.server.http.content.ETagProvider.Companion.StrongSha256)
++         */
++        public val StrongSha256: ETagProvider = ETagProvider { resource ->
++            val (key, streamSupplier) = try {
++                keyAndStreamSupplier(resource) ?: run {
++                    LOGGER.warn("StrongSha256 ETag not supported for ${resource::class}")
++                    return@ETagProvider null
++                }
++            } catch (cause: IOException) {
++                // failed to read metadata: no ETag
++                LOGGER.warn("Failed to prepare ETag computation for ${resource::class}: ${cause.message}")
++                return@ETagProvider null
++            }
++
++            etagCache[key] ?: run {
++                val computed = try {
++                    streamSupplier().use { ins ->
++                        val hex = sha256Hex(ins)
++                        EntityTagVersion(hex, weak = false)
++                    }
++                } catch (cause: IOException) {
++                    LOGGER.warn("Failed to compute ETag for resource $key: ${cause.message}")
++                    null // no ETag
++                }
++
++                if (computed != null) {
++                    etagCache.putIfAbsent(key, computed) ?: computed
++                } else {
++                    null
++                }
++            }
++        }
++    }
++}
++
++private fun keyAndStreamSupplier(resource: Any): Pair<String, () -> InputStream>? = when (resource) {
++    is File -> {
++        "${resource.absolutePath}:${resource.lastModified()}:${resource.length()}" to {
++            resource.inputStream()
++        }
++    }
++
++    is Path -> {
++        val path = resource.toAbsolutePath()
++        val attrs = Files.readAttributes(path, BasicFileAttributes::class.java)
++        "$path:${attrs.lastModifiedTime().toMillis()}:${attrs.size()}" to {
++            Files.newInputStream(path)
++        }
++    }
++
++    is URL -> {
++        val meta = runCatching {
++            val conn = resource.openConnection()
++            (conn.lastModified.takeIf { it > 0 }?.toString() ?: "") +
++                ":" + (conn.contentLengthLong.takeIf { it >= 0 }?.toString() ?: "")
++        }.getOrDefault("")
++        "${resource.toExternalForm()}:$meta" to { resource.openStream() }
++    }
++
++    else -> null
++}
++
++private fun sha256Hex(input: InputStream): String {
++    val md = MessageDigest.getInstance("SHA-256")
++    val buf = ByteArray(8192)
++    var n: Int
++    while (true) {
++        n = input.read(buf)
++        if (n == -1) break
++        md.update(buf, 0, n)
++    }
++    return md.digest().joinToString("") { "%02x".format(it) }
++}
+diff --git a/ktor-server/ktor-server-core/jvm/src/io/ktor/server/http/content/PreCompressed.kt b/ktor-server/ktor-server-core/jvm/src/io/ktor/server/http/content/PreCompressed.kt
+index 3905a7ee6..e7ed2c38b 100644
+--- a/ktor-server/ktor-server-core/jvm/src/io/ktor/server/http/content/PreCompressed.kt
++++ b/ktor-server/ktor-server-core/jvm/src/io/ktor/server/http/content/PreCompressed.kt
+@@ -11,9 +11,11 @@ import io.ktor.server.request.*
+ import io.ktor.server.response.*
+ import io.ktor.server.routing.*
+ import io.ktor.util.*
++import io.ktor.util.date.GMTDate
+ import java.io.*
+ import java.net.*
+ import java.nio.file.*
++import kotlin.collections.plus
+ import kotlin.io.path.*
+ 
+ /**
+@@ -119,6 +121,8 @@ internal suspend fun ApplicationCall.respondStaticFile(
+     compressedTypes: List<CompressedFileType>?,
+     contentType: (File) -> ContentType = { ContentType.defaultForFile(it) },
+     cacheControl: (File) -> List<CacheControl> = { emptyList() },
++    lastModified: (File) -> GMTDate? = { null },
++    etag: ETagProvider = ETagProvider { null },
+     modify: suspend (File, ApplicationCall) -> Unit = { _, _ -> }
+ ) {
+     attributes.put(StaticFileLocationProperty, requestedFile.path)
+@@ -128,7 +132,11 @@ internal suspend fun ApplicationCall.respondStaticFile(
+         if (requestedFile.isFile) {
+             if (cacheControlValues.isNotEmpty()) response.header(HttpHeaders.CacheControl, cacheControlValues)
+             modify(requestedFile, this)
+-            respond(LocalFileContent(requestedFile, contentType(requestedFile)))
++            val content = LocalFileContent(requestedFile, contentType(requestedFile)).apply {
++                etag.provide(requestedFile)?.let { versions += it }
++                lastModified(requestedFile)?.let { versions += LastModifiedVersion(it) }
++            }
++            respond(content)
+         }
+         return
+     }
+@@ -140,7 +148,10 @@ internal suspend fun ApplicationCall.respondStaticFile(
+         response.headers[HttpHeaders.Vary]?.plus(", ${HttpHeaders.AcceptEncoding}") ?: HttpHeaders.AcceptEncoding
+     )
+     modify(requestedFile, this)
+-    val localFileContent = LocalFileContent(compressedFile, contentType(requestedFile))
++    val localFileContent = LocalFileContent(compressedFile, contentType(requestedFile)).apply {
++        etag.provide(compressedFile)?.let { versions += it }
++        lastModified(compressedFile)?.let { versions += LastModifiedVersion(it) }
++    }
+     respond(PreCompressedResponse(localFileContent, bestCompressionFit.encoding))
+ }
+ 
+@@ -150,7 +161,9 @@ internal suspend fun ApplicationCall.respondStaticPath(
+     compressedTypes: List<CompressedFileType>?,
+     contentType: (Path) -> ContentType = { ContentType.defaultForPath(it) },
+     cacheControl: (Path) -> List<CacheControl> = { emptyList() },
+-    modify: suspend (Path, ApplicationCall) -> Unit = { _, _ -> }
++    modify: suspend (Path, ApplicationCall) -> Unit = { _, _ -> },
++    lastModified: (Path) -> GMTDate? = { null },
++    etag: ETagProvider = ETagProvider { null },
+ ) {
+     attributes.put(StaticFileLocationProperty, requestedPath.toString())
+     val bestCompressionFit =
+@@ -160,7 +173,11 @@ internal suspend fun ApplicationCall.respondStaticPath(
+         if (requestedPath.exists()) {
+             if (cacheControlValues.isNotEmpty()) response.header(HttpHeaders.CacheControl, cacheControlValues)
+             modify(requestedPath, this)
+-            respond(LocalPathContent(requestedPath, contentType(requestedPath)))
++            val content = LocalPathContent(requestedPath, contentType(requestedPath)).apply {
++                etag.provide(requestedPath)?.let { versions += it }
++                lastModified(requestedPath)?.let { versions += LastModifiedVersion(it) }
++            }
++            respond(content)
+         }
+         return
+     }
+@@ -168,7 +185,10 @@ internal suspend fun ApplicationCall.respondStaticPath(
+     val (compressedPath, compression) = bestCompressionFit
+     if (cacheControlValues.isNotEmpty()) response.header(HttpHeaders.CacheControl, cacheControlValues)
+     modify(requestedPath, this)
+-    val localFileContent = LocalPathContent(compressedPath, contentType(requestedPath))
++    val localFileContent = LocalPathContent(compressedPath, contentType(requestedPath)).apply {
++        etag.provide(compressedPath)?.let { versions += it }
++        lastModified(compressedPath)?.let { versions += LastModifiedVersion(it) }
++    }
+     respond(PreCompressedResponse(localFileContent, compression.encoding))
+ }
+ 
+@@ -179,6 +199,8 @@ internal suspend fun ApplicationCall.respondStaticResource(
+     contentType: (URL) -> ContentType = { ContentType.defaultForFileExtension(it.path.extension()) },
+     cacheControl: (URL) -> List<CacheControl> = { emptyList() },
+     modifier: suspend (URL, ApplicationCall) -> Unit = { _, _ -> },
++    lastModified: (URL) -> GMTDate? = { null },
++    etag: ETagProvider = ETagProvider { null },
+     exclude: (URL) -> Boolean = { false }
+ ) {
+     attributes.put(StaticFileLocationProperty, requestedResource)
+@@ -204,7 +226,11 @@ internal suspend fun ApplicationCall.respondStaticResource(
+             response.headers[HttpHeaders.Vary]?.plus(", ${HttpHeaders.AcceptEncoding}") ?: HttpHeaders.AcceptEncoding
+         )
+         modifier(bestCompressionFit.url, this)
+-        respond(PreCompressedResponse(bestCompressionFit.content, bestCompressionFit.compression.encoding))
++        val content = PreCompressedResponse(bestCompressionFit.content, bestCompressionFit.compression.encoding).apply {
++            etag.provide(bestCompressionFit.url)?.let { versions += it }
++            lastModified(bestCompressionFit.url)?.let { versions += LastModifiedVersion(it) }
++        }
++        respond(content)
+         return
+     }
+ 
+@@ -221,6 +247,10 @@ internal suspend fun ApplicationCall.respondStaticResource(
+         val cacheControlValues = cacheControl(content.first).joinToString(", ")
+         if (cacheControlValues.isNotEmpty()) response.header(HttpHeaders.CacheControl, cacheControlValues)
+         modifier(content.first, this)
+-        respond(content.second)
++        val outgoingContent = content.second.apply {
++            etag.provide(content.first)?.let { versions += it }
++            lastModified(content.first)?.let { versions += LastModifiedVersion(it) }
++        }
++        respond(outgoingContent)
+     }
+ }
+diff --git a/ktor-server/ktor-server-core/jvm/src/io/ktor/server/http/content/StaticContent.kt b/ktor-server/ktor-server-core/jvm/src/io/ktor/server/http/content/StaticContent.kt
+index 6aa4fd63c..bbfa2ba13 100644
+--- a/ktor-server/ktor-server-core/jvm/src/io/ktor/server/http/content/StaticContent.kt
++++ b/ktor-server/ktor-server-core/jvm/src/io/ktor/server/http/content/StaticContent.kt
+@@ -13,6 +13,7 @@ import io.ktor.server.http.content.FileSystemPaths.Companion.paths
+ import io.ktor.server.response.*
+ import io.ktor.server.routing.*
+ import io.ktor.util.*
++import io.ktor.util.date.*
+ import java.io.File
+ import java.net.URL
+ import java.nio.file.FileSystem
+@@ -78,6 +79,8 @@ public class StaticContentConfig<Resource : Any> internal constructor() {
+     internal var fallback: suspend (String, ApplicationCall) -> Unit = { _, _ -> }
+     internal var preCompressedFileTypes: List<CompressedFileType> = emptyList()
+     internal var autoHeadResponse: Boolean = false
++    internal var lastModifiedExtractor: (Resource) -> GMTDate? = { null }
++    internal var etagExtractor: ETagProvider = ETagProvider { null }
+ 
+     /**
+      * Enables pre-compressed files or resources.
+@@ -182,6 +185,32 @@ public class StaticContentConfig<Resource : Any> internal constructor() {
+         modifier = block
+     }
+ 
++    /**
++     * Configures [HttpHeaders.LastModified] for requested static content.
++     * For files, [Resource] is a requested [File].
++     * For resources, [Resource] is a [URL] to a requested resource.
++     *
++     * Note: for this functionality to work, you need to install the [ConditionalHeaders] plugin.
++     *
++     * [Report a problem](https://ktor.io/feedback/?fqname=io.ktor.server.http.content.StaticContentConfig.lastModified)
++     */
++    public fun lastModified(block: (Resource) -> GMTDate?) {
++        lastModifiedExtractor = block
++    }
++
++    /**
++     * Configures [HttpHeaders.ETag] for requested content.
++     * For files, [Resource] is a requested [File].
++     * For resources, [Resource] is a [URL] to a requested resource.
++     *
++     * Note: for this functionality to work, you need to install the [ConditionalHeaders] plugin.
++     *
++     * [Report a problem](https://ktor.io/feedback/?fqname=io.ktor.server.http.content.StaticContentConfig.etag)
++     */
++    public fun etag(block: ETagProvider) {
++        etagExtractor = block
++    }
++
+     /**
+      * Configures resources that should not be served.
+      * If this block returns `true` for [Resource], [Application] will respond with [HttpStatusCode.Forbidden].
+@@ -242,6 +271,8 @@ public fun Route.staticFiles(
+     val exclude = staticRoute.exclude
+     val defaultPath = staticRoute.defaultPath
+     val fallback = staticRoute.fallback
++    val lastModified = staticRoute.lastModifiedExtractor
++    val etag = staticRoute.etagExtractor
+     return staticContentRoute(remotePath, autoHead) {
+         respondStaticFile(
+             index = index,
+@@ -249,6 +280,8 @@ public fun Route.staticFiles(
+             compressedTypes = compressedTypes,
+             contentType = contentType,
+             cacheControl = cacheControl,
++            lastModified = lastModified,
++            etag = etag,
+             modify = modify,
+             exclude = exclude,
+             extensions = extensions,
+@@ -286,6 +319,8 @@ public fun Route.staticResources(
+     val exclude = staticRoute.exclude
+     val defaultPath = staticRoute.defaultPath
+     val fallback = staticRoute.fallback
++    val lastModified = staticRoute.lastModifiedExtractor
++    val etag = staticRoute.etagExtractor
+     return staticContentRoute(remotePath, autoHead) {
+         respondStaticResource(
+             index = index,
+@@ -293,6 +328,8 @@ public fun Route.staticResources(
+             compressedTypes = compressedTypes,
+             contentType = contentType,
+             cacheControl = cacheControl,
++            lastModified = lastModified,
++            etag = etag,
+             modifier = modifier,
+             exclude = exclude,
+             extensions = extensions,
+@@ -400,6 +437,8 @@ public fun Route.staticFileSystem(
+     val exclude = staticRoute.exclude
+     val defaultPath = staticRoute.defaultPath
+     val fallback = staticRoute.fallback
++    val lastModified = staticRoute.lastModifiedExtractor
++    val etag = staticRoute.etagExtractor
+     return staticContentRoute(remotePath, autoHead) {
+         respondStaticPath(
+             fileSystem = fileSystem,
+@@ -408,6 +447,8 @@ public fun Route.staticFileSystem(
+             compressedTypes = compressedTypes,
+             contentType = contentType,
+             cacheControl = cacheControl,
++            lastModified = lastModified,
++            etag = etag,
+             modify = modify,
+             exclude = exclude,
+             extensions = extensions,
+@@ -449,6 +490,10 @@ public fun Route.preCompressed(
+  *
+  * [Report a problem](https://ktor.io/feedback/?fqname=io.ktor.server.http.content.staticRootFolder)
+  */
++@Deprecated(
++    "This property only used in deprecated functions `files`, `file` and `default`. " +
++        "Please use `staticFiles` or `staticResources` instead"
++)
+ public var Route.staticRootFolder: File?
+     get() = attributes.getOrNull(staticRootFolderKey) ?: parent?.staticRootFolder
+     set(value) {
+@@ -676,6 +721,8 @@ private suspend fun ApplicationCall.respondStaticFile(
+     compressedTypes: List<CompressedFileType>?,
+     contentType: (File) -> ContentType,
+     cacheControl: (File) -> List<CacheControl>,
++    lastModified: (File) -> GMTDate?,
++    etag: ETagProvider,
+     modify: suspend (File, ApplicationCall) -> Unit,
+     exclude: (File) -> Boolean,
+     extensions: List<String>,
+@@ -693,23 +740,39 @@ private suspend fun ApplicationCall.respondStaticFile(
+ 
+     val isDirectory = requestedFile.isDirectory
+     if (index != null && isDirectory) {
+-        respondStaticFile(File(requestedFile, index), compressedTypes, contentType, cacheControl, modify)
++        respondStaticFile(
++            File(requestedFile, index),
++            compressedTypes,
++            contentType,
++            cacheControl,
++            lastModified,
++            etag,
++            modify
++        )
+     } else if (!isDirectory) {
+         if (checkExclude(requestedFile)) return
+ 
+-        respondStaticFile(requestedFile, compressedTypes, contentType, cacheControl, modify)
++        respondStaticFile(requestedFile, compressedTypes, contentType, cacheControl, lastModified, etag, modify)
+         if (isHandled) return
+         for (extension in extensions) {
+             val fileWithExtension = File("${requestedFile.path}.$extension")
+             if (checkExclude(fileWithExtension)) return
+-            respondStaticFile(fileWithExtension, compressedTypes, contentType, cacheControl, modify)
++            respondStaticFile(fileWithExtension, compressedTypes, contentType, cacheControl, lastModified, etag, modify)
+             if (isHandled) return
+         }
+     }
+ 
+     if (isHandled) return
+     if (defaultPath != null) {
+-        respondStaticFile(File(dir, defaultPath), compressedTypes, contentType, cacheControl, modify)
++        respondStaticFile(
++            File(dir, defaultPath),
++            compressedTypes,
++            contentType,
++            cacheControl,
++            lastModified,
++            etag,
++            modify
++        )
+     }
+ 
+     if (isHandled) return
+@@ -723,6 +786,8 @@ private suspend fun ApplicationCall.respondStaticPath(
+     compressedTypes: List<CompressedFileType>?,
+     contentType: (Path) -> ContentType,
+     cacheControl: (Path) -> List<CacheControl>,
++    lastModified: (Path) -> GMTDate?,
++    etag: ETagProvider,
+     modify: suspend (Path, ApplicationCall) -> Unit,
+     exclude: (Path) -> Boolean,
+     extensions: List<String>,
+@@ -740,16 +805,43 @@ private suspend fun ApplicationCall.respondStaticPath(
+ 
+     val isDirectory = requestedPath.isDirectory()
+     if (index != null && isDirectory) {
+-        respondStaticPath(fileSystem, requestedPath.resolve(index), compressedTypes, contentType, cacheControl, modify)
++        respondStaticPath(
++            fileSystem,
++            requestedPath.resolve(index),
++            compressedTypes,
++            contentType,
++            cacheControl,
++            modify,
++            lastModified,
++            etag
++        )
+     } else if (!isDirectory) {
+         if (checkExclude(requestedPath)) return
+ 
+-        respondStaticPath(fileSystem, requestedPath, compressedTypes, contentType, cacheControl, modify)
++        respondStaticPath(
++            fileSystem,
++            requestedPath,
++            compressedTypes,
++            contentType,
++            cacheControl,
++            modify,
++            lastModified,
++            etag
++        )
+         if (isHandled) return
+         for (extension in extensions) {
+             val pathWithExtension = fileSystem.getPath("${requestedPath.pathString}.$extension")
+             if (checkExclude(pathWithExtension)) return
+-            respondStaticPath(fileSystem, pathWithExtension, compressedTypes, contentType, cacheControl, modify)
++            respondStaticPath(
++                fileSystem,
++                pathWithExtension,
++                compressedTypes,
++                contentType,
++                cacheControl,
++                modify,
++                lastModified,
++                etag
++            )
+             if (isHandled) return
+         }
+     }
+@@ -762,7 +854,9 @@ private suspend fun ApplicationCall.respondStaticPath(
+             compressedTypes,
+             contentType,
+             cacheControl,
+-            modify
++            modify,
++            lastModified,
++            etag
+         )
+     }
+ 
+@@ -776,6 +870,8 @@ private suspend fun ApplicationCall.respondStaticResource(
+     compressedTypes: List<CompressedFileType>?,
+     contentType: (URL) -> ContentType,
+     cacheControl: (URL) -> List<CacheControl>,
++    lastModified: (URL) -> GMTDate?,
++    etag: ETagProvider,
+     modifier: suspend (URL, ApplicationCall) -> Unit,
+     exclude: (URL) -> Boolean,
+     extensions: List<String>,
+@@ -791,6 +887,8 @@ private suspend fun ApplicationCall.respondStaticResource(
+         contentType = contentType,
+         cacheControl = cacheControl,
+         modifier = modifier,
++        lastModified = lastModified,
++        etag = etag,
+         exclude = exclude
+     )
+ 
+@@ -803,6 +901,8 @@ private suspend fun ApplicationCall.respondStaticResource(
+             contentType = contentType,
+             cacheControl = cacheControl,
+             modifier = modifier,
++            lastModified = lastModified,
++            etag = etag,
+             exclude = exclude
+         )
+         if (isHandled) return
+@@ -815,7 +915,9 @@ private suspend fun ApplicationCall.respondStaticResource(
+             compressedTypes = compressedTypes,
+             contentType = contentType,
+             cacheControl = cacheControl,
+-            modifier = modifier
++            modifier = modifier,
++            lastModified = lastModified,
++            etag = etag,
+         )
+     }
+ 
+@@ -827,7 +929,9 @@ private suspend fun ApplicationCall.respondStaticResource(
+             compressedTypes = compressedTypes,
+             contentType = contentType,
+             cacheControl = cacheControl,
+-            modifier = modifier
++            modifier = modifier,
++            lastModified = lastModified,
++            etag = etag,
+         )
+     }
+ 

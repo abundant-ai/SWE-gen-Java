@@ -1,0 +1,1356 @@
+diff --git a/.blueprint/from-issue/command.mts b/.blueprint/from-issue/command.mts
+index 05339b16bc..63b2e43410 100644
+--- a/.blueprint/from-issue/command.mts
++++ b/.blueprint/from-issue/command.mts
+@@ -33,7 +33,7 @@ const command: JHipsterCommandDefinition = {
+         if (parsedIssue) {
+           gen.owner = parsedIssue.owner;
+           gen.repository = parsedIssue.repository;
+-          gen.issue = parsedIssue.issue;
++          gen.issueNumber = parsedIssue.issue;
+         }
+       },
+       scope: 'generator',
+diff --git a/.blueprint/from-issue/generator.mts b/.blueprint/from-issue/generator.mts
+index a26bf834d2..3d9624999b 100644
+--- a/.blueprint/from-issue/generator.mts
++++ b/.blueprint/from-issue/generator.mts
+@@ -1,30 +1,59 @@
+ import { join } from 'node:path';
+ 
+ import BaseGenerator from '../../generators/base/index.js';
+-import { getGithubIssue, setGithubTaskOutput, prepareSample } from '../../lib/testing/index.js';
++import { getGithubIssue, setGithubTaskOutput, prepareSample, appendToSummary } from '../../lib/testing/index.js';
+ import { promptSamplesFolder } from '../support.mjs';
+ import { GENERATOR_APP, GENERATOR_JDL, GENERATOR_WORKSPACES } from '../../generators/generator-list.js';
+-import { extractDataFromInfo, type InfoData } from '../../generators/info/support/index.js';
++import { extractDataFromInfo, markdownDetails, type InfoData } from '../../generators/info/support/index.js';
+ import EnvironmentBuilder from '../../cli/environment-builder.mjs';
+ 
+ const YO_RC_OUTPUT = 'yo-rc';
+ const ENTITIES_JDL_OUTPUT = 'entities-jdl';
+ const RESULT_OUTPUT = 'result';
+ const VALID_OUTPUT = 'valid';
++const SUMMARY_OUTPUT = 'summary';
++const FOOTER_OUTPUT = 'footer';
++const DIFFS_OUTPUT = 'diffs';
++
+ const CONTAINS_SAMPLE = 'contains-sample';
+ 
+ const BLANK = 'blank';
+ const VALID = 'valid';
++const VALID_EMOJI = ':heavy_check_mark:';
+ const ERROR = 'error';
++const ERROR_EMOJI = ':x:';
+ const SUCCESS = 'successfully generated';
+ 
++const generateSummary = (data: InfoData, { applicationGenerated, issue }: { applicationGenerated: boolean; issue: string }) => `
++| ${issue} | Value |
++| --- | --- |${data.yoRcBlank ? `` : `\n| **.yo-rc.json** | ${data.yoRcValid ? VALID_EMOJI : ERROR_EMOJI} |`}${
++  (data.jdlApplications ?? 0) > 0 ? `\n| **JDL** | ${VALID_EMOJI} |` : ``
++}
++| **Entities JDL** | ${data.jdlEntitiesDefinitions ? VALID_EMOJI : '-'} |
++| --- | --- |
++| **Application Generation** | ${applicationGenerated ? VALID_EMOJI : ERROR_EMOJI} |
++`;
++
++const generateFooter = (data: InfoData) =>
++  data.files.map(info => markdownDetails({ title: info.filename, codeType: 'jdl', content: info.content })).join('\n\n');
++
++const generateDiffOutput = (title: string, content: string) => markdownDetails({ title, codeType: 'diff', content });
++
+ export default class extends BaseGenerator {
+-  issue!: string;
+   projectFolder!: string;
+-  owner!: string;
++  issue!: string;
+   codeWorkspace!: boolean;
++
++  issueNumber!: string;
++  owner!: string;
+   repository!: string;
++
+   data!: InfoData;
++  logCwd = this.destinationPath();
++
++  summaryData = '';
++  summaryFooter = '';
++  summaryDiffs = '';
+ 
+   constructor(args, options, features) {
+     super(args, options, { queueCommandTasks: true, ...features });
+@@ -43,10 +72,10 @@ export default class extends BaseGenerator {
+   get [BaseGenerator.DEFAULT]() {
+     return this.asDefaultTaskGroup({
+       async generateSample() {
+-        const issue = await getGithubIssue({ owner: this.owner, repository: this.repository, issue: this.issue });
++        const issue = await getGithubIssue({ owner: this.owner, repository: this.repository, issue: this.issueNumber });
+ 
+-        this.projectFolder = this.destinationPath(
+-          this.projectFolder ?? join(this._globalConfig.get('samplesFolder'), `issues/${this.issue}`),
++        this.destinationRoot(
++          this.destinationPath(this.projectFolder ?? join(this._globalConfig.get('samplesFolder'), `issues/${this.issueNumber}`)),
+         );
+ 
+         this.data = extractDataFromInfo(issue.body ?? '');
+@@ -59,8 +88,13 @@ export default class extends BaseGenerator {
+         setGithubTaskOutput(ENTITIES_JDL_OUTPUT, this.data.jdlEntitiesDefinitions ? VALID : BLANK);
+         setGithubTaskOutput(CONTAINS_SAMPLE, Boolean(this.data.jdlDefinitions || this.data.yoRcContent));
+         setGithubTaskOutput(VALID_OUTPUT, this.data.yoRcValid);
++        this.summaryFooter = generateFooter(this.data);
++        setGithubTaskOutput(FOOTER_OUTPUT, this.summaryFooter);
+ 
+-        for (const file of await prepareSample(this.projectFolder, this.data.files)) {
++        for (const file of await prepareSample(
++          this.destinationPath(),
++          this.data.files.filter(file => file.type === 'yo-rc'),
++        )) {
+           this.writeDestination(file.filename, file.content);
+         }
+       },
+@@ -70,48 +104,77 @@ export default class extends BaseGenerator {
+   get [BaseGenerator.END]() {
+     return this.asEndTaskGroup({
+       async generateSample() {
+-        const envOptions = { cwd: this.projectFolder, logCwd: this.destinationPath() };
+-        const generatorOptions = { ...this.options, skipPriorities: ['prompting'], skipInstall: true, experimental: true };
++        const envOptions = { cwd: this.destinationPath(), logCwd: this.logCwd };
++        const generatorOptions = { ...this.options, skipPriorities: ['prompting'], skipInstall: true, experimental: true, force: true };
+         delete generatorOptions.sharedData;
+ 
+-        const { workspacesFolders, jdlEntitiesDefinitions, yoRcContent, jdlDefinitions } = this.data;
+-        if (jdlEntitiesDefinitions) {
+-          try {
++        const { workspacesFolders, jdlEntitiesDefinitions, yoRcContent, jdlApplications = 0, files } = this.data;
++        try {
++          if (jdlEntitiesDefinitions) {
++            try {
++              await EnvironmentBuilder.run(
++                [`jhipster:${GENERATOR_JDL}`],
++                { ...generatorOptions, inline: jdlEntitiesDefinitions, jsonOnly: true },
++                envOptions,
++              );
++            } catch (error) {
++              setGithubTaskOutput(ENTITIES_JDL_OUTPUT, ERROR);
++              throw error;
++            }
++          }
++          if (yoRcContent) {
+             await EnvironmentBuilder.run(
+-              [`jhipster:${GENERATOR_JDL}`],
+-              { ...generatorOptions, inline: jdlEntitiesDefinitions, jsonOnly: true },
++              [`jhipster:${workspacesFolders ? GENERATOR_WORKSPACES : GENERATOR_APP}`],
++              { ...generatorOptions, ...(workspacesFolders ? { workspacesFolders, generateApplications: true } : {}) },
+               envOptions,
+             );
+-          } catch (error) {
+-            setGithubTaskOutput(ENTITIES_JDL_OUTPUT, ERROR);
+-            throw error;
++          } else if (jdlApplications > 0) {
++            const workspaceOpts = jdlApplications > 1 ? { workspaces: true, monorepository: true } : {};
++            const diffs: string[] = [];
++            for (const file of files.filter(file => file.type === 'jdl')) {
++              await EnvironmentBuilder.run(
++                [`jhipster:${GENERATOR_JDL}`],
++                { ...generatorOptions, ...workspaceOpts, inline: file.content },
++                envOptions,
++              );
++              const git = this.createGit();
++              const status = await git.status();
++              if (!status.isClean()) {
++                await git.add('.').commit(`chore: generate application from ${file.filename}`);
++                const { all } = await this.spawn('git', ['diff', '--no-color', '@~1'], { stdio: 'pipe', all: true });
++                if (all) {
++                  this.log(all);
++                  diffs.push(generateDiffOutput(`diff ${file.filename}`, all));
++                }
++              }
++            }
++            this.summaryDiffs = diffs.join('\n\n');
++            setGithubTaskOutput(DIFFS_OUTPUT, this.summaryDiffs);
+           }
++        } catch (error) {
++          this.summaryData = generateSummary(this.data, { applicationGenerated: false, issue: this.issue });
++          setGithubTaskOutput(SUMMARY_OUTPUT, this.summaryData);
++          this.appendSummary();
++          throw error;
+         }
+-        if (yoRcContent) {
+-          await EnvironmentBuilder.run(
+-            [`jhipster:${workspacesFolders ? GENERATOR_WORKSPACES : GENERATOR_APP}`],
+-            { ...generatorOptions, ...(workspacesFolders ? { workspacesFolders, generateApplications: true } : {}) },
+-            envOptions,
+-          );
+-        } else if (jdlDefinitions) {
+-          const applications = (jdlDefinitions.match(/application\s*\{/g) || []).length;
+-          const workspaceOpts = applications > 1 ? { workspaces: true, monorepository: true } : {};
+-          await EnvironmentBuilder.run(
+-            [`jhipster:${GENERATOR_JDL}`],
+-            { ...generatorOptions, ...workspaceOpts, inline: jdlDefinitions },
+-            envOptions,
+-          );
+-        }
++
+         setGithubTaskOutput(RESULT_OUTPUT, SUCCESS);
++        this.summaryData = generateSummary(this.data, { applicationGenerated: true, issue: this.issue });
++        setGithubTaskOutput(SUMMARY_OUTPUT, this.summaryData);
++        this.appendSummary();
+ 
+         if (this.codeWorkspace) {
+           await this.composeWithJHipster('@jhipster/jhipster-dev:code-workspace', {
+             generatorOptions: {
+-              samplePath: this.projectFolder,
++              samplePath: this.destinationPath(),
+             } as any,
+           });
+         }
+       },
+     });
+   }
++
++  appendSummary() {
++    appendToSummary(this.summaryData + this.summaryDiffs + this.summaryFooter);
++  }
+ }
+diff --git a/generators/angular/resources/package.json b/generators/angular/resources/package.json
+index 11c4d382d1..5113b6f3fb 100644
+--- a/generators/angular/resources/package.json
++++ b/generators/angular/resources/package.json
+@@ -2,8 +2,8 @@
+   "dependencies": {
+     "@angular/common": "18.2.12",
+     "@fortawesome/angular-fontawesome": "0.15.0",
+-    "@fortawesome/fontawesome-svg-core": "6.7.0",
+-    "@fortawesome/free-solid-svg-icons": "6.7.0",
++    "@fortawesome/fontawesome-svg-core": "6.6.0",
++    "@fortawesome/free-solid-svg-icons": "6.6.0",
+     "@ng-bootstrap/ng-bootstrap": "17.0.1",
+     "@ngx-translate/core": "16.0.3",
+     "@ngx-translate/http-loader": "16.0.0",
+@@ -24,16 +24,16 @@
+     "@angular-builders/custom-webpack": "18.0.0",
+     "@angular-builders/jest": "18.0.0",
+     "@angular/cli": "18.2.12",
+-    "@eslint/js": "9.15.0",
++    "@eslint/js": "9.14.0",
+     "@types/jest": "29.5.14",
+     "@types/node": "20.11.25",
+     "@types/sockjs-client": "1.5.4",
+-    "angular-eslint": "18.4.1",
++    "angular-eslint": "18.4.0",
+     "browser-sync": "3.0.3",
+     "browser-sync-webpack-plugin": "2.3.0",
+     "buffer": "6.0.3",
+     "copy-webpack-plugin": "12.0.2",
+-    "eslint": "9.15.0",
++    "eslint": "9.14.0",
+     "eslint-config-prettier": "9.1.0",
+     "eslint-plugin-prettier": "5.2.1",
+     "eslint-webpack-plugin": "4.2.0",
+@@ -42,14 +42,14 @@
+     "jest": "29.7.0",
+     "jest-date-mock": "1.0.10",
+     "jest-junit": "16.0.0",
+-    "jest-preset-angular": "14.3.1",
++    "jest-preset-angular": "14.3.0",
+     "jest-sonar": "0.2.16",
+     "merge-jsons-webpack-plugin": "2.0.1",
+     "postcss-rtlcss": "5.5.0",
+     "rimraf": "5.0.8",
+     "ts-jest": "29.2.5",
+     "typescript": "5.5.4",
+-    "typescript-eslint": "8.15.0",
++    "typescript-eslint": "8.14.0",
+     "webpack": "5.96.1",
+     "webpack-bundle-analyzer": "4.10.2",
+     "webpack-merge": "6.0.1",
+diff --git a/generators/base-application/generator.ts b/generators/base-application/generator.ts
+index 8dc395802a..45d80f685e 100644
+--- a/generators/base-application/generator.ts
++++ b/generators/base-application/generator.ts
+@@ -30,6 +30,7 @@ import {
+   GENERATOR_BOOTSTRAP_APPLICATION_SERVER,
+ } from '../generator-list.js';
+ import type { TaskTypes as DefaultTaskTypes } from '../../lib/types/application/tasks.js';
++import type { ApplicationType } from '../../lib/types/application/application.js';
+ import type { Entity } from '../../lib/types/application/entity.js';
+ import type { GenericTaskGroup } from '../../lib/types/base/tasks.js';
+ import type { ApplicationConfiguration } from '../../lib/types/application/yo-rc.js';
+@@ -93,7 +94,7 @@ export default class BaseApplicationGenerator<
+   static POST_WRITING_ENTITIES = asPriority(POST_WRITING_ENTITIES);
+ 
+   declare jhipsterConfig: ApplicationConfiguration & Record<string, any>;
+-  declare sharedData: SharedData;
++  declare sharedData: SharedData<ApplicationType>;
+ 
+   constructor(args: string | string[], options: JHipsterGeneratorOptions, features: JHipsterGeneratorFeatures) {
+     super(args, options, features);
+diff --git a/generators/base-core/generator.ts b/generators/base-core/generator.ts
+index 908490bedb..f450912d6a 100644
+--- a/generators/base-core/generator.ts
++++ b/generators/base-core/generator.ts
+@@ -1390,7 +1390,7 @@ templates: ${JSON.stringify(existingTemplates, null, 2)}`;
+     return this.options.sharedData.applications?.[this.calculateApplicationId(applicationFolder)];
+   }
+ 
+-  private createSharedData({ help }: { help?: boolean }): SharedData {
++  private createSharedData({ help }: { help?: boolean }): SharedData<BaseApplication> {
+     const applicationId = this.options.applicationId ?? this.calculateApplicationId(this.destinationPath());
+     if (this.options.sharedData.applications === undefined) {
+       this.options.sharedData.applications = {};
+@@ -1401,7 +1401,7 @@ templates: ${JSON.stringify(existingTemplates, null, 2)}`;
+     }
+     const { ignoreNeedlesError } = this.options;
+ 
+-    return new SharedData(
++    return new SharedData<BaseApplication>(
+       sharedApplications[applicationId],
+       { destinationPath: this.destinationPath(), memFs: this.env.sharedFs, log: this.log, logCwd: this.env.logCwd },
+       { ignoreNeedlesError },
+diff --git a/generators/base/shared-data.ts b/generators/base/shared-data.ts
+index ac95dd5406..a7dcc28fd2 100644
+--- a/generators/base/shared-data.ts
++++ b/generators/base/shared-data.ts
+@@ -24,13 +24,11 @@ import { lt as semverLessThan } from 'semver';
+ import { defaults } from 'lodash-es';
+ import type { MemFsEditor } from 'mem-fs-editor';
+ import { create } from 'mem-fs-editor';
++import { type BaseApplication } from '../base-application/types.js';
+ import { GENERATOR_JHIPSTER } from '../generator-constants.js';
+-import type { ApplicationType } from '../../lib/types/application/application.js';
+-import type { Entity } from '../../lib/types/application/entity.js';
+-import type { Entity as BaseEntity } from '../../lib/types/base/entity.js';
+ import type { CleanupArgumentType, Control } from './types.js';
+ 
+-export default class SharedData<EntityType extends BaseEntity = Entity, Application = ApplicationType> {
++export default class SharedData<ApplicationType extends BaseApplication = BaseApplication> {
+   _storage: any;
+   _editor: MemFsEditor;
+   _log: any;
+@@ -147,20 +145,20 @@ export default class SharedData<EntityType extends BaseEntity = Entity, Applicat
+     return this._storage.control;
+   }
+ 
+-  getApplication(): Application {
++  getApplication(): ApplicationType {
+     if (!this._storage.sharedApplication) throw new Error('Shared application not loaded');
+     return this._storage.sharedApplication;
+   }
+ 
+-  setEntity(entityName: string, entity: { name: string } & Partial<EntityType>): void {
++  setEntity(entityName: string, entity) {
+     this._storage.sharedEntities[entityName] = entity;
+   }
+ 
+-  hasEntity(entityName): boolean {
++  hasEntity(entityName) {
+     return Boolean(this._storage.sharedEntities[entityName]);
+   }
+ 
+-  getEntity(entityName): EntityType {
++  getEntity(entityName) {
+     const entity = this._storage.sharedEntities[entityName];
+     if (!entity) {
+       throw new Error(`Entity definition not loaded for ${entityName}`);
+@@ -168,11 +166,11 @@ export default class SharedData<EntityType extends BaseEntity = Entity, Applicat
+     return entity;
+   }
+ 
+-  getEntities(entityNames = Object.keys(this._storage.sharedEntities)): { entityName: string; entity: EntityType }[] {
++  getEntities(entityNames = Object.keys(this._storage.sharedEntities)) {
+     return entityNames.map(entityName => ({ entityName, entity: this.getEntity(entityName) }));
+   }
+ 
+-  getEntitiesMap(): Record<string, EntityType> {
++  getEntitiesMap() {
+     return this._storage.sharedEntities;
+   }
+ }
+diff --git a/generators/bootstrap-application-base/generator.ts b/generators/bootstrap-application-base/generator.ts
+index cd0d59f339..50d6deb5e8 100644
+--- a/generators/bootstrap-application-base/generator.ts
++++ b/generators/bootstrap-application-base/generator.ts
+@@ -239,11 +239,11 @@ export default class BootstrapApplicationBase extends BaseApplicationGenerator {
+         }
+ 
+         if (entityConfig.changelogDate) {
+-          entityConfig.annotations!.changelogDate = entityConfig.changelogDate;
++          entityConfig.annotations.changelogDate = entityConfig.changelogDate;
+           delete entityConfig.changelogDate;
+         }
+-        if (!entityConfig.annotations!.changelogDate) {
+-          entityConfig.annotations!.changelogDate = this.dateFormatForLiquibase();
++        if (!entityConfig.annotations.changelogDate) {
++          entityConfig.annotations.changelogDate = this.dateFormatForLiquibase();
+           entityStorage.save();
+         }
+       },
+@@ -359,17 +359,6 @@ export default class BootstrapApplicationBase extends BaseApplicationGenerator {
+         this.validateResult(loadEntitiesOtherSide(entities, { application }));
+ 
+         for (const entity of entities) {
+-          if (!entity.builtIn) {
+-            const invalidRelationship = entity.relationships.find(
+-              ({ otherEntity }) => !otherEntity.builtIn && entity.microserviceName !== otherEntity.microserviceName,
+-            );
+-            if (invalidRelationship) {
+-              throw new Error(
+-                `Microservice entities cannot have relationships with entities from other microservice: '${entity.name}.${invalidRelationship.relationshipName}'`,
+-              );
+-            }
+-          }
+-
+           for (const field of entity.fields) {
+             if (isFieldBinaryType(field)) {
+               if (isFieldBlobType(field)) {
+diff --git a/generators/ci-cd/__snapshots__/ci-cd.spec.ts.snap b/generators/ci-cd/__snapshots__/ci-cd.spec.ts.snap
+index 60a8b82296..5ab973ad0a 100644
+--- a/generators/ci-cd/__snapshots__/ci-cd.spec.ts.snap
++++ b/generators/ci-cd/__snapshots__/ci-cd.spec.ts.snap
+@@ -1576,15 +1576,16 @@ gradle-package:
+             - build/classes
+         expire_in: 1 day
+ 
+-# Uncomment the following section to enable pushing the Docker image to the GitLab Container Registry
++# Uncomment the following line to use gitlabs container registry. You need to adapt the REGISTRY_URL in case you are not using gitlab.com
+ #docker-push:
+ #    stage: release
+ #    variables:
++#        REGISTRY_URL: registry.gitlab.com
+ #        IMAGE_TAG: $CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHA
+ #    dependencies:
+ #        - gradle-package
+ #    script:
+-#        - ./gradlew jib -Pprod -PnodeInstall -Djib.to.image=$IMAGE_TAG -Djib.to.auth.username=$CI_REGISTRY_USER -Djib.to.auth.password=$CI_REGISTRY_PASSWORD
++#        - ./gradlew jib -Pprod -PnodeInstall -Djib.to.image=$IMAGE_TAG -Djib.to.auth.username="gitlab-ci-token"  -Djib.to.auth.password=$CI_BUILD_TOKEN
+ 
+ ",
+     "stateCleared": "modified",
+@@ -1707,15 +1708,16 @@ maven-package:
+             - target/classes
+         expire_in: 1 day
+ 
+-# Uncomment the following section to enable pushing the Docker image to the GitLab Container Registry
++# Uncomment the following line to use gitlabs container registry. You need to adapt the REGISTRY_URL in case you are not using gitlab.com
+ #docker-push:
+ #    stage: release
+ #    variables:
++#        REGISTRY_URL: registry.gitlab.com
+ #        IMAGE_TAG: $CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHA
+ #    dependencies:
+ #        - maven-package
+ #    script:
+-#        - ./mvnw -ntp jib:build -Pprod -Djib.to.image=$IMAGE_TAG -Djib.to.auth.username=$CI_REGISTRY_USER -Djib.to.auth.password=$CI_REGISTRY_PASSWORD -Dmaven.repo.local=$MAVEN_USER_HOME
++#        - ./mvnw -ntp jib:build -Pprod -Djib.to.image=$IMAGE_TAG -Djib.to.auth.username=gitlab-ci-token  -Djib.to.auth.password=$CI_BUILD_TOKEN -Dmaven.repo.local=$MAVEN_USER_HOME
+ 
+ deploy-to-production:
+     stage: deploy
+@@ -1839,15 +1841,16 @@ maven-package:
+             - target/classes
+         expire_in: 1 day
+ 
+-# Uncomment the following section to enable pushing the Docker image to the GitLab Container Registry
++# Uncomment the following line to use gitlabs container registry. You need to adapt the REGISTRY_URL in case you are not using gitlab.com
+ #docker-push:
+ #    stage: release
+ #    variables:
++#        REGISTRY_URL: registry.gitlab.com
+ #        IMAGE_TAG: $CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHA
+ #    dependencies:
+ #        - maven-package
+ #    script:
+-#        - ./mvnw -ntp jib:build -Pprod -Djib.to.image=$IMAGE_TAG -Djib.to.auth.username=$CI_REGISTRY_USER -Djib.to.auth.password=$CI_REGISTRY_PASSWORD -Dmaven.repo.local=$MAVEN_USER_HOME
++#        - ./mvnw -ntp jib:build -Pprod -Djib.to.image=$IMAGE_TAG -Djib.to.auth.username=gitlab-ci-token  -Djib.to.auth.password=$CI_BUILD_TOKEN -Dmaven.repo.local=$MAVEN_USER_HOME
+ 
+ ",
+     "stateCleared": "modified",
+@@ -1962,15 +1965,16 @@ maven-package:
+             - target/classes
+         expire_in: 1 day
+ 
+-# Uncomment the following section to enable pushing the Docker image to the GitLab Container Registry
++# Uncomment the following line to use gitlabs container registry. You need to adapt the REGISTRY_URL in case you are not using gitlab.com
+ #docker-push:
+ #    stage: release
+ #    variables:
++#        REGISTRY_URL: registry.gitlab.com
+ #        IMAGE_TAG: $CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHA
+ #    dependencies:
+ #        - maven-package
+ #    script:
+-#        - ./mvnw -ntp jib:build -Pprod -Djib.to.image=$IMAGE_TAG -Djib.to.auth.username=$CI_REGISTRY_USER -Djib.to.auth.password=$CI_REGISTRY_PASSWORD -Dmaven.repo.local=$MAVEN_USER_HOME
++#        - ./mvnw -ntp jib:build -Pprod -Djib.to.image=$IMAGE_TAG -Djib.to.auth.username=gitlab-ci-token  -Djib.to.auth.password=$CI_BUILD_TOKEN -Dmaven.repo.local=$MAVEN_USER_HOME
+ 
+ deploy-to-production:
+     stage: deploy
+@@ -2102,15 +2106,16 @@ maven-package:
+             - target/classes
+         expire_in: 1 day
+ 
+-# Uncomment the following section to enable pushing the Docker image to the GitLab Container Registry
++# Uncomment the following line to use gitlabs container registry. You need to adapt the REGISTRY_URL in case you are not using gitlab.com
+ #docker-push:
+ #    stage: release
+ #    variables:
++#        REGISTRY_URL: registry.gitlab.com
+ #        IMAGE_TAG: $CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHA
+ #    dependencies:
+ #        - maven-package
+ #    script:
+-#        - ./mvnw -ntp jib:build -Pprod -Djib.to.image=$IMAGE_TAG -Djib.to.auth.username=$CI_REGISTRY_USER -Djib.to.auth.password=$CI_REGISTRY_PASSWORD -Dmaven.repo.local=$MAVEN_USER_HOME
++#        - ./mvnw -ntp jib:build -Pprod -Djib.to.image=$IMAGE_TAG -Djib.to.auth.username=gitlab-ci-token  -Djib.to.auth.password=$CI_BUILD_TOKEN -Dmaven.repo.local=$MAVEN_USER_HOME
+ 
+ ",
+     "stateCleared": "modified",
+@@ -2204,15 +2209,16 @@ maven-package:
+             - target/classes
+         expire_in: 1 day
+ 
+-# Uncomment the following section to enable pushing the Docker image to the GitLab Container Registry
++# Uncomment the following line to use gitlabs container registry. You need to adapt the REGISTRY_URL in case you are not using gitlab.com
+ #docker-push:
+ #    stage: release
+ #    variables:
++#        REGISTRY_URL: registry.gitlab.com
+ #        IMAGE_TAG: $CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHA
+ #    dependencies:
+ #        - maven-package
+ #    script:
+-#        - ./mvnw -ntp jib:build -Pprod -Djib.to.image=$IMAGE_TAG -Djib.to.auth.username=$CI_REGISTRY_USER -Djib.to.auth.password=$CI_REGISTRY_PASSWORD -Dmaven.repo.local=$MAVEN_USER_HOME
++#        - ./mvnw -ntp jib:build -Pprod -Djib.to.image=$IMAGE_TAG -Djib.to.auth.username=gitlab-ci-token  -Djib.to.auth.password=$CI_BUILD_TOKEN -Dmaven.repo.local=$MAVEN_USER_HOME
+ 
+ cache:
+     paths:
+diff --git a/generators/ci-cd/templates/.gitlab-ci.yml.ejs b/generators/ci-cd/templates/.gitlab-ci.yml.ejs
+index b0c38f8de4..7334272a05 100644
+--- a/generators/ci-cd/templates/.gitlab-ci.yml.ejs
++++ b/generators/ci-cd/templates/.gitlab-ci.yml.ejs
+@@ -155,15 +155,16 @@ gradle-package:
+             - build/classes
+         expire_in: 1 day
+ 
+-# Uncomment the following section to enable pushing the Docker image to the GitLab Container Registry
++# Uncomment the following line to use gitlabs container registry. You need to adapt the REGISTRY_URL in case you are not using gitlab.com
+ #docker-push:
+ #    stage: release
+ #    variables:
++#        REGISTRY_URL: registry.gitlab.com
+ #        IMAGE_TAG: $CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHA
+ #    dependencies:
+ #        - gradle-package
+ #    script:
+-#        - ./gradlew jib -Pprod -PnodeInstall -Djib.to.image=$IMAGE_TAG -Djib.to.auth.username=$CI_REGISTRY_USER -Djib.to.auth.password=$CI_REGISTRY_PASSWORD
++#        - ./gradlew jib -Pprod -PnodeInstall -Djib.to.image=$IMAGE_TAG -Djib.to.auth.username="gitlab-ci-token"  -Djib.to.auth.password=$CI_BUILD_TOKEN
+ 
+     <%_ if (ciCdIntegrationsHeroku) { _%>
+ deploy-to-production:
+@@ -283,15 +284,16 @@ maven-package:
+             - target/classes
+         expire_in: 1 day
+ 
+-# Uncomment the following section to enable pushing the Docker image to the GitLab Container Registry
++# Uncomment the following line to use gitlabs container registry. You need to adapt the REGISTRY_URL in case you are not using gitlab.com
+ #docker-push:
+ #    stage: release
+ #    variables:
++#        REGISTRY_URL: registry.gitlab.com
+ #        IMAGE_TAG: $CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHA
+ #    dependencies:
+ #        - maven-package
+ #    script:
+-#        - ./mvnw -ntp jib:build -Pprod -Djib.to.image=$IMAGE_TAG -Djib.to.auth.username=$CI_REGISTRY_USER -Djib.to.auth.password=$CI_REGISTRY_PASSWORD -Dmaven.repo.local=$MAVEN_USER_HOME
++#        - ./mvnw -ntp jib:build -Pprod -Djib.to.image=$IMAGE_TAG -Djib.to.auth.username=gitlab-ci-token  -Djib.to.auth.password=$CI_BUILD_TOKEN -Dmaven.repo.local=$MAVEN_USER_HOME
+ 
+     <%_ if (ciCdIntegrationsHeroku) { _%>
+ deploy-to-production:
+diff --git a/generators/client/resources/package.json b/generators/client/resources/package.json
+index 74aa692c70..0b3a64dfaa 100644
+--- a/generators/client/resources/package.json
++++ b/generators/client/resources/package.json
+@@ -3,7 +3,7 @@
+     "dayjs": "1.11.13"
+   },
+   "devDependencies": {
+-    "@cypress/code-coverage": "3.13.7",
++    "@cypress/code-coverage": "3.13.6",
+     "babel-loader": "9.2.1",
+     "babel-plugin-istanbul": "7.0.0",
+     "cypress": "13.15.2",
+diff --git a/generators/info/support/extract-info.ts b/generators/info/support/extract-info.ts
+index 51b3c3515e..9237d92005 100644
+--- a/generators/info/support/extract-info.ts
++++ b/generators/info/support/extract-info.ts
+@@ -1,10 +1,12 @@
++import { removeFieldsWithNullishValues } from '../../base/support/index.js';
+ import { GENERATOR_JHIPSTER } from '../../generator-constants.js';
+ 
+-export type InfoFile = { filename: string; content: string };
++export type InfoFile = { filename: string; content: string; type: 'jdl' | 'yo-rc' | 'entity-jdl' };
+ 
+ export type InfoData = {
+   yoRcContent: string | undefined;
+   jdlDefinitions: string | undefined;
++  jdlApplications: number | undefined;
+   jdlEntitiesDefinitions: string | undefined;
+   yoRcBlank: boolean;
+   yoRcValid: boolean;
+@@ -17,8 +19,9 @@ export const extractDataFromInfo = (info: string): InfoData => {
+   let yoRcContent: string | undefined;
+   let jdlEntitiesDefinitions: string | undefined;
+   let jdlDefinitions: string | undefined;
++  let jdlApplications: number | undefined;
+   let workspacesFolders;
+-  const files: { filename: string; content: string }[] = [];
++  const files: InfoFile[] = [];
+ 
+   for (const match of info.matchAll(regexp)) {
+     const { title, body } = match.groups ?? {};
+@@ -26,23 +29,28 @@ export const extractDataFromInfo = (info: string): InfoData => {
+       if (title.includes('.yo-rc.json file')) {
+         if (title.includes(' for ')) {
+           const folder = title.split(' for ')[1].trim();
+-          files.push({ filename: `${folder}/.yo-rc.json`, content: body.trim() });
++          files.push({ filename: `${folder}/.yo-rc.json`, content: body.trim(), type: 'yo-rc' });
+         } else {
+           yoRcContent = body.trim();
++          files.push({ filename: '.yo-rc.json', content: yoRcContent, type: 'yo-rc' });
+         }
+       } else if (title.includes('JDL entity definitions')) {
+         jdlEntitiesDefinitions = body.trim();
++        files.push({ filename: 'entities.jdl', content: jdlEntitiesDefinitions, type: 'entity-jdl' });
+       } else if (title.includes('JDL definitions')) {
+         // JDL definitions can be be a placehoder
+-        if (body.includes('application')) {
+-          jdlDefinitions = body.trim();
++        if ((body.match(/application\s*\{/g) || []).length > 0) {
++          const jdlCount = files.filter(file => file.type === 'jdl').length;
++          files.push({ filename: jdlCount === 0 ? 'app.jdl' : `app-${jdlCount}.jdl`, content: body.trim(), type: 'jdl' });
++          jdlApplications ??= (body.match(/application\s*\{/g) || []).length;
++          jdlDefinitions ??= body.trim();
+         }
+       }
+     }
+   }
+ 
+   let yoRcBlank = true;
+-  let yoRcValid = false;
++  let yoRcValid;
+   if (yoRcContent) {
+     yoRcBlank = false;
+     try {
+@@ -52,21 +60,25 @@ export const extractDataFromInfo = (info: string): InfoData => {
+       yoRcContent = JSON.stringify(content);
+       yoRcValid = true;
+     } catch (error) {
++      yoRcValid = false;
+       // eslint-disable-next-line no-console
+       console.log('Invalid .yo-rc.json file', error);
+     }
+   }
+ 
+   if (jdlDefinitions) {
+-    files.push({ filename: 'app.jdl', content: jdlDefinitions });
+     yoRcContent = undefined;
+     jdlEntitiesDefinitions = undefined;
+   }
+-  if (jdlEntitiesDefinitions) {
+-    files.push({ filename: 'entities.jdl', content: jdlEntitiesDefinitions });
+-  }
+-  if (yoRcContent) {
+-    files.push({ filename: '.yo-rc.json', content: yoRcContent });
+-  }
+-  return { yoRcContent, jdlEntitiesDefinitions, jdlDefinitions, yoRcBlank, yoRcValid, files, workspacesFolders };
++
++  return removeFieldsWithNullishValues({
++    yoRcContent,
++    jdlEntitiesDefinitions,
++    jdlDefinitions,
++    yoRcBlank,
++    yoRcValid,
++    files,
++    workspacesFolders,
++    jdlApplications,
++  });
+ };
+diff --git a/generators/info/support/index.ts b/generators/info/support/index.ts
+index b413a519b4..295c2b7cc4 100644
+--- a/generators/info/support/index.ts
++++ b/generators/info/support/index.ts
+@@ -18,3 +18,4 @@
+  */
+ export * from './utils.js';
+ export * from './extract-info.js';
++export * from './markdown-content.js';
+diff --git a/generators/info/support/markdown-content.ts b/generators/info/support/markdown-content.ts
+new file mode 100644
+index 0000000000..91c52fbcad
+--- /dev/null
++++ b/generators/info/support/markdown-content.ts
+@@ -0,0 +1,23 @@
++const ciMarkdownCodeSeparator = '````';
++
++export const markdownDetails = ({
++  title,
++  content,
++  codeType,
++  contentWrapper = codeType ? null : 'pre',
++}: {
++  title: string;
++  content: string;
++  contentWrapper?: string | null;
++  codeType?: string;
++}): string => {
++  let details: string;
++  if (contentWrapper) {
++    details = `  <${contentWrapper}>${content}</${contentWrapper}>`;
++  } else if (codeType) {
++    details = `\n${ciMarkdownCodeSeparator}${codeType}\n${content}\n${ciMarkdownCodeSeparator}`;
++  } else {
++    details = content;
++  }
++  return `<details>\n  <summary>${title}</summary>\n${details}\n</details>`;
++};
+diff --git a/generators/javascript/resources/package.json b/generators/javascript/resources/package.json
+index a3125901eb..7090fd3478 100644
+--- a/generators/javascript/resources/package.json
++++ b/generators/javascript/resources/package.json
+@@ -2,7 +2,7 @@
+   "dependencies": {
+     "eslint-config-prettier": "9.1.0",
+     "eslint-plugin-prettier": "5.2.1",
+-    "husky": "9.1.7",
++    "husky": "9.1.6",
+     "lint-staged": "15.2.10"
+   }
+ }
+diff --git a/generators/react/resources/package.json b/generators/react/resources/package.json
+index 6aca46c779..bd60101bfb 100644
+--- a/generators/react/resources/package.json
++++ b/generators/react/resources/package.json
+@@ -1,7 +1,7 @@
+ {
+   "dependencies": {
+-    "@fortawesome/fontawesome-svg-core": "6.7.0",
+-    "@fortawesome/free-solid-svg-icons": "6.7.0",
++    "@fortawesome/fontawesome-svg-core": "6.6.0",
++    "@fortawesome/free-solid-svg-icons": "6.6.0",
+     "@fortawesome/react-fontawesome": "0.2.2",
+     "@reduxjs/toolkit": "2.3.0",
+     "axios": "1.7.7",
+@@ -29,7 +29,7 @@
+     "webstomp-client": "1.2.6"
+   },
+   "devDependencies": {
+-    "@eslint/js": "9.15.0",
++    "@eslint/js": "9.14.0",
+     "@module-federation/enhanced": "0.7.5",
+     "@module-federation/utilities": "3.1.28",
+     "@testing-library/react": "16.0.1",
+@@ -49,7 +49,7 @@
+     "cross-env": "7.0.3",
+     "css-loader": "7.1.2",
+     "css-minimizer-webpack-plugin": "7.0.0",
+-    "eslint": "9.15.0",
++    "eslint": "9.14.0",
+     "eslint-config-prettier": "9.1.0",
+     "eslint-plugin-prettier": "5.2.1",
+     "eslint-plugin-react": "7.37.2",
+@@ -82,7 +82,7 @@
+     "ts-jest": "29.2.5",
+     "ts-loader": "9.5.1",
+     "typescript": "5.6.3",
+-    "typescript-eslint": "8.15.0",
++    "typescript-eslint": "8.14.0",
+     "webpack": "5.96.1",
+     "webpack-cli": "5.1.4",
+     "webpack-dev-server": "5.1.0",
+diff --git a/generators/server/resources/gradle/libs.versions.toml b/generators/server/resources/gradle/libs.versions.toml
+index 76c1e60920..f18c214b8e 100644
+--- a/generators/server/resources/gradle/libs.versions.toml
++++ b/generators/server/resources/gradle/libs.versions.toml
+@@ -42,4 +42,4 @@ common-custom-user-data-gradle-plugin = { id = 'com.gradle.common-custom-user-da
+ 
+ gatling-gradle = { id = 'io.gatling.gradle', version = '3.13.1' }
+ 
+-gradle-openapi-generator = { id = 'org.openapi.generator', version = '7.10.0' }
++gradle-openapi-generator = { id = 'org.openapi.generator', version = '7.9.0' }
+diff --git a/generators/server/resources/pom.xml b/generators/server/resources/pom.xml
+index 50b52260de..3b89cc5b8e 100644
+--- a/generators/server/resources/pom.xml
++++ b/generators/server/resources/pom.xml
+@@ -21,7 +21,7 @@
+         <checkstyle.version>10.20.1</checkstyle.version>
+         <checksum-maven-plugin.version>1.11</checksum-maven-plugin.version>
+         <frontend-maven-plugin.version>1.15.1</frontend-maven-plugin.version>
+-        <gatling-maven-plugin.version>4.11.0</gatling-maven-plugin.version>
++        <gatling-maven-plugin.version>4.10.2</gatling-maven-plugin.version>
+         <git-commit-id-maven-plugin.version>9.0.1</git-commit-id-maven-plugin.version>
+         <lifecycle-mapping.version>1.0.0</lifecycle-mapping.version>
+         <jacoco-maven-plugin.version>0.8.12</jacoco-maven-plugin.version>
+@@ -39,7 +39,7 @@
+         <maven-war-plugin.version>3.4.0</maven-war-plugin.version>
+         <modernizer-maven-plugin.version>2.9.0</modernizer-maven-plugin.version>
+         <nohttp-checkstyle.version>0.0.11</nohttp-checkstyle.version>
+-        <openapi-generator-maven-plugin.version>7.10.0</openapi-generator-maven-plugin.version>
++        <openapi-generator-maven-plugin.version>7.9.0</openapi-generator-maven-plugin.version>
+         <properties-maven-plugin.version>1.2.1</properties-maven-plugin.version>
+         <sonar-maven-plugin.version>5.0.0.4389</sonar-maven-plugin.version>
+         <spotless-maven-plugin.version>2.43.0</spotless-maven-plugin.version>
+diff --git a/generators/vue/resources/package.json b/generators/vue/resources/package.json
+index aca70e1327..fa97712c39 100644
+--- a/generators/vue/resources/package.json
++++ b/generators/vue/resources/package.json
+@@ -1,7 +1,7 @@
+ {
+   "dependencies": {
+-    "@fortawesome/fontawesome-svg-core": "6.7.0",
+-    "@fortawesome/free-solid-svg-icons": "6.7.0",
++    "@fortawesome/fontawesome-svg-core": "6.6.0",
++    "@fortawesome/free-solid-svg-icons": "6.6.0",
+     "@fortawesome/vue-fontawesome": "3.0.8",
+     "@stomp/rx-stomp": "2.0.0",
+     "@vuelidate/core": "2.0.3",
+@@ -21,7 +21,7 @@
+     "vue-router": "4.4.5"
+   },
+   "devDependencies": {
+-    "@eslint/js": "9.15.0",
++    "@eslint/js": "9.14.0",
+     "@module-federation/enhanced": "0.7.5",
+     "@pinia/testing": "0.1.7",
+     "@tsconfig/node18": "18.2.4",
+@@ -36,7 +36,7 @@
+     "copy-webpack-plugin": "12.0.2",
+     "css-loader": "7.1.2",
+     "css-minimizer-webpack-plugin": "7.0.0",
+-    "eslint": "9.15.0",
++    "eslint": "9.14.0",
+     "eslint-plugin-prettier": "5.2.1",
+     "eslint-plugin-vue": "9.31.0",
+     "flush-promises": "1.0.2",
+@@ -56,7 +56,7 @@
+     "terser-webpack-plugin": "5.3.10",
+     "ts-loader": "9.5.1",
+     "typescript": "5.6.3",
+-    "typescript-eslint": "8.15.0",
++    "typescript-eslint": "8.14.0",
+     "vite": "5.4.11",
+     "vite-plugin-static-copy": "2.1.0",
+     "vitest": "2.1.5",
+diff --git a/lib/testing/github.ts b/lib/testing/github.ts
+index 2dd19d1e7c..c2443b8673 100644
+--- a/lib/testing/github.ts
++++ b/lib/testing/github.ts
+@@ -1,6 +1,7 @@
+ import { randomUUID } from 'node:crypto';
+ import { appendFileSync, existsSync } from 'node:fs';
+ import { EOL } from 'node:os';
++import process from 'node:process';
+ import axios from 'axios';
+ 
+ export const parseIssue = (issue: string): undefined | { owner: string; repository: string; issue: string } => {
+@@ -30,10 +31,24 @@ export const setGithubTaskOutput = (name: string, value: string | boolean | numb
+ };
+ 
+ export const getGithubIssue = async ({ owner, repository, issue }: { owner: string; repository: string; issue: string }) => {
++  const token = process.env.GITHUB_TOKEN;
+   const response = await axios.get(`https://api.github.com/repos/${owner}/${repository}/issues/${issue}`, {
+     headers: {
+       'X-GitHub-Api-Version': '2022-11-28',
++      Authorization: token ? `Bearer ${token}` : undefined,
+     },
+   });
+   return response.data;
+ };
++
++export const getGithubSummaryFile = (): string | undefined => {
++  const filePath = process.env.GITHUB_STEP_SUMMARY;
++  return filePath && existsSync(filePath) ? filePath : undefined;
++};
++
++export const appendToSummary = (summary: string) => {
++  const summaryFile = getGithubSummaryFile();
++  if (summaryFile) {
++    appendFileSync(summaryFile, summary, { encoding: 'utf8' });
++  }
++};
+diff --git a/lib/testing/sample-config.ts b/lib/testing/sample-config.ts
+index dc14c5081b..f4c71ac96b 100644
+--- a/lib/testing/sample-config.ts
++++ b/lib/testing/sample-config.ts
+@@ -19,7 +19,7 @@ export const prepareSample = async (
+   { removeBlueprints }: { removeBlueprints?: boolean } = {},
+ ): Promise<InfoFile[]> => {
+   return Promise.all(
+-    files.map(async ({ filename, content }) => {
++    files.map(async ({ filename, content, type }) => {
+       filename = join(projectFolder, filename);
+       if (filename.endsWith('.yo-rc.json')) {
+         if (await isFile(filename)) {
+@@ -34,7 +34,7 @@ export const prepareSample = async (
+           }
+         }
+       }
+-      return { filename, content };
++      return { filename, content, type };
+     }),
+   );
+ };
+diff --git a/lib/types/base/entity.d.ts b/lib/types/base/entity.d.ts
+index 2b3d8079bd..c4c816a0d1 100644
+--- a/lib/types/base/entity.d.ts
++++ b/lib/types/base/entity.d.ts
+@@ -13,7 +13,6 @@ export type Entity<F extends Field = Field, R extends Relationship = Relationshi
+ 
+   fields?: F[];
+   relationships?: R[];
+-  annotations?: Record<string, string | boolean>;
+ 
+   readOnly?: boolean;
+   embedded?: boolean;
+diff --git a/lib/utils/object.ts b/lib/utils/object.ts
+index 16dca432ae..f72004a5ab 100644
+--- a/lib/utils/object.ts
++++ b/lib/utils/object.ts
+@@ -25,16 +25,17 @@ const filterNullishValues = value => value !== undefined && value !== null;
+  * @returns
+  */
+ 
+-export function removeFieldsWithNullishValues(object: Record<string, any>): Record<string, any> {
++export function removeFieldsWithNullishValues<const T extends Record<string, any>>(object: T): T {
+   return filterValue(object, filterNullishValues);
+ }
++
+ /**
+  * Copy and remove null and undefined values
+  * @param object
+  * @returns
+  */
+ 
+-function filterValue(object: Record<string, any>, filterValue: (any) => boolean = filterNullishValues): Record<string, any> {
++function filterValue<const T extends Record<string, any>>(object: T, filterValue: (any) => boolean = filterNullishValues): T {
+   const clone = {};
+   for (const [key, value] of Object.entries(object)) {
+     if (filterValue(value)) {
+@@ -49,7 +50,7 @@ function filterValue(object: Record<string, any>, filterValue: (any) => boolean
+       }
+     }
+   }
+-  return clone;
++  return clone as T;
+ }
+ 
+ /**
+diff --git a/package-lock.json b/package-lock.json
+index 3d656df977..e8dcc3d64a 100644
+--- a/package-lock.json
++++ b/package-lock.json
+@@ -9,7 +9,7 @@
+       "version": "8.7.3",
+       "license": "Apache-2.0",
+       "dependencies": {
+-        "@eslint/js": "9.15.0",
++        "@eslint/js": "9.14.0",
+         "@faker-js/faker": "9.2.0",
+         "@iarna/toml": "3.0.0",
+         "@types/ejs": "3.1.5",
+@@ -28,7 +28,7 @@
+         "dockerfile-ast": "0.7.0",
+         "dot-properties": "1.0.1",
+         "ejs": "3.1.10",
+-        "eslint": "9.15.0",
++        "eslint": "9.14.0",
+         "eslint-plugin-import-x": "4.4.2",
+         "eslint-plugin-unused-imports": "4.1.4",
+         "execa": "9.5.1",
+@@ -58,7 +58,7 @@
+         "sort-keys": "5.1.0",
+         "type-fest": "4.27.0",
+         "typescript": "5.5.4",
+-        "typescript-eslint": "8.15.0",
++        "typescript-eslint": "8.14.0",
+         "yaml": "2.6.0",
+         "yeoman-environment": "4.4.3",
+         "yeoman-generator": "7.3.3"
+@@ -1154,9 +1154,10 @@
+       }
+     },
+     "node_modules/@eslint/config-array": {
+-      "version": "0.19.0",
+-      "resolved": "https://registry.npmjs.org/@eslint/config-array/-/config-array-0.19.0.tgz",
+-      "integrity": "sha512-zdHg2FPIFNKPdcHWtiNT+jEFCHYVplAXRDlQDyqy0zGx/q2parwh7brGJSiTxRk/TSMkbM//zt/f5CHgyTyaSQ==",
++      "version": "0.18.0",
++      "resolved": "https://registry.npmjs.org/@eslint/config-array/-/config-array-0.18.0.tgz",
++      "integrity": "sha512-fTxvnS1sRMu3+JjXwJG0j/i4RT9u4qJ+lqS/yCGap4lH4zZGzQ7tu+xZqQmcMZq5OBZDL4QRxQzRjkWcGt8IVw==",
++      "license": "Apache-2.0",
+       "dependencies": {
+         "@eslint/object-schema": "^2.1.4",
+         "debug": "^4.3.1",
+@@ -1170,6 +1171,7 @@
+       "version": "1.1.11",
+       "resolved": "https://registry.npmjs.org/brace-expansion/-/brace-expansion-1.1.11.tgz",
+       "integrity": "sha512-iCuPHDFgrHX7H2vEI/5xpz07zSHB00TpugqhmYtVmMO6518mCuRMoOYFldEBl0g187ufozdaHgWKcYFb61qGiA==",
++      "license": "MIT",
+       "dependencies": {
+         "balanced-match": "^1.0.0",
+         "concat-map": "0.0.1"
+@@ -1179,6 +1181,7 @@
+       "version": "3.1.2",
+       "resolved": "https://registry.npmjs.org/minimatch/-/minimatch-3.1.2.tgz",
+       "integrity": "sha512-J7p63hRiAjw1NDEww1W7i37+ByIrOWO5XQQAzZ3VOcL0PNybwpfmV/N05zFAzwQ9USyEcX6t3UO+K5aqBQOIHw==",
++      "license": "ISC",
+       "dependencies": {
+         "brace-expansion": "^1.1.7"
+       },
+@@ -1190,6 +1193,7 @@
+       "version": "0.9.0",
+       "resolved": "https://registry.npmjs.org/@eslint/core/-/core-0.9.0.tgz",
+       "integrity": "sha512-7ATR9F0e4W85D/0w7cU0SNj7qkAexMG+bAHEZOjo9akvGuhHE2m7umzWzfnpa0XAg5Kxc1BWmtPMV67jJ+9VUg==",
++      "dev": true,
+       "license": "Apache-2.0",
+       "engines": {
+         "node": "^18.18.0 || ^20.9.0 || >=21.1.0"
+@@ -1253,9 +1257,10 @@
+       }
+     },
+     "node_modules/@eslint/js": {
+-      "version": "9.15.0",
+-      "resolved": "https://registry.npmjs.org/@eslint/js/-/js-9.15.0.tgz",
+-      "integrity": "sha512-tMTqrY+EzbXmKJR5ToI8lxu7jaN5EdmrBFJpQk5JmSlyLsx6o4t27r883K5xsLuCYCpfKBCGswMSWXsM+jB7lg==",
++      "version": "9.14.0",
++      "resolved": "https://registry.npmjs.org/@eslint/js/-/js-9.14.0.tgz",
++      "integrity": "sha512-pFoEtFWCPyDOl+C6Ift+wC7Ro89otjigCf5vcuWqWgqNSQbRrpjSvdeE6ofLz4dHmyxD5f7gIdGT4+p36L6Twg==",
++      "license": "MIT",
+       "engines": {
+         "node": "^18.18.0 || ^20.9.0 || >=21.1.0"
+       }
+@@ -1264,6 +1269,7 @@
+       "version": "2.1.4",
+       "resolved": "https://registry.npmjs.org/@eslint/object-schema/-/object-schema-2.1.4.tgz",
+       "integrity": "sha512-BsWiH1yFGjXXS2yvrf5LyuoSIIbPrGUWob917o+BTKuZ7qJdxX8aJLRxs1fS9n6r7vESrq1OUqb68dANcFXuQQ==",
++      "license": "Apache-2.0",
+       "engines": {
+         "node": "^18.18.0 || ^20.9.0 || >=21.1.0"
+       }
+@@ -3392,15 +3398,16 @@
+       "license": "MIT"
+     },
+     "node_modules/@typescript-eslint/eslint-plugin": {
+-      "version": "8.15.0",
+-      "resolved": "https://registry.npmjs.org/@typescript-eslint/eslint-plugin/-/eslint-plugin-8.15.0.tgz",
+-      "integrity": "sha512-+zkm9AR1Ds9uLWN3fkoeXgFppaQ+uEVtfOV62dDmsy9QCNqlRHWNEck4yarvRNrvRcHQLGfqBNui3cimoz8XAg==",
++      "version": "8.14.0",
++      "resolved": "https://registry.npmjs.org/@typescript-eslint/eslint-plugin/-/eslint-plugin-8.14.0.tgz",
++      "integrity": "sha512-tqp8H7UWFaZj0yNO6bycd5YjMwxa6wIHOLZvWPkidwbgLCsBMetQoGj7DPuAlWa2yGO3H48xmPwjhsSPPCGU5w==",
++      "license": "MIT",
+       "dependencies": {
+         "@eslint-community/regexpp": "^4.10.0",
+-        "@typescript-eslint/scope-manager": "8.15.0",
+-        "@typescript-eslint/type-utils": "8.15.0",
+-        "@typescript-eslint/utils": "8.15.0",
+-        "@typescript-eslint/visitor-keys": "8.15.0",
++        "@typescript-eslint/scope-manager": "8.14.0",
++        "@typescript-eslint/type-utils": "8.14.0",
++        "@typescript-eslint/utils": "8.14.0",
++        "@typescript-eslint/visitor-keys": "8.14.0",
+         "graphemer": "^1.4.0",
+         "ignore": "^5.3.1",
+         "natural-compare": "^1.4.0",
+@@ -3424,14 +3431,15 @@
+       }
+     },
+     "node_modules/@typescript-eslint/parser": {
+-      "version": "8.15.0",
+-      "resolved": "https://registry.npmjs.org/@typescript-eslint/parser/-/parser-8.15.0.tgz",
+-      "integrity": "sha512-7n59qFpghG4uazrF9qtGKBZXn7Oz4sOMm8dwNWDQY96Xlm2oX67eipqcblDj+oY1lLCbf1oltMZFpUso66Kl1A==",
+-      "dependencies": {
+-        "@typescript-eslint/scope-manager": "8.15.0",
+-        "@typescript-eslint/types": "8.15.0",
+-        "@typescript-eslint/typescript-estree": "8.15.0",
+-        "@typescript-eslint/visitor-keys": "8.15.0",
++      "version": "8.14.0",
++      "resolved": "https://registry.npmjs.org/@typescript-eslint/parser/-/parser-8.14.0.tgz",
++      "integrity": "sha512-2p82Yn9juUJq0XynBXtFCyrBDb6/dJombnz6vbo6mgQEtWHfvHbQuEa9kAOVIt1c9YFwi7H6WxtPj1kg+80+RA==",
++      "license": "BSD-2-Clause",
++      "dependencies": {
++        "@typescript-eslint/scope-manager": "8.14.0",
++        "@typescript-eslint/types": "8.14.0",
++        "@typescript-eslint/typescript-estree": "8.14.0",
++        "@typescript-eslint/visitor-keys": "8.14.0",
+         "debug": "^4.3.4"
+       },
+       "engines": {
+@@ -3451,12 +3459,13 @@
+       }
+     },
+     "node_modules/@typescript-eslint/scope-manager": {
+-      "version": "8.15.0",
+-      "resolved": "https://registry.npmjs.org/@typescript-eslint/scope-manager/-/scope-manager-8.15.0.tgz",
+-      "integrity": "sha512-QRGy8ADi4J7ii95xz4UoiymmmMd/zuy9azCaamnZ3FM8T5fZcex8UfJcjkiEZjJSztKfEBe3dZ5T/5RHAmw2mA==",
++      "version": "8.14.0",
++      "resolved": "https://registry.npmjs.org/@typescript-eslint/scope-manager/-/scope-manager-8.14.0.tgz",
++      "integrity": "sha512-aBbBrnW9ARIDn92Zbo7rguLnqQ/pOrUguVpbUwzOhkFg2npFDwTgPGqFqE0H5feXcOoJOfX3SxlJaKEVtq54dw==",
++      "license": "MIT",
+       "dependencies": {
+-        "@typescript-eslint/types": "8.15.0",
+-        "@typescript-eslint/visitor-keys": "8.15.0"
++        "@typescript-eslint/types": "8.14.0",
++        "@typescript-eslint/visitor-keys": "8.14.0"
+       },
+       "engines": {
+         "node": "^18.18.0 || ^20.9.0 || >=21.1.0"
+@@ -3467,12 +3476,13 @@
+       }
+     },
+     "node_modules/@typescript-eslint/type-utils": {
+-      "version": "8.15.0",
+-      "resolved": "https://registry.npmjs.org/@typescript-eslint/type-utils/-/type-utils-8.15.0.tgz",
+-      "integrity": "sha512-UU6uwXDoI3JGSXmcdnP5d8Fffa2KayOhUUqr/AiBnG1Gl7+7ut/oyagVeSkh7bxQ0zSXV9ptRh/4N15nkCqnpw==",
++      "version": "8.14.0",
++      "resolved": "https://registry.npmjs.org/@typescript-eslint/type-utils/-/type-utils-8.14.0.tgz",
++      "integrity": "sha512-Xcz9qOtZuGusVOH5Uk07NGs39wrKkf3AxlkK79RBK6aJC1l03CobXjJbwBPSidetAOV+5rEVuiT1VSBUOAsanQ==",
++      "license": "MIT",
+       "dependencies": {
+-        "@typescript-eslint/typescript-estree": "8.15.0",
+-        "@typescript-eslint/utils": "8.15.0",
++        "@typescript-eslint/typescript-estree": "8.14.0",
++        "@typescript-eslint/utils": "8.14.0",
+         "debug": "^4.3.4",
+         "ts-api-utils": "^1.3.0"
+       },
+@@ -3483,9 +3493,6 @@
+         "type": "opencollective",
+         "url": "https://opencollective.com/typescript-eslint"
+       },
+-      "peerDependencies": {
+-        "eslint": "^8.57.0 || ^9.0.0"
+-      },
+       "peerDependenciesMeta": {
+         "typescript": {
+           "optional": true
+@@ -3493,9 +3500,10 @@
+       }
+     },
+     "node_modules/@typescript-eslint/types": {
+-      "version": "8.15.0",
+-      "resolved": "https://registry.npmjs.org/@typescript-eslint/types/-/types-8.15.0.tgz",
+-      "integrity": "sha512-n3Gt8Y/KyJNe0S3yDCD2RVKrHBC4gTUcLTebVBXacPy091E6tNspFLKRXlk3hwT4G55nfr1n2AdFqi/XMxzmPQ==",
++      "version": "8.14.0",
++      "resolved": "https://registry.npmjs.org/@typescript-eslint/types/-/types-8.14.0.tgz",
++      "integrity": "sha512-yjeB9fnO/opvLJFAsPNYlKPnEM8+z4og09Pk504dkqonT02AyL5Z9SSqlE0XqezS93v6CXn49VHvB2G7XSsl0g==",
++      "license": "MIT",
+       "engines": {
+         "node": "^18.18.0 || ^20.9.0 || >=21.1.0"
+       },
+@@ -3505,12 +3513,13 @@
+       }
+     },
+     "node_modules/@typescript-eslint/typescript-estree": {
+-      "version": "8.15.0",
+-      "resolved": "https://registry.npmjs.org/@typescript-eslint/typescript-estree/-/typescript-estree-8.15.0.tgz",
+-      "integrity": "sha512-1eMp2JgNec/niZsR7ioFBlsh/Fk0oJbhaqO0jRyQBMgkz7RrFfkqF9lYYmBoGBaSiLnu8TAPQTwoTUiSTUW9dg==",
++      "version": "8.14.0",
++      "resolved": "https://registry.npmjs.org/@typescript-eslint/typescript-estree/-/typescript-estree-8.14.0.tgz",
++      "integrity": "sha512-OPXPLYKGZi9XS/49rdaCbR5j/S14HazviBlUQFvSKz3npr3NikF+mrgK7CFVur6XEt95DZp/cmke9d5i3vtVnQ==",
++      "license": "BSD-2-Clause",
+       "dependencies": {
+-        "@typescript-eslint/types": "8.15.0",
+-        "@typescript-eslint/visitor-keys": "8.15.0",
++        "@typescript-eslint/types": "8.14.0",
++        "@typescript-eslint/visitor-keys": "8.14.0",
+         "debug": "^4.3.4",
+         "fast-glob": "^3.3.2",
+         "is-glob": "^4.0.3",
+@@ -3532,14 +3541,15 @@
+       }
+     },
+     "node_modules/@typescript-eslint/utils": {
+-      "version": "8.15.0",
+-      "resolved": "https://registry.npmjs.org/@typescript-eslint/utils/-/utils-8.15.0.tgz",
+-      "integrity": "sha512-k82RI9yGhr0QM3Dnq+egEpz9qB6Un+WLYhmoNcvl8ltMEededhh7otBVVIDDsEEttauwdY/hQoSsOv13lxrFzQ==",
++      "version": "8.14.0",
++      "resolved": "https://registry.npmjs.org/@typescript-eslint/utils/-/utils-8.14.0.tgz",
++      "integrity": "sha512-OGqj6uB8THhrHj0Fk27DcHPojW7zKwKkPmHXHvQ58pLYp4hy8CSUdTKykKeh+5vFqTTVmjz0zCOOPKRovdsgHA==",
++      "license": "MIT",
+       "dependencies": {
+         "@eslint-community/eslint-utils": "^4.4.0",
+-        "@typescript-eslint/scope-manager": "8.15.0",
+-        "@typescript-eslint/types": "8.15.0",
+-        "@typescript-eslint/typescript-estree": "8.15.0"
++        "@typescript-eslint/scope-manager": "8.14.0",
++        "@typescript-eslint/types": "8.14.0",
++        "@typescript-eslint/typescript-estree": "8.14.0"
+       },
+       "engines": {
+         "node": "^18.18.0 || ^20.9.0 || >=21.1.0"
+@@ -3550,20 +3560,16 @@
+       },
+       "peerDependencies": {
+         "eslint": "^8.57.0 || ^9.0.0"
+-      },
+-      "peerDependenciesMeta": {
+-        "typescript": {
+-          "optional": true
+-        }
+       }
+     },
+     "node_modules/@typescript-eslint/visitor-keys": {
+-      "version": "8.15.0",
+-      "resolved": "https://registry.npmjs.org/@typescript-eslint/visitor-keys/-/visitor-keys-8.15.0.tgz",
+-      "integrity": "sha512-h8vYOulWec9LhpwfAdZf2bjr8xIp0KNKnpgqSz0qqYYKAW/QZKw3ktRndbiAtUz4acH4QLQavwZBYCc0wulA/Q==",
++      "version": "8.14.0",
++      "resolved": "https://registry.npmjs.org/@typescript-eslint/visitor-keys/-/visitor-keys-8.14.0.tgz",
++      "integrity": "sha512-vG0XZo8AdTH9OE6VFRwAZldNc7qtJ/6NLGWak+BtENuEUXGZgFpihILPiBvKXvJ2nFu27XNGC6rKiwuaoMbYzQ==",
++      "license": "MIT",
+       "dependencies": {
+-        "@typescript-eslint/types": "8.15.0",
+-        "eslint-visitor-keys": "^4.2.0"
++        "@typescript-eslint/types": "8.14.0",
++        "eslint-visitor-keys": "^3.4.3"
+       },
+       "engines": {
+         "node": "^18.18.0 || ^20.9.0 || >=21.1.0"
+@@ -3573,6 +3579,18 @@
+         "url": "https://opencollective.com/typescript-eslint"
+       }
+     },
++    "node_modules/@typescript-eslint/visitor-keys/node_modules/eslint-visitor-keys": {
++      "version": "3.4.3",
++      "resolved": "https://registry.npmjs.org/eslint-visitor-keys/-/eslint-visitor-keys-3.4.3.tgz",
++      "integrity": "sha512-wpc+LXeiyiisxPlEkUzU6svyS1frIO3Mgxj1fdy7Pm8Ygzguax2N3Fa/D/ag1WqbOprdI+uY6wMUl8/a2G+iag==",
++      "license": "Apache-2.0",
++      "engines": {
++        "node": "^12.22.0 || ^14.17.0 || >=16.0.0"
++      },
++      "funding": {
++        "url": "https://opencollective.com/eslint"
++      }
++    },
+     "node_modules/@yeoman/adapter": {
+       "version": "2.0.0",
+       "resolved": "https://registry.npmjs.org/@yeoman/adapter/-/adapter-2.0.0.tgz",
+@@ -5241,25 +5259,26 @@
+       }
+     },
+     "node_modules/eslint": {
+-      "version": "9.15.0",
+-      "resolved": "https://registry.npmjs.org/eslint/-/eslint-9.15.0.tgz",
+-      "integrity": "sha512-7CrWySmIibCgT1Os28lUU6upBshZ+GxybLOrmRzi08kS8MBuO8QA7pXEgYgY5W8vK3e74xv0lpjo9DbaGU9Rkw==",
++      "version": "9.14.0",
++      "resolved": "https://registry.npmjs.org/eslint/-/eslint-9.14.0.tgz",
++      "integrity": "sha512-c2FHsVBr87lnUtjP4Yhvk4yEhKrQavGafRA/Se1ouse8PfbfC/Qh9Mxa00yWsZRlqeUB9raXip0aiiUZkgnr9g==",
++      "license": "MIT",
+       "dependencies": {
+         "@eslint-community/eslint-utils": "^4.2.0",
+         "@eslint-community/regexpp": "^4.12.1",
+-        "@eslint/config-array": "^0.19.0",
+-        "@eslint/core": "^0.9.0",
+-        "@eslint/eslintrc": "^3.2.0",
+-        "@eslint/js": "9.15.0",
+-        "@eslint/plugin-kit": "^0.2.3",
++        "@eslint/config-array": "^0.18.0",
++        "@eslint/core": "^0.7.0",
++        "@eslint/eslintrc": "^3.1.0",
++        "@eslint/js": "9.14.0",
++        "@eslint/plugin-kit": "^0.2.0",
+         "@humanfs/node": "^0.16.6",
+         "@humanwhocodes/module-importer": "^1.0.1",
+-        "@humanwhocodes/retry": "^0.4.1",
++        "@humanwhocodes/retry": "^0.4.0",
+         "@types/estree": "^1.0.6",
+         "@types/json-schema": "^7.0.15",
+         "ajv": "^6.12.4",
+         "chalk": "^4.0.0",
+-        "cross-spawn": "^7.0.5",
++        "cross-spawn": "^7.0.2",
+         "debug": "^4.3.2",
+         "escape-string-regexp": "^4.0.0",
+         "eslint-scope": "^8.2.0",
+@@ -5278,7 +5297,8 @@
+         "lodash.merge": "^4.6.2",
+         "minimatch": "^3.1.2",
+         "natural-compare": "^1.4.0",
+-        "optionator": "^0.9.3"
++        "optionator": "^0.9.3",
++        "text-table": "^0.2.0"
+       },
+       "bin": {
+         "eslint": "bin/eslint.js"
+@@ -5506,6 +5526,15 @@
+         "url": "https://opencollective.com/eslint"
+       }
+     },
++    "node_modules/eslint/node_modules/@eslint/core": {
++      "version": "0.7.0",
++      "resolved": "https://registry.npmjs.org/@eslint/core/-/core-0.7.0.tgz",
++      "integrity": "sha512-xp5Jirz5DyPYlPiKat8jaq0EmYvDXKKpzTbxXMpT9eqlRJkRKIz9AGMdlvYjih+im+QlhWrpvVjl8IPC/lHlUw==",
++      "license": "Apache-2.0",
++      "engines": {
++        "node": "^18.18.0 || ^20.9.0 || >=21.1.0"
++      }
++    },
+     "node_modules/eslint/node_modules/ansi-styles": {
+       "version": "4.3.0",
+       "resolved": "https://registry.npmjs.org/ansi-styles/-/ansi-styles-4.3.0.tgz",
+@@ -11425,13 +11454,14 @@
+       }
+     },
+     "node_modules/typescript-eslint": {
+-      "version": "8.15.0",
+-      "resolved": "https://registry.npmjs.org/typescript-eslint/-/typescript-eslint-8.15.0.tgz",
+-      "integrity": "sha512-wY4FRGl0ZI+ZU4Jo/yjdBu0lVTSML58pu6PgGtJmCufvzfV565pUF6iACQt092uFOd49iLOTX/sEVmHtbSrS+w==",
++      "version": "8.14.0",
++      "resolved": "https://registry.npmjs.org/typescript-eslint/-/typescript-eslint-8.14.0.tgz",
++      "integrity": "sha512-K8fBJHxVL3kxMmwByvz8hNdBJ8a0YqKzKDX6jRlrjMuNXyd5T2V02HIq37+OiWXvUUOXgOOGiSSOh26Mh8pC3w==",
++      "license": "MIT",
+       "dependencies": {
+-        "@typescript-eslint/eslint-plugin": "8.15.0",
+-        "@typescript-eslint/parser": "8.15.0",
+-        "@typescript-eslint/utils": "8.15.0"
++        "@typescript-eslint/eslint-plugin": "8.14.0",
++        "@typescript-eslint/parser": "8.14.0",
++        "@typescript-eslint/utils": "8.14.0"
+       },
+       "engines": {
+         "node": "^18.18.0 || ^20.9.0 || >=21.1.0"
+@@ -11440,9 +11470,6 @@
+         "type": "opencollective",
+         "url": "https://opencollective.com/typescript-eslint"
+       },
+-      "peerDependencies": {
+-        "eslint": "^8.57.0 || ^9.0.0"
+-      },
+       "peerDependenciesMeta": {
+         "typescript": {
+           "optional": true
+diff --git a/package.json b/package.json
+index f359b6d215..baee4cb7d9 100644
+--- a/package.json
++++ b/package.json
+@@ -120,7 +120,7 @@
+     "update-snapshots": "esmocha lib/jdl generators cli --update-snapshot --no-insight --forbid-only"
+   },
+   "dependencies": {
+-    "@eslint/js": "9.15.0",
++    "@eslint/js": "9.14.0",
+     "@faker-js/faker": "9.2.0",
+     "@iarna/toml": "3.0.0",
+     "@types/ejs": "3.1.5",
+@@ -139,7 +139,7 @@
+     "dockerfile-ast": "0.7.0",
+     "dot-properties": "1.0.1",
+     "ejs": "3.1.10",
+-    "eslint": "9.15.0",
++    "eslint": "9.14.0",
+     "eslint-plugin-import-x": "4.4.2",
+     "eslint-plugin-unused-imports": "4.1.4",
+     "execa": "9.5.1",
+@@ -169,7 +169,7 @@
+     "sort-keys": "5.1.0",
+     "type-fest": "4.27.0",
+     "typescript": "5.5.4",
+-    "typescript-eslint": "8.15.0",
++    "typescript-eslint": "8.14.0",
+     "yaml": "2.6.0",
+     "yeoman-environment": "4.4.3",
+     "yeoman-generator": "7.3.3"

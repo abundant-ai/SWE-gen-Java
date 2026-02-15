@@ -1,0 +1,7 @@
+When using the OAuth2 authentication provider with `requestMethod = HttpMethod.Post`, the OAuth callback endpoint receives a POSTed form body (for example, `application/x-www-form-urlencoded`). During OAuth2 processing, Ktor consumes the request body, so by the time the request reaches the application route handler, calling `call.receiveParameters()` (or otherwise reading the request body) fails or returns no parameters because the body has already been read.
+
+This is a problem for applications that need to access the original callback POST parameters (such as `code`, `state`, or custom fields) in the route handler after OAuth2 authentication has run.
+
+Update the OAuth2 authentication flow so that for form POST callback requests, the request body is cached in a way that keeps it available to downstream handlers. After authentication completes, a route handler should still be able to read the form parameters from the request body and see the same values that were sent in the POST.
+
+Reproduction scenario: configure OAuth2 with `OAuthServerSettings.OAuth2ServerSettings` using `requestMethod = HttpMethod.Post`, perform the auth flow until the callback request is handled via POST with form parameters, and then inside the callback route handler call `call.receiveParameters()`. Expected: it returns parameters including the OAuth fields (e.g., `code`, `state`). Actual: the parameters are missing/empty or body consumption errors occur because the body was already consumed by the auth pipeline.

@@ -1,0 +1,150 @@
+diff --git a/ktor-server/ktor-server-plugins/ktor-server-auth/common/src/io/ktor/server/auth/AuthenticationInterceptors.kt b/ktor-server/ktor-server-plugins/ktor-server-auth/common/src/io/ktor/server/auth/AuthenticationInterceptors.kt
+index 1fe9c2ceb..ec90cba4d 100644
+--- a/ktor-server/ktor-server-plugins/ktor-server-auth/common/src/io/ktor/server/auth/AuthenticationInterceptors.kt
++++ b/ktor-server/ktor-server-plugins/ktor-server-auth/common/src/io/ktor/server/auth/AuthenticationInterceptors.kt
+@@ -4,7 +4,6 @@
+ 
+ package io.ktor.server.auth
+ 
+-import io.ktor.http.Parameters
+ import io.ktor.server.application.*
+ import io.ktor.server.request.*
+ import io.ktor.server.response.*
+@@ -12,9 +11,7 @@ import io.ktor.server.routing.*
+ import io.ktor.util.*
+ import io.ktor.util.logging.*
+ import io.ktor.util.pipeline.*
+-import io.ktor.util.reflect.typeInfo
+ import io.ktor.utils.io.*
+-import kotlinx.io.readByteArray
+ 
+ internal val LOGGER = KtorSimpleLogger("io.ktor.server.auth.Authentication")
+ 
+@@ -72,31 +69,6 @@ public val AuthenticationInterceptors: RouteScopedPlugin<RouteAuthenticationConf
+         .findProviders(providers) { it == AuthenticationStrategy.Optional } -
+         requiredProviders - firstSuccessfulProviders
+ 
+-    // To cache the request body which can be consumed by the OAuth2 callback handler
+-    on(ReceiveBytes) { call, body ->
+-        var newBody: Any = body
+-
+-        if (call.attributes.contains(cacheOAuthFormReceiveKey) && call.receiveType == typeInfo<Parameters>()) {
+-            if (body is ByteReadChannel) {
+-                try {
+-                    val array = body.readRemaining().readByteArray()
+-                    call.attributes.put(formCacheKey, array)
+-                    newBody = ByteReadChannel(array)
+-                } finally {
+-                    call.attributes.remove(cacheOAuthFormReceiveKey)
+-                }
+-            }
+-        } else {
+-            val cache = call.attributes.getOrNull(formCacheKey)
+-
+-            if (cache != null) {
+-                newBody = ByteReadChannel(cache)
+-            }
+-        }
+-
+-        newBody
+-    }
+-
+     on(AuthenticationHook) { call ->
+         if (call.isHandled) return@on
+ 
+@@ -156,22 +128,6 @@ public val AuthenticationInterceptors: RouteScopedPlugin<RouteAuthenticationConf
+     }
+ }
+ 
+-internal val cacheOAuthFormReceiveKey = AttributeKey<Unit>("OauthFormReceiveKey")
+-
+-private val formCacheKey = AttributeKey<ByteArray>("AuthFormCacheKey")
+-
+-private object ReceiveBytes : Hook<suspend (ApplicationCall, Any) -> Any> {
+-    override fun install(
+-        pipeline: ApplicationCallPipeline,
+-        handler: suspend (ApplicationCall, Any) -> Any
+-    ) {
+-        pipeline.receivePipeline.intercept(ApplicationReceivePipeline.Before) {
+-            val body = handler(call, it)
+-            proceedWith(body)
+-        }
+-    }
+-}
+-
+ private suspend fun AuthenticationContext.executeChallenges(call: ApplicationCall) {
+     val challenges = challenge.challenges
+ 
+diff --git a/ktor-server/ktor-server-plugins/ktor-server-auth/common/src/io/ktor/server/auth/OAuth2.kt b/ktor-server/ktor-server-plugins/ktor-server-auth/common/src/io/ktor/server/auth/OAuth2.kt
+index c54b2b3d0..ca035a9e4 100644
+--- a/ktor-server/ktor-server-plugins/ktor-server-auth/common/src/io/ktor/server/auth/OAuth2.kt
++++ b/ktor-server/ktor-server-plugins/ktor-server-auth/common/src/io/ktor/server/auth/OAuth2.kt
+@@ -26,10 +26,7 @@ private val Logger: Logger = KtorSimpleLogger("io.ktor.auth.oauth")
+ 
+ internal suspend fun ApplicationCall.oauth2HandleCallback(): OAuthCallback? {
+     val params = when (request.contentType()) {
+-        ContentType.Application.FormUrlEncoded -> {
+-            attributes.put(cacheOAuthFormReceiveKey, Unit)
+-            receiveParameters()
+-        }
++        ContentType.Application.FormUrlEncoded -> receiveParameters()
+         else -> parameters
+     }
+     val code = params[OAuth2RequestParameters.Code]
+diff --git a/ktor-server/ktor-server-plugins/ktor-server-auth/common/test/io/ktor/tests/auth/OAuth2Test.kt b/ktor-server/ktor-server-plugins/ktor-server-auth/common/test/io/ktor/tests/auth/OAuth2Test.kt
+index 00e291016..26de1a144 100644
+--- a/ktor-server/ktor-server-plugins/ktor-server-auth/common/test/io/ktor/tests/auth/OAuth2Test.kt
++++ b/ktor-server/ktor-server-plugins/ktor-server-auth/common/test/io/ktor/tests/auth/OAuth2Test.kt
+@@ -11,7 +11,6 @@ import io.ktor.client.request.*
+ import io.ktor.client.statement.*
+ import io.ktor.http.*
+ import io.ktor.http.auth.*
+-import io.ktor.http.content.TextContent
+ import io.ktor.server.application.*
+ import io.ktor.server.auth.*
+ import io.ktor.server.engine.*
+@@ -580,44 +579,6 @@ class OAuth2Test {
+         assertEquals("some-url", response1.bodyAsText())
+     }
+ 
+-    @Test
+-    fun formRequestBodyCanBeReceivedInRouteHandler() = testApplication {
+-        application {
+-            install(Authentication) {
+-                oauth {
+-                    urlProvider = { "http://localhost:8080/callback" }
+-                    providerLookup = {
+-                        OAuthServerSettings.OAuth2ServerSettings(
+-                            name = "dummy",
+-                            authorizeUrl = "localhost",
+-                            accessTokenUrl = "localhost",
+-                            clientId = "clientId",
+-                            clientSecret = "clientSecret"
+-                        )
+-                    }
+-                    client = this@testApplication.client
+-                }
+-            }
+-
+-            routing {
+-                route("/oauth") {
+-                    authenticate(optional = true) {
+-                        post {
+-                            call.respond(call.receiveText())
+-                        }
+-                    }
+-                }
+-            }
+-        }
+-
+-        client.post("/oauth") {
+-            setBody(TextContent(listOf("foo" to "bar").formUrlEncode(), ContentType.Application.FormUrlEncoded))
+-        }.let { response ->
+-            assertEquals(HttpStatusCode.OK, response.status)
+-            assertEquals("foo=bar", response.bodyAsText())
+-        }
+-    }
+-
+     private fun assertFailures() {
+         failures.forEach {
+             throw it
