@@ -1,0 +1,149 @@
+diff --git a/kotlin/codegen/pom.xml b/kotlin/codegen/pom.xml
+index 736f8ce8..21da5a3a 100644
+--- a/kotlin/codegen/pom.xml
++++ b/kotlin/codegen/pom.xml
+@@ -25,7 +25,14 @@
+     <dependency>
+       <groupId>com.squareup</groupId>
+       <artifactId>kotlinpoet</artifactId>
+-      <version>1.1.0</version>
++      <version>1.2.0</version>
++    </dependency>
++    <dependency>
++      <groupId>net.ltgt.gradle.incap</groupId>
++      <artifactId>incap</artifactId>
++      <version>${incap.version}</version>
++      <scope>provided</scope>
++      <optional>true</optional>
+     </dependency>
+     <dependency>
+       <groupId>com.google.auto</groupId>
+@@ -34,9 +41,10 @@
+     </dependency>
+     <dependency>
+       <groupId>com.google.auto.service</groupId>
+-      <artifactId>auto-service</artifactId>
+-      <version>1.0-rc4</version>
++      <artifactId>auto-service-annotations</artifactId>
++      <version>${autoservice.version}</version>
+       <scope>provided</scope>
++      <optional>true</optional>
+     </dependency>
+     <dependency>
+       <groupId>junit</groupId>
+@@ -56,10 +64,12 @@
+     <dependency>
+       <groupId>org.jetbrains.kotlin</groupId>
+       <artifactId>kotlin-compiler-embeddable</artifactId>
++      <scope>test</scope>
+     </dependency>
+     <dependency>
+       <groupId>org.jetbrains.kotlin</groupId>
+       <artifactId>kotlin-annotation-processing-embeddable</artifactId>
++      <scope>test</scope>
+     </dependency>
+     <dependency>
+       <groupId>me.eugeniomarletti.kotlin.metadata</groupId>
+@@ -101,7 +111,12 @@
+                 <annotationProcessorPath>
+                   <groupId>com.google.auto.service</groupId>
+                   <artifactId>auto-service</artifactId>
+-                  <version>1.0-rc4</version>
++                  <version>${autoservice.version}</version>
++                </annotationProcessorPath>
++                <annotationProcessorPath>
++                  <groupId>net.ltgt.gradle.incap</groupId>
++                  <artifactId>incap-processor</artifactId>
++                  <version>${incap.version}</version>
+                 </annotationProcessorPath>
+               </annotationProcessorPaths>
+             </configuration>
+diff --git a/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/AdapterGenerator.kt b/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/AdapterGenerator.kt
+index a75740dc..0deba31f 100644
+--- a/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/AdapterGenerator.kt
++++ b/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/AdapterGenerator.kt
+@@ -52,6 +52,7 @@ internal class AdapterGenerator(
+ 
+   private val nameAllocator = NameAllocator()
+   private val adapterName = "${className.simpleNames.joinToString(separator = "_")}JsonAdapter"
++  private val originalElement = target.element
+   private val originalTypeName = target.element.asType().asTypeName()
+ 
+   private val moshiParam = ParameterSpec.builder(
+@@ -97,6 +98,7 @@ internal class AdapterGenerator(
+ 
+   private fun generateType(generatedOption: TypeElement?): TypeSpec {
+     val result = TypeSpec.classBuilder(adapterName)
++        .addOriginatingElement(originalElement)
+ 
+     generatedOption?.let {
+       result.addAnnotation(AnnotationSpec.builder(it.asClassName())
+diff --git a/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/JsonClassCodegenProcessor.kt b/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/JsonClassCodegenProcessor.kt
+index 4821772c..ce3834e7 100644
+--- a/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/JsonClassCodegenProcessor.kt
++++ b/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/JsonClassCodegenProcessor.kt
+@@ -16,12 +16,12 @@
+ package com.squareup.moshi.kotlin.codegen
+ 
+ import com.google.auto.service.AutoService
+-import com.squareup.kotlinpoet.TypeSpec
+ import com.squareup.moshi.JsonClass
+ import me.eugeniomarletti.kotlin.metadata.KotlinMetadataUtils
+ import me.eugeniomarletti.kotlin.metadata.declaresDefaultValue
+ import me.eugeniomarletti.kotlin.processing.KotlinAbstractProcessor
+-import java.io.File
++import net.ltgt.gradle.incap.IncrementalAnnotationProcessor
++import net.ltgt.gradle.incap.IncrementalAnnotationProcessorType.ISOLATING
+ import javax.annotation.processing.ProcessingEnvironment
+ import javax.annotation.processing.Processor
+ import javax.annotation.processing.RoundEnvironment
+@@ -42,6 +42,7 @@ import javax.tools.Diagnostic.Kind.ERROR
+  * If you don't want this though, you can use the runtime [JsonClass] factory implementation.
+  */
+ @AutoService(Processor::class)
++@IncrementalAnnotationProcessor(ISOLATING)
+ class JsonClassCodegenProcessor : KotlinAbstractProcessor(), KotlinMetadataUtils {
+ 
+   companion object {
+@@ -86,7 +87,8 @@ class JsonClassCodegenProcessor : KotlinAbstractProcessor(), KotlinMetadataUtils
+       val jsonClass = type.getAnnotation(annotation)
+       if (jsonClass.generateAdapter) {
+         val generator = adapterGenerator(type) ?: continue
+-        generator.generateAndWrite(generatedType)
++        generator.generateFile(generatedType)
++            .writeTo(filer)
+       }
+     }
+ 
+@@ -123,18 +125,4 @@ class JsonClassCodegenProcessor : KotlinAbstractProcessor(), KotlinMetadataUtils
+ 
+     return AdapterGenerator(type, sortedProperties)
+   }
+-
+-  private fun AdapterGenerator.generateAndWrite(generatedOption: TypeElement?) {
+-    val fileSpec = generateFile(generatedOption)
+-    val adapterName = fileSpec.members.filterIsInstance<TypeSpec>().first().name!!
+-    val outputDir = generatedDir ?: mavenGeneratedDir(adapterName)
+-    fileSpec.writeTo(outputDir)
+-  }
+-
+-  private fun mavenGeneratedDir(adapterName: String): File {
+-    // Hack since the maven plugin doesn't supply `kapt.kotlin.generated` option
+-    // Bug filed at https://youtrack.jetbrains.com/issue/KT-22783
+-    val file = filer.createSourceFile(adapterName).toUri().let(::File)
+-    return file.parentFile.also { file.delete() }
+-  }
+ }
+diff --git a/pom.xml b/pom.xml
+index 10e3daf2..3ef492f6 100644
+--- a/pom.xml
++++ b/pom.xml
+@@ -33,6 +33,8 @@
+     <kotlin-metadata.version>1.4.0</kotlin-metadata.version>
+     <dokka.version>0.9.17</dokka.version>
+     <maven-assembly.version>3.1.0</maven-assembly.version>
++    <incap.version>0.2</incap.version>
++    <autoservice.version>1.0-rc5</autoservice.version>
+ 
+     <!-- Dependencies -->
+     <okio.version>1.16.0</okio.version>

@@ -1,0 +1,347 @@
+diff --git a/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/api/AdapterGenerator.kt b/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/api/AdapterGenerator.kt
+index 64272f66..00214acd 100644
+--- a/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/api/AdapterGenerator.kt
++++ b/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/api/AdapterGenerator.kt
+@@ -18,6 +18,7 @@ package com.squareup.moshi.kotlin.codegen.api
+ import com.squareup.kotlinpoet.ARRAY
+ import com.squareup.kotlinpoet.AnnotationSpec
+ import com.squareup.kotlinpoet.CodeBlock
++import com.squareup.kotlinpoet.CodeBlock.Companion
+ import com.squareup.kotlinpoet.FileSpec
+ import com.squareup.kotlinpoet.FunSpec
+ import com.squareup.kotlinpoet.INT
+@@ -73,9 +74,6 @@ internal class AdapterGenerator(
+         // Because we generate redundant `out` variance for some generics and there's no way
+         // for us to know when it's redundant.
+         "REDUNDANT_PROJECTION",
+-        // Because we may generate redundant explicit types for local vars with default values.
+-        // Example: 'var fooSet: Boolean = false'
+-        "RedundantExplicitType",
+         // NameAllocator will just add underscores to differentiate names, which Kotlin doesn't
+         // like for stylistic reasons.
+         "LocalVariableName"
+@@ -480,10 +478,8 @@ internal class AdapterGenerator(
+           localConstructorProperty
+       )
+     } else {
+-      // Standard constructor call. Don't omit generics for parameterized types even if they can be
+-      // inferred, as calculating the right condition for inference exceeds the value gained from
+-      // being less pedantic.
+-      result.addCode("«%L%T(", returnOrResultAssignment, originalTypeName)
++      // Standard constructor call. Can omit generics as they're inferred
++      result.addCode("«%L%T(", returnOrResultAssignment, originalTypeName.rawType())
+     }
+ 
+     for (input in components.filterIsInstance<ParameterComponent>()) {
+diff --git a/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/metadata.kt b/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/metadata.kt
+index 08c630f8..87a22016 100644
+--- a/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/metadata.kt
++++ b/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/metadata.kt
+@@ -18,10 +18,8 @@ package com.squareup.moshi.kotlin.codegen
+ import com.squareup.kotlinpoet.AnnotationSpec
+ import com.squareup.kotlinpoet.ClassName
+ import com.squareup.kotlinpoet.KModifier
+-import com.squareup.kotlinpoet.ParameterizedTypeName
+ import com.squareup.kotlinpoet.TypeName
+ import com.squareup.kotlinpoet.TypeSpec
+-import com.squareup.kotlinpoet.TypeVariableName
+ import com.squareup.kotlinpoet.asClassName
+ import com.squareup.kotlinpoet.asTypeName
+ import com.squareup.kotlinpoet.metadata.ImmutableKmConstructor
+@@ -55,7 +53,6 @@ import javax.lang.model.element.AnnotationMirror
+ import javax.lang.model.element.Element
+ import javax.lang.model.element.ElementKind
+ import javax.lang.model.element.TypeElement
+-import javax.lang.model.type.DeclaredType
+ import javax.lang.model.util.Elements
+ import javax.lang.model.util.Types
+ import javax.tools.Diagnostic.Kind.ERROR
+@@ -195,8 +192,6 @@ internal fun targetType(messager: Messager,
+   }
+ 
+   val properties = mutableMapOf<String, TargetProperty>()
+-
+-  val resolvedTypes = mutableListOf<ResolvedTypeMapping>()
+   val superTypes = appliedType.supertypes(types)
+       .filterNot { supertype ->
+         supertype.element.asClassName() == OBJECT_CLASS || // Don't load properties for java.lang.Object.
+@@ -212,53 +207,15 @@ internal fun targetType(messager: Messager,
+       }
+       .associateWithTo(LinkedHashMap()) { supertype ->
+         // Load the kotlin API cache into memory eagerly so we can reuse the parsed APIs
+-        val api = if (supertype.element == element) {
++        if (supertype.element == element) {
+           // We've already parsed this api above, reuse it
+           kotlinApi
+         } else {
+           cachedClassInspector.toTypeSpec(supertype.element)
+         }
+-
+-        val apiSuperClass = api.superclass
+-        if (apiSuperClass is ParameterizedTypeName) {
+-          //
+-          // This extends a typed generic superclass. We want to construct a mapping of the
+-          // superclass typevar names to their materialized types here.
+-          //
+-          // class Foo extends Bar<String>
+-          // class Bar<T>
+-          //
+-          // We will store {Foo : {T : [String]}}.
+-          //
+-          // Then when we look at Bar<T> later, we'll look up to the descendent Foo and extract its
+-          // materialized type from there.
+-          //
+-          val superSuperClass = supertype.element.superclass as DeclaredType
+-
+-          // Convert to an element and back to wipe the typed generics off of this
+-          val untyped = superSuperClass.asElement().asType().asTypeName() as ParameterizedTypeName
+-          resolvedTypes += ResolvedTypeMapping(
+-              target = untyped.rawType,
+-              args = untyped.typeArguments.asSequence()
+-                  .cast<TypeVariableName>()
+-                  .map(TypeVariableName::name)
+-                  .zip(apiSuperClass.typeArguments.asSequence())
+-                  .associate { it }
+-          )
+-        }
+-
+-        return@associateWithTo api
+       }
+-
+-  for ((localAppliedType, supertypeApi) in superTypes.entries) {
+-    val appliedClassName = localAppliedType.element.asClassName()
+-    val supertypeProperties = declaredProperties(
+-        constructor = constructor,
+-        kotlinApi = supertypeApi,
+-        allowedTypeVars = typeVariables.toSet(),
+-        currentClass = appliedClassName,
+-        resolvedTypes = resolvedTypes
+-    )
++  for (supertypeApi in superTypes.values) {
++    val supertypeProperties = declaredProperties(constructor, supertypeApi)
+     for ((name, property) in supertypeProperties) {
+       properties.putIfAbsent(name, property)
+     }
+@@ -286,71 +243,16 @@ internal fun targetType(messager: Messager,
+       visibility = resolvedVisibility)
+ }
+ 
+-/**
+- * Represents a resolved raw class to type arguments where [args] are a map of the parent type var
+- * name to its resolved [TypeName].
+- */
+-private data class ResolvedTypeMapping(val target: ClassName, val args: Map<String, TypeName>)
+-
+-private fun resolveTypeArgs(
+-    targetClass: ClassName,
+-    propertyType: TypeName,
+-    resolvedTypes: List<ResolvedTypeMapping>,
+-    allowedTypeVars: Set<TypeVariableName>,
+-    entryStartIndex: Int = resolvedTypes.indexOfLast { it.target == targetClass }
+-): TypeName {
+-  val unwrappedType = propertyType.unwrapTypeAlias()
+-
+-  if (unwrappedType !is TypeVariableName) {
+-    return unwrappedType
+-  } else if (entryStartIndex == -1) {
+-    return unwrappedType
+-  }
+-
+-  val targetMappingIndex = resolvedTypes[entryStartIndex]
+-  val targetMappings = targetMappingIndex.args
+-
+-  // Try to resolve the real type of this property based on mapped generics in the subclass.
+-  // We need to us a non-nullable version for mapping since we're just mapping based on raw java
+-  // type vars, but then can re-copy nullability back if it is found.
+-  val resolvedType = targetMappings[unwrappedType.name]
+-      ?.copy(nullable = unwrappedType.isNullable)
+-      ?: unwrappedType
+-
+-  return when {
+-    resolvedType !is TypeVariableName -> resolvedType
+-    entryStartIndex != 0 -> {
+-      // We need to go deeper
+-      resolveTypeArgs(targetClass, resolvedType, resolvedTypes, allowedTypeVars, entryStartIndex - 1)
+-    }
+-    resolvedType.copy(nullable = false) in allowedTypeVars -> {
+-      // This is a generic type in the top-level declared class. This is fine to leave in because
+-      // this will be handled by the `Type` array passed in at runtime.
+-      resolvedType
+-    }
+-    else -> error("Could not find $resolvedType in $resolvedTypes. Also not present in allowable top-level type vars $allowedTypeVars")
+-  }
+-}
+-
+ /** Returns the properties declared by `typeElement`. */
+ @KotlinPoetMetadataPreview
+ private fun declaredProperties(
+     constructor: TargetConstructor,
+-    kotlinApi: TypeSpec,
+-    allowedTypeVars: Set<TypeVariableName>,
+-    currentClass: ClassName,
+-    resolvedTypes: List<ResolvedTypeMapping>
++    kotlinApi: TypeSpec
+ ): Map<String, TargetProperty> {
+ 
+   val result = mutableMapOf<String, TargetProperty>()
+   for (initialProperty in kotlinApi.propertySpecs) {
+-    val resolvedType = resolveTypeArgs(
+-        targetClass = currentClass,
+-        propertyType = initialProperty.type,
+-        resolvedTypes = resolvedTypes,
+-        allowedTypeVars = allowedTypeVars
+-    )
+-    val property = initialProperty.toBuilder(type = resolvedType).build()
++    val property = initialProperty.toBuilder(type = initialProperty.type.unwrapTypeAlias()).build()
+     val name = property.name
+     val parameter = constructor.parameters[name]
+     result[name] = TargetProperty(
+@@ -478,10 +380,3 @@ internal val TypeElement.metadata: Metadata
+     return getAnnotation(Metadata::class.java)
+         ?: throw IllegalStateException("Not a kotlin type! $this")
+   }
+-
+-private fun <E> Sequence<*>.cast(): Sequence<E> {
+-  return map {
+-    @Suppress("UNCHECKED_CAST")
+-    it as E
+-  }
+-}
+diff --git a/kotlin/tests/src/test/kotlin/com/squareup/moshi/kotlin/codegen/ComplexGenericsInheritanceTest.kt b/kotlin/tests/src/test/kotlin/com/squareup/moshi/kotlin/codegen/ComplexGenericsInheritanceTest.kt
+deleted file mode 100644
+index a3a16f87..00000000
+--- a/kotlin/tests/src/test/kotlin/com/squareup/moshi/kotlin/codegen/ComplexGenericsInheritanceTest.kt
++++ /dev/null
+@@ -1,132 +0,0 @@
+-@file:Suppress("UNUSED", "UNUSED_PARAMETER")
+-
+-package com.squareup.moshi.kotlin.codegen
+-
+-import com.squareup.moshi.JsonClass
+-import com.squareup.moshi.Moshi
+-import com.squareup.moshi.kotlin.reflect.adapter
+-import org.assertj.core.api.Assertions.assertThat
+-import org.intellij.lang.annotations.Language
+-import org.junit.Test
+-
+-@ExperimentalStdlibApi
+-class ComplexGenericsInheritanceTest {
+-
+-  private val moshi = Moshi.Builder().build()
+-
+-  @Test
+-  fun simple() {
+-    val adapter = moshi.adapter<PersonResponse>()
+-
+-    @Language("JSON")
+-    val json = """{"data":{"name":"foo"},"data2":"bar","data3":"baz"}"""
+-
+-    val instance = adapter.fromJson(json)!!
+-    val testInstance = PersonResponse().apply {
+-      data = Person("foo")
+-    }
+-    assertThat(instance).isEqualTo(testInstance)
+-    assertThat(adapter.toJson(instance)).isEqualTo(json)
+-  }
+-
+-  @Test
+-  fun nested() {
+-    val adapter = moshi.adapter<NestedPersonResponse>()
+-
+-    @Language("JSON")
+-    val json = """{"data":{"name":"foo"},"data2":"bar","data3":"baz"}"""
+-
+-    val instance = adapter.fromJson(json)!!
+-    val testInstance = NestedPersonResponse().apply {
+-      data = Person("foo")
+-    }
+-    assertThat(instance).isEqualTo(testInstance)
+-    assertThat(adapter.toJson(instance)).isEqualTo(json)
+-  }
+-
+-  @Test
+-  fun untyped() {
+-    val adapter = moshi.adapter<UntypedNestedPersonResponse<Person>>()
+-
+-    @Language("JSON")
+-    val json = """{"data":{"name":"foo"},"data2":"bar","data3":"baz"}"""
+-
+-    val instance = adapter.fromJson(json)!!
+-    val testInstance = UntypedNestedPersonResponse<Person>().apply {
+-      data = Person("foo")
+-    }
+-    assertThat(instance).isEqualTo(testInstance)
+-    assertThat(adapter.toJson(instance)).isEqualTo(json)
+-  }
+-
+-  @Test
+-  fun complex() {
+-    val adapter = moshi.adapter<Layer4<Person, UntypedNestedPersonResponse<Person>>>()
+-
+-    @Language("JSON")
+-    val json = """{"layer4E":{"name":"layer4E"},"layer4F":{"data":{"name":"layer4F"},"data2":"layer4F","data3":"layer4F"},"layer3C":[1,2,3],"layer3D":"layer3D","layer2":"layer2","layer1":"layer1"}"""
+-
+-    val instance = adapter.fromJson(json)!!
+-    val testInstance = Layer4(
+-        layer4E = Person("layer4E"),
+-        layer4F = UntypedNestedPersonResponse<Person>().apply {
+-          data = Person("layer4F")
+-          data2 = "layer4F"
+-          data3 = "layer4F"
+-        }
+-    ).apply {
+-      layer3C = listOf(1, 2, 3)
+-      layer3D = "layer3D"
+-      layer2 = "layer2"
+-      layer1 = "layer1"
+-    }
+-    assertThat(instance).isEqualTo(testInstance)
+-    assertThat(adapter.toJson(testInstance)).isEqualTo(json)
+-  }
+-}
+-
+-open class ResponseWithSettableProperty<T, R> {
+-  var data: T? = null
+-  var data2: R? = null
+-  var data3: R? = null
+-}
+-
+-interface Personable
+-
+-@JsonClass(generateAdapter = true)
+-data class Person(val name: String) : Personable
+-
+-@JsonClass(generateAdapter = true)
+-data class PersonResponse(
+-    val extra: String? = null) : ResponseWithSettableProperty<Person, String>()
+-
+-abstract class NestedResponse<T : Personable> : ResponseWithSettableProperty<T, String>()
+-
+-@JsonClass(generateAdapter = true)
+-data class NestedPersonResponse(val extra: String? = null) : NestedResponse<Person>()
+-
+-@JsonClass(generateAdapter = true)
+-data class UntypedNestedPersonResponse<T : Personable>(
+-    val extra: String? = null
+-) : NestedResponse<T>()
+-
+-interface LayerInterface<I>
+-
+-abstract class Layer1<A> {
+-  var layer1: A? = null
+-}
+-
+-abstract class Layer2<B> : Layer1<B>(), LayerInterface<B> {
+-  var layer2: B? = null
+-}
+-
+-abstract class Layer3<C, D> : Layer2<D>() {
+-  var layer3C: C? = null
+-  var layer3D: D? = null
+-}
+-
+-@JsonClass(generateAdapter = true)
+-data class Layer4<E : Personable, F>(
+-    val layer4E: E,
+-    val layer4F: F? = null
+-) : Layer3<List<Int>, String>(), LayerInterface<String>

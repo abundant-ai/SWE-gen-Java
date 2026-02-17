@@ -1,0 +1,572 @@
+diff --git a/kotlin/codegen/pom.xml b/kotlin/codegen/pom.xml
+index 1a148b18..c34755a1 100644
+--- a/kotlin/codegen/pom.xml
++++ b/kotlin/codegen/pom.xml
+@@ -47,6 +47,11 @@
+       <artifactId>kotlinpoet-classinspector-elements</artifactId>
+       <version>${kotlinpoet.version}</version>
+     </dependency>
++    <dependency>
++      <groupId>org.ow2.asm</groupId>
++      <artifactId>asm</artifactId>
++      <version>${asm.version}</version>
++    </dependency>
+     <dependency>
+       <groupId>net.ltgt.gradle.incap</groupId>
+       <artifactId>incap</artifactId>
+diff --git a/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/JsonClassCodegenProcessor.kt b/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/JsonClassCodegenProcessor.kt
+index bfc2f72e..114d21c0 100644
+--- a/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/JsonClassCodegenProcessor.kt
++++ b/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/JsonClassCodegenProcessor.kt
+@@ -108,9 +108,9 @@ class JsonClassCodegenProcessor : AbstractProcessor() {
+       val jsonClass = type.getAnnotation(annotation)
+       if (jsonClass.generateAdapter && jsonClass.generator.isEmpty()) {
+         val generator = adapterGenerator(type, cachedClassInspector) ?: continue
+-        generator
+-            .generateFile {
+-              it.toBuilder()
++        val preparedAdapter = generator
++            .prepare { spec ->
++              spec.toBuilder()
+                   .apply {
+                     generatedType?.asClassName()?.let { generatedClassName ->
+                       addAnnotation(
+@@ -125,14 +125,19 @@ class JsonClassCodegenProcessor : AbstractProcessor() {
+                   .addOriginatingElement(type)
+                   .build()
+             }
+-            .writeTo(filer)
++
++        preparedAdapter.spec.writeTo(filer)
++        preparedAdapter.proguardConfig?.writeTo(filer, type)
+       }
+     }
+ 
+     return false
+   }
+ 
+-  private fun adapterGenerator(element: TypeElement, cachedClassInspector: MoshiCachedClassInspector): AdapterGenerator? {
++  private fun adapterGenerator(
++      element: TypeElement,
++      cachedClassInspector: MoshiCachedClassInspector
++  ): AdapterGenerator? {
+     val type = targetType(messager, elements, types, element, cachedClassInspector) ?: return null
+ 
+     val properties = mutableMapOf<String, PropertyGenerator>()
+diff --git a/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/api/AdapterGenerator.kt b/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/api/AdapterGenerator.kt
+index 58d2bc4c..636dcdcb 100644
+--- a/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/api/AdapterGenerator.kt
++++ b/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/api/AdapterGenerator.kt
+@@ -44,6 +44,7 @@ import com.squareup.moshi.kotlin.codegen.api.FromJsonComponent.ParameterProperty
+ import com.squareup.moshi.kotlin.codegen.api.FromJsonComponent.PropertyOnly
+ import java.lang.reflect.Constructor
+ import java.lang.reflect.Type
++import org.objectweb.asm.Type as AsmType
+ 
+ private val MOSHI_UTIL = Util::class.asClassName()
+ private const val TO_STRING_PREFIX = "GeneratedJsonAdapter("
+@@ -51,7 +52,7 @@ private const val TO_STRING_SIZE_BASE = TO_STRING_PREFIX.length + 1 // 1 is the
+ 
+ /** Generates a JSON adapter for a target type. */
+ internal class AdapterGenerator(
+-    target: TargetType,
++    private val target: TargetType,
+     private val propertyList: List<PropertyGenerator>
+ ) {
+ 
+@@ -59,6 +60,8 @@ internal class AdapterGenerator(
+     private val INT_TYPE_BLOCK = CodeBlock.of("%T::class.javaPrimitiveType", INT)
+     private val DEFAULT_CONSTRUCTOR_MARKER_TYPE_BLOCK = CodeBlock.of(
+         "%T.DEFAULT_CONSTRUCTOR_MARKER", Util::class)
++    private val CN_MOSHI = Moshi::class.asClassName()
++    private val CN_TYPE = Type::class.asClassName()
+ 
+     private val COMMON_SUPPRESS = arrayOf(
+         // https://github.com/square/moshi/issues/1023
+@@ -97,10 +100,10 @@ internal class AdapterGenerator(
+ 
+   private val moshiParam = ParameterSpec.builder(
+       nameAllocator.newName("moshi"),
+-      Moshi::class).build()
++      CN_MOSHI).build()
+   private val typesParam = ParameterSpec.builder(
+       nameAllocator.newName("types"),
+-      ARRAY.parameterizedBy(Type::class.asTypeName()))
++      ARRAY.parameterizedBy(CN_TYPE))
+       .build()
+   private val readerParam = ParameterSpec.builder(
+       nameAllocator.newName("reader"),
+@@ -139,15 +142,59 @@ internal class AdapterGenerator(
+       .initializer("null")
+       .build()
+ 
+-  fun generateFile(typeHook: (TypeSpec) -> TypeSpec = { it }): FileSpec {
++  fun prepare(typeHook: (TypeSpec) -> TypeSpec = { it }): PreparedAdapter {
+     for (property in nonTransientProperties) {
+       property.allocateNames(nameAllocator)
+     }
+ 
++    val generatedAdapter = generateType().let(typeHook)
+     val result = FileSpec.builder(className.packageName, adapterName)
+     result.addComment("Code generated by moshi-kotlin-codegen. Do not edit.")
+-    result.addType(generateType().let(typeHook))
+-    return result.build()
++    result.addType(generatedAdapter)
++    return PreparedAdapter(result.build(), generatedAdapter.createProguardRule())
++  }
++
++  private fun TypeSpec.createProguardRule(): ProguardConfig {
++    val adapterProperties = propertySpecs
++        .asSequence()
++        .filter { prop ->
++          prop.type.rawType() == JsonAdapter::class.asClassName()
++        }
++        .filter { prop -> prop.annotations.isNotEmpty() }
++        .mapTo(mutableSetOf()) { prop ->
++          QualifierAdapterProperty(
++              name = prop.name,
++              qualifiers = prop.annotations.mapTo(mutableSetOf()) { it.className }
++          )
++        }
++
++    val adapterConstructorParams = when (requireNotNull(primaryConstructor).parameters.size) {
++      1 -> listOf(CN_MOSHI.canonicalName)
++      2 -> listOf(CN_MOSHI.canonicalName, "${CN_TYPE.canonicalName}[]")
++      // Should never happen
++      else -> error("Unexpected number of arguments on primary constructor: $primaryConstructor")
++    }
++
++    var hasDefaultProperties = false
++    var parameterTypes = emptyList<String>()
++    target.constructor.signature?.let { constructorSignature ->
++      if (constructorSignature.startsWith("constructor-impl")) {
++        // Inline class, we don't support this yet.
++        // This is a static method with signature like 'constructor-impl(I)I'
++        return@let
++      }
++      hasDefaultProperties = propertyList.any { it.hasDefault }
++      parameterTypes = AsmType.getArgumentTypes(constructorSignature.removePrefix("<init>"))
++          .map { it.toCanonicalString() }
++    }
++    return ProguardConfig(
++        targetClass = className,
++        adapterName = adapterName,
++        adapterConstructorParams = adapterConstructorParams,
++        targetConstructorHasDefaults = hasDefaultProperties,
++        targetConstructorParams = parameterTypes,
++        qualifierProperties = adapterProperties
++    )
+   }
+ 
+   private fun generateType(): TypeSpec {
+@@ -501,6 +548,28 @@ internal class AdapterGenerator(
+   }
+ }
+ 
++/** Represents a prepared adapter with its [spec] and optional associated [proguardConfig]. */
++internal data class PreparedAdapter(val spec: FileSpec, val proguardConfig: ProguardConfig?)
++
++private fun AsmType.toCanonicalString(): String {
++  return when (this) {
++    AsmType.VOID_TYPE -> "void"
++    AsmType.BOOLEAN_TYPE -> "boolean"
++    AsmType.CHAR_TYPE -> "char"
++    AsmType.BYTE_TYPE -> "byte"
++    AsmType.SHORT_TYPE -> "short"
++    AsmType.INT_TYPE -> "int"
++    AsmType.FLOAT_TYPE -> "float"
++    AsmType.LONG_TYPE -> "long"
++    AsmType.DOUBLE_TYPE -> "double"
++    else -> when (sort) {
++      AsmType.ARRAY -> "${elementType.toCanonicalString()}[]"
++      // Object type
++      else -> className
++    }
++  }
++}
++
+ private interface PropertyComponent {
+   val property: PropertyGenerator
+   val type: TypeName
+diff --git a/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/api/ProguardRules.kt b/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/api/ProguardRules.kt
+new file mode 100644
+index 00000000..4ec51d5b
+--- /dev/null
++++ b/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/api/ProguardRules.kt
+@@ -0,0 +1,104 @@
++package com.squareup.moshi.kotlin.codegen.api
++
++import com.squareup.kotlinpoet.ClassName
++import javax.annotation.processing.Filer
++import javax.lang.model.element.Element
++import javax.tools.StandardLocation
++
++/**
++ * Represents a proguard configuration for a given spec. This covers three main areas:
++ * - Keeping the target class name to Moshi's reflective lookup of the adapter.
++ * - Keeping the generated adapter class name + public constructor for reflective lookup.
++ * - Keeping any used JsonQualifier annotations and the properties they are attached to.
++ * - If the target class has default parameter values, also keeping the associated synthetic
++ *   constructor as well as the DefaultConstructorMarker type Kotlin adds to it.
++ *
++ * Each rule is intended to be as specific and targeted as possible to reduce footprint, and each is
++ * conditioned on usage of the original target type.
++ *
++ * To keep this processor as an ISOLATING incremental processor, we generate one file per target
++ * class with a deterministic name (see [outputFile]) with an appropriate originating element.
++ */
++internal data class ProguardConfig(
++    val targetClass: ClassName,
++    val adapterName: String,
++    val adapterConstructorParams: List<String>,
++    val targetConstructorHasDefaults: Boolean,
++    val targetConstructorParams: List<String>,
++    val qualifierProperties: Set<QualifierAdapterProperty>
++) {
++  private val outputFile = "META-INF/proguard/moshi-${targetClass.canonicalName}.pro"
++
++  /** Writes this to `filer`. */
++  fun writeTo(filer: Filer, vararg originatingElements: Element) {
++    filer.createResource(StandardLocation.CLASS_OUTPUT, "", outputFile, *originatingElements)
++        .openWriter()
++        .use(::writeTo)
++  }
++
++  private fun writeTo(out: Appendable): Unit = out.run {
++    //
++    // -if class {the target class}
++    // -keepnames class {the target class}
++    // -if class {the target class}
++    // -keep class {the generated adapter} {
++    //    <init>(...);
++    //    private final {adapter fields}
++    // }
++    //
++    val targetName = targetClass.canonicalName
++    val adapterCanonicalName = ClassName(targetClass.packageName, adapterName)
++    // Keep the class name for Moshi's reflective lookup based on it
++    appendln("-if class $targetName")
++    appendln("-keepnames class $targetName")
++
++    appendln("-if class $targetName")
++    appendln("-keep class $adapterCanonicalName {")
++    // Keep the constructor for Moshi's reflective lookup
++    val constructorArgs = adapterConstructorParams.joinToString(",")
++    appendln("    public <init>($constructorArgs)")
++    // Keep any qualifier properties
++    for (qualifierProperty in qualifierProperties) {
++      appendln("    private com.squareup.moshi.JsonAdapter ${qualifierProperty.name}")
++    }
++    appendln("}")
++
++    qualifierProperties.asSequence()
++        .flatMap { it.qualifiers.asSequence() }
++        .map(ClassName::canonicalName)
++        .sorted()
++        .forEach { qualifier ->
++          appendln("-if class $targetName")
++          appendln("-keep @interface $qualifier")
++        }
++
++    if (targetConstructorHasDefaults) {
++      // If the target class has default parameter values, keep its synthetic constructor
++      //
++      // -keepnames class kotlin.jvm.internal.DefaultConstructorMarker
++      // -keepclassmembers @com.squareup.moshi.JsonClass @kotlin.Metadata class * {
++      //     synthetic <init>(...);
++      // }
++      //
++      appendln("-if class $targetName")
++      appendln("-keepnames class kotlin.jvm.internal.DefaultConstructorMarker")
++      appendln("-if class $targetName")
++      appendln("-keepclassmembers class ${targetClass.canonicalName} {")
++      val allParams = targetConstructorParams.toMutableList()
++      val maskCount = (targetConstructorParams.size % 32) + 1
++      repeat(maskCount) {
++        allParams += "int"
++      }
++      allParams += "kotlin.jvm.internal.DefaultConstructorMarker"
++      val params = allParams.joinToString(",")
++      appendln("    public synthetic <init>($params)")
++      appendln("}")
++    }
++  }
++}
++
++/**
++ * Represents a qualified property with its [name] in the adapter fields and list of [qualifiers]
++ * associated with it.
++ */
++internal data class QualifierAdapterProperty(val name: String, val qualifiers: Set<ClassName>)
+diff --git a/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/api/TargetConstructor.kt b/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/api/TargetConstructor.kt
+index 742cb4bd..94c23586 100644
+--- a/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/api/TargetConstructor.kt
++++ b/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/api/TargetConstructor.kt
+@@ -20,7 +20,8 @@ import com.squareup.kotlinpoet.KModifier
+ /** A constructor in user code that should be called by generated code. */
+ internal data class TargetConstructor(
+   val parameters: LinkedHashMap<String, TargetParameter>,
+-  val visibility: KModifier
++  val visibility: KModifier,
++  val signature: String?
+ ) {
+   init {
+     visibility.checkIsVisibility()
+diff --git a/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/metadata.kt b/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/metadata.kt
+index b0204927..87a22016 100644
+--- a/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/metadata.kt
++++ b/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/metadata.kt
+@@ -22,6 +22,7 @@ import com.squareup.kotlinpoet.TypeName
+ import com.squareup.kotlinpoet.TypeSpec
+ import com.squareup.kotlinpoet.asClassName
+ import com.squareup.kotlinpoet.asTypeName
++import com.squareup.kotlinpoet.metadata.ImmutableKmConstructor
+ import com.squareup.kotlinpoet.metadata.KotlinPoetMetadataPreview
+ import com.squareup.kotlinpoet.metadata.isAbstract
+ import com.squareup.kotlinpoet.metadata.isClass
+@@ -54,7 +55,7 @@ import javax.lang.model.element.ElementKind
+ import javax.lang.model.element.TypeElement
+ import javax.lang.model.util.Elements
+ import javax.lang.model.util.Types
+-import javax.tools.Diagnostic
++import javax.tools.Diagnostic.Kind.ERROR
+ 
+ private val JSON_QUALIFIER = JsonQualifier::class.java
+ private val JSON = Json::class.asClassName()
+@@ -71,7 +72,12 @@ private fun Collection<KModifier>.visibility(): KModifier {
+ }
+ 
+ @KotlinPoetMetadataPreview
+-internal fun primaryConstructor(kotlinApi: TypeSpec, elements: Elements): TargetConstructor? {
++internal fun primaryConstructor(
++    targetElement: TypeElement,
++    kotlinApi: TypeSpec,
++    elements: Elements,
++    messager: Messager
++): TargetConstructor? {
+   val primaryConstructor = kotlinApi.primaryConstructor ?: return null
+ 
+   val parameters = LinkedHashMap<String, TargetParameter>()
+@@ -87,7 +93,14 @@ internal fun primaryConstructor(kotlinApi: TypeSpec, elements: Elements): Target
+     )
+   }
+ 
+-  return TargetConstructor(parameters, primaryConstructor.modifiers.visibility())
++  val kmConstructorSignature = primaryConstructor.tag<ImmutableKmConstructor>()?.signature?.toString()
++      ?: run {
++        messager.printMessage(ERROR, "No KmConstructor found for primary constructor.",
++            targetElement)
++        null
++      }
++  return TargetConstructor(parameters, primaryConstructor.modifiers.visibility(),
++      kmConstructorSignature)
+ }
+ 
+ /** Returns a target type for `element`, or null if it cannot be used with code gen. */
+@@ -101,7 +114,7 @@ internal fun targetType(messager: Messager,
+   val typeMetadata = element.getAnnotation(Metadata::class.java)
+   if (typeMetadata == null) {
+     messager.printMessage(
+-        Diagnostic.Kind.ERROR, "@JsonClass can't be applied to $element: must be a Kotlin class",
++        ERROR, "@JsonClass can't be applied to $element: must be a Kotlin class",
+         element)
+     return null
+   }
+@@ -110,7 +123,7 @@ internal fun targetType(messager: Messager,
+     cachedClassInspector.toImmutableKmClass(typeMetadata)
+   } catch (e: UnsupportedOperationException) {
+     messager.printMessage(
+-        Diagnostic.Kind.ERROR, "@JsonClass can't be applied to $element: must be a Class type",
++        ERROR, "@JsonClass can't be applied to $element: must be a Class type",
+         element)
+     return null
+   }
+@@ -118,44 +131,44 @@ internal fun targetType(messager: Messager,
+   when {
+     kmClass.isEnum -> {
+       messager.printMessage(
+-          Diagnostic.Kind.ERROR,
++          ERROR,
+           "@JsonClass with 'generateAdapter = \"true\"' can't be applied to $element: code gen for enums is not supported or necessary",
+           element)
+       return null
+     }
+     !kmClass.isClass -> {
+       messager.printMessage(
+-          Diagnostic.Kind.ERROR, "@JsonClass can't be applied to $element: must be a Kotlin class",
++          ERROR, "@JsonClass can't be applied to $element: must be a Kotlin class",
+           element)
+       return null
+     }
+     kmClass.isInner -> {
+       messager.printMessage(
+-          Diagnostic.Kind.ERROR,
++          ERROR,
+           "@JsonClass can't be applied to $element: must not be an inner class", element)
+       return null
+     }
+     kmClass.isSealed -> {
+       messager.printMessage(
+-          Diagnostic.Kind.ERROR, "@JsonClass can't be applied to $element: must not be sealed",
++          ERROR, "@JsonClass can't be applied to $element: must not be sealed",
+           element)
+       return null
+     }
+     kmClass.isAbstract -> {
+       messager.printMessage(
+-          Diagnostic.Kind.ERROR, "@JsonClass can't be applied to $element: must not be abstract",
++          ERROR, "@JsonClass can't be applied to $element: must not be abstract",
+           element)
+       return null
+     }
+     kmClass.isLocal -> {
+       messager.printMessage(
+-          Diagnostic.Kind.ERROR, "@JsonClass can't be applied to $element: must not be local",
++          ERROR, "@JsonClass can't be applied to $element: must not be local",
+           element)
+       return null
+     }
+     !kmClass.isPublic && !kmClass.isInternal -> {
+       messager.printMessage(
+-          Diagnostic.Kind.ERROR,
++          ERROR,
+           "@JsonClass can't be applied to $element: must be internal or public",
+           element)
+       return null
+@@ -166,14 +179,14 @@ internal fun targetType(messager: Messager,
+   val typeVariables = kotlinApi.typeVariables
+   val appliedType = AppliedType.get(element)
+ 
+-  val constructor = primaryConstructor(kotlinApi, elements)
++  val constructor = primaryConstructor(element, kotlinApi, elements, messager)
+   if (constructor == null) {
+-    messager.printMessage(Diagnostic.Kind.ERROR, "No primary constructor found on $element",
++    messager.printMessage(ERROR, "No primary constructor found on $element",
+         element)
+     return null
+   }
+   if (constructor.visibility != KModifier.INTERNAL && constructor.visibility != KModifier.PUBLIC) {
+-    messager.printMessage(Diagnostic.Kind.ERROR, "@JsonClass can't be applied to $element: " +
++    messager.printMessage(ERROR, "@JsonClass can't be applied to $element: " +
+         "primary constructor is not internal or public", element)
+     return null
+   }
+@@ -186,7 +199,7 @@ internal fun targetType(messager: Messager,
+       }
+       .onEach { supertype ->
+         if (supertype.element.getAnnotation(Metadata::class.java) == null) {
+-          messager.printMessage(Diagnostic.Kind.ERROR,
++          messager.printMessage(ERROR,
+               "@JsonClass can't be applied to $element: supertype $supertype is not a Kotlin type",
+               element)
+           return null
+@@ -275,7 +288,7 @@ internal fun TargetProperty.generator(
+   if (isTransient) {
+     if (!hasDefault) {
+       messager.printMessage(
+-          Diagnostic.Kind.ERROR, "No default value for transient property $name",
++          ERROR, "No default value for transient property $name",
+           sourceElement)
+       return null
+     }
+@@ -283,7 +296,7 @@ internal fun TargetProperty.generator(
+   }
+ 
+   if (!isVisible) {
+-    messager.printMessage(Diagnostic.Kind.ERROR, "property $name is not visible",
++    messager.printMessage(ERROR, "property $name is not visible",
+         sourceElement)
+     return null
+   }
+@@ -300,13 +313,13 @@ internal fun TargetProperty.generator(
+         ?: continue
+     annotationElement.getAnnotation(Retention::class.java)?.let {
+       if (it.value != RetentionPolicy.RUNTIME) {
+-        messager.printMessage(Diagnostic.Kind.ERROR,
++        messager.printMessage(ERROR,
+             "JsonQualifier @${jsonQualifier.className.simpleName} must have RUNTIME retention")
+       }
+     }
+     annotationElement.getAnnotation(Target::class.java)?.let {
+       if (ElementType.FIELD !in it.value) {
+-        messager.printMessage(Diagnostic.Kind.ERROR,
++        messager.printMessage(ERROR,
+             "JsonQualifier @${jsonQualifier.className.simpleName} must support FIELD target")
+       }
+     }
+@@ -335,7 +348,9 @@ private fun List<AnnotationSpec>?.jsonName(): String? {
+     val mirror = requireNotNull(annotation.tag<AnnotationMirror>()) {
+       "Could not get the annotation mirror from the annotation spec"
+     }
+-    mirror.elementValues.entries.single { it.key.simpleName.contentEquals("name") }.value.value as String
++    mirror.elementValues.entries.single {
++      it.key.simpleName.contentEquals("name")
++    }.value.value as String
+   }
+ }
+ 
+diff --git a/moshi/src/main/resources/META-INF/proguard/moshi.pro b/moshi/src/main/resources/META-INF/proguard/moshi.pro
+index a63c38a5..c4cea383 100644
+--- a/moshi/src/main/resources/META-INF/proguard/moshi.pro
++++ b/moshi/src/main/resources/META-INF/proguard/moshi.pro
+@@ -14,48 +14,3 @@
+     <fields>;
+     **[] values();
+ }
+-
+-# The name of @JsonClass types is used to look up the generated adapter.
+--keepnames @com.squareup.moshi.JsonClass class *
+-
+-# Retain generated target class's synthetic defaults constructor and keep DefaultConstructorMarker's
+-# name. We will look this up reflectively to invoke the type's constructor.
+-#
+-# We can't _just_ keep the defaults constructor because Proguard/R8's spec doesn't allow wildcard
+-# matching preceding parameters.
+--keepnames class kotlin.jvm.internal.DefaultConstructorMarker
+--keepclassmembers @com.squareup.moshi.JsonClass @kotlin.Metadata class * {
+-    synthetic <init>(...);
+-}
+-
+-# Retain generated JsonAdapters if annotated type is retained.
+--if @com.squareup.moshi.JsonClass class *
+--keep class <1>JsonAdapter {
+-    <init>(...);
+-    <fields>;
+-}
+--if @com.squareup.moshi.JsonClass class **$*
+--keep class <1>_<2>JsonAdapter {
+-    <init>(...);
+-    <fields>;
+-}
+--if @com.squareup.moshi.JsonClass class **$*$*
+--keep class <1>_<2>_<3>JsonAdapter {
+-    <init>(...);
+-    <fields>;
+-}
+--if @com.squareup.moshi.JsonClass class **$*$*$*
+--keep class <1>_<2>_<3>_<4>JsonAdapter {
+-    <init>(...);
+-    <fields>;
+-}
+--if @com.squareup.moshi.JsonClass class **$*$*$*$*
+--keep class <1>_<2>_<3>_<4>_<5>JsonAdapter {
+-    <init>(...);
+-    <fields>;
+-}
+--if @com.squareup.moshi.JsonClass class **$*$*$*$*$*
+--keep class <1>_<2>_<3>_<4>_<5>_<6>JsonAdapter {
+-    <init>(...);
+-    <fields>;
+-}
+diff --git a/pom.xml b/pom.xml
+index 39ce45db..51d809fe 100644
+--- a/pom.xml
++++ b/pom.xml
+@@ -38,6 +38,7 @@
+     <okio2.version>2.1.0</okio2.version>
+     <kotlin.version>1.3.60</kotlin.version>
+     <kotlinpoet.version>1.5.0</kotlinpoet.version>
++    <asm.version>7.1</asm.version>
+     <kotlinx-metadata.version>0.1.0</kotlinx-metadata.version>
+     <maven-assembly.version>3.1.0</maven-assembly.version>
+ 

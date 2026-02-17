@@ -1,0 +1,10 @@
+Ktor’s Apache 5 HTTP client engine mishandles request body production for streaming content, which can break long-lived/streaming HTTP interactions (notably Server-Sent Events) by not correctly producing the outbound request entity when the request body is written asynchronously.
+
+When using an `HttpClient` configured with the Apache 5 engine and making requests whose body is implemented via Ktor’s streaming content APIs (for example `OutgoingContent.WriteChannelContent`), the engine should correctly bridge Ktor’s coroutine-based body writer into Apache’s entity producer mechanism. Currently, the entity producer handler is incorrect, causing streaming scenarios to fail (for example, SSE workflows where the client keeps an open response stream while also issuing subsequent requests), leading to stalled requests/responses or premature termination.
+
+Fix the Apache 5 engine’s entity producer handling so that:
+- Requests with streaming bodies (`OutgoingContent.WriteChannelContent` and similar non-buffered bodies) are sent correctly and do not hang or abort.
+- Long-lived responses such as `ContentType.Text.EventStream` can be consumed while additional requests are still issued by the same client without breaking the connection handling.
+- A client configured with `HttpTimeout` set to infinite (`requestTimeoutMillis`, `socketTimeoutMillis`, `connectTimeoutMillis`) can keep SSE connections open and still successfully complete subsequent POST/GET requests used to drive the SSE stream.
+
+The expected behavior is that an SSE client can connect to an event-stream endpoint and continuously receive messages as they are produced, while separate requests (e.g., posting “next” messages and a final “done” signal) succeed reliably. The actual behavior with the current Apache 5 engine is that this flow fails due to the faulty entity producer handler.

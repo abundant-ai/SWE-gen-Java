@@ -1,0 +1,694 @@
+diff --git a/moshi/japicmp/build.gradle.kts b/moshi/japicmp/build.gradle.kts
+index 10e55553..949ee341 100644
+--- a/moshi/japicmp/build.gradle.kts
++++ b/moshi/japicmp/build.gradle.kts
+@@ -32,7 +32,6 @@ val japicmp = tasks.register<JapicmpTask>("japicmp") {
+     "com.squareup.moshi.StandardJsonAdapters", // Package-private
+     "com.squareup.moshi.RecordJsonAdapter\$ComponentBinding", // Package-private
+     "com.squareup.moshi.AdapterMethodsFactory", // Internal.
+-    "com.squareup.moshi.ClassJsonAdapter", // Internal.
+   )
+   methodExcludes = listOf(
+     "com.squareup.moshi.JsonAdapter#indent(java.lang.String)", // Was unintentionally open before
+@@ -40,7 +39,7 @@ val japicmp = tasks.register<JapicmpTask>("japicmp") {
+   fieldExcludes = listOf(
+     "com.squareup.moshi.CollectionJsonAdapter#FACTORY", // False-positive, class is not public anyway
+     "com.squareup.moshi.MapJsonAdapter#FACTORY", // Class is not public
+-    "com.squareup.moshi.ArrayJsonAdapter#FACTORY", // Class is not public
++    "com.squareup.moshi.ArrayJsonAdapter#FACTORY" // Class is not public
+   )
+ }
+ 
+diff --git a/moshi/src/main/java/com/squareup/moshi/AdapterMethodsFactory.kt b/moshi/src/main/java/com/squareup/moshi/AdapterMethodsFactory.kt
+index 85e6d8fa..48c54442 100644
+--- a/moshi/src/main/java/com/squareup/moshi/AdapterMethodsFactory.kt
++++ b/moshi/src/main/java/com/squareup/moshi/AdapterMethodsFactory.kt
+@@ -16,10 +16,10 @@
+ package com.squareup.moshi
+ 
+ import com.squareup.moshi.internal.canonicalize
+-import com.squareup.moshi.internal.checkNull
+ import com.squareup.moshi.internal.hasNullable
+ import com.squareup.moshi.internal.jsonAnnotations
+ import com.squareup.moshi.internal.knownNotNull
++import com.squareup.moshi.internal.checkNull
+ import com.squareup.moshi.internal.toStringWithAnnotations
+ import java.io.IOException
+ import java.lang.reflect.InvocationTargetException
+@@ -191,14 +191,12 @@ internal class AdapterMethodsFactory(
+           }
+         }
+         else -> {
+-          throw IllegalArgumentException(
+-            """Unexpected signature for $method.
++          throw IllegalArgumentException("""Unexpected signature for $method.
+ @ToJson method signatures may have one of the following structures:
+     <any access modifier> void toJson(JsonWriter writer, T value) throws <any>;
+     <any access modifier> void toJson(JsonWriter writer, T value, JsonAdapter<any> delegate, <any more delegates>) throws <any>;
+     <any access modifier> R toJson(T value) throws <any>;
+-"""
+-          )
++""")
+         }
+       }
+     }
+@@ -274,14 +272,12 @@ internal class AdapterMethodsFactory(
+           }
+         }
+         else -> {
+-          throw IllegalArgumentException(
+-            """Unexpected signature for $method.
++          throw IllegalArgumentException("""Unexpected signature for $method.
+ @FromJson method signatures may have one of the following structures:
+     <any access modifier> R fromJson(JsonReader jsonReader) throws <any>;
+     <any access modifier> R fromJson(JsonReader jsonReader, JsonAdapter<any> delegate, <any more delegates>) throws <any>;
+     <any access modifier> R fromJson(T value) throws <any>;
+-"""
+-          )
++""")
+         }
+       }
+     }
+diff --git a/moshi/src/main/java/com/squareup/moshi/ClassFactory.kt b/moshi/src/main/java/com/squareup/moshi/ClassFactory.kt
+index 04b8d02c..f819c479 100644
+--- a/moshi/src/main/java/com/squareup/moshi/ClassFactory.kt
++++ b/moshi/src/main/java/com/squareup/moshi/ClassFactory.kt
+@@ -19,6 +19,7 @@ import com.squareup.moshi.internal.rethrowCause
+ import java.io.ObjectInputStream
+ import java.io.ObjectStreamClass
+ import java.lang.reflect.InvocationTargetException
++import kotlin.Throws
+ 
+ /**
+  * Magic that creates instances of arbitrary concrete classes. Derived from Gson's UnsafeAllocator
+@@ -28,6 +29,7 @@ import java.lang.reflect.InvocationTargetException
+  * @author Jesse Wilson
+  */
+ internal abstract class ClassFactory<T> {
++  @Throws(InvocationTargetException::class, IllegalAccessException::class, InstantiationException::class)
+   abstract fun newInstance(): T
+ 
+   companion object {
+diff --git a/moshi/src/main/java/com/squareup/moshi/ClassJsonAdapter.java b/moshi/src/main/java/com/squareup/moshi/ClassJsonAdapter.java
+new file mode 100644
+index 00000000..9437c4d7
+--- /dev/null
++++ b/moshi/src/main/java/com/squareup/moshi/ClassJsonAdapter.java
+@@ -0,0 +1,255 @@
++/*
++ * Copyright (C) 2015 Square, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *    https://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package com.squareup.moshi;
++
++import static com.squareup.moshi.internal.Util.jsonName;
++import static com.squareup.moshi.internal.Util.resolve;
++
++import com.squareup.moshi.internal.Util;
++import java.io.IOException;
++import java.lang.annotation.Annotation;
++import java.lang.reflect.Field;
++import java.lang.reflect.InvocationTargetException;
++import java.lang.reflect.Modifier;
++import java.lang.reflect.ParameterizedType;
++import java.lang.reflect.Type;
++import java.util.Collection;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++import java.util.TreeMap;
++import javax.annotation.Nullable;
++
++/**
++ * Emits a regular class as a JSON object by mapping Java fields to JSON object properties.
++ *
++ * <h1>Platform Types</h1>
++ *
++ * Fields from platform classes are omitted from both serialization and deserialization unless they
++ * are either public or protected. This includes the following packages and their subpackages:
++ *
++ * <ul>
++ *   <li>android.*
++ *   <li>androidx.*
++ *   <li>java.*
++ *   <li>javax.*
++ *   <li>kotlin.*
++ *   <li>kotlinx.*
++ *   <li>scala.*
++ * </ul>
++ */
++final class ClassJsonAdapter<T> extends JsonAdapter<T> {
++  public static final JsonAdapter.Factory FACTORY =
++      new JsonAdapter.Factory() {
++        @Override
++        public @Nullable JsonAdapter<?> create(
++            Type type, Set<? extends Annotation> annotations, Moshi moshi) {
++          if (!(type instanceof Class) && !(type instanceof ParameterizedType)) {
++            return null;
++          }
++          Class<?> rawType = Types.getRawType(type);
++          if (rawType.isInterface() || rawType.isEnum()) return null;
++          if (!annotations.isEmpty()) return null;
++          if (Util.isPlatformType(rawType)) {
++            throwIfIsCollectionClass(type, List.class);
++            throwIfIsCollectionClass(type, Set.class);
++            throwIfIsCollectionClass(type, Map.class);
++            throwIfIsCollectionClass(type, Collection.class);
++
++            String messagePrefix = "Platform " + rawType;
++            if (type instanceof ParameterizedType) {
++              messagePrefix += " in " + type;
++            }
++            throw new IllegalArgumentException(
++                messagePrefix + " requires explicit JsonAdapter to be registered");
++          }
++
++          if (rawType.isAnonymousClass()) {
++            throw new IllegalArgumentException(
++                "Cannot serialize anonymous class " + rawType.getName());
++          }
++          if (rawType.isLocalClass()) {
++            throw new IllegalArgumentException("Cannot serialize local class " + rawType.getName());
++          }
++          if (rawType.getEnclosingClass() != null && !Modifier.isStatic(rawType.getModifiers())) {
++            throw new IllegalArgumentException(
++                "Cannot serialize non-static nested class " + rawType.getName());
++          }
++          if (Modifier.isAbstract(rawType.getModifiers())) {
++            throw new IllegalArgumentException(
++                "Cannot serialize abstract class " + rawType.getName());
++          }
++          if (Util.isKotlin(rawType)) {
++            throw new IllegalArgumentException(
++                "Cannot serialize Kotlin type "
++                    + rawType.getName()
++                    + ". Reflective serialization of Kotlin classes without using kotlin-reflect has "
++                    + "undefined and unexpected behavior. Please use KotlinJsonAdapterFactory from the "
++                    + "moshi-kotlin artifact or use code gen from the moshi-kotlin-codegen artifact.");
++          }
++
++          ClassFactory<Object> classFactory = ClassFactory.get(rawType);
++          Map<String, FieldBinding<?>> fields = new TreeMap<>();
++          for (Type t = type; t != Object.class; t = Types.getGenericSuperclass(t)) {
++            createFieldBindings(moshi, t, fields);
++          }
++          return new ClassJsonAdapter<>(classFactory, fields).nullSafe();
++        }
++
++        /**
++         * Throw clear error messages for the common beginner mistake of using the concrete
++         * collection classes instead of the collection interfaces, eg: ArrayList instead of List.
++         */
++        private void throwIfIsCollectionClass(Type type, Class<?> collectionInterface) {
++          Class<?> rawClass = Types.getRawType(type);
++          if (collectionInterface.isAssignableFrom(rawClass)) {
++            throw new IllegalArgumentException(
++                "No JsonAdapter for "
++                    + type
++                    + ", you should probably use "
++                    + collectionInterface.getSimpleName()
++                    + " instead of "
++                    + rawClass.getSimpleName()
++                    + " (Moshi only supports the collection interfaces by default)"
++                    + " or else register a custom JsonAdapter.");
++          }
++        }
++
++        /** Creates a field binding for each of declared field of {@code type}. */
++        private void createFieldBindings(
++            Moshi moshi, Type type, Map<String, FieldBinding<?>> fieldBindings) {
++          Class<?> rawType = Types.getRawType(type);
++          boolean platformType = Util.isPlatformType(rawType);
++          for (Field field : rawType.getDeclaredFields()) {
++            if (!includeField(platformType, field.getModifiers())) continue;
++            Json jsonAnnotation = field.getAnnotation(Json.class);
++            if (jsonAnnotation != null && jsonAnnotation.ignore()) continue;
++
++            // Look up a type adapter for this type.
++            Type fieldType = resolve(field.getGenericType(), type, rawType);
++            Set<? extends Annotation> annotations = Util.getJsonAnnotations(field);
++            String fieldName = field.getName();
++            JsonAdapter<Object> adapter = moshi.adapter(fieldType, annotations, fieldName);
++
++            // Create the binding between field and JSON.
++            field.setAccessible(true);
++
++            // Store it using the field's name. If there was already a field with this name, fail!
++            String jsonName = jsonName(jsonAnnotation, fieldName);
++            FieldBinding<Object> fieldBinding = new FieldBinding<>(jsonName, field, adapter);
++            FieldBinding<?> replaced = fieldBindings.put(jsonName, fieldBinding);
++            if (replaced != null) {
++              throw new IllegalArgumentException(
++                  "Conflicting fields:\n"
++                      + "    "
++                      + replaced.field
++                      + "\n"
++                      + "    "
++                      + fieldBinding.field);
++            }
++          }
++        }
++
++        /** Returns true if fields with {@code modifiers} are included in the emitted JSON. */
++        private boolean includeField(boolean platformType, int modifiers) {
++          if (Modifier.isStatic(modifiers) || Modifier.isTransient(modifiers)) return false;
++          return Modifier.isPublic(modifiers) || Modifier.isProtected(modifiers) || !platformType;
++        }
++      };
++
++  private final ClassFactory<T> classFactory;
++  private final FieldBinding<?>[] fieldsArray;
++  private final JsonReader.Options options;
++
++  ClassJsonAdapter(ClassFactory<T> classFactory, Map<String, FieldBinding<?>> fieldsMap) {
++    this.classFactory = classFactory;
++    this.fieldsArray = fieldsMap.values().toArray(new FieldBinding[fieldsMap.size()]);
++    this.options = JsonReader.Options.of(fieldsMap.keySet().toArray(new String[fieldsMap.size()]));
++  }
++
++  @Override
++  public T fromJson(JsonReader reader) throws IOException {
++    T result;
++    try {
++      result = classFactory.newInstance();
++    } catch (InstantiationException e) {
++      throw new RuntimeException(e);
++    } catch (InvocationTargetException e) {
++      throw Util.rethrowCause(e);
++    } catch (IllegalAccessException e) {
++      throw new AssertionError();
++    }
++
++    try {
++      reader.beginObject();
++      while (reader.hasNext()) {
++        int index = reader.selectName(options);
++        if (index == -1) {
++          reader.skipName();
++          reader.skipValue();
++          continue;
++        }
++        fieldsArray[index].read(reader, result);
++      }
++      reader.endObject();
++      return result;
++    } catch (IllegalAccessException e) {
++      throw new AssertionError();
++    }
++  }
++
++  @Override
++  public void toJson(JsonWriter writer, T value) throws IOException {
++    try {
++      writer.beginObject();
++      for (FieldBinding<?> fieldBinding : fieldsArray) {
++        writer.name(fieldBinding.name);
++        fieldBinding.write(writer, value);
++      }
++      writer.endObject();
++    } catch (IllegalAccessException e) {
++      throw new AssertionError();
++    }
++  }
++
++  @Override
++  public String toString() {
++    return "JsonAdapter(" + classFactory + ")";
++  }
++
++  static class FieldBinding<T> {
++    final String name;
++    final Field field;
++    final JsonAdapter<T> adapter;
++
++    FieldBinding(String name, Field field, JsonAdapter<T> adapter) {
++      this.name = name;
++      this.field = field;
++      this.adapter = adapter;
++    }
++
++    void read(JsonReader reader, Object value) throws IOException, IllegalAccessException {
++      T fieldValue = adapter.fromJson(reader);
++      field.set(value, fieldValue);
++    }
++
++    @SuppressWarnings("unchecked") // We require that field's values are of type T.
++    void write(JsonWriter writer, Object value) throws IllegalAccessException, IOException {
++      T fieldValue = (T) field.get(value);
++      adapter.toJson(writer, fieldValue);
++    }
++  }
++}
+diff --git a/moshi/src/main/java/com/squareup/moshi/ClassJsonAdapter.kt b/moshi/src/main/java/com/squareup/moshi/ClassJsonAdapter.kt
+deleted file mode 100644
+index ef5da27a..00000000
+--- a/moshi/src/main/java/com/squareup/moshi/ClassJsonAdapter.kt
++++ /dev/null
+@@ -1,223 +0,0 @@
+-/*
+- * Copyright (C) 2015 Square, Inc.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *    https://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-package com.squareup.moshi
+-
+-import com.squareup.moshi.internal.checkNull
+-import com.squareup.moshi.internal.isKotlin
+-import com.squareup.moshi.internal.isPlatformType
+-import com.squareup.moshi.internal.jsonAnnotations
+-import com.squareup.moshi.internal.jsonName
+-import com.squareup.moshi.internal.resolve
+-import com.squareup.moshi.internal.rethrowCause
+-import java.lang.reflect.Field
+-import java.lang.reflect.InvocationTargetException
+-import java.lang.reflect.Modifier.isAbstract
+-import java.lang.reflect.Modifier.isProtected
+-import java.lang.reflect.Modifier.isPublic
+-import java.lang.reflect.Modifier.isStatic
+-import java.lang.reflect.Modifier.isTransient
+-import java.lang.reflect.ParameterizedType
+-import java.lang.reflect.Type
+-
+-/**
+- * Emits a regular class as a JSON object by mapping Java fields to JSON object properties.
+- *
+- * # Platform Types
+- *
+- * Fields from platform classes are omitted from both serialization and deserialization unless they
+- * are either public or protected. This includes the following packages and their subpackages:
+- *
+- *  * `android.*`
+- *  * `androidx.*`
+- *  * `java.*`
+- *  * `javax.*`
+- *  * `kotlin.*`
+- *  * `kotlinx.*`
+- *  * `scala.*`
+- *
+- */
+-internal class ClassJsonAdapter<T>(
+-  private val classFactory: ClassFactory<T>,
+-  fieldsMap: Map<String, FieldBinding<*>>
+-) : JsonAdapter<T>() {
+-  private val fieldsArray = fieldsMap.values.toTypedArray()
+-  private val options = JsonReader.Options.of(*fieldsMap.keys.toTypedArray())
+-
+-  override fun fromJson(reader: JsonReader): T {
+-    val result: T = try {
+-      classFactory.newInstance()
+-    } catch (e: InstantiationException) {
+-      throw RuntimeException(e)
+-    } catch (e: InvocationTargetException) {
+-      throw e.rethrowCause()
+-    } catch (e: IllegalAccessException) {
+-      throw AssertionError()
+-    }
+-
+-    try {
+-      reader.beginObject()
+-      while (reader.hasNext()) {
+-        val index = reader.selectName(options)
+-        if (index == -1) {
+-          reader.skipName()
+-          reader.skipValue()
+-          continue
+-        }
+-        fieldsArray[index].read(reader, result)
+-      }
+-      reader.endObject()
+-      return result
+-    } catch (e: IllegalAccessException) {
+-      throw AssertionError()
+-    }
+-  }
+-
+-  override fun toJson(writer: JsonWriter, value: T?) {
+-    try {
+-      writer.beginObject()
+-      for (fieldBinding in fieldsArray) {
+-        writer.name(fieldBinding.name)
+-        fieldBinding.write(writer, value)
+-      }
+-      writer.endObject()
+-    } catch (e: IllegalAccessException) {
+-      throw AssertionError()
+-    }
+-  }
+-
+-  override fun toString() = "JsonAdapter($classFactory)"
+-
+-  internal class FieldBinding<T>(val name: String, val field: Field, val adapter: JsonAdapter<T>) {
+-    fun read(reader: JsonReader, value: Any?) {
+-      val fieldValue = adapter.fromJson(reader)
+-      field[value] = fieldValue
+-    }
+-
+-    @Suppress("UNCHECKED_CAST") // We require that field's values are of type T.
+-    fun write(writer: JsonWriter, value: Any?) {
+-      val fieldValue = field[value] as T
+-      adapter.toJson(writer, fieldValue)
+-    }
+-  }
+-
+-  companion object Factory : JsonAdapter.Factory {
+-    override fun create(
+-      type: Type,
+-      annotations: Set<Annotation>,
+-      moshi: Moshi
+-    ): JsonAdapter<*>? {
+-      if (type !is Class<*> && type !is ParameterizedType) {
+-        return null
+-      }
+-      val rawType = type.rawType
+-      if (rawType.isInterface || rawType.isEnum) return null
+-      if (annotations.isNotEmpty()) return null
+-      if (rawType.isPlatformType) {
+-        type.throwIfIsCollectionClass(List::class.java)
+-        type.throwIfIsCollectionClass(Set::class.java)
+-        type.throwIfIsCollectionClass(Map::class.java)
+-        type.throwIfIsCollectionClass(Collection::class.java)
+-
+-        val messagePrefix = buildString {
+-          append("Platform $rawType")
+-          if (type is ParameterizedType) {
+-            append(" in $type")
+-          }
+-        }
+-        throw IllegalArgumentException(
+-          "$messagePrefix requires explicit JsonAdapter to be registered"
+-        )
+-      }
+-
+-      require(!rawType.isAnonymousClass) {
+-        "Cannot serialize anonymous class ${rawType.name}"
+-      }
+-      require(!rawType.isLocalClass) {
+-        "Cannot serialize local class ${rawType.name}"
+-      }
+-      val isNonStaticNestedClass = rawType.enclosingClass != null && !isStatic(rawType.modifiers)
+-      require(!isNonStaticNestedClass) {
+-        "Cannot serialize non-static nested class ${rawType.name}"
+-      }
+-      require(!isAbstract(rawType.modifiers)) {
+-        "Cannot serialize abstract class ${rawType.name}"
+-      }
+-      require(!rawType.isKotlin) {
+-        "Cannot serialize Kotlin type ${rawType.name}. Reflective serialization of Kotlin classes without using kotlin-reflect has undefined and unexpected behavior. Please use KotlinJsonAdapterFactory from the moshi-kotlin artifact or use code gen from the moshi-kotlin-codegen artifact."
+-      }
+-      val classFactory = ClassFactory.get<Any>(rawType)
+-      val fields = sortedMapOf<String, FieldBinding<*>>()
+-      var parentType = type
+-      while (parentType != Any::class.java) {
+-        createFieldBindings(moshi, parentType, fields)
+-        parentType = Types.getGenericSuperclass(parentType)
+-      }
+-      return ClassJsonAdapter(classFactory, fields).nullSafe()
+-    }
+-
+-    /**
+-     * Throw clear error messages for the common beginner mistake of using the concrete
+-     * collection classes instead of the collection interfaces, eg: ArrayList instead of List.
+-     */
+-    private fun Type.throwIfIsCollectionClass(collectionInterface: Class<*>) {
+-      require(!collectionInterface.isAssignableFrom(rawType)) {
+-        "No JsonAdapter for $this, you should probably use ${collectionInterface.simpleName} instead of ${rawType.simpleName} (Moshi only supports the collection interfaces by default) or else register a custom JsonAdapter."
+-      }
+-    }
+-
+-    /** Creates a field binding for each of declared field of `type`.  */
+-    private fun createFieldBindings(
+-      moshi: Moshi,
+-      type: Type,
+-      fieldBindings: MutableMap<String, FieldBinding<*>>
+-    ) {
+-      val rawType = type.rawType
+-      val platformType = rawType.isPlatformType
+-      for (field in rawType.declaredFields) {
+-        if (!includeField(platformType, field.modifiers)) continue
+-        val jsonAnnotation = field.getAnnotation(Json::class.java)
+-        if (jsonAnnotation != null && jsonAnnotation.ignore) continue
+-
+-        // Look up a type adapter for this type.
+-        val fieldType = field.genericType.resolve(type, rawType)
+-        val annotations = field.jsonAnnotations
+-        val fieldName = field.name
+-        val adapter = moshi.adapter<Any>(
+-          type = fieldType,
+-          annotations = annotations,
+-          fieldName = fieldName
+-        )
+-
+-        // Create the binding between field and JSON.
+-        field.isAccessible = true
+-
+-        // Store it using the field's name. If there was already a field with this name, fail!
+-        val jsonName = jsonAnnotation.jsonName(fieldName)
+-        val fieldBinding = FieldBinding(jsonName, field, adapter)
+-        val replaced = fieldBindings.put(jsonName, fieldBinding)
+-        checkNull(replaced) {
+-          "Conflicting fields:\n    ${it.field}\n    ${fieldBinding.field}"
+-        }
+-      }
+-    }
+-
+-    /** Returns true if fields with `modifiers` are included in the emitted JSON.  */
+-    private fun includeField(platformType: Boolean, modifiers: Int): Boolean {
+-      if (isStatic(modifiers) || isTransient(modifiers)) return false
+-      return isPublic(modifiers) || isProtected(modifiers) || !platformType
+-    }
+-  }
+-}
+diff --git a/moshi/src/main/java/com/squareup/moshi/Moshi.kt b/moshi/src/main/java/com/squareup/moshi/Moshi.kt
+index 0b05e6e6..1fff3016 100644
+--- a/moshi/src/main/java/com/squareup/moshi/Moshi.kt
++++ b/moshi/src/main/java/com/squareup/moshi/Moshi.kt
+@@ -369,7 +369,7 @@ public class Moshi internal constructor(builder: Builder) {
+       add(MapJsonAdapter.Factory)
+       add(ArrayJsonAdapter.Factory)
+       add(RecordJsonAdapter.Factory)
+-      add(ClassJsonAdapter.Factory)
++      add(ClassJsonAdapter.FACTORY)
+     }
+ 
+     fun <T> newAdapterFactory(
+diff --git a/moshi/src/test/java/com/squareup/moshi/ClassJsonAdapterTest.java b/moshi/src/test/java/com/squareup/moshi/ClassJsonAdapterTest.java
+index 0d09f006..c17fde88 100644
+--- a/moshi/src/test/java/com/squareup/moshi/ClassJsonAdapterTest.java
++++ b/moshi/src/test/java/com/squareup/moshi/ClassJsonAdapterTest.java
+@@ -184,9 +184,9 @@ public final class ClassJsonAdapterTest {
+   @Test
+   public void fieldNameCollision() throws Exception {
+     try {
+-      ClassJsonAdapter.Factory.create(ExtendsBaseA.class, NO_ANNOTATIONS, moshi);
++      ClassJsonAdapter.FACTORY.create(ExtendsBaseA.class, NO_ANNOTATIONS, moshi);
+       fail();
+-    } catch (IllegalStateException expected) {
++    } catch (IllegalArgumentException expected) {
+       assertThat(expected)
+           .hasMessageThat()
+           .isEqualTo(
+@@ -206,9 +206,9 @@ public final class ClassJsonAdapterTest {
+   @Test
+   public void jsonAnnotationNameCollision() throws Exception {
+     try {
+-      ClassJsonAdapter.Factory.create(NameCollision.class, NO_ANNOTATIONS, moshi);
++      ClassJsonAdapter.FACTORY.create(NameCollision.class, NO_ANNOTATIONS, moshi);
+       fail();
+-    } catch (IllegalStateException expected) {
++    } catch (IllegalArgumentException expected) {
+       assertThat(expected)
+           .hasMessageThat()
+           .isEqualTo(
+@@ -364,7 +364,7 @@ public final class ClassJsonAdapterTest {
+   @Test
+   public void nonStaticNestedClassNotSupported() throws Exception {
+     try {
+-      ClassJsonAdapter.Factory.create(NonStatic.class, NO_ANNOTATIONS, moshi);
++      ClassJsonAdapter.FACTORY.create(NonStatic.class, NO_ANNOTATIONS, moshi);
+       fail();
+     } catch (IllegalArgumentException expected) {
+       assertThat(expected)
+@@ -385,7 +385,7 @@ public final class ClassJsonAdapterTest {
+           }
+         };
+     try {
+-      ClassJsonAdapter.Factory.create(c.getClass(), NO_ANNOTATIONS, moshi);
++      ClassJsonAdapter.FACTORY.create(c.getClass(), NO_ANNOTATIONS, moshi);
+       fail();
+     } catch (IllegalArgumentException expected) {
+       assertThat(expected)
+@@ -398,7 +398,7 @@ public final class ClassJsonAdapterTest {
+   public void localClassNotSupported() throws Exception {
+     class Local {}
+     try {
+-      ClassJsonAdapter.Factory.create(Local.class, NO_ANNOTATIONS, moshi);
++      ClassJsonAdapter.FACTORY.create(Local.class, NO_ANNOTATIONS, moshi);
+       fail();
+     } catch (IllegalArgumentException expected) {
+       assertThat(expected)
+@@ -412,7 +412,7 @@ public final class ClassJsonAdapterTest {
+ 
+   @Test
+   public void interfaceNotSupported() throws Exception {
+-    assertThat(ClassJsonAdapter.Factory.create(Interface.class, NO_ANNOTATIONS, moshi)).isNull();
++    assertThat(ClassJsonAdapter.FACTORY.create(Interface.class, NO_ANNOTATIONS, moshi)).isNull();
+   }
+ 
+   abstract static class Abstract {}
+@@ -420,7 +420,7 @@ public final class ClassJsonAdapterTest {
+   @Test
+   public void abstractClassNotSupported() throws Exception {
+     try {
+-      ClassJsonAdapter.Factory.create(Abstract.class, NO_ANNOTATIONS, moshi);
++      ClassJsonAdapter.FACTORY.create(Abstract.class, NO_ANNOTATIONS, moshi);
+       fail();
+     } catch (IllegalArgumentException expected) {
+       assertThat(expected)
+@@ -529,7 +529,7 @@ public final class ClassJsonAdapterTest {
+     @SuppressWarnings("unchecked")
+     JsonAdapter<Box<Integer>> adapter =
+         (JsonAdapter<Box<Integer>>)
+-            ClassJsonAdapter.Factory.create(
++            ClassJsonAdapter.FACTORY.create(
+                 Types.newParameterizedTypeWithOwner(
+                     ClassJsonAdapterTest.class, Box.class, Integer.class),
+                 NO_ANNOTATIONS,
+@@ -541,7 +541,7 @@ public final class ClassJsonAdapterTest {
+   private <T> String toJson(Class<T> type, T value) throws IOException {
+     @SuppressWarnings("unchecked") // Factory.create returns an adapter that matches its argument.
+     JsonAdapter<T> jsonAdapter =
+-        (JsonAdapter<T>) ClassJsonAdapter.Factory.create(type, NO_ANNOTATIONS, moshi);
++        (JsonAdapter<T>) ClassJsonAdapter.FACTORY.create(type, NO_ANNOTATIONS, moshi);
+ 
+     // Wrap in an array to avoid top-level object warnings without going completely lenient.
+     Buffer buffer = new Buffer();
+@@ -559,7 +559,7 @@ public final class ClassJsonAdapterTest {
+   private <T> T fromJson(Class<T> type, String json) throws IOException {
+     @SuppressWarnings("unchecked") // Factory.create returns an adapter that matches its argument.
+     JsonAdapter<T> jsonAdapter =
+-        (JsonAdapter<T>) ClassJsonAdapter.Factory.create(type, NO_ANNOTATIONS, moshi);
++        (JsonAdapter<T>) ClassJsonAdapter.FACTORY.create(type, NO_ANNOTATIONS, moshi);
+     // Wrap in an array to avoid top-level object warnings without going completely lenient.
+     JsonReader jsonReader = newReader("[" + json + "]");
+     jsonReader.beginArray();

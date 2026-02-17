@@ -1,0 +1,149 @@
+diff --git a/core/src/main/scala/cats/data/Kleisli.scala b/core/src/main/scala/cats/data/Kleisli.scala
+index e0d75bc88..27ef35a7e 100644
+--- a/core/src/main/scala/cats/data/Kleisli.scala
++++ b/core/src/main/scala/cats/data/Kleisli.scala
+@@ -656,8 +656,19 @@ private[data] trait KleisliApply[F[_], A] extends Apply[Kleisli[F, A, *]] with K
+ 
+   override def map2Eval[B, C, Z](fa: Kleisli[F, A, B], fb: Eval[Kleisli[F, A, C]])(
+     f: (B, C) => Z
+-  ): Eval[Kleisli[F, A, Z]] =
+-    Eval.now(Kleisli(a => F.map2Eval(fa.run(a), fb.map(_.run(a)))(f).value))
++  ): Eval[Kleisli[F, A, Z]] = {
++    // We should only evaluate fb once
++    val memoFb = fb.memoize
++
++    Eval.now(Kleisli { a =>
++      val fb = fa.run(a)
++      val efc = memoFb.map(_.run(a))
++      val efz: Eval[F[Z]] = F.map2Eval(fb, efc)(f)
++      // This is not safe and results in stack overflows:
++      // see: https://github.com/typelevel/cats/issues/3947
++      efz.value
++    })
++  }
+ 
+   override def product[B, C](fb: Kleisli[F, A, B], fc: Kleisli[F, A, C]): Kleisli[F, A, (B, C)] =
+     Kleisli(a => F.product(fb.run(a), fc.run(a)))
+diff --git a/core/src/main/scala/cats/instances/list.scala b/core/src/main/scala/cats/instances/list.scala
+index de746232d..36f741dd9 100644
+--- a/core/src/main/scala/cats/instances/list.scala
++++ b/core/src/main/scala/cats/instances/list.scala
+@@ -95,6 +95,46 @@ trait ListInstances extends cats.kernel.instances.ListInstances {
+             wrapMutableIndexedSeq(as)
+           }(f))(_.toList)
+ 
++      /**
++       * This avoids making a very deep stack by building a tree instead
++       */
++      override def traverse_[G[_], A, B](fa: List[A])(f: A => G[B])(implicit G: Applicative[G]): G[Unit] = {
++        // the cost of this is O(size log size)
++        // c(n) = n + 2 * c(n/2) = n + 2(n/2 log (n/2)) = n + n (logn - 1) = n log n
++        // invariant: size >= 1
++        def runHalf(size: Int, fa: List[A]): Eval[G[Unit]] =
++          if (size > 1) {
++            val leftSize = size / 2
++            val rightSize = size - leftSize
++            val (leftL, rightL) = fa.splitAt(leftSize)
++            runHalf(leftSize, leftL)
++              .flatMap { left =>
++                val right = runHalf(rightSize, rightL)
++                G.map2Eval(left, right) { (_, _) => () }
++              }
++          } else {
++            // avoid pattern matching when we know that there is only one element
++            val a = fa.head
++            // we evaluate this at most one time,
++            // always is a bit cheaper in such cases
++            //
++            // Here is the point of the laziness using Eval:
++            // we avoid calling f(a) or G.void in the
++            // event that the computation has already
++            // failed. We do not use laziness to avoid
++            // traversing fa, which we will do fully
++            // in all cases.
++            Eval.always {
++              val gb = f(a)
++              G.void(gb)
++            }
++          }
++
++        val len = fa.length
++        if (len == 0) G.unit
++        else runHalf(len, fa).value
++      }
++
+       def functor: Functor[List] = this
+ 
+       def align[A, B](fa: List[A], fb: List[B]): List[A Ior B] =
+diff --git a/core/src/main/scala/cats/instances/vector.scala b/core/src/main/scala/cats/instances/vector.scala
+index 736231483..a9e53a9a0 100644
+--- a/core/src/main/scala/cats/instances/vector.scala
++++ b/core/src/main/scala/cats/instances/vector.scala
+@@ -95,6 +95,43 @@ trait VectorInstances extends cats.kernel.instances.VectorInstances {
+       final override def traverse[G[_], A, B](fa: Vector[A])(f: A => G[B])(implicit G: Applicative[G]): G[Vector[B]] =
+         G.map(Chain.traverseViaChain(fa)(f))(_.toVector)
+ 
++      /**
++       * This avoids making a very deep stack by building a tree instead
++       */
++      override def traverse_[G[_], A, B](fa: Vector[A])(f: A => G[B])(implicit G: Applicative[G]): G[Unit] = {
++        // the cost of this is O(size)
++        // c(n) = 1 + 2 * c(n/2)
++        // invariant: size >= 1
++        def runHalf(size: Int, idx: Int): Eval[G[Unit]] =
++          if (size > 1) {
++            val leftSize = size / 2
++            val rightSize = size - leftSize
++            runHalf(leftSize, idx)
++              .flatMap { left =>
++                val right = runHalf(rightSize, idx + leftSize)
++                G.map2Eval(left, right) { (_, _) => () }
++              }
++          } else {
++            val a = fa(idx)
++            // we evaluate this at most one time,
++            // always is a bit cheaper in such cases
++            //
++            // Here is the point of the laziness using Eval:
++            // we avoid calling f(a) or G.void in the
++            // event that the computation has already
++            // failed. We do not use laziness to avoid
++            // traversing fa, which we will do fully
++            // in all cases.
++            Eval.always {
++              val gb = f(a)
++              G.void(gb)
++            }
++          }
++
++        val len = fa.length
++        if (len == 0) G.unit
++        else runHalf(len, 0).value
++      }
+       override def mapWithIndex[A, B](fa: Vector[A])(f: (A, Int) => B): Vector[B] =
+         fa.iterator.zipWithIndex.map(ai => f(ai._1, ai._2)).toVector
+ 
+diff --git a/core/src/main/scala/cats/package.scala b/core/src/main/scala/cats/package.scala
+index 804cb8ace..6dc866bd8 100644
+--- a/core/src/main/scala/cats/package.scala
++++ b/core/src/main/scala/cats/package.scala
+@@ -82,6 +82,7 @@ package object cats {
+       override def ap[A, B](ff: A => B)(fa: A): B = ff(fa)
+       override def flatten[A](ffa: A): A = ffa
+       override def map2[A, B, Z](fa: A, fb: B)(f: (A, B) => Z): Z = f(fa, fb)
++      override def map2Eval[A, B, Z](fa: A, fb: Eval[B])(f: (A, B) => Z): Eval[Z] = fb.map(f(fa, _))
+       override def lift[A, B](f: A => B): A => B = f
+       override def imap[A, B](fa: A)(f: A => B)(fi: B => A): B = f(fa)
+       def foldLeft[A, B](a: A, b: B)(f: (B, A) => B) = f(b, a)
+diff --git a/laws/src/main/scala/cats/laws/TraverseLaws.scala b/laws/src/main/scala/cats/laws/TraverseLaws.scala
+index 8d90825c7..856e21239 100644
+--- a/laws/src/main/scala/cats/laws/TraverseLaws.scala
++++ b/laws/src/main/scala/cats/laws/TraverseLaws.scala
+@@ -84,6 +84,7 @@ trait TraverseLaws[F[_]] extends FunctorLaws[F] with FoldableLaws[F] with Unorde
+ 
+     first <-> traverseFirst
+   }
++
+   def mapWithIndexRef[A, B](fa: F[A], f: (A, Int) => B): IsEq[F[B]] = {
+     val lhs = F.mapWithIndex(fa)(f)
+     val rhs = F.traverse(fa)(a => State((s: Int) => (s + 1, f(a, s)))).runA(0).value

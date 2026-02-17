@@ -1,0 +1,123 @@
+diff --git a/ktor-client/ktor-client-core/common/src/io/ktor/client/request/forms/formDsl.kt b/ktor-client/ktor-client-core/common/src/io/ktor/client/request/forms/formDsl.kt
+index ef14c5b53..dbaf86739 100644
+--- a/ktor-client/ktor-client-core/common/src/io/ktor/client/request/forms/formDsl.kt
++++ b/ktor-client/ktor-client-core/common/src/io/ktor/client/request/forms/formDsl.kt
+@@ -9,6 +9,7 @@ import io.ktor.http.content.*
+ import io.ktor.utils.io.*
+ import io.ktor.utils.io.core.*
+ import kotlinx.io.*
++import kotlinx.io.Buffer
+ import kotlin.contracts.*
+ 
+ /**
+@@ -49,8 +50,10 @@ public fun formData(vararg values: FormPart<*>): List<PartData> {
+                 PartData.BinaryItem({ ByteReadPacket(value) }, {}, partHeaders.build())
+             }
+             is Source -> {
+-                partHeaders.append(HttpHeaders.ContentLength, value.remaining.toString())
+-                PartData.BinaryItem({ value.copy() }, { value.close() }, partHeaders.build())
++                if (value is Buffer) {
++                    partHeaders.append(HttpHeaders.ContentLength, value.remaining.toString())
++                }
++                PartData.BinaryItem({ value.peek() }, { value.close() }, partHeaders.build())
+             }
+             is InputProvider -> {
+                 val size = value.size
+diff --git a/ktor-io/common/src/io/ktor/utils/io/core/ByteReadPacket.kt b/ktor-io/common/src/io/ktor/utils/io/core/ByteReadPacket.kt
+index 4fc4b8851..6fad093c4 100644
+--- a/ktor-io/common/src/io/ktor/utils/io/core/ByteReadPacket.kt
++++ b/ktor-io/common/src/io/ktor/utils/io/core/ByteReadPacket.kt
+@@ -49,8 +49,15 @@ public fun Source.readAvailable(out: kotlinx.io.Buffer): Int {
+     return result.toInt()
+ }
+ 
++/**
++ * Returns a copy of the current buffer attached to this Source.
++ */
++@Deprecated(
++    "Use peek() or buffer.copy() instead, depending on your use case.",
++    ReplaceWith("peek()", "kotlinx.io.Source")
++)
+ @OptIn(InternalIoApi::class)
+-public fun Source.copy(): Source = buffer.copy()
++public fun Source.copy(): Source = peek()
+ 
+ @OptIn(InternalIoApi::class)
+ public fun Source.readShortLittleEndian(): Short {
+diff --git a/ktor-io/jvm/src/io/ktor/utils/io/streams/Streams.kt b/ktor-io/jvm/src/io/ktor/utils/io/streams/Streams.kt
+index d68c8d5cd..bc7148b92 100644
+--- a/ktor-io/jvm/src/io/ktor/utils/io/streams/Streams.kt
++++ b/ktor-io/jvm/src/io/ktor/utils/io/streams/Streams.kt
+@@ -18,7 +18,7 @@ public fun Source.inputStream(): InputStream = asInputStream()
+ 
+ @OptIn(InternalIoApi::class)
+ public fun OutputStream.writePacket(packet: Source) {
+-    packet.buffer.copyTo(this)
++    packet.transferTo(this.asSink())
+ }
+ 
+ public fun OutputStream.writePacket(block: Sink.() -> Unit) {
+diff --git a/ktor-server/ktor-server-test-suites/jvm/src/io/ktor/server/testing/suites/SustainabilityTestSuite.kt b/ktor-server/ktor-server-test-suites/jvm/src/io/ktor/server/testing/suites/SustainabilityTestSuite.kt
+index 6375ed53e..4688b9527 100644
+--- a/ktor-server/ktor-server-test-suites/jvm/src/io/ktor/server/testing/suites/SustainabilityTestSuite.kt
++++ b/ktor-server/ktor-server-test-suites/jvm/src/io/ktor/server/testing/suites/SustainabilityTestSuite.kt
+@@ -120,7 +120,7 @@ abstract class SustainabilityTestSuite<TEngine : ApplicationEngine, TConfigurati
+                         emptyLine()
+                     }.build().use { request ->
+                         repeat(repeatCount) {
+-                            getOutputStream().writePacket(request.copy())
++                            getOutputStream().writePacket(request.peek())
+                             getOutputStream().write(body)
+                             getOutputStream().flush()
+                         }
+diff --git a/ktor-shared/ktor-websockets/jvm/src/io/ktor/websocket/internals/BytePacketUtils.kt b/ktor-shared/ktor-websockets/jvm/src/io/ktor/websocket/internals/BytePacketUtils.kt
+index 828476dca..63df6a0bd 100644
+--- a/ktor-shared/ktor-websockets/jvm/src/io/ktor/websocket/internals/BytePacketUtils.kt
++++ b/ktor-shared/ktor-websockets/jvm/src/io/ktor/websocket/internals/BytePacketUtils.kt
+@@ -7,8 +7,9 @@ package io.ktor.websocket.internals
+ import io.ktor.utils.io.core.*
+ import kotlinx.io.*
+ 
++@OptIn(InternalIoApi::class)
+ internal fun Source.endsWith(data: ByteArray): Boolean {
+-    copy().apply {
++    buffer.copy().apply {
+         discard(remaining - data.size)
+         return readByteArray().contentEquals(data)
+     }
+diff --git a/ktor-utils/common/src/io/ktor/util/Base64.kt b/ktor-utils/common/src/io/ktor/util/Base64.kt
+index 6d56fe00c..24177342f 100644
+--- a/ktor-utils/common/src/io/ktor/util/Base64.kt
++++ b/ktor-utils/common/src/io/ktor/util/Base64.kt
+@@ -104,7 +104,7 @@ public fun String.decodeBase64Bytes(): ByteArray = buildPacket {
+ public fun Source.decodeBase64Bytes(): Input = buildPacket {
+     val data = ByteArray(4)
+ 
+-    while (remaining > 0) {
++    while (!exhausted()) {
+         val read = readAvailable(data)
+ 
+         val chunk = data.foldIndexed(0) { index, result, current ->
+diff --git a/ktor-utils/common/src/io/ktor/util/ByteChannels.kt b/ktor-utils/common/src/io/ktor/util/ByteChannels.kt
+index 91403a67a..59e89c715 100644
+--- a/ktor-utils/common/src/io/ktor/util/ByteChannels.kt
++++ b/ktor-utils/common/src/io/ktor/util/ByteChannels.kt
+@@ -5,7 +5,6 @@
+ package io.ktor.util
+ 
+ import io.ktor.utils.io.*
+-import io.ktor.utils.io.core.*
+ import io.ktor.utils.io.pool.*
+ import kotlinx.coroutines.*
+ 
+@@ -64,8 +63,8 @@ public fun ByteReadChannel.copyToBoth(first: ByteWriteChannel, second: ByteWrite
+             while (!isClosedForRead && (!first.isClosedForWrite || !second.isClosedForWrite)) {
+                 readRemaining(CHUNK_BUFFER_SIZE).use {
+                     try {
+-                        first.writePacket(it.copy())
+-                        second.writePacket(it.copy())
++                        first.writePacket(it.peek())
++                        second.writePacket(it.peek())
+                     } catch (cause: Throwable) {
+                         this@copyToBoth.cancel(cause)
+                         first.close(cause)

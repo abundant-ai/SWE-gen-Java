@@ -1,0 +1,523 @@
+diff --git a/README.md b/README.md
+index 4072d42e..f7682375 100644
+--- a/README.md
++++ b/README.md
+@@ -504,6 +504,99 @@ public final class BlackjackHand {
+ }
+ ```
+ 
++### Composing Adapters
++
++In some situations Moshi's default Java-to-JSON conversion isn't sufficient. You can compose
++adapters to build upon the standard conversion.
++
++In this example, we turn serialize nulls, then delegate to the built-in adapter:
++
++```java
++class TournamentWithNullsAdapter {
++  @ToJson void toJson(JsonWriter writer, Tournament tournament,
++      JsonAdapter<Tournament> delegate) throws IOException {
++    boolean wasSerializeNulls = writer.getSerializeNulls();
++    writer.setSerializeNulls(true);
++    try {
++      delegate.toJson(writer, tournament);
++    } finally {
++      writer.setLenient(wasSerializeNulls);
++    }
++  }
++}
++```
++
++When we use this to serialize a tournament, nulls are written! But nulls elsewhere in our JSON
++document are skipped as usual.
++
++Moshi has a powerful composition system in its `JsonAdapter.Factory` interface. We can hook in to
++the encoding and decoding process for any type, even without knowing about the types beforehand. In
++this example, we customize types annotated `@AlwaysSerializeNulls`, which an annotation we create,
++not built-in to Moshi:
++
++```java
++@Target(TYPE)
++@Retention(RUNTIME)
++public @interface AlwaysSerializeNulls {}
++```
++
++```java
++@AlwaysSerializeNulls
++static class Car {
++  String make;
++  String model;
++  String color;
++}
++```
++
++Each `JsonAdapter.Factory` interface is invoked by `Moshi` when it needs to build an adapter for a
++user's type. The factory either returns an adapter to use, or null if it doesn't apply to the
++requested type. In our case we match all classes that have our annotation.
++
++```java
++static class AlwaysSerializeNullsFactory implements JsonAdapter.Factory {
++  @Override public JsonAdapter<?> create(
++      Type type, Set<? extends Annotation> annotations, Moshi moshi) {
++    Class<?> rawType = Types.getRawType(type);
++    if (!rawType.isAnnotationPresent(AlwaysSerializeNulls.class)) {
++      return null;
++    }
++
++    JsonAdapter<Object> delegate = moshi.nextAdapter(this, type, annotations);
++    return delegate.serializeNulls();
++  }
++}
++```
++
++After determining that it applies, the factory looks up Moshi's built-in adapter by calling
++`Moshi.nextAdapter()`. This is key to the composition mechanism: adapters delegate to each other!
++The composition in this example is simple: it applies the `serializeNulls()` transform on the
++delegate.
++
++Composing adapters can be very sophisticated:
++
++ * An adapter could transform the input object before it is JSON-encoded. A string could be
++   trimmed or truncated; a value object could be simplified or normalized.
++
++ * An adapter could repair the output object after it is JSON-decoded. It could fill-in missing
++   data or discard unwanted data.
++
++ * The JSON could be given extra structure, such as wrapping values in objects or arrays.
++
++Moshi is itself built on the pattern of repeatedly composing adapters. For example, Moshi's built-in
++adapter for `List<T>` delegates to the adapter of `T`, and calls it repeatedly.
++
++### Precedence
++
++Moshi's composition mechanism tries to find the best adapter for each type. It starts with the first
++adapter or factory registered with `Moshi.Builder.add()`, and proceeds until it finds an adapter for
++the target type.
++
++If a type can be matched multiple adapters, the earliest one wins.
++
++To register an adapter at the end of the list, use `Moshi.Builder.addLast()` instead. This is most
++useful when registering general-purpose adapters, such as the `KotlinJsonAdapterFactory` below.
++
+ Kotlin
+ ------
+ 
+@@ -517,14 +610,12 @@ JSON. Enable it by adding the `KotlinJsonAdapterFactory` to your `Moshi.Builder`
+ 
+ ```kotlin
+ val moshi = Moshi.Builder()
+-    // ... add your own JsonAdapters and factories ...
+-    .add(KotlinJsonAdapterFactory())
++    .addLast(KotlinJsonAdapterFactory())
+     .build()
+ ```
+ 
+-Moshi’s adapters are ordered by precedence, so you always want to add the Kotlin adapter after your
+-own custom adapters. Otherwise the `KotlinJsonAdapterFactory` will take precedence and your custom
+-adapters will not be called.
++Moshi’s adapters are ordered by precedence, so you should use `addLast()` with
++`KotlinJsonAdapterFactory`, and `add()` with your custom adapters.
+ 
+ The reflection adapter requires the following additional dependency:
+ 
+diff --git a/examples/src/main/java/com/squareup/moshi/recipes/IncludeNullsForAnnotatedTypes.java b/examples/src/main/java/com/squareup/moshi/recipes/IncludeNullsForAnnotatedTypes.java
+new file mode 100644
+index 00000000..9383e586
+--- /dev/null
++++ b/examples/src/main/java/com/squareup/moshi/recipes/IncludeNullsForAnnotatedTypes.java
+@@ -0,0 +1,81 @@
++/*
++ * Copyright (C) 2020 Square, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package com.squareup.moshi.recipes;
++
++import static java.lang.annotation.ElementType.TYPE;
++import static java.lang.annotation.RetentionPolicy.RUNTIME;
++
++import com.squareup.moshi.JsonAdapter;
++import com.squareup.moshi.Moshi;
++import com.squareup.moshi.Types;
++import java.lang.annotation.Annotation;
++import java.lang.annotation.Retention;
++import java.lang.annotation.Target;
++import java.lang.reflect.Type;
++import java.util.Set;
++
++public final class IncludeNullsForAnnotatedTypes {
++  public void run() throws Exception {
++    Moshi moshi = new Moshi.Builder().add(new AlwaysSerializeNullsFactory()).build();
++
++    JsonAdapter<Driver> driverAdapter = moshi.adapter(Driver.class);
++
++    Car car = new Car();
++    car.make = "Ford";
++    car.model = "Mach-E";
++    car.color = null; // This null will show up in the JSON because Car has @AlwaysSerializeNulls.
++
++    Driver driver = new Driver();
++    driver.name = "Jesse";
++    driver.emailAddress = null; // This null will be omitted.
++    driver.favoriteCar = car;
++
++    System.out.println(driverAdapter.toJson(driver));
++  }
++
++  @Target(TYPE)
++  @Retention(RUNTIME)
++  public @interface AlwaysSerializeNulls {}
++
++  @AlwaysSerializeNulls
++  static class Car {
++    String make;
++    String model;
++    String color;
++  }
++
++  static class Driver {
++    String name;
++    String emailAddress;
++    Car favoriteCar;
++  }
++
++  static class AlwaysSerializeNullsFactory implements JsonAdapter.Factory {
++    @Override
++    public JsonAdapter<?> create(Type type, Set<? extends Annotation> annotations, Moshi moshi) {
++      Class<?> rawType = Types.getRawType(type);
++      if (!rawType.isAnnotationPresent(AlwaysSerializeNulls.class)) {
++        return null;
++      }
++      JsonAdapter<Object> delegate = moshi.nextAdapter(this, type, annotations);
++      return delegate.serializeNulls();
++    }
++  }
++
++  public static void main(String[] args) throws Exception {
++    new IncludeNullsForAnnotatedTypes().run();
++  }
++}
+diff --git a/examples/src/main/java/com/squareup/moshi/recipes/IncludeNullsForOneType.java b/examples/src/main/java/com/squareup/moshi/recipes/IncludeNullsForOneType.java
+new file mode 100644
+index 00000000..56ee698b
+--- /dev/null
++++ b/examples/src/main/java/com/squareup/moshi/recipes/IncludeNullsForOneType.java
+@@ -0,0 +1,60 @@
++/*
++ * Copyright (C) 2020 Square, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package com.squareup.moshi.recipes;
++
++import com.squareup.moshi.JsonAdapter;
++import com.squareup.moshi.JsonWriter;
++import com.squareup.moshi.Moshi;
++import com.squareup.moshi.ToJson;
++import com.squareup.moshi.adapters.Rfc3339DateJsonAdapter;
++import com.squareup.moshi.recipes.models.Tournament;
++import java.io.IOException;
++import java.util.Date;
++
++public final class IncludeNullsForOneType {
++  public void run() throws Exception {
++    Moshi moshi =
++        new Moshi.Builder()
++            .add(Date.class, new Rfc3339DateJsonAdapter())
++            .add(new TournamentWithNullsAdapter())
++            .build();
++
++    JsonAdapter<Tournament> tournamentAdapter = moshi.adapter(Tournament.class);
++
++    // Moshi normally skips nulls, but with our adapter registered they are emitted.
++    Tournament withNulls = new Tournament("Waterloo Classic", null, null);
++    System.out.println(tournamentAdapter.toJson(withNulls));
++  }
++
++  public static final class TournamentWithNullsAdapter {
++    @ToJson
++    void toJson(JsonWriter writer, Tournament tournament, JsonAdapter<Tournament> delegate)
++        throws IOException {
++      boolean wasSerializeNulls = writer.getSerializeNulls();
++      writer.setSerializeNulls(true);
++      try {
++        // Once we've customized the JSON writer, we let the default JSON adapter do its job.
++        delegate.toJson(writer, tournament);
++      } finally {
++        writer.setLenient(wasSerializeNulls);
++      }
++    }
++  }
++
++  public static void main(String[] args) throws Exception {
++    new IncludeNullsForOneType().run();
++  }
++}
+diff --git a/kotlin/codegen/build.gradle.kts b/kotlin/codegen/build.gradle.kts
+index 1eb51597..1522dc0a 100644
+--- a/kotlin/codegen/build.gradle.kts
++++ b/kotlin/codegen/build.gradle.kts
+@@ -22,7 +22,7 @@ plugins {
+   kotlin("jvm")
+   kotlin("kapt")
+   id("com.vanniktech.maven.publish")
+-  id("com.github.johnrengelman.shadow") version "6.0.0"
++  id("com.github.johnrengelman.shadow") version "5.2.0"
+ }
+ 
+ tasks.withType<KotlinCompile>().configureEach {
+@@ -38,31 +38,26 @@ tasks.withType<KotlinCompile>().configureEach {
+ val shade: Configuration = configurations.maybeCreate("compileShaded")
+ configurations.getByName("compileOnly").extendsFrom(shade)
+ dependencies {
+-  // Use `api` because kapt will not resolve `runtime` dependencies without it, only `compile`
+-  // https://youtrack.jetbrains.com/issue/KT-41702
+-  api(project(":moshi"))
+-  api(kotlin("reflect"))
++  implementation(project(":moshi"))
++  implementation(kotlin("reflect"))
+   shade(Dependencies.Kotlin.metadata) {
+     exclude(group = "org.jetbrains.kotlin", module = "kotlin-stdlib")
+   }
+-  api(Dependencies.KotlinPoet.kotlinPoet)
++  implementation(Dependencies.KotlinPoet.kotlinPoet)
+   shade(Dependencies.KotlinPoet.metadata) {
+     exclude(group = "org.jetbrains.kotlin")
+-    exclude(group = "com.squareup", module = "kotlinpoet")
+   }
+   shade(Dependencies.KotlinPoet.metadataSpecs) {
+     exclude(group = "org.jetbrains.kotlin")
+-    exclude(group = "com.squareup", module = "kotlinpoet")
+   }
+   shade(Dependencies.KotlinPoet.elementsClassInspector) {
+     exclude(group = "org.jetbrains.kotlin")
+-    exclude(group = "com.squareup", module = "kotlinpoet")
+   }
+-  api(Dependencies.asm)
++  implementation(Dependencies.asm)
+ 
+-  api(Dependencies.AutoService.annotations)
++  implementation(Dependencies.AutoService.annotations)
+   kapt(Dependencies.AutoService.processor)
+-  api(Dependencies.Incap.annotations)
++  implementation(Dependencies.Incap.annotations)
+   kapt(Dependencies.Incap.processor)
+ 
+   // Copy these again as they're not automatically included since they're shaded
+@@ -99,3 +94,18 @@ artifacts {
+   runtime(shadowJar)
+   archives(shadowJar)
+ }
++
++// Shadow plugin doesn't natively support gradle metadata, so we have to tell the maven plugin where
++// to get a jar now.
++afterEvaluate {
++  configure<PublishingExtension> {
++    publications.withType<MavenPublication>().configureEach {
++      if (name == "pluginMaven") {
++        // This is to properly wire the shadow jar's gradle metadata and pom information
++        setArtifacts(artifacts.matching { it.classifier != "" })
++        // Ugly but artifact() doesn't support TaskProviders
++        artifact(shadowJar.get())
++      }
++    }
++  }
++}
+diff --git a/moshi/src/main/java/com/squareup/moshi/Moshi.java b/moshi/src/main/java/com/squareup/moshi/Moshi.java
+index 96079393..c4a20cec 100644
+--- a/moshi/src/main/java/com/squareup/moshi/Moshi.java
++++ b/moshi/src/main/java/com/squareup/moshi/Moshi.java
+@@ -55,6 +55,7 @@ public final class Moshi {
+   }
+ 
+   private final List<JsonAdapter.Factory> factories;
++  private final int lastOffset;
+   private final ThreadLocal<LookupChain> lookupChainThreadLocal = new ThreadLocal<>();
+   private final Map<Object, JsonAdapter<?>> adapterCache = new LinkedHashMap<>();
+ 
+@@ -64,6 +65,7 @@ public final class Moshi {
+     factories.addAll(builder.factories);
+     factories.addAll(BUILT_IN_FACTORIES);
+     this.factories = Collections.unmodifiableList(factories);
++    this.lastOffset = builder.lastOffset;
+   }
+ 
+   /** Returns a JSON adapter for {@code type}, creating it if necessary. */
+@@ -181,10 +183,14 @@ public final class Moshi {
+   /** Returns a new builder containing all custom factories used by the current instance. */
+   @CheckReturnValue
+   public Moshi.Builder newBuilder() {
+-    int fullSize = factories.size();
+-    int tailSize = BUILT_IN_FACTORIES.size();
+-    List<JsonAdapter.Factory> customFactories = factories.subList(0, fullSize - tailSize);
+-    return new Builder().addAll(customFactories);
++    Builder result = new Builder();
++    for (int i = 0, limit = lastOffset; i < limit; i++) {
++      result.add(factories.get(i));
++    }
++    for (int i = lastOffset, limit = factories.size() - BUILT_IN_FACTORIES.size(); i < limit; i++) {
++      result.addLast(factories.get(i));
++    }
++    return result;
+   }
+ 
+   /** Returns an opaque object that's equal if the type and annotations are equal. */
+@@ -195,55 +201,20 @@ public final class Moshi {
+ 
+   public static final class Builder {
+     final List<JsonAdapter.Factory> factories = new ArrayList<>();
++    int lastOffset = 0;
+ 
+-    public <T> Builder add(final Type type, final JsonAdapter<T> jsonAdapter) {
+-      if (type == null) throw new IllegalArgumentException("type == null");
+-      if (jsonAdapter == null) throw new IllegalArgumentException("jsonAdapter == null");
+-
+-      return add(
+-          new JsonAdapter.Factory() {
+-            @Override
+-            public @Nullable JsonAdapter<?> create(
+-                Type targetType, Set<? extends Annotation> annotations, Moshi moshi) {
+-              return annotations.isEmpty() && Util.typesMatch(type, targetType)
+-                  ? jsonAdapter
+-                  : null;
+-            }
+-          });
++    public <T> Builder add(Type type, JsonAdapter<T> jsonAdapter) {
++      return add(newAdapterFactory(type, jsonAdapter));
+     }
+ 
+     public <T> Builder add(
+-        final Type type,
+-        final Class<? extends Annotation> annotation,
+-        final JsonAdapter<T> jsonAdapter) {
+-      if (type == null) throw new IllegalArgumentException("type == null");
+-      if (annotation == null) throw new IllegalArgumentException("annotation == null");
+-      if (jsonAdapter == null) throw new IllegalArgumentException("jsonAdapter == null");
+-      if (!annotation.isAnnotationPresent(JsonQualifier.class)) {
+-        throw new IllegalArgumentException(annotation + " does not have @JsonQualifier");
+-      }
+-      if (annotation.getDeclaredMethods().length > 0) {
+-        throw new IllegalArgumentException("Use JsonAdapter.Factory for annotations with elements");
+-      }
+-
+-      return add(
+-          new JsonAdapter.Factory() {
+-            @Override
+-            public @Nullable JsonAdapter<?> create(
+-                Type targetType, Set<? extends Annotation> annotations, Moshi moshi) {
+-              if (Util.typesMatch(type, targetType)
+-                  && annotations.size() == 1
+-                  && Util.isAnnotationPresent(annotations, annotation)) {
+-                return jsonAdapter;
+-              }
+-              return null;
+-            }
+-          });
++        Type type, Class<? extends Annotation> annotation, JsonAdapter<T> jsonAdapter) {
++      return add(newAdapterFactory(type, annotation, jsonAdapter));
+     }
+ 
+     public Builder add(JsonAdapter.Factory factory) {
+       if (factory == null) throw new IllegalArgumentException("factory == null");
+-      factories.add(factory);
++      factories.add(lastOffset++, factory);
+       return this;
+     }
+ 
+@@ -252,17 +223,74 @@ public final class Moshi {
+       return add(AdapterMethodsFactory.get(adapter));
+     }
+ 
+-    Builder addAll(List<JsonAdapter.Factory> factories) {
+-      this.factories.addAll(factories);
++    public <T> Builder addLast(Type type, JsonAdapter<T> jsonAdapter) {
++      return addLast(newAdapterFactory(type, jsonAdapter));
++    }
++
++    public <T> Builder addLast(
++        Type type, Class<? extends Annotation> annotation, JsonAdapter<T> jsonAdapter) {
++      return addLast(newAdapterFactory(type, annotation, jsonAdapter));
++    }
++
++    public Builder addLast(JsonAdapter.Factory factory) {
++      if (factory == null) throw new IllegalArgumentException("factory == null");
++      factories.add(factory);
+       return this;
+     }
+ 
++    public Builder addLast(Object adapter) {
++      if (adapter == null) throw new IllegalArgumentException("adapter == null");
++      return addLast(AdapterMethodsFactory.get(adapter));
++    }
++
+     @CheckReturnValue
+     public Moshi build() {
+       return new Moshi(this);
+     }
+   }
+ 
++  static <T> JsonAdapter.Factory newAdapterFactory(
++      final Type type, final JsonAdapter<T> jsonAdapter) {
++    if (type == null) throw new IllegalArgumentException("type == null");
++    if (jsonAdapter == null) throw new IllegalArgumentException("jsonAdapter == null");
++
++    return new JsonAdapter.Factory() {
++      @Override
++      public @Nullable JsonAdapter<?> create(
++          Type targetType, Set<? extends Annotation> annotations, Moshi moshi) {
++        return annotations.isEmpty() && Util.typesMatch(type, targetType) ? jsonAdapter : null;
++      }
++    };
++  }
++
++  static <T> JsonAdapter.Factory newAdapterFactory(
++      final Type type,
++      final Class<? extends Annotation> annotation,
++      final JsonAdapter<T> jsonAdapter) {
++    if (type == null) throw new IllegalArgumentException("type == null");
++    if (annotation == null) throw new IllegalArgumentException("annotation == null");
++    if (jsonAdapter == null) throw new IllegalArgumentException("jsonAdapter == null");
++    if (!annotation.isAnnotationPresent(JsonQualifier.class)) {
++      throw new IllegalArgumentException(annotation + " does not have @JsonQualifier");
++    }
++    if (annotation.getDeclaredMethods().length > 0) {
++      throw new IllegalArgumentException("Use JsonAdapter.Factory for annotations with elements");
++    }
++
++    return new JsonAdapter.Factory() {
++      @Override
++      public @Nullable JsonAdapter<?> create(
++          Type targetType, Set<? extends Annotation> annotations, Moshi moshi) {
++        if (Util.typesMatch(type, targetType)
++            && annotations.size() == 1
++            && Util.isAnnotationPresent(annotations, annotation)) {
++          return jsonAdapter;
++        }
++        return null;
++      }
++    };
++  }
++
+   /**
+    * A possibly-reentrant chain of lookups for JSON adapters.
+    *

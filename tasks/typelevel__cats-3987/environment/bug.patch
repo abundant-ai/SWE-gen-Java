@@ -1,0 +1,371 @@
+diff --git a/build.sbt b/build.sbt
+index 4a625fac4..aaf0f41d3 100644
+--- a/build.sbt
++++ b/build.sbt
+@@ -516,12 +516,6 @@ def mimaSettings(moduleName: String, includeCats1: Boolean = true) =
+         Seq(
+           exclude[MissingClassProblem]("algebra.laws.IsSerializable"),
+           exclude[MissingClassProblem]("algebra.laws.IsSerializable$")
+-        ) ++ // https://github.com/typelevel/cats/pull/3987
+-        Seq(
+-          exclude[DirectAbstractMethodProblem]("cats.free.ContravariantCoyoneda.k"),
+-          exclude[ReversedAbstractMethodProblem]("cats.free.ContravariantCoyoneda.k"),
+-          exclude[DirectAbstractMethodProblem]("cats.free.Coyoneda.k"),
+-          exclude[ReversedAbstractMethodProblem]("cats.free.Coyoneda.k")
+         )
+     }
+   )
+diff --git a/free/src/main/scala/cats/free/ContravariantCoyoneda.scala b/free/src/main/scala/cats/free/ContravariantCoyoneda.scala
+index b862facb4..57760f08a 100644
+--- a/free/src/main/scala/cats/free/ContravariantCoyoneda.scala
++++ b/free/src/main/scala/cats/free/ContravariantCoyoneda.scala
+@@ -1,15 +1,13 @@
+ package cats
+ package free
+ 
+-import cats.data.AndThen
+-
+ /**
+  * The free contravariant functor on `F`. This is isomorphic to `F` as long as `F` itself is a
+  * contravariant functor. The function from `F[A]` to `ContravariantCoyoneda[F,A]` exists even when
+  * `F` is not a contravariant functor. Implemented using a List of functions for stack-safety.
+  */
+ sealed abstract class ContravariantCoyoneda[F[_], A] extends Serializable { self =>
+-  import ContravariantCoyoneda.Aux
++  import ContravariantCoyoneda.{unsafeApply, Aux}
+ 
+   /**
+    * The pivot between `fi` and `k`, usually existential.
+@@ -21,10 +19,15 @@ sealed abstract class ContravariantCoyoneda[F[_], A] extends Serializable { self
+    */
+   val fi: F[Pivot]
+ 
++  /**
++   * The list of transformer functions, to be composed and lifted into `F` by `run`.
++   */
++  private[cats] val ks: List[Any => Any]
++
+   /**
+    * The composed transformer function, to be lifted into `F` by `run`.
+    */
+-  def k: A => Pivot
++  final def k: A => Pivot = Function.chain(ks)(_).asInstanceOf[Pivot]
+ 
+   /**
+    * Converts to `F[A]` given that `F` is a contravariant functor
+@@ -41,13 +44,13 @@ sealed abstract class ContravariantCoyoneda[F[_], A] extends Serializable { self
+    * Simple function composition. Allows contramap fusion without touching the underlying `F`.
+    */
+   final def contramap[B](f: B => A): Aux[F, B, Pivot] =
+-    ContravariantCoyoneda(fi)(AndThen(k).compose(f))
++    unsafeApply(fi)(f.asInstanceOf[Any => Any] :: ks)
+ 
+   /**
+    * Modify the context `F` using transformation `f`.
+    */
+   final def mapK[G[_]](f: F ~> G): Aux[G, A, Pivot] =
+-    ContravariantCoyoneda(f(fi))(k)
++    unsafeApply(f(fi))(ks)
+ 
+ }
+ 
+@@ -62,16 +65,23 @@ object ContravariantCoyoneda {
+   /**
+    * `F[A]` converts to `ContravariantCoyoneda[F,A]` for any `F`
+    */
+-  def lift[F[_], A](fa: F[A]): Aux[F, A, A] =
++  def lift[F[_], A](fa: F[A]): ContravariantCoyoneda[F, A] =
+     apply(fa)(identity[A])
+ 
+   /**
+    * Like `lift(fa).contramap(k0)`.
+    */
+   def apply[F[_], A, B](fa: F[A])(k0: B => A): Aux[F, B, A] =
++    unsafeApply(fa)(k0.asInstanceOf[Any => Any] :: Nil)
++
++  /**
++   * Creates a `ContravariantCoyoneda[F, A]` for any `F`, taking an `F[A]` and a list of
++   * [[Contravariant.contramap]]ped functions to apply later
++   */
++  private[cats] def unsafeApply[F[_], A, B](fa: F[A])(ks0: List[Any => Any]): Aux[F, B, A] =
+     new ContravariantCoyoneda[F, B] {
+       type Pivot = A
+-      val k = k0
++      val ks = ks0
+       val fi = fa
+     }
+ 
+diff --git a/free/src/main/scala/cats/free/Coyoneda.scala b/free/src/main/scala/cats/free/Coyoneda.scala
+index 1645ae828..7f40ab83a 100644
+--- a/free/src/main/scala/cats/free/Coyoneda.scala
++++ b/free/src/main/scala/cats/free/Coyoneda.scala
+@@ -2,7 +2,6 @@ package cats
+ package free
+ 
+ import cats.arrow.FunctionK
+-import cats.data.AndThen
+ 
+ /**
+  * The dual view of the Yoneda lemma. The free functor on `F`.
+@@ -23,12 +22,17 @@ sealed abstract class Coyoneda[F[_], A] extends Serializable { self =>
+    */
+   val fi: F[Pivot]
+ 
++  /**
++   * The list of transformer functions, to be composed and lifted into `F` by `run`.
++   */
++  private[cats] val ks: List[Any => Any]
++
+   /**
+    * The list of transformer functions composed into a single function, to be lifted into `F` by `run`.
+    */
+-  def k: Pivot => A
++  final def k: Pivot => A = Function.chain(ks.reverse)(_).asInstanceOf[A]
+ 
+-  import Coyoneda.Aux
++  import Coyoneda.{unsafeApply, Aux}
+ 
+   /**
+    * Converts to `F[A]` given that `F` is a functor
+@@ -54,13 +58,13 @@ sealed abstract class Coyoneda[F[_], A] extends Serializable { self =>
+    * the underlying `F`.
+    */
+   final def map[B](f: A => B): Aux[F, B, Pivot] =
+-    Coyoneda(fi)(AndThen(k).andThen(f))
++    unsafeApply(fi)(f.asInstanceOf[Any => Any] :: ks)
+ 
+   /**
+    * Modify the context `F` using transformation `f`.
+    */
+   final def mapK[G[_]](f: F ~> G): Aux[G, A, Pivot] =
+-    Coyoneda(f(fi))(k)
++    unsafeApply(f(fi))(ks)
+ 
+   @deprecated("Use mapK", "1.0.0-RC2")
+   final private[free] def transform[G[_]](f: FunctionK[F, G]): Aux[G, A, Pivot] =
+@@ -79,15 +83,22 @@ object Coyoneda {
+   /**
+    * `F[A]` converts to `Coyoneda[F,A]` for any `F`
+    */
+-  def lift[F[_], A](fa: F[A]): Aux[F, A, A] = apply(fa)(identity[A])
++  def lift[F[_], A](fa: F[A]): Coyoneda[F, A] = apply(fa)(identity[A])
+ 
+   /**
+    * Like `lift(fa).map(k0)`.
+    */
+   def apply[F[_], A, B](fa: F[A])(k0: A => B): Aux[F, B, A] =
++    unsafeApply(fa)(k0.asInstanceOf[Any => Any] :: Nil)
++
++  /**
++   * Creates a `Coyoneda[F, A]` for any `F`, taking an `F[A]`
++   * and a list of [[Functor.map]]ped functions to apply later
++   */
++  private[cats] def unsafeApply[F[_], A, B](fa: F[A])(ks0: List[Any => Any]): Aux[F, B, A] =
+     new Coyoneda[F, B] {
+       type Pivot = A
+-      val k = k0
++      val ks = ks0
+       val fi = fa
+     }
+ 
+diff --git a/free/src/main/scala/cats/free/InvariantCoyoneda.scala b/free/src/main/scala/cats/free/InvariantCoyoneda.scala
+deleted file mode 100644
+index fc76efae9..000000000
+--- a/free/src/main/scala/cats/free/InvariantCoyoneda.scala
++++ /dev/null
+@@ -1,93 +0,0 @@
+-package cats
+-package free
+-
+-import cats.data.AndThen
+-
+-/**
+- * The free invariant functor on `F`. This is isomorphic to `F` as long as `F` itself is a
+- * invariant functor. The function from `F[A]` to `InvariantCoyoneda[F,A]` exists even when
+- * `F` is not an invariant functor. Implemented using a List of functions for stack-safety.
+- */
+-sealed abstract class InvariantCoyoneda[F[_], A] extends Serializable { self =>
+-  import InvariantCoyoneda.Aux
+-
+-  /**
+-   * The pivot between `fi` and `k`, usually existential.
+-   */
+-  type Pivot
+-
+-  /**
+-   * The underlying value.
+-   */
+-  val fi: F[Pivot]
+-
+-  /**
+-   * Half of the composed transformer function, to be lifted into `F` by `run`.
+-   */
+-  def k0: Pivot => A
+-
+-  /**
+-   * The other half of the composed transformer function, to be lifted into `F` by `run`.
+-   */
+-  def k1: A => Pivot
+-
+-  /**
+-   * Converts to `F[A]` given that `F` is a invariant functor
+-   */
+-  final def run(implicit F: Invariant[F]): F[A] = F.imap(fi)(k0)(k1)
+-
+-  /**
+-   * Converts to `G[A]` given that `G` is a invariant functor
+-   */
+-  final def foldMap[G[_]](trans: F ~> G)(implicit G: Invariant[G]): G[A] =
+-    G.imap(trans(fi))(k0)(k1)
+-
+-  /**
+-   * Simple function composition. Allows imap fusion without touching the underlying `F`.
+-   */
+-  final def imap[B](f: A => B)(g: B => A): Aux[F, B, Pivot] =
+-    InvariantCoyoneda(fi)(AndThen(k0).andThen(f))(AndThen(k1).compose(g))
+-
+-  /**
+-   * Modify the context `F` using transformation `f`.
+-   */
+-  final def mapK[G[_]](f: F ~> G): Aux[G, A, Pivot] =
+-    InvariantCoyoneda(f(fi))(k0)(k1)
+-
+-}
+-
+-object InvariantCoyoneda {
+-
+-  /**
+-   * Lift the `Pivot` type member to a parameter. It is usually more convenient to use `Aux` than
+-   * a refinment type.
+-   */
+-  type Aux[F[_], A, B] = InvariantCoyoneda[F, A] { type Pivot = B }
+-
+-  /**
+-   * `F[A]` converts to `InvariantCoyoneda[F,A]` for any `F`
+-   */
+-  def lift[F[_], A](fa: F[A]): Aux[F, A, A] =
+-    apply(fa)(identity[A])(identity[A])
+-
+-  /**
+-   * Like `lift(fa).imap(k0)`.
+-   */
+-  def apply[F[_], A, B](fa: F[A])(f: A => B)(g: B => A): Aux[F, B, A] =
+-    new InvariantCoyoneda[F, B] {
+-      type Pivot = A
+-      val k0 = f
+-      val k1 = g
+-      val fi = fa
+-    }
+-
+-  /**
+-   * `InvariantCoyoneda[F, *]` provides a invariant functor for any `F`.
+-   */
+-  implicit def catsFreeInvariantFunctorForInvariantCoyoneda[F[_]]: Invariant[InvariantCoyoneda[F, *]] =
+-    new Invariant[InvariantCoyoneda[F, *]] {
+-      def imap[A, B](cfa: InvariantCoyoneda[F, A])(f: A => B)(g: B => A): InvariantCoyoneda[F, B] =
+-        cfa.imap(f)(g)
+-    }
+-
+-}
+diff --git a/free/src/test/scala/cats/free/InvariantCoyonedaSuite.scala b/free/src/test/scala/cats/free/InvariantCoyonedaSuite.scala
+deleted file mode 100644
+index 584842dbb..000000000
+--- a/free/src/test/scala/cats/free/InvariantCoyonedaSuite.scala
++++ /dev/null
+@@ -1,96 +0,0 @@
+-package cats.free
+-
+-import cats.~>
+-import cats.arrow.FunctionK
+-import cats.Invariant
+-import cats.Semigroup
+-import cats.instances.all._
+-import cats.kernel.Eq
+-import cats.laws.discipline.{InvariantTests, SerializableTests}
+-import cats.tests.CatsSuite
+-import org.scalacheck.{Arbitrary}
+-import cats.syntax.eq._
+-import org.scalacheck.Prop._
+-
+-class InvariantCoyonedaSuite extends CatsSuite {
+-
+-  type Magma[A] = (A, A) => A
+-  implicit def semigroupIsMagma[A: Semigroup]: Magma[A] = Semigroup[A].combine
+-  implicit object invariantForMagma extends Invariant[Magma] {
+-    override def imap[A, B](fa: Magma[A])(f: A => B)(g: B => A): Magma[B] =
+-      (x, y) => f(fa(g(x), g(y)))
+-  }
+-
+-  // If we can generate functions we can generate an interesting InvariantCoyoneda.
+-  implicit def invariantCoyonedaArbitrary[F[_], A: Magma, T](implicit
+-    F: Arbitrary[(A, A) => A]
+-  ): Arbitrary[InvariantCoyoneda[Magma, A]] =
+-    Arbitrary(F.arbitrary.map(InvariantCoyoneda.lift[Magma, A]))
+-
+-  // We can't really test that magmas are equal but we can try it with a bunch of test data.
+-  implicit def invariantCoyonedaEq[A: Arbitrary: Eq]: Eq[InvariantCoyoneda[Magma, A]] =
+-    new Eq[InvariantCoyoneda[Magma, A]] {
+-      def eqv(cca: InvariantCoyoneda[Magma, A], ccb: InvariantCoyoneda[Magma, A]): Boolean =
+-        Arbitrary.arbitrary[List[(A, A)]].sample.get.forall { case (x, y) =>
+-          cca.run.apply(x, y) == ccb.run.apply(x, y)
+-        }
+-    }
+-
+-  // Needed to help implicit resolution?
+-  implicit val invariantCoyonedaMagma: Invariant[InvariantCoyoneda[Magma, *]] =
+-    InvariantCoyoneda.catsFreeInvariantFunctorForInvariantCoyoneda[Magma]
+-
+-  checkAll("InvariantCoyoneda[Magma, Int]",
+-           InvariantTests[InvariantCoyoneda[Magma, *]].invariant[List[Int], List[Int], List[Int]]
+-  )
+-  checkAll("Invariant[InvariantCoyoneda[Magma, *]]",
+-           SerializableTests.serializable(Invariant[InvariantCoyoneda[Magma, *]])
+-  )
+-
+-  test("mapK and run is same as applying natural trans") {
+-    forAll { (x: Option[Int], y: Option[Int]) =>
+-      val nt = new (Magma ~> Magma) {
+-        def apply[A](m: Magma[A]): Magma[A] = (x, y) => m(y, x)
+-      }
+-      val m: Magma[Option[Int]] = _.orElse(_)
+-      val c = InvariantCoyoneda.lift[Magma, Option[Int]](m)
+-      c.mapK[Magma](nt).run.apply(x, y) === nt(m).apply(x, y)
+-    }
+-  }
+-
+-  test("imap order") {
+-    forAll { (x: String, y: String) =>
+-      InvariantCoyoneda
+-        .lift[Magma, String](_ + _)
+-        .imap(Some(_))(_.value)
+-        .imap(Right(_))(_.value)
+-        .run
+-        .apply(Right(Some(x)), Right(Some(y))) == Right(Some(x + y))
+-    }
+-  }
+-
+-  test("stack-safe imapmap") {
+-    def loop(n: Int, acc: InvariantCoyoneda[Magma, Int]): InvariantCoyoneda[Magma, Int] =
+-      if (n <= 0) acc
+-      else loop(n - 1, acc.imap((_: Int) + 1)((_: Int) - 1))
+-    loop(20000, InvariantCoyoneda.lift[Magma, Int](_ + _)).run.apply(10, 11)
+-  }
+-
+-  test("run, foldMap consistent") {
+-    forAll {
+-      (
+-        c: InvariantCoyoneda[Magma, String],
+-        f1: String => Byte,
+-        g1: Byte => String,
+-        f2: Byte => Float,
+-        g2: Float => Byte,
+-        s1: Float,
+-        s2: Float
+-      ) =>
+-        val cʹ = c.imap(f1)(g1).imap(f2)(g2) // just to ensure there's some structure
+-        val h = cʹ.foldMap[Magma](FunctionK.id[Magma])
+-        cʹ.run.apply(s1, s2) === h.apply(s1, s2)
+-    }
+-  }
+-
+-}

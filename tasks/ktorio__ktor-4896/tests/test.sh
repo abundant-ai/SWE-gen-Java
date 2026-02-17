@@ -17,10 +17,10 @@ export GRADLE_OPTS="-Xms512m -Xmx1536m -XX:MaxMetaspaceSize=512m -Dorg.gradle.da
 # Clear Gradle caches to force it to see the updated test files
 rm -rf .gradle/configuration-cache 2>/dev/null || true
 rm -rf .gradle/*/kotlin 2>/dev/null || true
-rm -rf ktor-client/ktor-client-core/build 2>/dev/null || true
+rm -rf ktor-client-core/build 2>/dev/null || true
 
 # Run the specific tests
-./gradlew :ktor-client:ktor-client-core:jvmTest --tests "CachingCacheStorageTest" --tests "FileStorageTest" --no-daemon --no-configuration-cache 2>&1 | tee /tmp/test_output.txt
+./gradlew :ktor-client-core:jvmTest --tests "CachingCacheStorageTest" --tests "FileStorageTest" --no-daemon --no-configuration-cache 2>&1 | tee /tmp/test_output.txt
 test_status=${PIPESTATUS[0]}
 
 # Gradle might exit 0 even with test failures in some KMP setups

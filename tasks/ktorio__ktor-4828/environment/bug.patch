@@ -1,0 +1,118 @@
+diff --git a/ktor-server/ktor-server-cio/common/src/io/ktor/server/cio/CIOApplicationEngine.kt b/ktor-server/ktor-server-cio/common/src/io/ktor/server/cio/CIOApplicationEngine.kt
+index 452b8eb80..79ba9b2e2 100644
+--- a/ktor-server/ktor-server-cio/common/src/io/ktor/server/cio/CIOApplicationEngine.kt
++++ b/ktor-server/ktor-server-cio/common/src/io/ktor/server/cio/CIOApplicationEngine.kt
+@@ -224,12 +224,12 @@ public class CIOApplicationEngine(
+             // stopping
+             connectors.forEach {
+                 it.acceptJob.cancel()
++                it.rootServerJob.cancel()
+             }
+ 
+             withContext(userDispatcher) {
+                 monitor.raise(ApplicationStopPreparing, environment)
+             }
+-            connectors.map { it.rootServerJob }.joinAll()
+         }
+     }
+ }
+diff --git a/ktor-server/ktor-server-cio/common/src/io/ktor/server/cio/backend/HttpServer.kt b/ktor-server/ktor-server-cio/common/src/io/ktor/server/cio/backend/HttpServer.kt
+index 781746efc..8b0d4b36a 100644
+--- a/ktor-server/ktor-server-cio/common/src/io/ktor/server/cio/backend/HttpServer.kt
++++ b/ktor-server/ktor-server-cio/common/src/io/ktor/server/cio/backend/HttpServer.kt
+@@ -12,7 +12,7 @@ import io.ktor.server.engine.internal.*
+ import io.ktor.util.logging.*
+ import io.ktor.utils.io.*
+ import kotlinx.coroutines.*
+-import kotlinx.io.IOException
++import kotlinx.io.*
+ import kotlin.time.Duration.Companion.seconds
+ 
+ private val LOGGER = KtorSimpleLogger("io.ktor.server.cio.HttpServer")
+@@ -40,7 +40,6 @@ public fun CoroutineScope.httpServer(
+ 
+     val selector = SelectorManager(coroutineContext)
+     val timeout = settings.connectionIdleTimeoutSeconds.seconds
+-    val rootConnectionJob = SupervisorJob(serverJob)
+ 
+     val acceptJob = launch(serverJob + CoroutineName("accept-${settings.port}")) {
+         aSocket(selector).tcp().bind(settings.host, settings.port) {
+@@ -53,7 +52,7 @@ public fun CoroutineScope.httpServer(
+ 
+             val connectionScope = CoroutineScope(
+                 coroutineContext +
+-                    rootConnectionJob +
++                    SupervisorJob(serverJob) +
+                     exceptionHandler +
+                     CoroutineName("request")
+             )
+@@ -87,9 +86,8 @@ public fun CoroutineScope.httpServer(
+                 coroutineContext.cancel()
+             } finally {
+                 server.close()
+-                rootConnectionJob.complete()
+-                rootConnectionJob.join()
+                 server.awaitClosed()
++                connectionScope.coroutineContext.cancel()
+             }
+         }
+     }
+diff --git a/ktor-server/ktor-server-cio/common/test/io/ktor/tests/server/cio/CIOEngineTest.kt b/ktor-server/ktor-server-cio/common/test/io/ktor/tests/server/cio/CIOEngineTest.kt
+index 931db607b..e6a93f08d 100644
+--- a/ktor-server/ktor-server-cio/common/test/io/ktor/tests/server/cio/CIOEngineTest.kt
++++ b/ktor-server/ktor-server-cio/common/test/io/ktor/tests/server/cio/CIOEngineTest.kt
+@@ -4,7 +4,7 @@
+ 
+ package io.ktor.tests.server.cio
+ 
+-import io.ktor.client.request.*
++import io.ktor.client.request.header
+ import io.ktor.client.statement.*
+ import io.ktor.http.*
+ import io.ktor.http.content.*
+@@ -16,13 +16,7 @@ import io.ktor.server.response.*
+ import io.ktor.server.routing.*
+ import io.ktor.server.testing.suites.*
+ import io.ktor.utils.io.*
+-import kotlinx.coroutines.CompletableDeferred
+-import kotlinx.coroutines.delay
+-import kotlinx.coroutines.launch
+-import kotlin.test.Test
+-import kotlin.test.assertEquals
+-import kotlin.test.assertFalse
+-import kotlin.test.assertTrue
++import kotlin.test.*
+ 
+ class CIOHttpServerTest : HttpServerCommonTestSuite<CIOApplicationEngine, CIOApplicationEngine.Configuration>(CIO) {
+ 
+@@ -31,30 +25,6 @@ class CIOHttpServerTest : HttpServerCommonTestSuite<CIOApplicationEngine, CIOApp
+         enableSsl = false
+     }
+ 
+-    @Test
+-    fun testGracefulShutdown() = runTest {
+-        val server = createAndStartServer {
+-            get("/") {
+-                delay(100)
+-                call.respond("OK")
+-            }
+-        }
+-        val body = CompletableDeferred<String?>()
+-        launch {
+-            withUrl("/") {
+-                body.complete(bodyAsText())
+-            }
+-        }
+-        launch {
+-            delay(20)
+-            server.stopSuspend(
+-                gracePeriodMillis = 10_000,
+-                timeoutMillis = 20_000,
+-            )
+-        }
+-        assertEquals("OK", body.await())
+-    }
+-
+     @Test
+     fun testChunkedResponse() = runTest {
+         createAndStartServer {

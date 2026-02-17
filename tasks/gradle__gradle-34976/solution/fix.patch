@@ -1,0 +1,598 @@
+diff --git a/.teamcity/src/main/kotlin/model/CIBuildModel.kt b/.teamcity/src/main/kotlin/model/CIBuildModel.kt
+index dcccc68bb85..6809cee03c6 100644
+--- a/.teamcity/src/main/kotlin/model/CIBuildModel.kt
++++ b/.teamcity/src/main/kotlin/model/CIBuildModel.kt
+@@ -216,7 +216,6 @@ data class CIBuildModel(
+                 specificBuilds =
+                     listOf(
+                         SpecificBuild.TestPerformanceTest,
+-                        SpecificBuild.SantaTrackerSmokeTests,
+                     ),
+                 functionalTests =
+                     listOf(
+diff --git a/platforms/core-runtime/launcher/src/main/java/org/gradle/launcher/exec/BuildTreeLifecycleBuildActionExecutor.java b/platforms/core-runtime/launcher/src/main/java/org/gradle/launcher/exec/BuildTreeLifecycleBuildActionExecutor.java
+index 72007307af6..6de04bc8218 100644
+--- a/platforms/core-runtime/launcher/src/main/java/org/gradle/launcher/exec/BuildTreeLifecycleBuildActionExecutor.java
++++ b/platforms/core-runtime/launcher/src/main/java/org/gradle/launcher/exec/BuildTreeLifecycleBuildActionExecutor.java
+@@ -28,6 +28,7 @@
+ import org.gradle.internal.id.UniqueId;
+ import org.gradle.internal.invocation.BuildAction;
+ import org.gradle.internal.scopeids.id.BuildInvocationScopeId;
++import org.gradle.internal.service.ServiceRegistry;
+ import org.gradle.internal.session.BuildSessionActionExecutor;
+ import org.gradle.internal.session.BuildSessionContext;
+ import org.gradle.internal.snapshot.ValueSnapshotter;
+@@ -65,13 +66,7 @@ public BuildActionRunner.Result execute(BuildAction action, BuildSessionContext
+ 
+             BuildActionModelRequirements actionRequirements = buildActionModelRequirementsFor(action);
+             BuildTreeModelControllerServices.Supplier modelServices = buildTreeModelControllerServices.servicesForBuildTree(actionRequirements);
+-            BuildInvocationScopeId buildInvocationScopeId = new BuildInvocationScopeId(UniqueId.generate());
+-            BuildTreeState buildTree = new BuildTreeState(buildInvocationScopeId, buildSession.getServices(), modelServices);
+-            try {
+-                result = buildTree.run(context -> context.execute(action));
+-            } finally {
+-                buildTree.close();
+-            }
++            result = runRootBuildAction(action, buildSession.getServices(), modelServices);
+         } catch (Throwable t) {
+             if (result == null) {
+                 // Did not create a result
+@@ -88,6 +83,22 @@ public BuildActionRunner.Result execute(BuildAction action, BuildSessionContext
+         return result;
+     }
+ 
++    /**
++     * Creates a new build tree and runs the action on behalf of the root build in that tree.
++     * <p>
++     * The build tree and its services are disposed of before this method returns.
++     */
++    private static BuildActionRunner.Result runRootBuildAction(
++        BuildAction action,
++        ServiceRegistry buildSessionServices,
++        BuildTreeModelControllerServices.Supplier modelServices
++    ) {
++        BuildInvocationScopeId buildInvocationScopeId = new BuildInvocationScopeId(UniqueId.generate());
++        try (BuildTreeState buildTree = new BuildTreeState(buildInvocationScopeId, buildSessionServices, modelServices)) {
++            return buildTree.getServices().get(RootBuildLifecycleBuildActionExecutor.class).execute(action);
++        }
++    }
++
+     private BuildActionModelRequirements buildActionModelRequirementsFor(BuildAction action) {
+         if (action instanceof BuildModelAction && action.isCreateModel()) {
+             BuildModelAction buildModelAction = (BuildModelAction) action;
+diff --git a/platforms/core-runtime/launcher/src/main/java/org/gradle/launcher/exec/RootBuildLifecycleBuildActionExecutor.java b/platforms/core-runtime/launcher/src/main/java/org/gradle/launcher/exec/RootBuildLifecycleBuildActionExecutor.java
+index 089f63a2df3..cf2177e8087 100644
+--- a/platforms/core-runtime/launcher/src/main/java/org/gradle/launcher/exec/RootBuildLifecycleBuildActionExecutor.java
++++ b/platforms/core-runtime/launcher/src/main/java/org/gradle/launcher/exec/RootBuildLifecycleBuildActionExecutor.java
+@@ -16,34 +16,107 @@
+ 
+ package org.gradle.launcher.exec;
+ 
++import org.gradle.StartParameter;
+ import org.gradle.api.JavaVersion;
+ import org.gradle.api.internal.BuildDefinition;
++import org.gradle.api.logging.configuration.ShowStacktrace;
++import org.gradle.api.problems.internal.InternalProblems;
++import org.gradle.api.problems.internal.ProblemsProgressEventEmitterHolder;
+ import org.gradle.internal.build.BuildStateRegistry;
+ import org.gradle.internal.build.RootBuildState;
+ import org.gradle.internal.buildtree.BuildActionRunner;
+-import org.gradle.internal.buildtree.BuildTreeActionExecutor;
+-import org.gradle.internal.buildtree.BuildTreeContext;
++import org.gradle.internal.buildtree.BuildModelParameters;
++import org.gradle.internal.buildtree.BuildTreeLifecycleListener;
+ import org.gradle.internal.deprecation.DeprecationLogger;
++import org.gradle.internal.featurelifecycle.LoggingDeprecatedFeatureHandler;
+ import org.gradle.internal.invocation.BuildAction;
+ import org.gradle.internal.jvm.SupportedJavaVersions;
++import org.gradle.internal.operations.BuildOperationProgressEventEmitter;
++import org.gradle.internal.service.scopes.Scope;
++import org.gradle.internal.service.scopes.ServiceScope;
++import org.gradle.internal.work.ProjectParallelExecutionController;
++import org.gradle.problems.buildtree.ProblemStream;
+ import org.gradle.util.GradleVersion;
+ import org.gradle.util.internal.VersionNumber;
+ 
+-public class RootBuildLifecycleBuildActionExecutor implements BuildTreeActionExecutor {
++/**
++ * Prepares the build-tree services and runs the build action on behalf of the root build.
++ */
++@ServiceScope(Scope.BuildTree.class)
++public class RootBuildLifecycleBuildActionExecutor {
+ 
++    private final BuildModelParameters buildModelParameters;
++    private final ProjectParallelExecutionController projectParallelExecutionController;
++    private final BuildTreeLifecycleListener lifecycleListener;
++    private final InternalProblems problemsService;
++    private final BuildOperationProgressEventEmitter eventEmitter;
++    private final StartParameter startParameter;
++    private final ProblemStream problemsStream;
+     private final BuildActionRunner buildActionRunner;
+     private final BuildStateRegistry buildStateRegistry;
+ 
+-    public RootBuildLifecycleBuildActionExecutor(BuildStateRegistry buildStateRegistry,
+-                                                 BuildActionRunner buildActionRunner) {
++    private boolean executed;
++
++    public RootBuildLifecycleBuildActionExecutor(
++        BuildModelParameters buildModelParameters,
++        ProjectParallelExecutionController projectParallelExecutionController,
++        BuildTreeLifecycleListener lifecycleListener,
++        InternalProblems problemsService,
++        BuildOperationProgressEventEmitter eventEmitter,
++        StartParameter startParameter,
++        ProblemStream problemsStream,
++        BuildStateRegistry buildStateRegistry,
++        BuildActionRunner buildActionRunner
++    ) {
++        this.buildModelParameters = buildModelParameters;
++        this.projectParallelExecutionController = projectParallelExecutionController;
++        this.lifecycleListener = lifecycleListener;
++        this.problemsService = problemsService;
++        this.eventEmitter = eventEmitter;
++        this.startParameter = startParameter;
++        this.problemsStream = problemsStream;
+         this.buildActionRunner = buildActionRunner;
+         this.buildStateRegistry = buildStateRegistry;
+     }
+ 
+-    @Override
+-    public BuildActionRunner.Result execute(BuildAction action, BuildTreeContext buildTreeContext) {
++    /**
++     * Creates the root build state and executes the given action against it.
++     * <p>
++     * When this method returns, all user code will have been completed, including 'build finished' hooks.
++     */
++    public BuildActionRunner.Result execute(BuildAction action) {
++        if (executed) {
++            throw new IllegalStateException("Cannot execute a root build action more than once per build tree.");
++        }
++        executed = true;
++
++        projectParallelExecutionController.startProjectExecution(buildModelParameters.isParallelProjectExecution());
++        try {
++            lifecycleListener.afterStart();
++            try {
++                ProblemsProgressEventEmitterHolder.init(problemsService);
++                initDeprecationLogging();
++                maybeNagOnDeprecatedJavaRuntimeVersion();
++                RootBuildState rootBuild = buildStateRegistry.createRootBuild(BuildDefinition.fromStartParameter(action.getStartParameter(), null));
++                return rootBuild.run(buildController -> buildActionRunner.run(action, buildController));
++            } finally {
++                lifecycleListener.beforeStop();
++            }
++        } finally {
++            projectParallelExecutionController.finishProjectExecution();
++        }
++    }
++
++    private void initDeprecationLogging() {
++        ShowStacktrace showStacktrace = startParameter.getShowStacktrace();
++        LoggingDeprecatedFeatureHandler.setTraceLoggingEnabled(showStacktrace.equals(ShowStacktrace.ALWAYS) || showStacktrace.equals(ShowStacktrace.ALWAYS_FULL));
++        DeprecationLogger.init(startParameter.getWarningMode(), eventEmitter, problemsService, problemsStream);
++    }
++
++    private static void maybeNagOnDeprecatedJavaRuntimeVersion() {
+         int currentMajor = Integer.parseInt(JavaVersion.current().getMajorVersion());
+         if (currentMajor < SupportedJavaVersions.FUTURE_MINIMUM_DAEMON_JAVA_VERSION) {
++            // Note: this deprecation is unreachable while the future version is the same as MINIMUM_DAEMON_JAVA_VERSION, we keep it for ease of future upgrades
+             int currentMajorGradleVersion = VersionNumber.parse(GradleVersion.current().getVersion()).getMajor();
+             DeprecationLogger.deprecateAction(String.format("Executing Gradle on JVM versions %d and lower", SupportedJavaVersions.FUTURE_MINIMUM_DAEMON_JAVA_VERSION - 1))
+                 .withContext(String.format("Use JVM %d or greater to execute Gradle. Projects can continue to use older JVM versions via toolchains.", SupportedJavaVersions.FUTURE_MINIMUM_DAEMON_JAVA_VERSION))
+@@ -51,8 +124,5 @@ public BuildActionRunner.Result execute(BuildAction action, BuildTreeContext bui
+                 .withUpgradeGuideSection(currentMajorGradleVersion, "minimum_daemon_jvm_version")
+                 .nagUser();
+         }
+-
+-        RootBuildState rootBuild = buildStateRegistry.createRootBuild(BuildDefinition.fromStartParameter(action.getStartParameter(), null));
+-        return rootBuild.run(buildController -> buildActionRunner.run(action, buildController));
+     }
+ }
+diff --git a/platforms/core-runtime/launcher/src/main/java/org/gradle/tooling/internal/provider/LauncherServices.java b/platforms/core-runtime/launcher/src/main/java/org/gradle/tooling/internal/provider/LauncherServices.java
+index 2d892fe4218..d00d0a2917f 100644
+--- a/platforms/core-runtime/launcher/src/main/java/org/gradle/tooling/internal/provider/LauncherServices.java
++++ b/platforms/core-runtime/launcher/src/main/java/org/gradle/tooling/internal/provider/LauncherServices.java
+@@ -39,10 +39,9 @@
+ import org.gradle.internal.buildevents.BuildStartedTime;
+ import org.gradle.internal.buildoption.InternalOptions;
+ import org.gradle.internal.buildtree.BuildActionRunner;
+-import org.gradle.internal.buildtree.BuildTreeActionExecutor;
++import org.gradle.internal.buildtree.BuildModelParameters;
++import org.gradle.internal.buildtree.BuildTreeLifecycleListener;
+ import org.gradle.internal.buildtree.BuildTreeModelControllerServices;
+-import org.gradle.internal.buildtree.InitDeprecationLoggingActionExecutor;
+-import org.gradle.internal.buildtree.InitProblems;
+ import org.gradle.internal.buildtree.ProblemReportingBuildActionRunner;
+ import org.gradle.internal.concurrent.ExecutorFactory;
+ import org.gradle.internal.enterprise.core.GradleEnterprisePluginManager;
+@@ -71,6 +70,7 @@
+ import org.gradle.internal.time.Time;
+ import org.gradle.internal.watch.vfs.BuildLifecycleAwareVirtualFileSystem;
+ import org.gradle.internal.watch.vfs.FileChangeListeners;
++import org.gradle.internal.work.ProjectParallelExecutionController;
+ import org.gradle.internal.work.WorkerLeaseService;
+ import org.gradle.launcher.exec.BuildCompletionNotifyingBuildActionRunner;
+ import org.gradle.launcher.exec.BuildOutcomeReportingBuildActionRunner;
+@@ -201,7 +201,9 @@ ProblemStream createProblemStream(StartParameter parameter, ProblemDiagnosticsFa
+         }
+ 
+         @Provides
+-        BuildTreeActionExecutor createActionExecutor(
++        RootBuildLifecycleBuildActionExecutor createActionExecutor(
++            BuildModelParameters buildModelParameters,
++            ProjectParallelExecutionController projectParallelExecutionController,
+             List<BuildActionRunner> buildActionRunners,
+             StyledTextOutputFactory styledTextOutputFactory,
+             BuildStateRegistry buildStateRegistry,
+@@ -227,46 +229,44 @@ BuildTreeActionExecutor createActionExecutor(
+             ProblemStream problemStream,
+             ExceptionProblemRegistry registry
+         ) {
+-            return new InitProblems(
+-                new InitDeprecationLoggingActionExecutor(
+-                    eventEmitter,
+-                    startParameter,
+-                    problemsService,
+-                    problemStream,
+-                    new RootBuildLifecycleBuildActionExecutor(
+-                        buildStateRegistry,
+-                        new BuildCompletionNotifyingBuildActionRunner(
+-                            gradleEnterprisePluginManager,
++            return new RootBuildLifecycleBuildActionExecutor(
++                buildModelParameters,
++                projectParallelExecutionController,
++                listenerManager.getBroadcaster(BuildTreeLifecycleListener.class),
++                problemsService,
++                eventEmitter,
++                startParameter,
++                problemStream,
++                buildStateRegistry,
++                new BuildCompletionNotifyingBuildActionRunner(
++                    gradleEnterprisePluginManager,
++                    failureFactory,
++                    new FileSystemWatchingBuildActionRunner(
++                        eventEmitter,
++                        virtualFileSystem,
++                        deploymentRegistry,
++                        statStatisticsCollector,
++                        fileHasherStatisticsCollector,
++                        directorySnapshotterStatisticsCollector,
++                        buildOperationRunner,
++                        options,
++                        new BuildOutcomeReportingBuildActionRunner(
++                            styledTextOutputFactory,
++                            listenerManager,
++                            buildStartedTime,
++                            buildRequestMetaData,
++                            buildLoggerFactory,
+                             failureFactory,
+-                            new FileSystemWatchingBuildActionRunner(
+-                                eventEmitter,
+-                                virtualFileSystem,
+-                                deploymentRegistry,
+-                                statStatisticsCollector,
+-                                fileHasherStatisticsCollector,
+-                                directorySnapshotterStatisticsCollector,
+-                                buildOperationRunner,
+-                                options,
+-                                new BuildOutcomeReportingBuildActionRunner(
+-                                    styledTextOutputFactory,
+-                                    listenerManager,
+-                                    buildStartedTime,
+-                                    buildRequestMetaData,
+-                                    buildLoggerFactory,
+-                                    failureFactory,
+-                                    registry,
+-                                    new ProblemReportingBuildActionRunner(
+-                                        exceptionAnalyser,
+-                                        buildTreeLocations,
+-                                        problemReporters,
+-                                        new ChainingBuildActionRunner(buildActionRunners)
+-                                    )
+-                                )
++                            registry,
++                            new ProblemReportingBuildActionRunner(
++                                exceptionAnalyser,
++                                buildTreeLocations,
++                                problemReporters,
++                                new ChainingBuildActionRunner(buildActionRunners)
+                             )
+                         )
+                     )
+-                ),
+-                problemsService);
++                ));
+         }
+ 
+         @Provides
+diff --git a/subprojects/core/src/main/java/org/gradle/internal/buildtree/BuildTreeActionExecutor.java b/subprojects/core/src/main/java/org/gradle/internal/buildtree/BuildTreeActionExecutor.java
+deleted file mode 100644
+index 44bea13c262..00000000000
+--- a/subprojects/core/src/main/java/org/gradle/internal/buildtree/BuildTreeActionExecutor.java
++++ /dev/null
+@@ -1,33 +0,0 @@
+-/*
+- * Copyright 2021 the original author or authors.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-package org.gradle.internal.buildtree;
+-
+-import org.gradle.internal.invocation.BuildAction;
+-import org.gradle.internal.service.scopes.Scope;
+-import org.gradle.internal.service.scopes.ServiceScope;
+-
+-/**
+- * Responsible for running the given action against a build tree.
+- */
+-@ServiceScope(Scope.BuildTree.class)
+-public interface BuildTreeActionExecutor {
+-    /**
+-     * Runs the given action and returns the result. Failures should be packaged in the result.
+-     * When this method returns, all user code will have completed, including 'build finished' hooks.
+-     */
+-    BuildActionRunner.Result execute(BuildAction action, BuildTreeContext buildTreeContext);
+-}
+diff --git a/subprojects/core/src/main/java/org/gradle/internal/buildtree/BuildTreeContext.java b/subprojects/core/src/main/java/org/gradle/internal/buildtree/BuildTreeContext.java
+deleted file mode 100644
+index 24d88eb6372..00000000000
+--- a/subprojects/core/src/main/java/org/gradle/internal/buildtree/BuildTreeContext.java
++++ /dev/null
+@@ -1,27 +0,0 @@
+-/*
+- * Copyright 2020 the original author or authors.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-package org.gradle.internal.buildtree;
+-
+-import org.gradle.internal.invocation.BuildAction;
+-
+-public interface BuildTreeContext {
+-    /**
+-     * Runs the given action and returns the result. Failures should be packaged in the result.
+-     * When this method returns, all user code will have completed, including 'build finished' hooks.
+-     */
+-    BuildActionRunner.Result execute(BuildAction action);
+-}
+diff --git a/subprojects/core/src/main/java/org/gradle/internal/buildtree/BuildTreeState.java b/subprojects/core/src/main/java/org/gradle/internal/buildtree/BuildTreeState.java
+index e0c19904a3f..0e9e93ee0ef 100644
+--- a/subprojects/core/src/main/java/org/gradle/internal/buildtree/BuildTreeState.java
++++ b/subprojects/core/src/main/java/org/gradle/internal/buildtree/BuildTreeState.java
+@@ -22,10 +22,8 @@
+ import org.gradle.internal.service.ServiceRegistryBuilder;
+ import org.gradle.internal.service.scopes.Scope;
+ import org.gradle.internal.service.scopes.ServiceScope;
+-import org.gradle.internal.work.ProjectParallelExecutionController;
+ 
+ import java.io.Closeable;
+-import java.util.function.Function;
+ 
+ /**
+  * Encapsulates the state for a particular build tree.
+@@ -33,7 +31,6 @@
+ @ServiceScope(Scope.BuildTree.class)
+ public class BuildTreeState implements Closeable {
+     private final ServiceRegistry services;
+-    private final DefaultBuildTreeContext context;
+ 
+     public BuildTreeState(BuildInvocationScopeId buildInvocationScopeId, ServiceRegistry parent, BuildTreeModelControllerServices.Supplier modelServices) {
+         services = ServiceRegistryBuilder.builder()
+@@ -42,27 +39,12 @@ public BuildTreeState(BuildInvocationScopeId buildInvocationScopeId, ServiceRegi
+             .parent(parent)
+             .provider(new BuildTreeScopeServices(buildInvocationScopeId, this, modelServices))
+             .build();
+-        context = new DefaultBuildTreeContext(services);
+     }
+ 
+     public ServiceRegistry getServices() {
+         return services;
+     }
+ 
+-    /**
+-     * Runs the given action against the state of this build tree.
+-     */
+-    public <T> T run(Function<? super BuildTreeContext, T> action) {
+-        BuildModelParameters modelParameters = services.get(BuildModelParameters.class);
+-        ProjectParallelExecutionController parallelExecutionController = services.get(ProjectParallelExecutionController.class);
+-        parallelExecutionController.startProjectExecution(modelParameters.isParallelProjectExecution());
+-        try {
+-            return action.apply(context);
+-        } finally {
+-            parallelExecutionController.finishProjectExecution();
+-        }
+-    }
+-
+     @Override
+     public void close() {
+         CompositeStoppable.stoppable(services).stop();
+diff --git a/subprojects/core/src/main/java/org/gradle/internal/buildtree/DefaultBuildTreeContext.java b/subprojects/core/src/main/java/org/gradle/internal/buildtree/DefaultBuildTreeContext.java
+deleted file mode 100644
+index e457970414d..00000000000
+--- a/subprojects/core/src/main/java/org/gradle/internal/buildtree/DefaultBuildTreeContext.java
++++ /dev/null
+@@ -1,48 +0,0 @@
+-/*
+- * Copyright 2021 the original author or authors.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-package org.gradle.internal.buildtree;
+-
+-import org.gradle.internal.event.ListenerManager;
+-import org.gradle.internal.invocation.BuildAction;
+-import org.gradle.internal.service.ServiceRegistry;
+-
+-class DefaultBuildTreeContext implements BuildTreeContext {
+-    private final ServiceRegistry services;
+-    private boolean completed;
+-
+-    public DefaultBuildTreeContext(ServiceRegistry services) {
+-        this.services = services;
+-    }
+-
+-    @Override
+-    public BuildActionRunner.Result execute(BuildAction action) {
+-        if (completed) {
+-            throw new IllegalStateException("Cannot run more than one action for a build tree.");
+-        }
+-        try {
+-            BuildTreeLifecycleListener broadcaster = services.get(ListenerManager.class).getBroadcaster(BuildTreeLifecycleListener.class);
+-            broadcaster.afterStart();
+-            try {
+-                return services.get(BuildTreeActionExecutor.class).execute(action, this);
+-            } finally {
+-                broadcaster.beforeStop();
+-            }
+-        } finally {
+-            completed = true;
+-        }
+-    }
+-}
+diff --git a/subprojects/core/src/main/java/org/gradle/internal/buildtree/InitDeprecationLoggingActionExecutor.java b/subprojects/core/src/main/java/org/gradle/internal/buildtree/InitDeprecationLoggingActionExecutor.java
+deleted file mode 100644
+index 2d1d54fe9ad..00000000000
+--- a/subprojects/core/src/main/java/org/gradle/internal/buildtree/InitDeprecationLoggingActionExecutor.java
++++ /dev/null
+@@ -1,64 +0,0 @@
+-/*
+- * Copyright 2022 the original author or authors.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-package org.gradle.internal.buildtree;
+-
+-import org.gradle.StartParameter;
+-import org.gradle.api.logging.configuration.ShowStacktrace;
+-import org.gradle.api.problems.Problems;
+-import org.gradle.internal.deprecation.DeprecationLogger;
+-import org.gradle.internal.featurelifecycle.LoggingDeprecatedFeatureHandler;
+-import org.gradle.internal.invocation.BuildAction;
+-import org.gradle.internal.operations.BuildOperationProgressEventEmitter;
+-import org.gradle.problems.buildtree.ProblemStream;
+-
+-public class InitDeprecationLoggingActionExecutor implements BuildTreeActionExecutor {
+-    private final BuildTreeActionExecutor delegate;
+-    private final BuildOperationProgressEventEmitter eventEmitter;
+-    private final StartParameter startParameter;
+-    private final Problems problemsService;
+-    private final ProblemStream problemsStream;
+-
+-    public InitDeprecationLoggingActionExecutor(
+-        BuildOperationProgressEventEmitter eventEmitter,
+-        StartParameter startParameter,
+-        Problems problemsService,
+-        ProblemStream problemsStream,
+-        BuildTreeActionExecutor delegate
+-    ) {
+-        this.delegate = delegate;
+-        this.eventEmitter = eventEmitter;
+-        this.startParameter = startParameter;
+-        this.problemsService = problemsService;
+-        this.problemsStream = problemsStream;
+-    }
+-
+-    @Override
+-    public BuildActionRunner.Result execute(BuildAction action, BuildTreeContext buildTreeContext) {
+-        ShowStacktrace showStacktrace = startParameter.getShowStacktrace();
+-        switch (showStacktrace) {
+-            case ALWAYS:
+-            case ALWAYS_FULL:
+-                LoggingDeprecatedFeatureHandler.setTraceLoggingEnabled(true);
+-                break;
+-            default:
+-                LoggingDeprecatedFeatureHandler.setTraceLoggingEnabled(false);
+-        }
+-
+-        DeprecationLogger.init(startParameter.getWarningMode(), eventEmitter, problemsService, problemsStream);
+-        return delegate.execute(action, buildTreeContext);
+-    }
+-}
+diff --git a/subprojects/core/src/main/java/org/gradle/internal/buildtree/InitProblems.java b/subprojects/core/src/main/java/org/gradle/internal/buildtree/InitProblems.java
+deleted file mode 100644
+index bb834507cab..00000000000
+--- a/subprojects/core/src/main/java/org/gradle/internal/buildtree/InitProblems.java
++++ /dev/null
+@@ -1,38 +0,0 @@
+-/*
+- * Copyright 2023 the original author or authors.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-package org.gradle.internal.buildtree;
+-
+-import org.gradle.api.problems.internal.InternalProblems;
+-import org.gradle.api.problems.internal.ProblemsProgressEventEmitterHolder;
+-import org.gradle.internal.invocation.BuildAction;
+-
+-public class InitProblems implements BuildTreeActionExecutor  {
+-
+-    private final BuildTreeActionExecutor delegate;
+-    private final InternalProblems problemsService;
+-
+-    public InitProblems(BuildTreeActionExecutor delegate, InternalProblems problemsService) {
+-        this.delegate = delegate;
+-        this.problemsService = problemsService;
+-    }
+-
+-    @Override
+-    public BuildActionRunner.Result execute(BuildAction action, BuildTreeContext buildTreeContext) {
+-        ProblemsProgressEventEmitterHolder.init(problemsService);
+-        return delegate.execute(action, buildTreeContext);
+-    }
+-}

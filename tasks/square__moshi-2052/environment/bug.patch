@@ -1,0 +1,608 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 34d33bac..abeaa031 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -6,10 +6,7 @@ Change Log
+ * Refuse `j$.*` types from Android library desugaring as platform types.
+ * In-development snapshots are now published to the Central Portal Snapshots repository at https://central.sonatype.com/repository/maven-snapshots/.
+ * Fully supports encoding/decoding of value classes in both moshi-kotlin and code gen.
+-  * Note that Moshi does not propagate inlining to JSON by default. For example: `@JvmInline value class Color(val raw: Int)` is serialized to `{"raw": 12345}`.
+-* New `@JsonClass.inline` property to allow inlining single-property JSON classes during encoding/decoding.
+-  * This is particularly useful for value classes.
+-  * For example, a class `@JvmInline value class UserId(val id: Int)` with `inline = true` will serialize as just `123` rather than `{"id": 123}`.
++  * Note that Moshi does not propagate inlining to JSON. For example: `@JvmInline value class Color(val raw: Int)` is serialized to `{"raw": 12345}`.
+ 
+ ## Upgrading to Moshi 2.x
+ 
+diff --git a/moshi-kotlin-codegen/src/main/java/com/squareup/moshi/kotlin/codegen/api/AdapterGenerator.kt b/moshi-kotlin-codegen/src/main/java/com/squareup/moshi/kotlin/codegen/api/AdapterGenerator.kt
+index 852588e6..a86fd02e 100644
+--- a/moshi-kotlin-codegen/src/main/java/com/squareup/moshi/kotlin/codegen/api/AdapterGenerator.kt
++++ b/moshi-kotlin-codegen/src/main/java/com/squareup/moshi/kotlin/codegen/api/AdapterGenerator.kt
+@@ -101,7 +101,7 @@ public class AdapterGenerator(
+     }
+   }
+ 
+-  private val nonTransientProperties = propertyList.filterNot { it.isIgnored }
++  private val nonTransientProperties = propertyList.filterNot { it.isTransient }
+   private val className = target.typeName.rawType()
+   private val visibility = target.visibility
+   private val typeVariables = target.typeVariables
+@@ -283,11 +283,7 @@ public class AdapterGenerator(
+       }
+     }
+ 
+-    // For inline types, we don't need the options property since we read the value directly
+-    if (!target.isInline) {
+-      result.addProperty(optionsProperty)
+-    }
+-
++    result.addProperty(optionsProperty)
+     for (uniqueAdapter in nonTransientProperties.distinctBy { it.delegateKey }) {
+       result.addProperty(
+         uniqueAdapter.delegateKey.generateProperty(
+@@ -300,8 +296,8 @@ public class AdapterGenerator(
+     }
+ 
+     result.addFunction(generateToStringFun())
+-    result.addFunction(generateFromJsonFun(target.isInline, result))
+-    result.addFunction(generateToJson(target.isInline))
++    result.addFunction(generateFromJsonFun(result))
++    result.addFunction(generateToJsonFun())
+ 
+     return result.build()
+   }
+@@ -334,23 +330,12 @@ public class AdapterGenerator(
+       .build()
+   }
+ 
+-  private fun generateFromJsonFun(isInline: Boolean, classBuilder: TypeSpec.Builder): FunSpec {
++  private fun generateFromJsonFun(classBuilder: TypeSpec.Builder): FunSpec {
+     val result = FunSpec.builder("fromJson")
+       .addModifiers(KModifier.OVERRIDE)
+       .addParameter(readerParam)
+       .returns(originalTypeName)
+ 
+-    return if (isInline) {
+-      generateFromJsonInline(result)
+-    } else {
+-      generateFromJsonRegular(classBuilder, result)
+-    }
+-  }
+-
+-  private fun generateFromJsonRegular(
+-    classBuilder: TypeSpec.Builder,
+-    result: FunSpec.Builder,
+-  ): FunSpec {
+     for (property in nonTransientProperties) {
+       result.addCode("%L", property.generateLocalProperty())
+       if (property.hasLocalIsPresentName) {
+@@ -378,7 +363,7 @@ public class AdapterGenerator(
+       if (property.target.parameterIndex in targetConstructorParams) {
+         continue // Already handled
+       }
+-      if (property.isIgnored) {
++      if (property.isTransient) {
+         continue // We don't care about these outside of constructor parameters
+       }
+       components += PropertyOnly(property)
+@@ -436,12 +421,12 @@ public class AdapterGenerator(
+ 
+     for (input in components) {
+       if (input is ParameterOnly ||
+-        (input is ParameterProperty && input.property.isIgnored)
++        (input is ParameterProperty && input.property.isTransient)
+       ) {
+         updateMaskIndexes()
+         constructorPropertyTypes += input.type.asTypeBlock()
+         continue
+-      } else if (input is PropertyOnly && input.property.isIgnored) {
++      } else if (input is PropertyOnly && input.property.isTransient) {
+         continue
+       }
+ 
+@@ -581,7 +566,7 @@ public class AdapterGenerator(
+         result.addCode("«%L·%T(", returnOrResultAssignment, originalTypeName)
+         var localSeparator = "\n"
+         val paramsToSet = components.filterIsInstance<ParameterProperty>()
+-          .filterNot { it.property.isIgnored }
++          .filterNot { it.property.isTransient }
+ 
+         // Set all non-transient property parameters
+         for (input in paramsToSet) {
+@@ -652,7 +637,7 @@ public class AdapterGenerator(
+     for (input in components.filterIsInstance<ParameterComponent>()) {
+       result.addCode(separator)
+       if (useDefaultsConstructor) {
+-        if (input is ParameterOnly || (input is ParameterProperty && input.property.isIgnored)) {
++        if (input is ParameterOnly || (input is ParameterProperty && input.property.isTransient)) {
+           // We have to use the default primitive for the available type in order for
+           // invokeDefaultConstructor to properly invoke it. Just using "null" isn't safe because
+           // the transient type may be a primitive type.
+@@ -671,7 +656,7 @@ public class AdapterGenerator(
+       }
+       if (input is PropertyComponent) {
+         val property = input.property
+-        if (!property.isIgnored && property.isRequired) {
++        if (!property.isTransient && property.isRequired) {
+           result.addMissingPropertyCheck(property, readerParam)
+         }
+       }
+@@ -733,33 +718,25 @@ public class AdapterGenerator(
+     )
+   }
+ 
+-  private fun generateToJson(isInline: Boolean): FunSpec {
+-    val builder = FunSpec.builder("toJson")
++  private fun generateToJsonFun(): FunSpec {
++    val result = FunSpec.builder("toJson")
+       .addModifiers(KModifier.OVERRIDE)
+       .addParameter(writerParam)
+       .addParameter(valueParam)
+ 
+-    return if (isInline) {
+-      generateToJsonInline(builder)
+-    } else {
+-      generateToJsonRegular(builder)
+-    }
+-  }
+-
+-  private fun generateToJsonRegular(builder: FunSpec.Builder): FunSpec {
+-    builder.beginControlFlow("if (%N == null)", valueParam)
+-    builder.addStatement(
++    result.beginControlFlow("if (%N == null)", valueParam)
++    result.addStatement(
+       "throw·%T(%S)",
+       NullPointerException::class,
+       "${valueParam.name} was null! Wrap in .nullSafe() to write nullable values.",
+     )
+-    builder.endControlFlow()
++    result.endControlFlow()
+ 
+-    builder.addStatement("%N.beginObject()", writerParam)
++    result.addStatement("%N.beginObject()", writerParam)
+     nonTransientProperties.forEach { property ->
+       // We manually put in quotes because we know the jsonName is already escaped
+-      builder.addStatement("%N.name(%S)", writerParam, property.jsonName)
+-      builder.addStatement(
++      result.addStatement("%N.name(%S)", writerParam, property.jsonName)
++      result.addStatement(
+         "%N.toJson(%N, %N.%N)",
+         nameAllocator[property.delegateKey],
+         writerParam,
+@@ -767,58 +744,9 @@ public class AdapterGenerator(
+         property.name,
+       )
+     }
+-    builder.addStatement("%N.endObject()", writerParam)
+-
+-    return builder.build()
+-  }
+-
+-  /** Generates a fromJson function for inline types that reads the value directly. */
+-  private fun generateFromJsonInline(builder: FunSpec.Builder): FunSpec {
+-    val property = nonTransientProperties.single()
+-
+-    // Read the value directly
+-    if (property.delegateKey.nullable) {
+-      builder.addStatement(
+-        "val %N = %N.fromJson(%N)",
+-        property.localName,
+-        nameAllocator[property.delegateKey],
+-        readerParam,
+-      )
+-    } else {
+-      val exception = unexpectedNull(property, readerParam)
+-      builder.addStatement(
+-        "val %N = %N.fromJson(%N) ?: throw·%L",
+-        property.localName,
+-        nameAllocator[property.delegateKey],
+-        readerParam,
+-        exception,
+-      )
+-    }
+-    builder.addStatement("return %T(%N = %N)", originalTypeName, property.name, property.localName)
+-
+-    return builder.build()
+-  }
++    result.addStatement("%N.endObject()", writerParam)
+ 
+-  /** Generates a toJson function for inline types that writes the value directly. */
+-  private fun generateToJsonInline(builder: FunSpec.Builder): FunSpec {
+-    builder.beginControlFlow("if (%N == null)", valueParam)
+-    builder.addStatement(
+-      "throw·%T(%S)",
+-      NullPointerException::class,
+-      "${valueParam.name} was null! Wrap in .nullSafe() to write nullable values.",
+-    )
+-    builder.endControlFlow()
+-
+-    val property = nonTransientProperties.single()
+-    builder.addStatement(
+-      "%N.toJson(%N, %N.%N)",
+-      nameAllocator[property.delegateKey],
+-      writerParam,
+-      valueParam,
+-      property.name,
+-    )
+-
+-    return builder.build()
++    return result.build()
+   }
+ }
+ 
+diff --git a/moshi-kotlin-codegen/src/main/java/com/squareup/moshi/kotlin/codegen/api/PropertyGenerator.kt b/moshi-kotlin-codegen/src/main/java/com/squareup/moshi/kotlin/codegen/api/PropertyGenerator.kt
+index b00468ee..77437692 100644
+--- a/moshi-kotlin-codegen/src/main/java/com/squareup/moshi/kotlin/codegen/api/PropertyGenerator.kt
++++ b/moshi-kotlin-codegen/src/main/java/com/squareup/moshi/kotlin/codegen/api/PropertyGenerator.kt
+@@ -24,7 +24,7 @@ import com.squareup.kotlinpoet.PropertySpec
+ public class PropertyGenerator(
+   public val target: TargetProperty,
+   public val delegateKey: DelegateKey,
+-  public val isIgnored: Boolean = false,
++  public val isTransient: Boolean = false,
+ ) {
+   public val name: String = target.name
+   public val jsonName: String = target.jsonName ?: target.name
+@@ -48,7 +48,7 @@ public class PropertyGenerator(
+    * to an absent value
+    */
+   public val hasLocalIsPresentName: Boolean =
+-    !isIgnored && hasDefault && !hasConstructorParameter && delegateKey.nullable
++    !isTransient && hasDefault && !hasConstructorParameter && delegateKey.nullable
+   public val hasConstructorDefault: Boolean = hasDefault && hasConstructorParameter
+ 
+   internal fun allocateNames(nameAllocator: NameAllocator) {
+diff --git a/moshi-kotlin-codegen/src/main/java/com/squareup/moshi/kotlin/codegen/api/TargetType.kt b/moshi-kotlin-codegen/src/main/java/com/squareup/moshi/kotlin/codegen/api/TargetType.kt
+index a1fc28c9..760c3ae4 100644
+--- a/moshi-kotlin-codegen/src/main/java/com/squareup/moshi/kotlin/codegen/api/TargetType.kt
++++ b/moshi-kotlin-codegen/src/main/java/com/squareup/moshi/kotlin/codegen/api/TargetType.kt
+@@ -29,7 +29,6 @@ public data class TargetType(
+   val isDataClass: Boolean,
+   val visibility: KModifier,
+   val isValueClass: Boolean,
+-  val isInline: Boolean = false,
+ ) {
+ 
+   init {
+diff --git a/moshi-kotlin-codegen/src/main/java/com/squareup/moshi/kotlin/codegen/ksp/JsonClassSymbolProcessorProvider.kt b/moshi-kotlin-codegen/src/main/java/com/squareup/moshi/kotlin/codegen/ksp/JsonClassSymbolProcessorProvider.kt
+index 5bbe934c..92ffb316 100644
+--- a/moshi-kotlin-codegen/src/main/java/com/squareup/moshi/kotlin/codegen/ksp/JsonClassSymbolProcessorProvider.kt
++++ b/moshi-kotlin-codegen/src/main/java/com/squareup/moshi/kotlin/codegen/ksp/JsonClassSymbolProcessorProvider.kt
+@@ -86,12 +86,9 @@ private class JsonClassSymbolProcessor(environment: SymbolProcessorEnvironment)
+ 
+       if (!jsonClassAnnotation.generateAdapter) continue
+ 
+-      val isInline = jsonClassAnnotation.inline
+-
+       try {
+         val originatingFile = type.containingFile!!
+-        val adapterGenerator =
+-          adapterGenerator(logger, resolver, type, isInline) ?: return emptyList()
++        val adapterGenerator = adapterGenerator(logger, resolver, type) ?: return emptyList()
+         val preparedAdapter = adapterGenerator
+           .prepare(generateProguardRules) { spec ->
+             spec.toBuilder()
+@@ -116,9 +113,8 @@ private class JsonClassSymbolProcessor(environment: SymbolProcessorEnvironment)
+     logger: KSPLogger,
+     resolver: Resolver,
+     originalType: KSDeclaration,
+-    isInline: Boolean,
+   ): AdapterGenerator? {
+-    val type = targetType(originalType, resolver, logger, isInline) ?: return null
++    val type = targetType(originalType, resolver, logger) ?: return null
+ 
+     val properties = mutableMapOf<String, PropertyGenerator>()
+     for (property in type.properties.values) {
+@@ -128,30 +124,6 @@ private class JsonClassSymbolProcessor(environment: SymbolProcessorEnvironment)
+       }
+     }
+ 
+-    // Validate inline types have exactly one non-transient property that is not nullable
+-    if (isInline) {
+-      val nonIgnoredBindings = properties.values
+-        .filterNot { it.isIgnored }
+-      if (nonIgnoredBindings.size != 1) {
+-        logger.error(
+-          "@JsonClass with inline = true requires exactly one non-transient property, " +
+-            "but ${originalType.simpleName.asString()} has ${nonIgnoredBindings.size}: " +
+-            "${nonIgnoredBindings.joinToString { it.name }}.",
+-          originalType,
+-        )
+-        return null
+-      }
+-      val inlineProperty = nonIgnoredBindings[0]
+-      if (inlineProperty.delegateKey.nullable) {
+-        logger.error(
+-          "@JsonClass with inline = true requires a non-nullable property, " +
+-            "but ${originalType.simpleName.asString()}.${inlineProperty.name} is nullable.",
+-          originalType,
+-        )
+-        return null
+-      }
+-    }
+-
+     for ((name, parameter) in type.constructor.parameters) {
+       if (type.properties[parameter.name] == null && !parameter.hasDefault) {
+         // TODO would be nice if we could pass the parameter node directly?
+diff --git a/moshi-kotlin-codegen/src/main/java/com/squareup/moshi/kotlin/codegen/ksp/TargetTypes.kt b/moshi-kotlin-codegen/src/main/java/com/squareup/moshi/kotlin/codegen/ksp/TargetTypes.kt
+index 3b3c48a3..f5579089 100644
+--- a/moshi-kotlin-codegen/src/main/java/com/squareup/moshi/kotlin/codegen/ksp/TargetTypes.kt
++++ b/moshi-kotlin-codegen/src/main/java/com/squareup/moshi/kotlin/codegen/ksp/TargetTypes.kt
+@@ -56,12 +56,7 @@ import com.squareup.moshi.kotlin.codegen.api.TargetType
+ import com.squareup.moshi.kotlin.codegen.api.unwrapTypeAlias
+ 
+ /** Returns a target type for [type] or null if it cannot be used with code gen. */
+-internal fun targetType(
+-  type: KSDeclaration,
+-  resolver: Resolver,
+-  logger: KSPLogger,
+-  isInline: Boolean = false,
+-): TargetType? {
++internal fun targetType(type: KSDeclaration, resolver: Resolver, logger: KSPLogger): TargetType? {
+   if (type !is KSClassDeclaration) {
+     logger.error(
+       "@JsonClass can't be applied to ${type.qualifiedName?.asString()}: must be a Kotlin class",
+@@ -162,7 +157,6 @@ internal fun targetType(
+     isDataClass = Modifier.DATA in type.modifiers,
+     visibility = resolvedVisibility,
+     isValueClass = Modifier.VALUE in type.modifiers,
+-    isInline = isInline,
+   )
+ }
+ 
+diff --git a/moshi-kotlin-codegen/src/test/java/com/squareup/moshi/kotlin/codegen/ksp/JsonClassSymbolProcessorTest.kt b/moshi-kotlin-codegen/src/test/java/com/squareup/moshi/kotlin/codegen/ksp/JsonClassSymbolProcessorTest.kt
+index d32f65fd..13f53433 100644
+--- a/moshi-kotlin-codegen/src/test/java/com/squareup/moshi/kotlin/codegen/ksp/JsonClassSymbolProcessorTest.kt
++++ b/moshi-kotlin-codegen/src/test/java/com/squareup/moshi/kotlin/codegen/ksp/JsonClassSymbolProcessorTest.kt
+@@ -567,48 +567,6 @@ class JsonClassSymbolProcessorTest {
+     assertThat(result.messages).contains("Error preparing ElementEnvelope")
+   }
+ 
+-  @Test
+-  fun inlineClassWithMultiplePropertiesFails() {
+-    val result = compile(
+-      kotlin(
+-        "source.kt",
+-        """
+-          package test
+-          import com.squareup.moshi.JsonClass
+-
+-          @JsonClass(generateAdapter = true, inline = true)
+-          class MultipleProperties(val a: Int, val b: Int)
+-          """,
+-      ),
+-    )
+-    assertThat(result.exitCode).isEqualTo(KotlinCompilation.ExitCode.COMPILATION_ERROR)
+-    assertThat(result.messages).contains(
+-      "@JsonClass with inline = true requires exactly one non-transient property, but " +
+-        "MultipleProperties has 2: a, b.",
+-    )
+-  }
+-
+-  @Test
+-  fun inlineClassWithNullablePropertyFails() {
+-    val result = compile(
+-      kotlin(
+-        "source.kt",
+-        """
+-          package test
+-          import com.squareup.moshi.JsonClass
+-
+-          @JsonClass(generateAdapter = true, inline = true)
+-          class NullableProperty(val a: Int?)
+-          """,
+-      ),
+-    )
+-    assertThat(result.exitCode).isEqualTo(KotlinCompilation.ExitCode.COMPILATION_ERROR)
+-    assertThat(result.messages).contains(
+-      "@JsonClass with inline = true requires a non-nullable property, " +
+-        "but NullableProperty.a is nullable.",
+-    )
+-  }
+-
+   @Test
+   fun `TypeAliases with the same backing type should share the same adapter`() {
+     val result = compile(
+diff --git a/moshi-kotlin-tests/src/test/kotlin/com/squareup/moshi/kotlin/DualKotlinTest.kt b/moshi-kotlin-tests/src/test/kotlin/com/squareup/moshi/kotlin/DualKotlinTest.kt
+index edefd789..71136d31 100644
+--- a/moshi-kotlin-tests/src/test/kotlin/com/squareup/moshi/kotlin/DualKotlinTest.kt
++++ b/moshi-kotlin-tests/src/test/kotlin/com/squareup/moshi/kotlin/DualKotlinTest.kt
+@@ -795,38 +795,6 @@ class DualKotlinTest {
+     @NestedEnum
+     val value: String,
+   )
+-
+-  @Test fun inlineClass() {
+-    val adapter = moshi.adapter<InlineValueClass>()
+-
+-    // Test encoding - should output raw value, not wrapped in object
+-    val instance = InlineValueClass(42)
+-    assertThat(adapter.toJson(instance)).isEqualTo("42")
+-
+-    // Test decoding from raw value
+-    val decoded = adapter.fromJson("123")
+-    assertThat(decoded.value).isEqualTo(123)
+-  }
+-
+-  @Test fun inlineClassNullSafe() {
+-    val adapter = moshi.adapter<InlineValueClass?>()
+-
+-    // The adapter is wrapped with nullSafe(), so null JSON returns a null object
+-    assertThat(adapter.fromJson("null")).isNull()
+-    assertThat(adapter.toJson(null)).isEqualTo("null")
+-  }
+-
+-  @Test fun delegateClassWithMultiplePropertiesAreFine() {
+-    val adapter = moshi.adapter<List<Location>>()
+-    val location = adapter.fromJson("[{\"x\":3,\"y\":\"5\"}]")
+-    assertThat(location).isEqualTo(listOf(Location(Point(3, 5))))
+-  }
+-
+-  @JsonClass(generateAdapter = true, inline = true)
+-  data class Location(val point: Point)
+-
+-  @JsonClass(generateAdapter = true)
+-  data class Point(val x: Int, val y: Int)
+ }
+ 
+ typealias TypeAlias = Int
+@@ -842,11 +810,6 @@ data class GenericClass<T>(val value: T)
+ @JsonClass(generateAdapter = true)
+ value class ValueClass(val i: Int = 0)
+ 
+-// Inline value classes for testing @JsonClass(inline = true)
+-@JvmInline
+-@JsonClass(generateAdapter = true, inline = true)
+-value class InlineValueClass(val value: Int)
+-
+ typealias A = Int
+ typealias NullableA = A?
+ typealias B = NullableA
+diff --git a/moshi-kotlin-tests/src/test/kotlin/com/squareup/moshi/kotlin/reflect/KotlinJsonAdapterTest.kt b/moshi-kotlin-tests/src/test/kotlin/com/squareup/moshi/kotlin/reflect/KotlinJsonAdapterTest.kt
+index f21cbf89..f3f2e4f4 100644
+--- a/moshi-kotlin-tests/src/test/kotlin/com/squareup/moshi/kotlin/reflect/KotlinJsonAdapterTest.kt
++++ b/moshi-kotlin-tests/src/test/kotlin/com/squareup/moshi/kotlin/reflect/KotlinJsonAdapterTest.kt
+@@ -1052,46 +1052,6 @@ class KotlinJsonAdapterTest {
+ 
+   sealed class SealedClass
+ 
+-  @Test fun inlineClassWithMultiplePropertiesFails() {
+-    val moshi = Moshi.Builder()
+-      .add(KotlinJsonAdapterFactory())
+-      .build()
+-
+-    try {
+-      moshi.adapter<InlineWithMultipleProperties>()
+-      fail()
+-    } catch (e: IllegalArgumentException) {
+-      assertThat(e).hasMessageThat().isEqualTo(
+-        "@JsonClass with inline = true requires exactly one non-transient property, " +
+-          "but " +
+-          "com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterTest.InlineWithMultipleProperties " +
+-          "has 2: a, b.",
+-      )
+-    }
+-  }
+-
+-  @JsonClass(generateAdapter = false, inline = true)
+-  class InlineWithMultipleProperties(val a: Int, val b: Int)
+-
+-  @Test fun inlineClassWithNullablePropertyFails() {
+-    val moshi = Moshi.Builder()
+-      .add(KotlinJsonAdapterFactory())
+-      .build()
+-
+-    try {
+-      moshi.adapter<InlineWithNullableProperty>()
+-      fail()
+-    } catch (e: IllegalArgumentException) {
+-      assertThat(e).hasMessageThat().isEqualTo(
+-        "@JsonClass with inline = true requires a non-nullable property, " +
+-          "but com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterTest.InlineWithNullableProperty.a is nullable.",
+-      )
+-    }
+-  }
+-
+-  @JsonClass(generateAdapter = false, inline = true)
+-  class InlineWithNullableProperty(val a: Int?)
+-
+   private fun <T> mapWildcardsParameterizedTest(type: Class<T>, json: String, value: T) {
+     // Ensure the map was created with the expected wildcards of a Kotlin map.
+     val fieldType = type.getDeclaredField("map").genericType
+diff --git a/moshi-kotlin/src/main/java/com/squareup/moshi/kotlin/reflect/KotlinJsonAdapterFactory.kt b/moshi-kotlin/src/main/java/com/squareup/moshi/kotlin/reflect/KotlinJsonAdapterFactory.kt
+index d2d905fc..0dff3ca0 100644
+--- a/moshi-kotlin/src/main/java/com/squareup/moshi/kotlin/reflect/KotlinJsonAdapterFactory.kt
++++ b/moshi-kotlin/src/main/java/com/squareup/moshi/kotlin/reflect/KotlinJsonAdapterFactory.kt
+@@ -17,7 +17,6 @@ package com.squareup.moshi.kotlin.reflect
+ 
+ import com.squareup.moshi.Json
+ import com.squareup.moshi.JsonAdapter
+-import com.squareup.moshi.JsonClass
+ import com.squareup.moshi.JsonDataException
+ import com.squareup.moshi.JsonReader
+ import com.squareup.moshi.JsonWriter
+@@ -186,34 +185,6 @@ internal class KotlinJsonAdapter<T>(
+   }
+ }
+ 
+-/**
+- * A JsonAdapter for inline types that reads/writes the single property value directly
+- * without wrapping it in a JSON object.
+- */
+-private class InlineKotlinJsonAdapter<T>(
+-  private val constructor: KtConstructor,
+-  private val binding: KotlinJsonAdapter.Binding<T, Any?>,
+-) : JsonAdapter<T?>() {
+-
+-  override fun fromJson(reader: JsonReader): T {
+-    // Read the value directly
+-    val value = binding.adapter.fromJson(reader)
+-    if (value == null && !binding.property.km.returnType.isNullable) {
+-      throw unexpectedNull(binding.property.name, binding.jsonName, reader)
+-    }
+-
+-    @Suppress("UNCHECKED_CAST")
+-    return constructor.callBy(IndexedParameterMap(constructor.parameters, arrayOf(value)))
+-  }
+-
+-  override fun toJson(writer: JsonWriter, value: T?) {
+-    if (value == null) throw NullPointerException("value == null")
+-    binding.adapter.toJson(writer, binding.get(value))
+-  }
+-
+-  override fun toString() = "InlineKotlinJsonAdapter(${constructor.type.canonicalName})"
+-}
+-
+ public class KotlinJsonAdapterFactory : JsonAdapter.Factory {
+   override fun create(type: Type, annotations: Set<Annotation>, moshi: Moshi): JsonAdapter<*>? {
+     if (annotations.isNotEmpty()) return null
+@@ -348,27 +319,6 @@ public class KotlinJsonAdapterFactory : JsonAdapter.Factory {
+     }
+ 
+     val nonIgnoredBindings = bindings.filterNotNull()
+-
+-    // Check if this is an inline type
+-    val jsonClassAnnotation = rawType.getAnnotation(JsonClass::class.java)
+-    if (jsonClassAnnotation?.inline == true) {
+-      require(nonIgnoredBindings.size == 1) {
+-        "@JsonClass with inline = true requires exactly one non-transient property, " +
+-          "but ${rawType.canonicalName} has ${nonIgnoredBindings.size}: " +
+-          "${nonIgnoredBindings.joinToString { it.name }}."
+-      }
+-      val inlineBinding = nonIgnoredBindings[0]
+-      require(!inlineBinding.property.km.returnType.isNullable) {
+-        "@JsonClass with inline = true requires a non-nullable property, " +
+-          "but ${rawType.canonicalName}.${inlineBinding.name} is nullable."
+-      }
+-      @Suppress("UNCHECKED_CAST")
+-      return InlineKotlinJsonAdapter(
+-        ktConstructor,
+-        inlineBinding,
+-      ).nullSafe()
+-    }
+-
+     val options = JsonReader.Options.of(*nonIgnoredBindings.map { it.name }.toTypedArray())
+     return KotlinJsonAdapter(ktConstructor, bindings, nonIgnoredBindings, options).nullSafe()
+   }
+diff --git a/moshi/src/main/java/com/squareup/moshi/JsonClass.kt b/moshi/src/main/java/com/squareup/moshi/JsonClass.kt
+index 05741287..da4316f9 100644
+--- a/moshi/src/main/java/com/squareup/moshi/JsonClass.kt
++++ b/moshi/src/main/java/com/squareup/moshi/JsonClass.kt
+@@ -64,17 +64,4 @@ public annotation class JsonClass(
+    * expected signature.
+    */
+   val generator: String = "",
+-  /**
+-   * Set to true to generate an adapter that "inlines" the single property's value directly in JSON
+-   * rather than wrapping it in an object. This is primarily useful for Kotlin value classes but
+-   * can technically be used with any classes that wrap a single value.
+-   *
+-   * For example, a class `@JvmInline value class UserId(val id: Int)` with `inline = true` will
+-   * serialize as just `123` rather than `{"id": 123}`.
+-   *
+-   * Requirements:
+-   * - The class must have exactly one non-transient/non-ignored property.
+-   * - The property cannot be nullable.
+-   */
+-  val inline: Boolean = false,
+ )

@@ -1,0 +1,171 @@
+diff --git a/ktor-client/ktor-client-core/common/src/io/ktor/client/plugins/cache/HttpCache.kt b/ktor-client/ktor-client-core/common/src/io/ktor/client/plugins/cache/HttpCache.kt
+index 556f06edf..dee1ef0a4 100644
+--- a/ktor-client/ktor-client-core/common/src/io/ktor/client/plugins/cache/HttpCache.kt
++++ b/ktor-client/ktor-client-core/common/src/io/ktor/client/plugins/cache/HttpCache.kt
+@@ -240,17 +240,6 @@ public class HttpCache private constructor(
+                         plugin.findAndRefresh(response.call.request, response) ?: throw InvalidCacheStateException(
+                             response.call.request.url
+                         )
+-                    if (responseFromCache.varyKeys().size != response.varyKeys().size) {
+-                        LOGGER.warn(
+-                            "Vary header mismatch on cached response for ${response.call.request.url}. " +
+-                                "Received 304 Not Modified with Vary: ${response.varyKeys()} " +
+-                                "but cached response has Vary: ${responseFromCache.varyKeys()}. " +
+-                                "According to RFC 7232 §4.1 and RFC 9111 §4.1, " +
+-                                "the server must include the full Vary header in 304 responses. " +
+-                                "Falling back to missing cache logic. " +
+-                                "Consider reporting this issue to the server maintainers."
+-                        )
+-                    }
+ 
+                     scope.monitor.raise(HttpResponseFromCache, responseFromCache)
+                     proceedWith(responseFromCache)
+@@ -340,8 +329,10 @@ public class HttpCache private constructor(
+             else -> publicStorageNew
+         }
+ 
+-        val cache = findResponse(storage, response.varyKeys(), url, request) ?: return null
+-        storage.store(request.url, cache.copy(cache.varyKeys, response.cacheExpires(isSharedClient)))
++        val varyKeysFrom304 = response.varyKeys()
++        val cache = findResponse(storage, varyKeysFrom304, url, request) ?: return null
++        val newVaryKeys = varyKeysFrom304.ifEmpty { cache.varyKeys }
++        storage.store(request.url, cache.copy(newVaryKeys, response.cacheExpires(isSharedClient)))
+         return cache.createResponse(request.call.client, request, response.coroutineContext)
+     }
+ 
+diff --git a/ktor-client/ktor-client-core/common/src/io/ktor/client/plugins/cache/HttpCacheLegacy.kt b/ktor-client/ktor-client-core/common/src/io/ktor/client/plugins/cache/HttpCacheLegacy.kt
+index 84fdd7a2d..ec592f4c3 100644
+--- a/ktor-client/ktor-client-core/common/src/io/ktor/client/plugins/cache/HttpCacheLegacy.kt
++++ b/ktor-client/ktor-client-core/common/src/io/ktor/client/plugins/cache/HttpCacheLegacy.kt
+@@ -66,17 +66,6 @@ internal suspend fun PipelineContext<HttpResponse, Unit>.interceptReceiveLegacy(
+     if (response.status == HttpStatusCode.NotModified) {
+         val responseFromCache = plugin.findAndRefresh(response.call.request, response)
+             ?: throw InvalidCacheStateException(response.call.request.url)
+-        if (responseFromCache.varyKeys().size != response.varyKeys().size) {
+-            LOGGER.warn(
+-                "Vary header mismatch on cached response for ${response.call.request.url}. " +
+-                    "Received 304 Not Modified with Vary: ${response.varyKeys()} " +
+-                    "but cached response has Vary: ${responseFromCache.varyKeys()}. " +
+-                    "According to RFC 7232 §4.1 and RFC 9111 §4.1, " +
+-                    "the server must include the full Vary header in 304 responses. " +
+-                    "Proceeding with cached response despite mismatch. " +
+-                    "Consider reporting this issue to the server maintainers."
+-            )
+-        }
+ 
+         scope.monitor.raise(HttpCache.HttpResponseFromCache, responseFromCache)
+         proceedWith(responseFromCache)
+@@ -127,11 +116,10 @@ private fun HttpCache.findAndRefresh(request: HttpRequest, response: HttpRespons
+ 
+     val storage = if (CacheControl.PRIVATE in cacheControl) privateStorage else publicStorage
+ 
+-    val cache = findResponse(storage, response.varyKeys(), url, request) ?: return null
+-    storage.store(
+-        url,
+-        HttpCacheEntry(response.cacheExpires(isSharedClient), cache.varyKeys, cache.response, cache.body)
+-    )
++    val varyKeysFrom304 = response.varyKeys()
++    val cache = findResponse(storage, varyKeysFrom304, url, request) ?: return null
++    val newVaryKeys = varyKeysFrom304.ifEmpty { cache.varyKeys }
++    storage.store(url, HttpCacheEntry(response.cacheExpires(isSharedClient), newVaryKeys, cache.response, cache.body))
+     return cache.produceResponse()
+ }
+ 
+diff --git a/ktor-client/ktor-client-core/common/src/io/ktor/client/plugins/cache/storage/UnlimitedCacheStorage.kt b/ktor-client/ktor-client-core/common/src/io/ktor/client/plugins/cache/storage/UnlimitedCacheStorage.kt
+index 917c0d149..bc514e021 100644
+--- a/ktor-client/ktor-client-core/common/src/io/ktor/client/plugins/cache/storage/UnlimitedCacheStorage.kt
++++ b/ktor-client/ktor-client-core/common/src/io/ktor/client/plugins/cache/storage/UnlimitedCacheStorage.kt
+@@ -23,7 +23,7 @@ internal class UnlimitedCacheStorage : HttpCacheStorage() {
+     override fun find(url: Url, varyKeys: Map<String, String>): HttpCacheEntry? {
+         val data = store.computeIfAbsent(url) { ConcurrentSet() }
+         return data.find {
+-            varyKeys.all { (key, value) -> it.varyKeys[key] == value }
++            varyKeys.all { (key, value) -> it.varyKeys[key] == value } && varyKeys.size == it.varyKeys.size
+         }
+     }
+ 
+@@ -45,7 +45,7 @@ internal class UnlimitedStorage : CacheStorage {
+     override suspend fun find(url: Url, varyKeys: Map<String, String>): CachedResponseData? {
+         val data = store.computeIfAbsent(url) { ConcurrentSet() }
+         return data.find {
+-            varyKeys.all { (key, value) -> it.varyKeys[key] == value }
++            varyKeys.all { (key, value) -> it.varyKeys[key] == value } && varyKeys.size == it.varyKeys.size
+         }
+     }
+ 
+diff --git a/ktor-client/ktor-client-core/jvm/src/io/ktor/client/plugins/cache/storage/FileCacheStorage.kt b/ktor-client/ktor-client-core/jvm/src/io/ktor/client/plugins/cache/storage/FileCacheStorage.kt
+index eaee95be8..ac17d1086 100644
+--- a/ktor-client/ktor-client-core/jvm/src/io/ktor/client/plugins/cache/storage/FileCacheStorage.kt
++++ b/ktor-client/ktor-client-core/jvm/src/io/ktor/client/plugins/cache/storage/FileCacheStorage.kt
+@@ -47,7 +47,7 @@ internal class CachingCacheStorage(
+         }
+         val data = store.getValue(url)
+         return data.find {
+-            varyKeys.all { (key, value) -> it.varyKeys[key] == value }
++            varyKeys.all { (key, value) -> it.varyKeys[key] == value } && varyKeys.size == it.varyKeys.size
+         }
+     }
+ 
+@@ -83,7 +83,7 @@ private class FileCacheStorage(
+     override suspend fun find(url: Url, varyKeys: Map<String, String>): CachedResponseData? {
+         val data = readCache(key(url))
+         return data.find {
+-            varyKeys.all { (key, value) -> it.varyKeys[key] == value }
++            varyKeys.all { (key, value) -> it.varyKeys[key] == value } && varyKeys.size == it.varyKeys.size
+         }
+     }
+ 
+diff --git a/ktor-client/ktor-client-core/jvm/test/CachingCacheStorageTest.kt b/ktor-client/ktor-client-core/jvm/test/CachingCacheStorageTest.kt
+index d7598b003..929501080 100644
+--- a/ktor-client/ktor-client-core/jvm/test/CachingCacheStorageTest.kt
++++ b/ktor-client/ktor-client-core/jvm/test/CachingCacheStorageTest.kt
+@@ -99,7 +99,7 @@ private class InMemoryCacheStorage : CacheStorage {
+         findCalledCount++
+         val cache = store.computeIfAbsent(url) { mutableSetOf() }
+         return cache.find {
+-            varyKeys.all { (key, value) -> it.varyKeys[key] == value }
++            varyKeys.all { (key, value) -> it.varyKeys[key] == value } && varyKeys.size == it.varyKeys.size
+         }
+     }
+ 
+diff --git a/ktor-client/ktor-client-tests/common/test/io/ktor/client/tests/plugins/CacheTest.kt b/ktor-client/ktor-client-tests/common/test/io/ktor/client/tests/plugins/CacheTest.kt
+index bac771a8e..c340f9847 100644
+--- a/ktor-client/ktor-client-tests/common/test/io/ktor/client/tests/plugins/CacheTest.kt
++++ b/ktor-client/ktor-client-tests/common/test/io/ktor/client/tests/plugins/CacheTest.kt
+@@ -846,14 +846,15 @@ class CacheTest : ClientLoader() {
+         }
+ 
+         test { client ->
+-            val url = "$TEST_SERVER/cache/different-vary"
+-            val first = client.get(url) {
++            client.get("$TEST_SERVER/cache/different-vary") {
+                 header("200", "true")
++                header("Set-Vary", "X-Requested-With,Accept-Encoding")
++            }
++            assertFailsWith<InvalidCacheStateException> {
++                client.get("$TEST_SERVER/cache/different-vary") {
++                    header("Set-Vary", "X-Requested-With")
++                }
+             }
+-            val second = client.get(url)
+-
+-            assertEquals(first.bodyAsText(), second.bodyAsText())
+-            assertEquals(storage.findAll(Url("$TEST_SERVER/cache/different-vary")).size, 1)
+         }
+     }
+ 
+diff --git a/ktor-test-server/src/main/kotlin/test/server/tests/Cache.kt b/ktor-test-server/src/main/kotlin/test/server/tests/Cache.kt
+index 05c91647b..8d0a57006 100644
+--- a/ktor-test-server/src/main/kotlin/test/server/tests/Cache.kt
++++ b/ktor-test-server/src/main/kotlin/test/server/tests/Cache.kt
+@@ -120,8 +120,8 @@ internal fun Application.cacheTestServer() {
+             }
+             get("/different-vary") {
+                 if (call.request.headers.contains("200")) {
+-                    call.response.header("Vary", "X-Requested-With, Accept-Encoding")
+-                    call.respondText { "Ok" }
++                    call.response.header("Vary", "X-Requested-With,Accept-Encoding")
++                    call.respond(HttpStatusCode.OK)
+                 } else {
+                     call.response.header("Vary", "X-Requested-With")
+                     call.respond(HttpStatusCode.NotModified)

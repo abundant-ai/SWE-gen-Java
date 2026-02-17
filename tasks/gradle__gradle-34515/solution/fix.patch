@@ -1,0 +1,403 @@
+diff --git a/platforms/core-configuration/configuration-cache/src/main/kotlin/org/gradle/internal/cc/impl/DefaultConfigurationCacheIO.kt b/platforms/core-configuration/configuration-cache/src/main/kotlin/org/gradle/internal/cc/impl/DefaultConfigurationCacheIO.kt
+index d696696cc6e..1ca5495504b 100644
+--- a/platforms/core-configuration/configuration-cache/src/main/kotlin/org/gradle/internal/cc/impl/DefaultConfigurationCacheIO.kt
++++ b/platforms/core-configuration/configuration-cache/src/main/kotlin/org/gradle/internal/cc/impl/DefaultConfigurationCacheIO.kt
+@@ -707,6 +707,7 @@ class DefaultConfigurationCacheIO internal constructor(
+             parallelLoad = startParameter.isParallelLoad,
+             problems = service(),
+             attributeDesugaring = service(),
++            taskDependencyFactory = service(),
+         )
+ 
+     private
+diff --git a/platforms/core-configuration/configuration-cache/src/main/kotlin/org/gradle/internal/cc/impl/serialize/Codecs.kt b/platforms/core-configuration/configuration-cache/src/main/kotlin/org/gradle/internal/cc/impl/serialize/Codecs.kt
+index 39a6dfe685d..c096ff665e1 100644
+--- a/platforms/core-configuration/configuration-cache/src/main/kotlin/org/gradle/internal/cc/impl/serialize/Codecs.kt
++++ b/platforms/core-configuration/configuration-cache/src/main/kotlin/org/gradle/internal/cc/impl/serialize/Codecs.kt
+@@ -37,6 +37,7 @@ import org.gradle.api.internal.file.FileResolver
+ import org.gradle.api.internal.file.collections.DirectoryFileTreeFactory
+ import org.gradle.api.internal.provider.PropertyFactory
+ import org.gradle.api.internal.provider.ValueSourceProviderFactory
++import org.gradle.api.internal.tasks.TaskDependencyFactory
+ import org.gradle.api.problems.internal.InternalProblems
+ import org.gradle.api.tasks.util.internal.PatternSetFactory
+ import org.gradle.composite.internal.BuildTreeWorkGraphController
+@@ -174,6 +175,7 @@ class Codecs(
+     includedTaskGraph: BuildTreeWorkGraphController,
+     buildStateRegistry: BuildStateRegistry,
+     documentationRegistry: DocumentationRegistry,
++    taskDependencyFactory: TaskDependencyFactory,
+     val javaSerializationEncodingLookup: JavaSerializationEncodingLookup,
+     flowProviders: FlowProviders,
+     transformStepNodeFactory: TransformStepNodeFactory,
+@@ -202,7 +204,7 @@ class Codecs(
+             bind(DefaultContextAwareTaskLoggerCodec)
+             bind(LoggerCodec)
+ 
+-            fileCollectionTypes(directoryFileTreeFactory, fileCollectionFactory, artifactSetConverter, fileOperations, fileFactory, patternSetFactory, fileLookup)
++            fileCollectionTypes(directoryFileTreeFactory, fileCollectionFactory, artifactSetConverter, fileOperations, fileFactory, patternSetFactory, fileLookup, taskDependencyFactory)
+ 
+             bind(org.gradle.internal.serialize.codecs.core.ApiTextResourceAdapterCodec)
+ 
+@@ -210,7 +212,7 @@ class Codecs(
+             bind(SerializedLambdaParametersCheckingCodec)
+ 
+             // Dependency management types
+-            bind(ArtifactCollectionCodec(calculatedValueContainerFactory, artifactSetConverter, attributeDesugaring))
++            bind(ArtifactCollectionCodec(calculatedValueContainerFactory, artifactSetConverter, attributeDesugaring, taskDependencyFactory))
+             bind(ImmutableAttributesCodec(attributesFactory, managedFactoryRegistry))
+             bind(AttributeContainerCodec(attributesFactory, managedFactoryRegistry))
+             bind(ComponentVariantIdentifierCodec)
+@@ -310,7 +312,7 @@ class Codecs(
+         baseTypes()
+ 
+         providerTypes(propertyFactory, filePropertyFactory, nestedProviderCodec(valueSourceProviderFactory, buildStateRegistry, flowProviders))
+-        fileCollectionTypes(directoryFileTreeFactory, fileCollectionFactory, artifactSetConverter, fileOperations, fileFactory, patternSetFactory, fileLookup)
++        fileCollectionTypes(directoryFileTreeFactory, fileCollectionFactory, artifactSetConverter, fileOperations, fileFactory, patternSetFactory, fileLookup, taskDependencyFactory)
+ 
+         bind(TaskInAnotherBuildCodec(includedTaskGraph))
+ 
+@@ -381,14 +383,15 @@ class Codecs(
+         fileOperations: FileOperations,
+         fileFactory: FileFactory,
+         patternSetFactory: PatternSetFactory,
+-        fileLookup: FileLookup
++        fileLookup: FileLookup,
++        taskDependencyFactory: TaskDependencyFactory
+     ) {
+         bind(PathToFileResolverCodec(fileLookup))
+         bind(DirectoryCodec(fileFactory))
+         bind(RegularFileCodec(fileFactory))
+         bind(ConfigurableFileTreeCodec(fileCollectionFactory))
+         bind(FileTreeCodec(fileCollectionFactory, directoryFileTreeFactory, fileOperations))
+-        val fileCollectionCodec = FileCollectionCodec(fileCollectionFactory, artifactSetConverter)
++        val fileCollectionCodec = FileCollectionCodec(fileCollectionFactory, artifactSetConverter, taskDependencyFactory)
+         bind(ConfigurableFileCollectionCodec(fileCollectionCodec, fileCollectionFactory))
+         bind(fileCollectionCodec)
+         bind(IntersectionPatternSetCodec)
+diff --git a/platforms/core-configuration/core-serialization-codecs/src/main/kotlin/org/gradle/internal/serialize/codecs/core/FileCollectionCodec.kt b/platforms/core-configuration/core-serialization-codecs/src/main/kotlin/org/gradle/internal/serialize/codecs/core/FileCollectionCodec.kt
+index e4e18262f0e..63fa012fe9e 100644
+--- a/platforms/core-configuration/core-serialization-codecs/src/main/kotlin/org/gradle/internal/serialize/codecs/core/FileCollectionCodec.kt
++++ b/platforms/core-configuration/core-serialization-codecs/src/main/kotlin/org/gradle/internal/serialize/codecs/core/FileCollectionCodec.kt
+@@ -32,6 +32,7 @@ import org.gradle.api.internal.file.collections.FailingFileCollection
+ import org.gradle.api.internal.file.collections.FileSystemMirroringFileTree
+ import org.gradle.api.internal.file.collections.ProviderBackedFileCollection
+ import org.gradle.api.internal.provider.ProviderInternal
++import org.gradle.api.internal.tasks.TaskDependencyFactory
+ import org.gradle.api.specs.Spec
+ import org.gradle.api.tasks.TaskProvider
+ import org.gradle.api.tasks.util.PatternSet
+@@ -51,7 +52,8 @@ import kotlin.jvm.optionals.getOrNull
+ 
+ class FileCollectionCodec(
+     private val fileCollectionFactory: FileCollectionFactory,
+-    private val artifactSetConverter: ArtifactSetToFileCollectionFactory
++    private val artifactSetConverter: ArtifactSetToFileCollectionFactory,
++    private val taskDependencyFactory: TaskDependencyFactory
+ ) : Codec<FileCollectionInternal> {
+ 
+     override suspend fun WriteContext.encode(value: FileCollectionInternal) {
+@@ -97,7 +99,12 @@ class FileCollectionCodec(
+                     is FilteredFileCollectionSpec -> element.collection.filter(element.filter)
+                     is ProviderBackedFileCollectionSpec -> fileCollectionFactory.withResolver(element.resolver).resolving(element.provider)
+                     is FileTree -> element
+-                    is ResolutionBackedFileCollectionSpec -> artifactSetConverter.asFileCollection(element.displayName, element.lenient, element.elements)
++                    is ResolutionBackedFileCollectionSpec -> ResolutionBackedFileCollection(
++                        artifactSetConverter.getSelectedArtifacts(element.elements),
++                        element.lenient,
++                        artifactSetConverter.resolutionHost(element.displayName),
++                        taskDependencyFactory
++                    )
+                     is BeanSpec -> element.bean
+                     else -> throw IllegalArgumentException("Unexpected item $element in file collection contents")
+                 }
+diff --git a/platforms/core-configuration/dependency-management-serialization-codecs/src/main/kotlin/org/gradle/internal/serialize/codecs/dm/ArtifactCollectionCodec.kt b/platforms/core-configuration/dependency-management-serialization-codecs/src/main/kotlin/org/gradle/internal/serialize/codecs/dm/ArtifactCollectionCodec.kt
+index 121cad07b98..d42575adad3 100644
+--- a/platforms/core-configuration/dependency-management-serialization-codecs/src/main/kotlin/org/gradle/internal/serialize/codecs/dm/ArtifactCollectionCodec.kt
++++ b/platforms/core-configuration/dependency-management-serialization-codecs/src/main/kotlin/org/gradle/internal/serialize/codecs/dm/ArtifactCollectionCodec.kt
+@@ -29,6 +29,7 @@ import org.gradle.api.internal.attributes.AttributeDesugaring
+ import org.gradle.api.internal.attributes.ImmutableAttributes
+ import org.gradle.api.internal.file.FileCollectionInternal
+ import org.gradle.api.internal.file.FileCollectionStructureVisitor
++import org.gradle.api.internal.tasks.TaskDependencyFactory
+ import org.gradle.internal.DisplayName
+ import org.gradle.internal.component.external.model.ImmutableCapabilities
+ import org.gradle.internal.extensions.stdlib.uncheckedCast
+@@ -45,6 +46,7 @@ class ArtifactCollectionCodec(
+     private val calculatedValueContainerFactory: CalculatedValueContainerFactory,
+     private val artifactSetConverter: ArtifactSetToFileCollectionFactory,
+     private val attributeDesugaring: AttributeDesugaring,
++    private val taskDependencyFactory: TaskDependencyFactory
+ ) : Codec<ArtifactCollectionInternal> {
+ 
+     override suspend fun WriteContext.encode(value: ArtifactCollectionInternal) {
+@@ -60,7 +62,7 @@ class ArtifactCollectionCodec(
+         val lenient = readBoolean()
+         val elements = readList().uncheckedCast<List<Any>>()
+ 
+-        val files = artifactSetConverter.asFileCollection(displayName, lenient,
++        val artifacts = artifactSetConverter.getSelectedArtifacts(
+             elements.map { element ->
+                 when (element) {
+                     is Throwable -> artifactSetConverter.asResolvedArtifactSet(element)
+@@ -70,7 +72,8 @@ class ArtifactCollectionCodec(
+                 }
+             }
+         )
+-        return DefaultArtifactCollection(files, lenient, artifactSetConverter.resolutionHost(displayName), calculatedValueContainerFactory, attributeDesugaring)
++
++        return DefaultArtifactCollection(artifacts, lenient, artifactSetConverter.resolutionHost(displayName), taskDependencyFactory, calculatedValueContainerFactory, attributeDesugaring)
+     }
+ }
+ 
+diff --git a/platforms/software/dependency-management/src/main/java/org/gradle/api/internal/artifacts/configurations/ArtifactCollectionInternal.java b/platforms/software/dependency-management/src/main/java/org/gradle/api/internal/artifacts/configurations/ArtifactCollectionInternal.java
+index 3aadf055e2a..e26f9d6c66d 100644
+--- a/platforms/software/dependency-management/src/main/java/org/gradle/api/internal/artifacts/configurations/ArtifactCollectionInternal.java
++++ b/platforms/software/dependency-management/src/main/java/org/gradle/api/internal/artifacts/configurations/ArtifactCollectionInternal.java
+@@ -18,6 +18,7 @@
+ 
+ import org.gradle.api.artifacts.ArtifactCollection;
+ import org.gradle.api.internal.artifacts.ivyservice.resolveengine.artifact.ArtifactVisitor;
++import org.gradle.api.internal.file.FileCollectionInternal;
+ 
+ public interface ArtifactCollectionInternal extends ArtifactCollection {
+     ResolutionHost getResolutionHost();
+@@ -25,4 +26,7 @@ public interface ArtifactCollectionInternal extends ArtifactCollection {
+     boolean isLenient();
+ 
+     void visitArtifacts(ArtifactVisitor visitor);
++
++    @Override
++    FileCollectionInternal getArtifactFiles();
+ }
+diff --git a/platforms/software/dependency-management/src/main/java/org/gradle/api/internal/artifacts/configurations/DefaultArtifactCollection.java b/platforms/software/dependency-management/src/main/java/org/gradle/api/internal/artifacts/configurations/DefaultArtifactCollection.java
+index 61f4e6db31b..c1fb93b37bd 100644
+--- a/platforms/software/dependency-management/src/main/java/org/gradle/api/internal/artifacts/configurations/DefaultArtifactCollection.java
++++ b/platforms/software/dependency-management/src/main/java/org/gradle/api/internal/artifacts/configurations/DefaultArtifactCollection.java
+@@ -18,12 +18,13 @@
+ 
+ import org.gradle.api.artifacts.ArtifactCollection;
+ import org.gradle.api.artifacts.result.ResolvedArtifactResult;
+-import org.gradle.api.file.FileCollection;
+ import org.gradle.api.internal.artifacts.ivyservice.ResolvedArtifactCollectingVisitor;
+ import org.gradle.api.internal.artifacts.ivyservice.resolveengine.artifact.ArtifactVisitor;
++import org.gradle.api.internal.artifacts.ivyservice.resolveengine.artifact.SelectedArtifactSet;
+ import org.gradle.api.internal.attributes.AttributeDesugaring;
+ import org.gradle.api.internal.file.FileCollectionInternal;
+ import org.gradle.api.internal.provider.BuildableBackedProvider;
++import org.gradle.api.internal.tasks.TaskDependencyFactory;
+ import org.gradle.api.provider.Provider;
+ import org.gradle.internal.Cast;
+ import org.gradle.internal.Factory;
+@@ -35,16 +36,29 @@
+ import java.util.Set;
+ 
+ public class DefaultArtifactCollection implements ArtifactCollectionInternal {
+-    private final ResolutionBackedFileCollection fileCollection;
++
++    private final SelectedArtifactSet artifacts;
+     private final boolean lenient;
++    private final ResolutionHost resolutionHost;
+     private final CalculatedValue<ArtifactSetResult> result;
+-
+-    public DefaultArtifactCollection(ResolutionBackedFileCollection files, boolean lenient, ResolutionHost resolutionHost, CalculatedValueFactory calculatedValueFactory, AttributeDesugaring attributeDesugaring) {
+-        this.fileCollection = files;
++    private final TaskDependencyFactory taskDependencyFactory;
++
++    public DefaultArtifactCollection(
++        SelectedArtifactSet artifacts,
++        boolean lenient,
++        ResolutionHost resolutionHost,
++        TaskDependencyFactory taskDependencyFactory,
++        CalculatedValueFactory calculatedValueFactory,
++        AttributeDesugaring attributeDesugaring
++    ) {
++        this.artifacts = artifacts;
+         this.lenient = lenient;
++        this.resolutionHost = resolutionHost;
++        this.taskDependencyFactory = taskDependencyFactory;
++
+         this.result = calculatedValueFactory.create(resolutionHost.displayName("files"), () -> {
+             ResolvedArtifactCollectingVisitor visitor = new ResolvedArtifactCollectingVisitor(attributeDesugaring);
+-            fileCollection.getArtifacts().visitArtifacts(visitor, lenient);
++            artifacts.visitArtifacts(visitor, lenient);
+ 
+             Set<ResolvedArtifactResult> artifactResults = visitor.getArtifacts();
+             Set<Throwable> failures = visitor.getFailures();
+@@ -58,7 +72,7 @@ public DefaultArtifactCollection(ResolutionBackedFileCollection files, boolean l
+ 
+     @Override
+     public ResolutionHost getResolutionHost() {
+-        return fileCollection.getResolutionHost();
++        return resolutionHost;
+     }
+ 
+     @Override
+@@ -67,8 +81,13 @@ public boolean isLenient() {
+     }
+ 
+     @Override
+-    public FileCollection getArtifactFiles() {
+-        return fileCollection;
++    public FileCollectionInternal getArtifactFiles() {
++        return new ResolutionBackedFileCollection(
++            artifacts,
++            lenient,
++            resolutionHost,
++            taskDependencyFactory
++        );
+     }
+ 
+     @Override
+@@ -79,7 +98,7 @@ public Set<ResolvedArtifactResult> getArtifacts() {
+ 
+     @Override
+     public Provider<Set<ResolvedArtifactResult>> getResolvedArtifacts() {
+-        return new BuildableBackedProvider<>((FileCollectionInternal) getArtifactFiles(), Cast.uncheckedCast(Set.class), new ArtifactCollectionResolvedArtifactsFactory(this));
++        return new BuildableBackedProvider<>(getArtifactFiles(), Cast.uncheckedCast(Set.class), new ArtifactCollectionResolvedArtifactsFactory(this));
+     }
+ 
+     @Override
+@@ -97,7 +116,7 @@ public Collection<Throwable> getFailures() {
+     @Override
+     public void visitArtifacts(ArtifactVisitor visitor) {
+         // TODO - if already resolved, use the results
+-        fileCollection.getArtifacts().visitArtifacts(visitor, lenient);
++        artifacts.visitArtifacts(visitor, lenient);
+     }
+ 
+     private void ensureResolved() {
+diff --git a/platforms/software/dependency-management/src/main/java/org/gradle/api/internal/artifacts/configurations/ResolutionBackedFileCollection.java b/platforms/software/dependency-management/src/main/java/org/gradle/api/internal/artifacts/configurations/ResolutionBackedFileCollection.java
+index a61f78c75ce..36fa0a6a94c 100644
+--- a/platforms/software/dependency-management/src/main/java/org/gradle/api/internal/artifacts/configurations/ResolutionBackedFileCollection.java
++++ b/platforms/software/dependency-management/src/main/java/org/gradle/api/internal/artifacts/configurations/ResolutionBackedFileCollection.java
+@@ -92,7 +92,4 @@ protected void appendContents(TreeFormatter formatter) {
+         formatter.node("contains: " + getDisplayName());
+     }
+ 
+-    SelectedArtifactSet getArtifacts() {
+-        return artifacts;
+-    }
+ }
+diff --git a/platforms/software/dependency-management/src/main/java/org/gradle/api/internal/artifacts/ivyservice/resolveengine/artifact/ArtifactSetToFileCollectionFactory.java b/platforms/software/dependency-management/src/main/java/org/gradle/api/internal/artifacts/ivyservice/resolveengine/artifact/ArtifactSetToFileCollectionFactory.java
+index 5bcb3ed5869..13099164aa1 100644
+--- a/platforms/software/dependency-management/src/main/java/org/gradle/api/internal/artifacts/ivyservice/resolveengine/artifact/ArtifactSetToFileCollectionFactory.java
++++ b/platforms/software/dependency-management/src/main/java/org/gradle/api/internal/artifacts/ivyservice/resolveengine/artifact/ArtifactSetToFileCollectionFactory.java
+@@ -20,20 +20,18 @@
+ import org.gradle.api.Action;
+ import org.gradle.api.artifacts.ResolvedArtifact;
+ import org.gradle.api.artifacts.component.ComponentArtifactIdentifier;
+-import org.gradle.internal.component.model.VariantIdentifier;
+-import org.gradle.api.internal.artifacts.configurations.ResolutionBackedFileCollection;
+ import org.gradle.api.internal.artifacts.configurations.ResolutionHost;
+ import org.gradle.api.internal.artifacts.ivyservice.TypedResolveException;
+ import org.gradle.api.internal.attributes.ImmutableAttributes;
+ import org.gradle.api.internal.file.FileCollectionInternal;
+ import org.gradle.api.internal.file.FileCollectionStructureVisitor;
+-import org.gradle.api.internal.tasks.TaskDependencyFactory;
+ import org.gradle.api.internal.tasks.TaskDependencyResolveContext;
+ import org.gradle.api.problems.internal.InternalProblems;
+ import org.gradle.internal.DisplayName;
+ import org.gradle.internal.component.external.model.ImmutableCapabilities;
+ import org.gradle.internal.component.model.DefaultIvyArtifactName;
+ import org.gradle.internal.component.model.IvyArtifactName;
++import org.gradle.internal.component.model.VariantIdentifier;
+ import org.gradle.internal.model.CalculatedValue;
+ import org.gradle.internal.operations.BuildOperationExecutor;
+ import org.gradle.internal.operations.BuildOperationQueue;
+@@ -49,12 +47,11 @@
+ 
+ @ServiceScope(Scope.BuildTree.class)
+ public class ArtifactSetToFileCollectionFactory {
++
+     private final BuildOperationExecutor buildOperationExecutor;
+-    private final TaskDependencyFactory taskDependencyFactory;
+     private final InternalProblems problemsService;
+ 
+-    public ArtifactSetToFileCollectionFactory(TaskDependencyFactory taskDependencyFactory, BuildOperationExecutor buildOperationExecutor, InternalProblems problemsService) {
+-        this.taskDependencyFactory = taskDependencyFactory;
++    public ArtifactSetToFileCollectionFactory(BuildOperationExecutor buildOperationExecutor, InternalProblems problemsService) {
+         this.buildOperationExecutor = buildOperationExecutor;
+         this.problemsService = problemsService;
+     }
+@@ -64,13 +61,13 @@ public ResolutionHost resolutionHost(String displayName) {
+     }
+ 
+     /**
+-     * Presents the contents of the given artifacts as a partial {@link FileCollectionInternal} implementation.
++     * Presents the contents of the given artifacts as a partial {@link SelectedArtifactSet} implementation.
+      *
+      * <p>This produces only a minimal implementation to use for artifact sets loaded from the configuration cache
+      * Over time, this should be merged with the FileCollection implementation in DefaultConfiguration
+      */
+-    public ResolutionBackedFileCollection asFileCollection(String displayName, boolean lenient, List<?> elements) {
+-        return new ResolutionBackedFileCollection(new PartialSelectedArtifactSet(elements, buildOperationExecutor), lenient, new NameBackedResolutionHost(problemsService, displayName), taskDependencyFactory);
++    public SelectedArtifactSet getSelectedArtifacts(List<?> elements) {
++        return new PartialSelectedArtifactSet(elements, buildOperationExecutor);
+     }
+ 
+     public ResolvedArtifactSet asResolvedArtifactSet(Throwable failure) {
+@@ -283,4 +280,5 @@ public void visitDependencies(TaskDependencyResolveContext context) {
+             // No dependencies
+         }
+     }
++
+ }
+diff --git a/platforms/software/dependency-management/src/main/java/org/gradle/api/internal/artifacts/resolver/DefaultResolutionOutputs.java b/platforms/software/dependency-management/src/main/java/org/gradle/api/internal/artifacts/resolver/DefaultResolutionOutputs.java
+index 3568b3ce645..ea63ca95c1d 100644
+--- a/platforms/software/dependency-management/src/main/java/org/gradle/api/internal/artifacts/resolver/DefaultResolutionOutputs.java
++++ b/platforms/software/dependency-management/src/main/java/org/gradle/api/internal/artifacts/resolver/DefaultResolutionOutputs.java
+@@ -26,7 +26,6 @@
+ import org.gradle.api.internal.artifacts.ResolverResults;
+ import org.gradle.api.internal.artifacts.configurations.ArtifactCollectionInternal;
+ import org.gradle.api.internal.artifacts.configurations.DefaultArtifactCollection;
+-import org.gradle.api.internal.artifacts.configurations.ResolutionBackedFileCollection;
+ import org.gradle.api.internal.artifacts.configurations.ResolutionResultProviderBackedSelectedArtifactSet;
+ import org.gradle.api.internal.artifacts.ivyservice.resolveengine.artifact.ArtifactSelectionSpec;
+ import org.gradle.api.internal.artifacts.ivyservice.resolveengine.artifact.SelectedArtifactSet;
+@@ -177,25 +176,23 @@ public DefaultArtifactView(
+ 
+         @Override
+         public ArtifactCollectionInternal getArtifacts() {
++            SelectedArtifactSet selectedArtifacts = new ResolutionResultProviderBackedSelectedArtifactSet(
++                resolutionAccess.getResults().map(this::selectArtifacts)
++            );
++
+             return new DefaultArtifactCollection(
+-                getFiles(),
++                selectedArtifacts,
+                 lenient,
+                 resolutionAccess.getHost(),
++                taskDependencyFactory,
+                 calculatedValueContainerFactory,
+                 attributeDesugaring
+             );
+         }
+ 
+         @Override
+-        public ResolutionBackedFileCollection getFiles() {
+-            return new ResolutionBackedFileCollection(
+-                new ResolutionResultProviderBackedSelectedArtifactSet(
+-                    resolutionAccess.getResults().map(this::selectArtifacts)
+-                ),
+-                lenient,
+-                resolutionAccess.getHost(),
+-                taskDependencyFactory
+-            );
++        public FileCollectionInternal getFiles() {
++            return getArtifacts().getArtifactFiles();
+         }
+ 
+         private SelectedArtifactSet selectArtifacts(ResolverResults results) {
+diff --git a/testing/architecture-test/src/changes/archunit-store/platform-coupling.txt b/testing/architecture-test/src/changes/archunit-store/platform-coupling.txt
+index 2a6eade60a4..e9c7f9c47a1 100644
+--- a/testing/architecture-test/src/changes/archunit-store/platform-coupling.txt
++++ b/testing/architecture-test/src/changes/archunit-store/platform-coupling.txt
+@@ -107,6 +107,7 @@ Class 'org.gradle.internal.extensions.core.ScriptSourceExtensionsKt' from platfo
+ Class 'org.gradle.internal.serialize.codecs.core.BaseTypesKt' from platform 'core' imports class 'org.gradle.api.internal.artifacts.ivyservice.resolveengine.result.BuildIdentifierSerializer' from a forbidden platform 'software'
+ Class 'org.gradle.internal.serialize.codecs.core.CollectingVisitor' from platform 'core' imports class 'org.gradle.api.internal.artifacts.configurations.ResolutionBackedFileCollection' from a forbidden platform 'software'
+ Class 'org.gradle.internal.serialize.codecs.core.CollectingVisitor' from platform 'core' imports class 'org.gradle.api.internal.artifacts.configurations.ResolutionHost' from a forbidden platform 'software'
++Class 'org.gradle.internal.serialize.codecs.core.FileCollectionCodec' from platform 'core' imports class 'org.gradle.api.internal.artifacts.configurations.ResolutionBackedFileCollection' from a forbidden platform 'software'
+ Class 'org.gradle.internal.serialize.codecs.core.FileCollectionCodec' from platform 'core' imports class 'org.gradle.api.internal.artifacts.ivyservice.resolveengine.artifact.ArtifactSetToFileCollectionFactory' from a forbidden platform 'software'
+ Class 'org.gradle.internal.serialize.codecs.dm.ArtifactCollectionCodec' from platform 'core' imports class 'org.gradle.api.internal.artifacts.configurations.ArtifactCollectionInternal' from a forbidden platform 'software'
+ Class 'org.gradle.internal.serialize.codecs.dm.ArtifactCollectionCodec' from platform 'core' imports class 'org.gradle.api.internal.artifacts.configurations.DefaultArtifactCollection' from a forbidden platform 'software'

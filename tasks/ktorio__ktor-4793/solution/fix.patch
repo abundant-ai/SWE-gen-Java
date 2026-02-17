@@ -1,0 +1,244 @@
+diff --git a/ktor-client/ktor-client-core/api/ktor-client-core.klib.api b/ktor-client/ktor-client-core/api/ktor-client-core.klib.api
+index f543412a0..ffd655591 100644
+--- a/ktor-client/ktor-client-core/api/ktor-client-core.klib.api
++++ b/ktor-client/ktor-client-core/api/ktor-client-core.klib.api
+@@ -1834,6 +1834,8 @@ open class io.ktor.client.engine.js/JsClientEngineConfig : io.ktor.client.engine
+ 
+         // Targets: [wasmJs]
+         final fun <set-nodeOptions>(kotlin.js/JsAny) // io.ktor.client.engine.js/JsClientEngineConfig.nodeOptions.<set-nodeOptions>|<set-nodeOptions>(kotlin.js.JsAny){}[0]
++
++    final fun configureRequest(kotlin/Function1<io.ktor.client.fetch/RequestInit, kotlin/Unit>) // io.ktor.client.engine.js/JsClientEngineConfig.configureRequest|configureRequest(kotlin.Function1<io.ktor.client.fetch.RequestInit,kotlin.Unit>){}[0]
+ }
+ 
+ // Targets: [js, wasmJs]
+@@ -1844,6 +1846,9 @@ final object io.ktor.client.engine.js/Js : io.ktor.client.engine/HttpClientEngin
+     final fun toString(): kotlin/String // io.ktor.client.engine.js/Js.toString|toString(){}[0]
+ }
+ 
++// Targets: [js, wasmJs]
++final fun (io.ktor.client.request/HttpRequestBuilder).io.ktor.client/fetchOptions(kotlin/Function1<io.ktor.client.fetch/RequestInit, kotlin/Unit>) // io.ktor.client/fetchOptions|fetchOptions@io.ktor.client.request.HttpRequestBuilder(kotlin.Function1<io.ktor.client.fetch.RequestInit,kotlin.Unit>){}[0]
++
+ // Targets: [js, wasmJs]
+ final fun io.ktor.client.engine.js/JsClient(): io.ktor.client.engine/HttpClientEngineFactory<io.ktor.client.engine.js/JsClientEngineConfig> // io.ktor.client.engine.js/JsClient|JsClient(){}[0]
+ 
+diff --git a/ktor-client/ktor-client-core/js/src/io/ktor/client/JsRequestUtils.kt b/ktor-client/ktor-client-core/js/src/io/ktor/client/JsRequestUtils.kt
+new file mode 100644
+index 000000000..71f3bb84e
+--- /dev/null
++++ b/ktor-client/ktor-client-core/js/src/io/ktor/client/JsRequestUtils.kt
+@@ -0,0 +1,24 @@
++/*
++ * Copyright 2014-2025 JetBrains s.r.o and contributors. Use of this source code is governed by the Apache 2.0 license.
++ */
++
++package io.ktor.client
++
++import io.ktor.client.fetch.*
++import io.ktor.client.request.*
++import io.ktor.util.*
++
++/**
++ * Configures the HTTP request with custom options using the provided [block].
++ *
++ * @param block A lambda with a [RequestInit] receiver used to set additional options such as headers, body, or method.
++ */
++public fun HttpRequestBuilder.fetchOptions(block: RequestInit.() -> Unit) {
++    attributes.put(FetchOptions.key, FetchOptions(block))
++}
++
++internal class FetchOptions(val requestInit: RequestInit.() -> Unit) {
++    companion object {
++        val key = AttributeKey<FetchOptions>("FetchOptions")
++    }
++}
+diff --git a/ktor-client/ktor-client-core/js/src/io/ktor/client/engine/js/Js.kt b/ktor-client/ktor-client-core/js/src/io/ktor/client/engine/js/Js.kt
+index 6c4fbee6d..b336c6ab7 100644
+--- a/ktor-client/ktor-client-core/js/src/io/ktor/client/engine/js/Js.kt
++++ b/ktor-client/ktor-client-core/js/src/io/ktor/client/engine/js/Js.kt
+@@ -6,6 +6,7 @@ package io.ktor.client.engine.js
+ 
+ import io.ktor.client.engine.*
+ import io.ktor.utils.io.*
++import org.w3c.fetch.RequestInit
+ 
+ /**
+  * A JavaScript client engine that uses the fetch API to execute requests.
+@@ -34,6 +35,16 @@ public actual data object Js : HttpClientEngineFactory<JsClientEngineConfig> {
+  * [Report a problem](https://ktor.io/feedback/?fqname=io.ktor.client.engine.js.JsClientEngineConfig)
+  */
+ public actual open class JsClientEngineConfig : HttpClientEngineConfig() {
++    internal var requestInit: io.ktor.client.fetch.RequestInit.() -> Unit = {}
++
++    /**
++     * Provides access to the underlying fetch options of the engine.
++     * It allows setting credentials, cache, mode, redirect, referrer, integrity, keepalive, signal, window.
++     */
++    public fun configureRequest(block: io.ktor.client.fetch.RequestInit.() -> Unit) {
++        requestInit = block
++    }
++
+     /**
+      * An `Object` which can contain additional configuration options that should get passed to node-fetch.
+      *
+@@ -52,6 +63,7 @@ public actual open class JsClientEngineConfig : HttpClientEngineConfig() {
+      *
+      * [Report a problem](https://ktor.io/feedback/?fqname=io.ktor.client.engine.js.JsClientEngineConfig.nodeOptions)
+      */
++    @Deprecated("Use configureRequest instead", level = DeprecationLevel.WARNING)
+     public var nodeOptions: dynamic = js("Object").create(null)
+ }
+ 
+diff --git a/ktor-client/ktor-client-core/js/src/io/ktor/client/engine/js/JsClientEngine.kt b/ktor-client/ktor-client-core/js/src/io/ktor/client/engine/js/JsClientEngine.kt
+index 4cf77ee87..0a3da65f9 100644
+--- a/ktor-client/ktor-client-core/js/src/io/ktor/client/engine/js/JsClientEngine.kt
++++ b/ktor-client/ktor-client-core/js/src/io/ktor/client/engine/js/JsClientEngine.kt
+@@ -4,6 +4,7 @@
+ 
+ package io.ktor.client.engine.js
+ 
++import io.ktor.client.FetchOptions
+ import io.ktor.client.engine.*
+ import io.ktor.client.engine.js.compatibility.*
+ import io.ktor.client.plugins.*
+@@ -44,7 +45,8 @@ internal class JsClientEngine(
+ 
+         val requestTime = GMTDate()
+         val rawRequest = data.toRaw(clientConfig, callContext)
+-        val rawResponse = commonFetch(data.url.toString(), rawRequest, config, callContext.job)
++        val fetchOptions = data.attributes.getOrNull(FetchOptions.key)?.requestInit ?: {}
++        val rawResponse = commonFetch(data.url.toString(), rawRequest, fetchOptions, config, callContext.job)
+ 
+         val status = HttpStatusCode(rawResponse.status.toInt(), rawResponse.statusText)
+         val headers = rawResponse.headers.mapToKtor(data.method, data.attributes)
+diff --git a/ktor-client/ktor-client-core/js/src/io/ktor/client/engine/js/compatibility/Utils.kt b/ktor-client/ktor-client-core/js/src/io/ktor/client/engine/js/compatibility/Utils.kt
+index 168abdc68..4b3972c9e 100644
+--- a/ktor-client/ktor-client-core/js/src/io/ktor/client/engine/js/compatibility/Utils.kt
++++ b/ktor-client/ktor-client-core/js/src/io/ktor/client/engine/js/compatibility/Utils.kt
+@@ -21,11 +21,14 @@ import kotlin.js.Promise
+ internal suspend fun commonFetch(
+     input: String,
+     init: RequestInit,
++    requestConfig: RequestInit.() -> Unit,
+     config: JsClientEngineConfig,
+     callJob: Job,
+ ): org.w3c.fetch.Response = suspendCancellableCoroutine { continuation ->
+     val controller = AbortController()
+     init.signal = controller.signal
++    config.requestInit(init)
++    requestConfig(init)
+ 
+     callJob.invokeOnCompletion(onCancelling = true) { controller.abort() }
+ 
+diff --git a/ktor-client/ktor-client-core/wasmJs/src/io/ktor/client/JsRequestUtils.kt b/ktor-client/ktor-client-core/wasmJs/src/io/ktor/client/JsRequestUtils.kt
+new file mode 100644
+index 000000000..71f3bb84e
+--- /dev/null
++++ b/ktor-client/ktor-client-core/wasmJs/src/io/ktor/client/JsRequestUtils.kt
+@@ -0,0 +1,24 @@
++/*
++ * Copyright 2014-2025 JetBrains s.r.o and contributors. Use of this source code is governed by the Apache 2.0 license.
++ */
++
++package io.ktor.client
++
++import io.ktor.client.fetch.*
++import io.ktor.client.request.*
++import io.ktor.util.*
++
++/**
++ * Configures the HTTP request with custom options using the provided [block].
++ *
++ * @param block A lambda with a [RequestInit] receiver used to set additional options such as headers, body, or method.
++ */
++public fun HttpRequestBuilder.fetchOptions(block: RequestInit.() -> Unit) {
++    attributes.put(FetchOptions.key, FetchOptions(block))
++}
++
++internal class FetchOptions(val requestInit: RequestInit.() -> Unit) {
++    companion object {
++        val key = AttributeKey<FetchOptions>("FetchOptions")
++    }
++}
+diff --git a/ktor-client/ktor-client-core/wasmJs/src/io/ktor/client/engine/js/Js.kt b/ktor-client/ktor-client-core/wasmJs/src/io/ktor/client/engine/js/Js.kt
+index 73411ceef..8c2be614d 100644
+--- a/ktor-client/ktor-client-core/wasmJs/src/io/ktor/client/engine/js/Js.kt
++++ b/ktor-client/ktor-client-core/wasmJs/src/io/ktor/client/engine/js/Js.kt
+@@ -5,6 +5,7 @@
+ package io.ktor.client.engine.js
+ 
+ import io.ktor.client.engine.*
++import io.ktor.client.fetch.RequestInit
+ import io.ktor.client.utils.*
+ import io.ktor.utils.io.*
+ 
+@@ -35,6 +36,16 @@ public actual data object Js : HttpClientEngineFactory<JsClientEngineConfig> {
+  * [Report a problem](https://ktor.io/feedback/?fqname=io.ktor.client.engine.js.JsClientEngineConfig)
+  */
+ public actual open class JsClientEngineConfig : HttpClientEngineConfig() {
++    internal var requestInit: RequestInit.() -> Unit = {}
++
++    /**
++     * Provides access to the underlying fetch options of the engine.
++     * It allows setting credentials, cache, mode, redirect, referrer, integrity, keepalive, signal, window.
++     */
++    public fun configureRequest(block: RequestInit.() -> Unit) {
++        requestInit = block
++    }
++
+     /**
+      * An `Object` which can contain additional configuration options that should get passed to node-fetch.
+      *
+@@ -53,6 +64,7 @@ public actual open class JsClientEngineConfig : HttpClientEngineConfig() {
+      *
+      * [Report a problem](https://ktor.io/feedback/?fqname=io.ktor.client.engine.js.JsClientEngineConfig.nodeOptions)
+      */
++    @Deprecated("Use configureRequest instead", level = DeprecationLevel.WARNING)
+     public var nodeOptions: JsAny = makeJsObject()
+ }
+ 
+diff --git a/ktor-client/ktor-client-core/wasmJs/src/io/ktor/client/engine/js/WasmJsClientEngine.kt b/ktor-client/ktor-client-core/wasmJs/src/io/ktor/client/engine/js/WasmJsClientEngine.kt
+index 2bb89f35c..4f667708e 100644
+--- a/ktor-client/ktor-client-core/wasmJs/src/io/ktor/client/engine/js/WasmJsClientEngine.kt
++++ b/ktor-client/ktor-client-core/wasmJs/src/io/ktor/client/engine/js/WasmJsClientEngine.kt
+@@ -4,6 +4,7 @@
+ 
+ package io.ktor.client.engine.js
+ 
++import io.ktor.client.FetchOptions
+ import io.ktor.client.engine.*
+ import io.ktor.client.engine.js.compatibility.*
+ import io.ktor.client.plugins.*
+@@ -56,7 +57,8 @@ internal class JsClientEngine(
+ 
+         val requestTime = GMTDate()
+         val rawRequest = data.toRaw(clientConfig, callContext)
+-        val rawResponse = commonFetch(data.url.toString(), rawRequest, config, callContext.job)
++        val requestConfig = data.attributes.getOrNull(FetchOptions.key)?.requestInit ?: {}
++        val rawResponse = commonFetch(data.url.toString(), rawRequest, requestConfig, config, callContext.job)
+ 
+         val status = HttpStatusCode(rawResponse.status.toInt(), rawResponse.statusText)
+         val headers = rawResponse.headers.mapToKtor(data.method, data.attributes)
+diff --git a/ktor-client/ktor-client-core/wasmJs/src/io/ktor/client/engine/js/compatibility/Utils.kt b/ktor-client/ktor-client-core/wasmJs/src/io/ktor/client/engine/js/compatibility/Utils.kt
+index fa24ccd64..897d75020 100644
+--- a/ktor-client/ktor-client-core/wasmJs/src/io/ktor/client/engine/js/compatibility/Utils.kt
++++ b/ktor-client/ktor-client-core/wasmJs/src/io/ktor/client/engine/js/compatibility/Utils.kt
+@@ -18,15 +18,19 @@ import kotlin.coroutines.resume
+ import kotlin.coroutines.resumeWithException
+ import kotlin.js.Promise
+ 
++@Suppress("DEPRECATION")
+ @OptIn(InternalCoroutinesApi::class)
+ internal suspend fun commonFetch(
+     input: String,
+     init: RequestInit,
++    requestConfig: RequestInit.() -> Unit,
+     config: JsClientEngineConfig,
+     callJob: Job,
+ ): org.w3c.fetch.Response = suspendCancellableCoroutine { continuation ->
+     val controller = AbortController()
+     init.signal = controller.signal
++    config.requestInit(init)
++    requestConfig(init)
+ 
+     callJob.invokeOnCompletion(onCancelling = true) { controller.abort() }
+ 

@@ -1,0 +1,9 @@
+When using the CIO HTTP client engine, a server that closes the connection prematurely during HTTP response parsing can cause an exception to be surfaced as a generic parsing failure (for example an error like: "Failed to parse HTTP response: the server prematurely closed the connection"). Internally this scenario may manifest as an EOFException while reading from the response channel.
+
+The CIO engine should treat an unexpected end-of-stream during response parsing as a closed read channel condition, and surface it consistently as a ClosedReadChannelException (or a higher-level exception whose cause is a ClosedReadChannelException), rather than leaking a raw EOFException or wrapping it as a generic “failed to parse HTTP response” error.
+
+Reproduction scenario: create an HttpClient using the CIO engine, connect to a server endpoint that accepts a TCP connection and then closes it before a complete HTTP response can be read (or closes mid-response). Performing a request (e.g., client.get(url)) should fail with a ClosedReadChannelException semantics, not an EOFException or an HTTP parsing exception message implying malformed data.
+
+Expected behavior: if the peer closes the connection while the client is still reading/parsing the HTTP response, the client call fails with a ClosedReadChannelException (or an exception that clearly indicates the channel was closed, with ClosedReadChannelException as the root cause). Actual behavior: the failure is reported as an EOFException and/or as a generic HTTP response parsing failure message.
+
+Additionally, this change must not break normal connection error recovery: after repeated connection failures (e.g., ConnectException during connect attempts), subsequent successful requests using the same HttpClient instance should still work normally and return the correct response body when a server becomes available.

@@ -1,0 +1,159 @@
+diff --git a/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/api/AdapterGenerator.kt b/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/api/AdapterGenerator.kt
+index 3ea13edc..638fd1d7 100644
+--- a/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/api/AdapterGenerator.kt
++++ b/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/api/AdapterGenerator.kt
+@@ -203,7 +203,7 @@ internal class AdapterGenerator(
+           result.addStatement("%N = %N.fromJson(%N)",
+               property.localName, nameAllocator[property.delegateKey], readerParam)
+         } else {
+-          val exception = unexpectedNull(property.localName, readerParam)
++          val exception = unexpectedNull(property, readerParam)
+           result.addStatement("%N = %N.fromJson(%N) ?: throw·%L",
+               property.localName, nameAllocator[property.delegateKey], readerParam, exception)
+         }
+@@ -221,7 +221,7 @@ internal class AdapterGenerator(
+           result.addStatement("%L -> %N = %N.fromJson(%N)",
+               propertyIndex, property.localName, nameAllocator[property.delegateKey], readerParam)
+         } else {
+-          val exception = unexpectedNull(property.localName, readerParam)
++          val exception = unexpectedNull(property, readerParam)
+           result.addStatement("%L -> %N = %N.fromJson(%N) ?: throw·%L",
+               propertyIndex, property.localName, nameAllocator[property.delegateKey], readerParam,
+               exception)
+@@ -308,7 +308,8 @@ internal class AdapterGenerator(
+       }
+       if (!property.isTransient && property.isRequired) {
+         val missingPropertyBlock =
+-            CodeBlock.of("%T.missingProperty(%S, %N)", Util::class, property.localName, readerParam)
++            CodeBlock.of("%T.missingProperty(%S, %S, %N)",
++                MOSHI_UTIL, property.localName, property.jsonName, readerParam)
+         result.addCode(" ?: throw·%L", missingPropertyBlock)
+       }
+       separator = ",\n"
+@@ -341,8 +342,9 @@ internal class AdapterGenerator(
+     return result.build()
+   }
+ 
+-  private fun unexpectedNull(identifier: String, reader: ParameterSpec): CodeBlock {
+-    return CodeBlock.of("%T.unexpectedNull(%S, %N)", Util::class, identifier, reader)
++  private fun unexpectedNull(property: PropertyGenerator, reader: ParameterSpec): CodeBlock {
++    return CodeBlock.of("%T.unexpectedNull(%S, %S, %N)",
++        MOSHI_UTIL, property.localName, property.jsonName, reader)
+   }
+ 
+   private fun generateToJsonFun(): FunSpec {
+diff --git a/kotlin/reflect/src/main/java/com/squareup/moshi/kotlin/reflect/KotlinJsonAdapter.kt b/kotlin/reflect/src/main/java/com/squareup/moshi/kotlin/reflect/KotlinJsonAdapter.kt
+index 0aafe568..555638b5 100644
+--- a/kotlin/reflect/src/main/java/com/squareup/moshi/kotlin/reflect/KotlinJsonAdapter.kt
++++ b/kotlin/reflect/src/main/java/com/squareup/moshi/kotlin/reflect/KotlinJsonAdapter.kt
+@@ -83,8 +83,11 @@ internal class KotlinJsonAdapter<T>(
+       values[index] = binding.adapter.fromJson(reader)
+ 
+       if (values[index] == null && !binding.property.returnType.isMarkedNullable) {
+-        throw JsonDataException(
+-            "Non-null value '${binding.property.name}' was null at ${reader.path}")
++        throw Util.unexpectedNull(
++            binding.property.name,
++            binding.jsonName,
++            reader
++        )
+       }
+     }
+     reader.endObject()
+@@ -93,8 +96,11 @@ internal class KotlinJsonAdapter<T>(
+     for (i in 0 until constructorSize) {
+       if (values[i] === ABSENT_VALUE && !constructor.parameters[i].isOptional) {
+         if (!constructor.parameters[i].type.isMarkedNullable) {
+-          throw JsonDataException(
+-              "Required value '${constructor.parameters[i].name}' missing at ${reader.path}")
++          throw Util.missingProperty(
++              constructor.parameters[i].name,
++              bindings[i]?.jsonName,
++              reader
++          )
+         }
+         values[i] = null // Replace absent with null.
+       }
+@@ -130,6 +136,7 @@ internal class KotlinJsonAdapter<T>(
+ 
+   data class Binding<K, P>(
+       val name: String,
++      val jsonName: String?,
+       val adapter: JsonAdapter<P>,
+       val property: KProperty1<K, P>,
+       val parameter: KParameter?) {
+@@ -245,8 +252,13 @@ class KotlinJsonAdapterFactory : JsonAdapter.Factory {
+           resolvedPropertyType, Util.jsonAnnotations(allAnnotations.toTypedArray()), property.name)
+ 
+       @Suppress("UNCHECKED_CAST")
+-      bindingsByName[property.name] = KotlinJsonAdapter.Binding(name, adapter,
+-          property as KProperty1<Any, Any?>, parameter)
++      bindingsByName[property.name] = KotlinJsonAdapter.Binding(
++          name,
++          jsonAnnotation?.name ?: name,
++          adapter,
++          property as KProperty1<Any, Any?>,
++          parameter
++      )
+     }
+ 
+     val bindings = ArrayList<KotlinJsonAdapter.Binding<Any, Any?>?>()
+diff --git a/moshi/src/main/java/com/squareup/moshi/internal/Util.java b/moshi/src/main/java/com/squareup/moshi/internal/Util.java
+index 3f1c866d..1c498697 100644
+--- a/moshi/src/main/java/com/squareup/moshi/internal/Util.java
++++ b/moshi/src/main/java/com/squareup/moshi/internal/Util.java
+@@ -44,8 +44,6 @@ import static com.squareup.moshi.Types.subtypeOf;
+ import static com.squareup.moshi.Types.supertypeOf;
+ 
+ public final class Util {
+-  private static final String REQUIRED_PROPERTY_TEMPLATE = "Required property '%s' missing at %s";
+-  private static final String UNEXPECTED_NULL_TEMPLATE = "Non-null value '%s' was null at %s";
+   public static final Set<Annotation> NO_ANNOTATIONS = Collections.emptySet();
+   public static final Type[] EMPTY_TYPE_ARRAY = new Type[] {};
+   @Nullable private static final Class<?> DEFAULT_CONSTRUCTOR_MARKER;
+@@ -567,17 +565,35 @@ public final class Util {
+     throw new IllegalStateException("No defaults constructor found for " + targetClass);
+   }
+ 
+-  public static JsonDataException missingProperty(String property, JsonReader reader) {
+-    return jsonDataException(REQUIRED_PROPERTY_TEMPLATE, property, reader);
+-  }
+-
+-  public static JsonDataException unexpectedNull(String property, JsonReader reader) {
+-    return jsonDataException(UNEXPECTED_NULL_TEMPLATE, property, reader);
++  public static JsonDataException missingProperty(
++      String propertyName,
++      String jsonName,
++      JsonReader reader
++  ) {
++    String path = reader.getPath();
++    String message;
++    if (jsonName.equals(propertyName)) {
++      message = String.format("Required value '%s' missing at %s", propertyName, path);
++    } else {
++      message = String.format("Required value '%s' (JSON name '%s') missing at %s",
++          propertyName, jsonName, path);
++    }
++    return new JsonDataException(message);
+   }
+ 
+-  private static JsonDataException jsonDataException(
+-      String template, String property, JsonReader reader) {
+-    return new JsonDataException(
+-        String.format(template, property, reader.getPath()));
++  public static JsonDataException unexpectedNull(
++      String propertyName,
++      String jsonName,
++      JsonReader reader
++  ) {
++    String path = reader.getPath();
++    String message;
++    if (jsonName.equals(propertyName)) {
++      message = String.format("Non-null value '%s' was null at %s", propertyName, path);
++    } else {
++      message = String.format("Non-null value '%s' (JSON name '%s') was null at %s",
++          propertyName, jsonName, path);
++    }
++    return new JsonDataException(message);
+   }
+ }

@@ -1,0 +1,514 @@
+diff --git a/ktor-http/ktor-http-cio/common/src/io/ktor/http/cio/ChunkedTransferEncoding.kt b/ktor-http/ktor-http-cio/common/src/io/ktor/http/cio/ChunkedTransferEncoding.kt
+index 0e044e7ff..245e7871b 100644
+--- a/ktor-http/ktor-http-cio/common/src/io/ktor/http/cio/ChunkedTransferEncoding.kt
++++ b/ktor-http/ktor-http-cio/common/src/io/ktor/http/cio/ChunkedTransferEncoding.kt
+@@ -1,17 +1,18 @@
+ /*
+-* Copyright 2014-2021 JetBrains s.r.o and contributors. Use of this source code is governed by the Apache 2.0 license.
+-*/
++ * Copyright 2014-2025 JetBrains s.r.o and contributors. Use of this source code is governed by the Apache 2.0 license.
++ */
+ 
+ package io.ktor.http.cio
+ 
+ import io.ktor.http.cio.internals.*
+ import io.ktor.utils.io.*
+-import io.ktor.utils.io.bits.*
+ import io.ktor.utils.io.core.*
+ import io.ktor.utils.io.pool.*
+-import kotlinx.coroutines.*
+-import kotlinx.io.*
+-import kotlin.coroutines.*
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.DelicateCoroutinesApi
++import kotlinx.coroutines.GlobalScope
++import kotlinx.io.EOFException
++import kotlin.coroutines.CoroutineContext
+ 
+ private const val MAX_CHUNK_SIZE_LENGTH = 128
+ private const val CHUNK_BUFFER_POOL_SIZE = 2048
+@@ -34,7 +35,6 @@ public typealias DecoderJob = WriterJob
+  *
+  * [Report a problem](https://ktor.io/feedback/?fqname=io.ktor.http.cio.decodeChunked)
+  */
+-@Suppress("TYPEALIAS_EXPANSION_DEPRECATION")
+ @Deprecated(
+     "Specify content length if known or pass -1L",
+     ReplaceWith("decodeChunked(input, -1L)"),
+@@ -48,7 +48,7 @@ public fun CoroutineScope.decodeChunked(input: ByteReadChannel): DecoderJob =
+  *
+  * [Report a problem](https://ktor.io/feedback/?fqname=io.ktor.http.cio.decodeChunked)
+  */
+-@Suppress("UNUSED_PARAMETER", "TYPEALIAS_EXPANSION_DEPRECATION")
++@Suppress("UNUSED_PARAMETER")
+ public fun CoroutineScope.decodeChunked(input: ByteReadChannel, contentLength: Long): DecoderJob =
+     writer(coroutineContext) {
+         decodeChunked(input, channel)
+@@ -63,6 +63,7 @@ public fun CoroutineScope.decodeChunked(input: ByteReadChannel, contentLength: L
+  * @throws EOFException if stream has ended unexpectedly.
+  * @throws ParserException if the format is invalid.
+  */
++@OptIn(InternalAPI::class)
+ public suspend fun decodeChunked(input: ByteReadChannel, out: ByteWriteChannel) {
+     val chunkSizeBuffer = ChunkSizeBufferPool.borrow()
+     var totalBytesCopied = 0L
+@@ -70,7 +71,7 @@ public suspend fun decodeChunked(input: ByteReadChannel, out: ByteWriteChannel)
+     try {
+         while (true) {
+             chunkSizeBuffer.clear()
+-            if (!input.readUTF8LineTo(chunkSizeBuffer, MAX_CHUNK_SIZE_LENGTH)) {
++            if (!input.readUTF8LineTo(chunkSizeBuffer, MAX_CHUNK_SIZE_LENGTH, httpLineEndings)) {
+                 throw EOFException("Chunked stream has ended unexpectedly: no chunk size")
+             } else if (chunkSizeBuffer.isEmpty()) {
+                 throw EOFException("Invalid chunk size: empty")
+@@ -86,7 +87,7 @@ public suspend fun decodeChunked(input: ByteReadChannel, out: ByteWriteChannel)
+             }
+ 
+             chunkSizeBuffer.clear()
+-            if (!input.readUTF8LineTo(chunkSizeBuffer, 2)) {
++            if (!input.readUTF8LineTo(chunkSizeBuffer, 2, httpLineEndings)) {
+                 throw EOFException("Invalid chunk: content block of size $chunkSize ended unexpectedly")
+             }
+             if (chunkSizeBuffer.isNotEmpty()) {
+diff --git a/ktor-http/ktor-http-cio/common/src/io/ktor/http/cio/HttpParser.kt b/ktor-http/ktor-http-cio/common/src/io/ktor/http/cio/HttpParser.kt
+index 045f3f9a8..c8a787c7d 100644
+--- a/ktor-http/ktor-http-cio/common/src/io/ktor/http/cio/HttpParser.kt
++++ b/ktor-http/ktor-http-cio/common/src/io/ktor/http/cio/HttpParser.kt
+@@ -1,6 +1,6 @@
+ /*
+-* Copyright 2014-2021 JetBrains s.r.o and contributors. Use of this source code is governed by the Apache 2.0 license.
+-*/
++ * Copyright 2014-2025 JetBrains s.r.o and contributors. Use of this source code is governed by the Apache 2.0 license.
++ */
+ 
+ package io.ktor.http.cio
+ 
+@@ -20,18 +20,29 @@ private const val HTTP_STATUS_CODE_MIN_RANGE = 100
+ private const val HTTP_STATUS_CODE_MAX_RANGE = 999
+ private val hostForbiddenSymbols = setOf('/', '?', '#', '@')
+ 
++/**
++ * Line endings allowed as a separator for HTTP fields and start line.
++ *
++ * "Although the line terminator for the start-line and fields is the sequence CRLF,
++ * a recipient MAY recognize a single LF as a line terminator and ignore any preceding CR."
++ * https://datatracker.ietf.org/doc/html/rfc9112#section-2.2-3
++ */
++@OptIn(InternalAPI::class)
++internal val httpLineEndings: LineEndingMode = LineEndingMode.CRLF + LineEndingMode.LF
++
+ /**
+  * Parse an HTTP request line and headers
+  *
+  * [Report a problem](https://ktor.io/feedback/?fqname=io.ktor.http.cio.parseRequest)
+  */
++@OptIn(InternalAPI::class)
+ public suspend fun parseRequest(input: ByteReadChannel): Request? {
+     val builder = CharArrayBuilder()
+     val range = MutableRange(0, 0)
+ 
+     try {
+         while (true) {
+-            if (!input.readUTF8LineTo(builder, HTTP_LINE_LIMIT)) return null
++            if (!input.readUTF8LineTo(builder, HTTP_LINE_LIMIT, httpLineEndings)) return null
+             range.end = builder.length
+             if (range.start == range.end) continue
+ 
+@@ -61,12 +72,13 @@ public suspend fun parseRequest(input: ByteReadChannel): Request? {
+  *
+  * [Report a problem](https://ktor.io/feedback/?fqname=io.ktor.http.cio.parseResponse)
+  */
++@OptIn(InternalAPI::class)
+ public suspend fun parseResponse(input: ByteReadChannel): Response? {
+     val builder = CharArrayBuilder()
+     val range = MutableRange(0, 0)
+ 
+     try {
+-        if (!input.readUTF8LineTo(builder, HTTP_LINE_LIMIT)) return null
++        if (!input.readUTF8LineTo(builder, HTTP_LINE_LIMIT, httpLineEndings)) return null
+         range.end = builder.length
+ 
+         val version = parseVersion(builder, range)
+@@ -97,6 +109,7 @@ public suspend fun parseHeaders(input: ByteReadChannel): HttpHeadersMap {
+ /**
+  * Parse HTTP headers. Not applicable to request and response status lines.
+  */
++@OptIn(InternalAPI::class)
+ internal suspend fun parseHeaders(
+     input: ByteReadChannel,
+     builder: CharArrayBuilder,
+@@ -106,7 +119,7 @@ internal suspend fun parseHeaders(
+ 
+     try {
+         while (true) {
+-            if (!input.readUTF8LineTo(builder, HTTP_LINE_LIMIT)) {
++            if (!input.readUTF8LineTo(builder, HTTP_LINE_LIMIT, httpLineEndings)) {
+                 headers.release()
+                 return null
+             }
+diff --git a/ktor-io/api/ktor-io.api b/ktor-io/api/ktor-io.api
+index ee51e090b..e1891dc73 100644
+--- a/ktor-io/api/ktor-io.api
++++ b/ktor-io/api/ktor-io.api
+@@ -89,6 +89,8 @@ public final class io/ktor/utils/io/ByteReadChannelOperationsKt {
+ 	public static synthetic fun readUTF8Line$default (Lio/ktor/utils/io/ByteReadChannel;ILkotlin/coroutines/Continuation;ILjava/lang/Object;)Ljava/lang/Object;
+ 	public static final fun readUTF8LineTo (Lio/ktor/utils/io/ByteReadChannel;Ljava/lang/Appendable;ILkotlin/coroutines/Continuation;)Ljava/lang/Object;
+ 	public static synthetic fun readUTF8LineTo$default (Lio/ktor/utils/io/ByteReadChannel;Ljava/lang/Appendable;ILkotlin/coroutines/Continuation;ILjava/lang/Object;)Ljava/lang/Object;
++	public static final fun readUTF8LineTo-RRvyBJ8 (Lio/ktor/utils/io/ByteReadChannel;Ljava/lang/Appendable;IILkotlin/coroutines/Continuation;)Ljava/lang/Object;
++	public static synthetic fun readUTF8LineTo-RRvyBJ8$default (Lio/ktor/utils/io/ByteReadChannel;Ljava/lang/Appendable;IILkotlin/coroutines/Continuation;ILjava/lang/Object;)Ljava/lang/Object;
+ 	public static final fun readUntil (Lio/ktor/utils/io/ByteReadChannel;Lkotlinx/io/bytestring/ByteString;Lio/ktor/utils/io/ByteWriteChannel;JZLkotlin/coroutines/Continuation;)Ljava/lang/Object;
+ 	public static synthetic fun readUntil$default (Lio/ktor/utils/io/ByteReadChannel;Lkotlinx/io/bytestring/ByteString;Lio/ktor/utils/io/ByteWriteChannel;JZLkotlin/coroutines/Continuation;ILjava/lang/Object;)Ljava/lang/Object;
+ 	public static final fun reader (Lkotlinx/coroutines/CoroutineScope;Lkotlin/coroutines/CoroutineContext;Lio/ktor/utils/io/ByteChannel;Lkotlin/jvm/functions/Function2;)Lio/ktor/utils/io/ReaderJob;
+@@ -278,6 +280,28 @@ public abstract interface annotation class io/ktor/utils/io/KtorDsl : java/lang/
+ public abstract interface annotation class io/ktor/utils/io/KtorExperimentalAPI : java/lang/annotation/Annotation {
+ }
+ 
++public final class io/ktor/utils/io/LineEndingMode {
++	public static final field Companion Lio/ktor/utils/io/LineEndingMode$Companion;
++	public static final synthetic fun box-impl (I)Lio/ktor/utils/io/LineEndingMode;
++	public static final fun contains-lTjpP64 (II)Z
++	public fun equals (Ljava/lang/Object;)Z
++	public static fun equals-impl (ILjava/lang/Object;)Z
++	public static final fun equals-impl0 (II)Z
++	public fun hashCode ()I
++	public static fun hashCode-impl (I)I
++	public static final fun plus-1Ter-O4 (II)I
++	public fun toString ()Ljava/lang/String;
++	public static fun toString-impl (I)Ljava/lang/String;
++	public final synthetic fun unbox-impl ()I
++}
++
++public final class io/ktor/utils/io/LineEndingMode$Companion {
++	public final fun getAny-f0jXZW8 ()I
++	public final fun getCR-f0jXZW8 ()I
++	public final fun getCRLF-f0jXZW8 ()I
++	public final fun getLF-f0jXZW8 ()I
++}
++
+ public final class io/ktor/utils/io/LookAheadSessionKt {
+ 	public static final fun lookAhead (Lio/ktor/utils/io/ByteReadChannel;Lkotlin/jvm/functions/Function2;Lkotlin/coroutines/Continuation;)Ljava/lang/Object;
+ 	public static final fun lookAheadSuspend (Lio/ktor/utils/io/ByteReadChannel;Lkotlin/jvm/functions/Function2;Lkotlin/coroutines/Continuation;)Ljava/lang/Object;
+diff --git a/ktor-io/api/ktor-io.klib.api b/ktor-io/api/ktor-io.klib.api
+index bd393c28e..d468d1535 100644
+--- a/ktor-io/api/ktor-io.klib.api
++++ b/ktor-io/api/ktor-io.klib.api
+@@ -297,6 +297,25 @@ final class io.ktor.utils.io/WriterScope : kotlinx.coroutines/CoroutineScope { /
+         final fun <get-coroutineContext>(): kotlin.coroutines/CoroutineContext // io.ktor.utils.io/WriterScope.coroutineContext.<get-coroutineContext>|<get-coroutineContext>(){}[0]
+ }
+ 
++final value class io.ktor.utils.io/LineEndingMode { // io.ktor.utils.io/LineEndingMode|null[0]
++    final fun contains(io.ktor.utils.io/LineEndingMode): kotlin/Boolean // io.ktor.utils.io/LineEndingMode.contains|contains(io.ktor.utils.io.LineEndingMode){}[0]
++    final fun equals(kotlin/Any?): kotlin/Boolean // io.ktor.utils.io/LineEndingMode.equals|equals(kotlin.Any?){}[0]
++    final fun hashCode(): kotlin/Int // io.ktor.utils.io/LineEndingMode.hashCode|hashCode(){}[0]
++    final fun plus(io.ktor.utils.io/LineEndingMode): io.ktor.utils.io/LineEndingMode // io.ktor.utils.io/LineEndingMode.plus|plus(io.ktor.utils.io.LineEndingMode){}[0]
++    final fun toString(): kotlin/String // io.ktor.utils.io/LineEndingMode.toString|toString(){}[0]
++
++    final object Companion { // io.ktor.utils.io/LineEndingMode.Companion|null[0]
++        final val Any // io.ktor.utils.io/LineEndingMode.Companion.Any|{}Any[0]
++            final fun <get-Any>(): io.ktor.utils.io/LineEndingMode // io.ktor.utils.io/LineEndingMode.Companion.Any.<get-Any>|<get-Any>(){}[0]
++        final val CR // io.ktor.utils.io/LineEndingMode.Companion.CR|{}CR[0]
++            final fun <get-CR>(): io.ktor.utils.io/LineEndingMode // io.ktor.utils.io/LineEndingMode.Companion.CR.<get-CR>|<get-CR>(){}[0]
++        final val CRLF // io.ktor.utils.io/LineEndingMode.Companion.CRLF|{}CRLF[0]
++            final fun <get-CRLF>(): io.ktor.utils.io/LineEndingMode // io.ktor.utils.io/LineEndingMode.Companion.CRLF.<get-CRLF>|<get-CRLF>(){}[0]
++        final val LF // io.ktor.utils.io/LineEndingMode.Companion.LF|{}LF[0]
++            final fun <get-LF>(): io.ktor.utils.io/LineEndingMode // io.ktor.utils.io/LineEndingMode.Companion.LF.<get-LF>|<get-LF>(){}[0]
++    }
++}
++
+ open class io.ktor.utils.io.charsets/MalformedInputException : kotlinx.io/IOException { // io.ktor.utils.io.charsets/MalformedInputException|null[0]
+     constructor <init>(kotlin/String) // io.ktor.utils.io.charsets/MalformedInputException.<init>|<init>(kotlin.String){}[0]
+ }
+@@ -461,6 +480,7 @@ final suspend fun (io.ktor.utils.io/ByteReadChannel).io.ktor.utils.io/readRemain
+ final suspend fun (io.ktor.utils.io/ByteReadChannel).io.ktor.utils.io/readShort(): kotlin/Short // io.ktor.utils.io/readShort|readShort@io.ktor.utils.io.ByteReadChannel(){}[0]
+ final suspend fun (io.ktor.utils.io/ByteReadChannel).io.ktor.utils.io/readUTF8Line(kotlin/Int = ...): kotlin/String? // io.ktor.utils.io/readUTF8Line|readUTF8Line@io.ktor.utils.io.ByteReadChannel(kotlin.Int){}[0]
+ final suspend fun (io.ktor.utils.io/ByteReadChannel).io.ktor.utils.io/readUTF8LineTo(kotlin.text/Appendable, kotlin/Int = ...): kotlin/Boolean // io.ktor.utils.io/readUTF8LineTo|readUTF8LineTo@io.ktor.utils.io.ByteReadChannel(kotlin.text.Appendable;kotlin.Int){}[0]
++final suspend fun (io.ktor.utils.io/ByteReadChannel).io.ktor.utils.io/readUTF8LineTo(kotlin.text/Appendable, kotlin/Int = ..., io.ktor.utils.io/LineEndingMode = ...): kotlin/Boolean // io.ktor.utils.io/readUTF8LineTo|readUTF8LineTo@io.ktor.utils.io.ByteReadChannel(kotlin.text.Appendable;kotlin.Int;io.ktor.utils.io.LineEndingMode){}[0]
+ final suspend fun (io.ktor.utils.io/ByteReadChannel).io.ktor.utils.io/readUntil(kotlinx.io.bytestring/ByteString, io.ktor.utils.io/ByteWriteChannel, kotlin/Long = ..., kotlin/Boolean = ...): kotlin/Long // io.ktor.utils.io/readUntil|readUntil@io.ktor.utils.io.ByteReadChannel(kotlinx.io.bytestring.ByteString;io.ktor.utils.io.ByteWriteChannel;kotlin.Long;kotlin.Boolean){}[0]
+ final suspend fun (io.ktor.utils.io/ByteReadChannel).io.ktor.utils.io/skipIfFound(kotlinx.io.bytestring/ByteString): kotlin/Boolean // io.ktor.utils.io/skipIfFound|skipIfFound@io.ktor.utils.io.ByteReadChannel(kotlinx.io.bytestring.ByteString){}[0]
+ final suspend fun (io.ktor.utils.io/ByteReadChannel).io.ktor.utils.io/toByteArray(): kotlin/ByteArray // io.ktor.utils.io/toByteArray|toByteArray@io.ktor.utils.io.ByteReadChannel(){}[0]
+diff --git a/ktor-io/common/src/io/ktor/utils/io/ByteChannel.kt b/ktor-io/common/src/io/ktor/utils/io/ByteChannel.kt
+index 8e8da8bc0..71f8ccda4 100644
+--- a/ktor-io/common/src/io/ktor/utils/io/ByteChannel.kt
++++ b/ktor-io/common/src/io/ktor/utils/io/ByteChannel.kt
+@@ -1,16 +1,19 @@
+ /*
+- * Copyright 2014-2024 JetBrains s.r.o and contributors. Use of this source code is governed by the Apache 2.0 license.
++ * Copyright 2014-2025 JetBrains s.r.o and contributors. Use of this source code is governed by the Apache 2.0 license.
+  */
+ 
+ package io.ktor.utils.io
+ 
+ import io.ktor.utils.io.locks.*
+-import kotlinx.atomicfu.*
+-import kotlinx.coroutines.*
+-import kotlinx.io.*
++import kotlinx.atomicfu.AtomicRef
++import kotlinx.atomicfu.atomic
++import kotlinx.coroutines.suspendCancellableCoroutine
++import kotlinx.io.Buffer
++import kotlinx.io.Sink
++import kotlinx.io.Source
+ import kotlin.concurrent.Volatile
+-import kotlin.coroutines.*
+-import kotlin.jvm.*
++import kotlin.coroutines.Continuation
++import kotlin.jvm.JvmStatic
+ 
+ internal expect val DEVELOPMENT_MODE: Boolean
+ internal const val CHANNEL_MAX_SIZE: Int = 1024 * 1024
+@@ -171,9 +174,7 @@ public class ByteChannel(public val autoFlush: Boolean = false) : ByteReadChanne
+     private fun closeSlot(cause: Throwable?) {
+         val closeContinuation = if (cause != null) Slot.Closed(cause) else Slot.CLOSED
+         val continuation = suspensionSlot.getAndSet(closeContinuation)
+-        if (continuation !is Slot.Task) return
+-
+-        continuation.resume(cause)
++        if (continuation is Slot.Task) continuation.resume(cause)
+     }
+ 
+     private inline fun <reified TaskType : Slot.Task> trySuspend(
+diff --git a/ktor-io/common/src/io/ktor/utils/io/ByteReadChannelOperations.kt b/ktor-io/common/src/io/ktor/utils/io/ByteReadChannelOperations.kt
+index 17a22e462..5e2108a93 100644
+--- a/ktor-io/common/src/io/ktor/utils/io/ByteReadChannelOperations.kt
++++ b/ktor-io/common/src/io/ktor/utils/io/ByteReadChannelOperations.kt
+@@ -1,9 +1,7 @@
+ /*
+- * Copyright 2014-2024 JetBrains s.r.o and contributors. Use of this source code is governed by the Apache 2.0 license.
++ * Copyright 2014-2025 JetBrains s.r.o and contributors. Use of this source code is governed by the Apache 2.0 license.
+  */
+ 
+-@file:Suppress("DEPRECATION")
+-
+ package io.ktor.utils.io
+ 
+ import io.ktor.utils.io.charsets.*
+@@ -250,7 +248,7 @@ public suspend fun ByteReadChannel.readRemaining(max: Long): Source {
+ }
+ 
+ /**
+- * Reads all available bytes to [dst] buffer and returns immediately or suspends if no bytes available
++ * Reads all available bytes to [buffer] and returns immediately or suspends if no bytes available
+  *
+  * [Report a problem](https://ktor.io/feedback/?fqname=io.ktor.utils.io.readAvailable)
+  *
+@@ -399,7 +397,6 @@ private const val LF: Byte = '\n'.code.toByte()
+  * Reads a line of UTF-8 characters to the specified [out] buffer.
+  * It recognizes CR, LF and CRLF as a line delimiter.
+  *
+- *
+  * [Report a problem](https://ktor.io/feedback/?fqname=io.ktor.utils.io.readUTF8LineTo)
+  *
+  * @param out the buffer to write the line to
+@@ -408,11 +405,42 @@ private const val LF: Byte = '\n'.code.toByte()
+  * @return `true` if a new line separator was found or max bytes appended. `false` if no new line separator and no bytes read.
+  * @throws TooLongLineException if max is reached before encountering a newline or end of input
+  */
+-@OptIn(InternalAPI::class, InternalIoApi::class)
++@OptIn(InternalAPI::class)
+ public suspend fun ByteReadChannel.readUTF8LineTo(out: Appendable, max: Int = Int.MAX_VALUE): Boolean {
++    return readUTF8LineTo(out, max, lineEnding = LineEndingMode.Any)
++}
++
++/**
++ * Reads a line of UTF-8 characters to the specified [out] buffer.
++ * It recognizes the specified line ending as a line delimiter and throws an exception
++ * if an unexpected line delimiter is found.
++ * By default, all line endings (CR, LF and CRLF) are allowed as a line delimiter.
++ *
++ * [Report a problem](https://ktor.io/feedback/?fqname=io.ktor.utils.io.readUTF8LineTo)
++ *
++ * @param out the buffer to write the line to
++ * @param max the maximum number of characters to read
++ * @param lineEnding the allowed line endings
++ *
++ * @return `true` if a new line separator was found or max bytes appended. `false` if no new line separator and no bytes read.
++ * @throws TooLongLineException if max is reached before encountering a newline or end of input
++ */
++@InternalAPI
++@OptIn(InternalIoApi::class)
++public suspend fun ByteReadChannel.readUTF8LineTo(
++    out: Appendable,
++    max: Int = Int.MAX_VALUE,
++    lineEnding: LineEndingMode = LineEndingMode.Any,
++): Boolean {
+     if (readBuffer.exhausted()) awaitContent()
+     if (isClosedForRead) return false
+ 
++    fun checkLineEndingAllowed(lineEndingToCheck: LineEndingMode) {
++        if (lineEndingToCheck !in lineEnding) {
++            throw IOException("Unexpected line ending $lineEndingToCheck, while expected $lineEnding")
++        }
++    }
++
+     Buffer().use { lineBuffer ->
+         while (!isClosedForRead) {
+             while (!readBuffer.exhausted()) {
+@@ -421,13 +449,17 @@ public suspend fun ByteReadChannel.readUTF8LineTo(out: Appendable, max: Int = In
+                         // Check if LF follows CR after awaiting
+                         if (readBuffer.exhausted()) awaitContent()
+                         if (readBuffer.buffer[0] == LF) {
++                            checkLineEndingAllowed(LineEndingMode.CRLF)
+                             readBuffer.discard(1)
++                        } else {
++                            checkLineEndingAllowed(LineEndingMode.CR)
+                         }
+                         out.append(lineBuffer.readString())
+                         return true
+                     }
+ 
+                     LF -> {
++                        checkLineEndingAllowed(LineEndingMode.LF)
+                         out.append(lineBuffer.readString())
+                         return true
+                     }
+diff --git a/ktor-io/common/src/io/ktor/utils/io/CloseToken.kt b/ktor-io/common/src/io/ktor/utils/io/CloseToken.kt
+index 37419667a..9884f05e3 100644
+--- a/ktor-io/common/src/io/ktor/utils/io/CloseToken.kt
++++ b/ktor-io/common/src/io/ktor/utils/io/CloseToken.kt
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2014-2024 JetBrains s.r.o and contributors. Use of this source code is governed by the Apache 2.0 license.
++ * Copyright 2014-2025 JetBrains s.r.o and contributors. Use of this source code is governed by the Apache 2.0 license.
+  */
+ 
+ package io.ktor.utils.io
+@@ -13,7 +13,7 @@ internal val CLOSED = CloseToken(null)
+ @OptIn(ExperimentalCoroutinesApi::class)
+ internal class CloseToken(private val origin: Throwable?) {
+ 
+-    fun wrapCause(wrap: (Throwable?) -> Throwable = ::ClosedByteChannelException): Throwable? {
++    fun wrapCause(wrap: (Throwable) -> Throwable = ::ClosedByteChannelException): Throwable? {
+         return when (origin) {
+             null -> null
+             is CopyableThrowable<*> -> origin.createCopy()
+@@ -22,6 +22,6 @@ internal class CloseToken(private val origin: Throwable?) {
+         }
+     }
+ 
+-    fun throwOrNull(wrap: (Throwable?) -> Throwable): Unit? =
++    fun throwOrNull(wrap: (Throwable) -> Throwable): Unit? =
+         wrapCause(wrap)?.let { throw it }
+ }
+diff --git a/ktor-io/common/src/io/ktor/utils/io/LineEndingMode.kt b/ktor-io/common/src/io/ktor/utils/io/LineEndingMode.kt
+new file mode 100644
+index 000000000..ba252f037
+--- /dev/null
++++ b/ktor-io/common/src/io/ktor/utils/io/LineEndingMode.kt
+@@ -0,0 +1,74 @@
++/*
++ * Copyright 2014-2025 JetBrains s.r.o and contributors. Use of this source code is governed by the Apache 2.0 license.
++ */
++
++package io.ktor.utils.io
++
++import kotlin.jvm.JvmInline
++
++/**
++ * Represents different line ending modes and provides operations to work with them.
++ * The class uses a bitmask internally to represent different line ending combinations.
++ *
++ * [Report a problem](https://ktor.io/feedback/?fqname=io.ktor.utils.io.LineEndingMode)
++ */
++@InternalAPI
++@JvmInline
++public value class LineEndingMode private constructor(private val mode: Int) {
++
++    /**
++     * Checks if this line ending mode includes another mode.
++     *
++     * [Report a problem](https://ktor.io/feedback/?fqname=io.ktor.utils.io.LineEndingMode.contains)
++     */
++    public operator fun contains(other: LineEndingMode): Boolean =
++        mode or other.mode == mode
++
++    /**
++     * Combines this line ending mode with another mode.
++     * The resulting mode will accept both line endings.
++     *
++     * [Report a problem](https://ktor.io/feedback/?fqname=io.ktor.utils.io.LineEndingMode.plus)
++     */
++    public operator fun plus(other: LineEndingMode): LineEndingMode =
++        LineEndingMode(mode or other.mode)
++
++    override fun toString(): String = when (this) {
++        CR -> "CR"
++        LF -> "LF"
++        CRLF -> "CRLF"
++        else -> values.filter { it in this }.toString()
++    }
++
++    public companion object {
++        /**
++         * Represents Carriage Return (\r) line ending.
++         *
++         * [Report a problem](https://ktor.io/feedback/?fqname=io.ktor.utils.io.LineEndingMode.CR)
++         */
++        public val CR: LineEndingMode = LineEndingMode(0b001)
++
++        /**
++         * Represents Line Feed (\n) line ending.
++         *
++         * [Report a problem](https://ktor.io/feedback/?fqname=io.ktor.utils.io.LineEndingMode.LF)
++         */
++        public val LF: LineEndingMode = LineEndingMode(0b010)
++
++        /**
++         * Represents Carriage Return + Line Feed (\r\n) line ending.
++         *
++         * [Report a problem](https://ktor.io/feedback/?fqname=io.ktor.utils.io.LineEndingMode.CRLF)
++         */
++        public val CRLF: LineEndingMode = LineEndingMode(0b100)
++
++        /**
++         * Represents a mode that accepts any line ending ([CR], [LF], or [CRLF]).
++         *
++         * [Report a problem](https://ktor.io/feedback/?fqname=io.ktor.utils.io.LineEndingMode.Any)
++         */
++        public val Any: LineEndingMode = LineEndingMode(0b111)
++
++        private val values = listOf(CR, LF, CRLF)
++    }
++}
+diff --git a/ktor-io/common/src/io/ktor/utils/io/SinkByteWriteChannel.kt b/ktor-io/common/src/io/ktor/utils/io/SinkByteWriteChannel.kt
+index c79acbf03..693814c23 100644
+--- a/ktor-io/common/src/io/ktor/utils/io/SinkByteWriteChannel.kt
++++ b/ktor-io/common/src/io/ktor/utils/io/SinkByteWriteChannel.kt
+@@ -6,7 +6,10 @@ package io.ktor.utils.io
+ 
+ import kotlinx.atomicfu.AtomicRef
+ import kotlinx.atomicfu.atomic
+-import kotlinx.io.*
++import kotlinx.io.IOException
++import kotlinx.io.RawSink
++import kotlinx.io.Sink
++import kotlinx.io.buffered
+ 
+ /**
+  * Creates a [ByteWriteChannel] that writes to this [Sink].
+@@ -58,7 +61,6 @@ internal class SinkByteWriteChannel(origin: RawSink) : ByteWriteChannel {
+         if (!closed.compareAndSet(expect = null, update = CLOSED)) return
+     }
+ 
+-    @OptIn(InternalAPI::class)
+     override fun cancel(cause: Throwable?) {
+         val token = if (cause == null) CLOSED else CloseToken(cause)
+         if (!closed.compareAndSet(expect = null, update = token)) return
+diff --git a/ktor-server/ktor-server-test-suites/jvm/src/io/ktor/server/testing/suites/SustainabilityTestSuite.kt b/ktor-server/ktor-server-test-suites/jvm/src/io/ktor/server/testing/suites/SustainabilityTestSuite.kt
+index c939d3334..ecd7f2361 100644
+--- a/ktor-server/ktor-server-test-suites/jvm/src/io/ktor/server/testing/suites/SustainabilityTestSuite.kt
++++ b/ktor-server/ktor-server-test-suites/jvm/src/io/ktor/server/testing/suites/SustainabilityTestSuite.kt
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2014-2024 JetBrains s.r.o and contributors. Use of this source code is governed by the Apache 2.0 license.
++ * Copyright 2014-2025 JetBrains s.r.o and contributors. Use of this source code is governed by the Apache 2.0 license.
+  */
+ 
+ package io.ktor.server.testing.suites
+@@ -11,6 +11,7 @@ import io.ktor.client.statement.*
+ import io.ktor.http.*
+ import io.ktor.http.cio.*
+ import io.ktor.http.content.*
++import io.ktor.network.sockets.*
+ import io.ktor.server.application.*
+ import io.ktor.server.engine.*
+ import io.ktor.server.http.content.*

@@ -1,0 +1,263 @@
+diff --git a/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/api/AdapterGenerator.kt b/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/api/AdapterGenerator.kt
+index 06ae89fb..5eec3be0 100644
+--- a/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/api/AdapterGenerator.kt
++++ b/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/api/AdapterGenerator.kt
+@@ -95,13 +95,12 @@ internal class AdapterGenerator(
+   private val className = target.typeName.rawType()
+   private val visibility = target.visibility
+   private val typeVariables = target.typeVariables
+-  private val typeVariableResolver = typeVariables.toTypeVariableResolver()
+   private val targetConstructorParams = target.constructor.parameters
+     .mapKeys { (_, param) -> param.index }
+ 
+   private val nameAllocator = NameAllocator()
+   private val adapterName = "${className.simpleNames.joinToString(separator = "_")}JsonAdapter"
+-  private val originalTypeName = target.typeName.stripTypeVarVariance(typeVariableResolver)
++  private val originalTypeName = target.typeName.stripTypeVarVariance()
+   private val originalRawTypeName = originalTypeName.rawType()
+ 
+   private val moshiParam = ParameterSpec.builder(
+@@ -219,7 +218,7 @@ internal class AdapterGenerator(
+     result.superclass(jsonAdapterTypeName)
+ 
+     if (typeVariables.isNotEmpty()) {
+-      result.addTypeVariables(typeVariables.map { it.stripTypeVarVariance(typeVariableResolver) as TypeVariableName })
++      result.addTypeVariables(typeVariables.map { it.stripTypeVarVariance() as TypeVariableName })
+       // require(types.size == 1) {
+       //   "TypeVariable mismatch: Expecting 1 type(s) for generic type variables [T], but received ${types.size} with values $types"
+       // }
+diff --git a/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/api/kotlintypes.kt b/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/api/kotlintypes.kt
+index 9f1a7764..bb287246 100644
+--- a/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/api/kotlintypes.kt
++++ b/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/api/kotlintypes.kt
+@@ -37,6 +37,7 @@ import com.squareup.kotlinpoet.TypeVariableName
+ import com.squareup.kotlinpoet.UNIT
+ import com.squareup.kotlinpoet.WildcardTypeName
+ import com.squareup.kotlinpoet.asTypeName
++import kotlin.reflect.KClass
+ 
+ internal fun TypeName.rawType(): ClassName {
+   return when (this) {
+@@ -102,83 +103,47 @@ internal fun KModifier.checkIsVisibility() {
+   }
+ }
+ 
+-internal fun TypeName.stripTypeVarVariance(resolver: TypeVariableResolver): TypeName {
++internal inline fun <reified T : TypeName> TypeName.mapTypes(noinline transform: T.() -> TypeName?): TypeName {
++  return mapTypes(T::class, transform)
++}
++
++@Suppress("UNCHECKED_CAST")
++internal fun <T : TypeName> TypeName.mapTypes(target: KClass<T>, transform: T.() -> TypeName?): TypeName {
++  if (target.java == javaClass) {
++    return (this as T).transform() ?: return this
++  }
+   return when (this) {
+     is ClassName -> this
+     is ParameterizedTypeName -> {
+-      deepCopy { it.stripTypeVarVariance(resolver) }
+-    }
+-    is TypeVariableName -> resolver[name]
+-    is WildcardTypeName -> deepCopy { it.stripTypeVarVariance(resolver) }
+-    else -> throw UnsupportedOperationException("Type '${javaClass.simpleName}' is illegal. Only classes, parameterized types, wildcard types, or type variables are allowed.")
+-  }
+-}
+-
+-internal fun ParameterizedTypeName.deepCopy(
+-  transform: (TypeName) -> TypeName
+-): ParameterizedTypeName {
+-  return rawType.parameterizedBy(typeArguments.map { transform(it) })
+-    .copy(nullable = isNullable, annotations = annotations, tags = tags)
+-}
+-
+-internal fun TypeVariableName.deepCopy(
+-  variance: KModifier? = this.variance,
+-  transform: (TypeName) -> TypeName
+-): TypeVariableName {
+-  return TypeVariableName(name = name, bounds = bounds.map { transform(it) }, variance = variance)
+-    .copy(nullable = isNullable, annotations = annotations, tags = tags)
+-}
+-
+-internal fun WildcardTypeName.deepCopy(transform: (TypeName) -> TypeName): TypeName {
+-  // TODO Would be nice if KotlinPoet modeled these easier.
+-  // Producer type - empty inTypes, single element outTypes
+-  // Consumer type - single element inTypes, single ANY element outType.
+-  return when {
+-    this == STAR -> this
+-    outTypes.isNotEmpty() && inTypes.isEmpty() -> {
+-      WildcardTypeName.producerOf(transform(outTypes[0]))
++      (rawType.mapTypes(target, transform) as ClassName).parameterizedBy(typeArguments.map { it.mapTypes(target, transform) })
+         .copy(nullable = isNullable, annotations = annotations)
+     }
+-    inTypes.isNotEmpty() -> {
+-      WildcardTypeName.consumerOf(transform(inTypes[0]))
+-        .copy(nullable = isNullable, annotations = annotations)
++    is TypeVariableName -> {
++      copy(bounds = bounds.map { it.mapTypes(target, transform) })
+     }
+-    else -> throw UnsupportedOperationException("Not possible.")
++    is WildcardTypeName -> {
++      // TODO Would be nice if KotlinPoet modeled these easier.
++      // Producer type - empty inTypes, single element outTypes
++      // Consumer type - single element inTypes, single ANY element outType.
++      when {
++        this == STAR -> this
++        outTypes.isNotEmpty() && inTypes.isEmpty() -> {
++          WildcardTypeName.producerOf(outTypes[0].mapTypes(target, transform))
++            .copy(nullable = isNullable, annotations = annotations)
++        }
++        inTypes.isNotEmpty() -> {
++          WildcardTypeName.consumerOf(inTypes[0].mapTypes(target, transform))
++            .copy(nullable = isNullable, annotations = annotations)
++        }
++        else -> throw UnsupportedOperationException("Not possible.")
++      }
++    }
++    else -> throw UnsupportedOperationException("Type '${javaClass.simpleName}' is illegal. Only classes, parameterized types, wildcard types, or type variables are allowed.")
+   }
+ }
+ 
+-internal interface TypeVariableResolver {
+-  val parametersMap: Map<String, TypeVariableName>
+-  operator fun get(index: String): TypeVariableName
+-}
+-
+-internal fun List<TypeName>.toTypeVariableResolver(
+-  fallback: TypeVariableResolver? = null,
+-  sourceType: String? = null,
+-): TypeVariableResolver {
+-  val parametersMap = LinkedHashMap<String, TypeVariableName>()
+-  val typeParamResolver = { id: String ->
+-    parametersMap[id]
+-      ?: fallback?.get(id)
+-      ?: throw IllegalStateException("No type argument found for $id! Anaylzing $sourceType")
++internal fun TypeName.stripTypeVarVariance(): TypeName {
++  return mapTypes<TypeVariableName> {
++    TypeVariableName(name = name, bounds = bounds.map { it.mapTypes(TypeVariableName::stripTypeVarVariance) }, variance = null)
+   }
+-
+-  val resolver = object : TypeVariableResolver {
+-    override val parametersMap: Map<String, TypeVariableName> = parametersMap
+-
+-    override operator fun get(index: String): TypeVariableName = typeParamResolver(index)
+-  }
+-
+-  // Fill the parametersMap. Need to do sequentially and allow for referencing previously defined params
+-  for (typeVar in this) {
+-    check(typeVar is TypeVariableName)
+-    // Put the simple typevar in first, then it can be referenced in the full toTypeVariable()
+-    // replacement later that may add bounds referencing this.
+-    val id = typeVar.name
+-    parametersMap[id] = TypeVariableName(id)
+-    // Now replace it with the full version.
+-    parametersMap[id] = typeVar.deepCopy(null) { it.stripTypeVarVariance(resolver) }
+-  }
+-
+-  return resolver
+ }
+diff --git a/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/metadata.kt b/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/metadata.kt
+index b3bdd11a..4e93bad4 100644
+--- a/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/metadata.kt
++++ b/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/metadata.kt
+@@ -22,7 +22,6 @@ import com.squareup.kotlinpoet.ParameterizedTypeName
+ import com.squareup.kotlinpoet.TypeName
+ import com.squareup.kotlinpoet.TypeSpec
+ import com.squareup.kotlinpoet.TypeVariableName
+-import com.squareup.kotlinpoet.WildcardTypeName
+ import com.squareup.kotlinpoet.asClassName
+ import com.squareup.kotlinpoet.asTypeName
+ import com.squareup.kotlinpoet.metadata.ImmutableKmConstructor
+@@ -45,7 +44,7 @@ import com.squareup.moshi.kotlin.codegen.api.TargetConstructor
+ import com.squareup.moshi.kotlin.codegen.api.TargetParameter
+ import com.squareup.moshi.kotlin.codegen.api.TargetProperty
+ import com.squareup.moshi.kotlin.codegen.api.TargetType
+-import com.squareup.moshi.kotlin.codegen.api.deepCopy
++import com.squareup.moshi.kotlin.codegen.api.mapTypes
+ import com.squareup.moshi.kotlin.codegen.api.rawType
+ import java.lang.annotation.ElementType
+ import java.lang.annotation.Retention
+@@ -504,25 +503,19 @@ private fun String.escapeDollarSigns(): String {
+ }
+ 
+ internal fun TypeName.unwrapTypeAlias(): TypeName {
+-  return when (this) {
+-    is ClassName -> {
+-      tag<TypeNameAliasTag>()?.type?.let { unwrappedType ->
+-        // If any type is nullable, then the whole thing is nullable
+-        var isAnyNullable = isNullable
+-        // Keep track of all annotations across type levels. Sort them too for consistency.
+-        val runningAnnotations = TreeSet<AnnotationSpec>(compareBy { it.toString() }).apply {
+-          addAll(annotations)
+-        }
+-        val nestedUnwrappedType = unwrappedType.unwrapTypeAlias()
+-        runningAnnotations.addAll(nestedUnwrappedType.annotations)
+-        isAnyNullable = isAnyNullable || nestedUnwrappedType.isNullable
+-        nestedUnwrappedType.copy(nullable = isAnyNullable, annotations = runningAnnotations.toList())
+-      } ?: this
++  return mapTypes<ClassName> {
++    tag<TypeNameAliasTag>()?.type?.let { unwrappedType ->
++      // If any type is nullable, then the whole thing is nullable
++      var isAnyNullable = isNullable
++      // Keep track of all annotations across type levels. Sort them too for consistency.
++      val runningAnnotations = TreeSet<AnnotationSpec>(compareBy { it.toString() }).apply {
++        addAll(annotations)
++      }
++      val nestedUnwrappedType = unwrappedType.unwrapTypeAlias()
++      runningAnnotations.addAll(nestedUnwrappedType.annotations)
++      isAnyNullable = isAnyNullable || nestedUnwrappedType.isNullable
++      nestedUnwrappedType.copy(nullable = isAnyNullable, annotations = runningAnnotations.toList())
+     }
+-    is ParameterizedTypeName -> deepCopy(TypeName::unwrapTypeAlias)
+-    is TypeVariableName -> deepCopy(transform = TypeName::unwrapTypeAlias)
+-    is WildcardTypeName -> deepCopy(TypeName::unwrapTypeAlias)
+-    else -> throw UnsupportedOperationException("Type '${javaClass.simpleName}' is illegal. Only classes, parameterized types, wildcard types, or type variables are allowed.")
+   }
+ }
+ 
+diff --git a/kotlin/tests/src/test/kotlin/com/squareup/moshi/kotlin/DualKotlinTest.kt b/kotlin/tests/src/test/kotlin/com/squareup/moshi/kotlin/DualKotlinTest.kt
+index 4b4b1b9c..4c538c37 100644
+--- a/kotlin/tests/src/test/kotlin/com/squareup/moshi/kotlin/DualKotlinTest.kt
++++ b/kotlin/tests/src/test/kotlin/com/squareup/moshi/kotlin/DualKotlinTest.kt
+@@ -68,7 +68,7 @@ class DualKotlinTest(useReflection: Boolean) {
+               // Prevent falling back to generated adapter lookup
+               val rawType = Types.getRawType(type)
+               val metadataClass = Class.forName("kotlin.Metadata") as Class<out Annotation>
+-              check(rawType.isEnum || !rawType.isAnnotationPresent(metadataClass)) {
++              check(!rawType.isAnnotationPresent(metadataClass)) {
+                 "Unhandled Kotlin type in reflective test! $rawType"
+               }
+               return moshi.nextAdapter<Any>(this, type, annotations)
+@@ -585,33 +585,6 @@ class DualKotlinTest(useReflection: Boolean) {
+ 
+   @JsonClass(generateAdapter = true)
+   data class OutDeclaration<out T>(val input: T)
+-
+-  // Regression test for https://github.com/square/moshi/issues/1244
+-  @Test fun backwardReferencingTypeVarsAndIntersectionTypes() {
+-    val adapter = moshi.adapter<IntersectionTypes<IntersectionTypesEnum>>()
+-
+-    @Language("JSON")
+-    val testJson =
+-      """{"value":"VALUE"}"""
+-
+-    val instance = IntersectionTypes(IntersectionTypesEnum.VALUE)
+-    assertThat(adapter.serializeNulls().toJson(instance))
+-      .isEqualTo(testJson)
+-
+-    val result = adapter.fromJson(testJson)!!
+-    assertThat(result).isEqualTo(instance)
+-  }
+-
+-  interface IntersectionTypeInterface<E : Enum<E>>
+-
+-  enum class IntersectionTypesEnum : IntersectionTypeInterface<IntersectionTypesEnum> {
+-    VALUE
+-  }
+-
+-  @JsonClass(generateAdapter = true)
+-  data class IntersectionTypes<E>(
+-    val value: E
+-  ) where E : Enum<E>, E : IntersectionTypeInterface<E>
+ }
+ 
+ typealias TypeAlias = Int

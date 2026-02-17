@@ -1,0 +1,1327 @@
+diff --git a/kotlin/codegen/pom.xml b/kotlin/codegen/pom.xml
+index 81d75ee5..21bda8ef 100644
+--- a/kotlin/codegen/pom.xml
++++ b/kotlin/codegen/pom.xml
+@@ -27,26 +27,6 @@
+       <artifactId>kotlinpoet</artifactId>
+       <version>${kotlinpoet.version}</version>
+     </dependency>
+-    <dependency>
+-      <groupId>org.jetbrains.kotlinx</groupId>
+-      <artifactId>kotlinx-metadata-jvm</artifactId>
+-      <version>0.1.0</version>
+-    </dependency>
+-    <dependency>
+-      <groupId>com.squareup</groupId>
+-      <artifactId>kotlinpoet-metadata</artifactId>
+-      <version>${kotlinpoet.version}</version>
+-    </dependency>
+-    <dependency>
+-      <groupId>com.squareup</groupId>
+-      <artifactId>kotlinpoet-metadata-specs</artifactId>
+-      <version>${kotlinpoet.version}</version>
+-    </dependency>
+-    <dependency>
+-      <groupId>com.squareup</groupId>
+-      <artifactId>kotlinpoet-classinspector-elements</artifactId>
+-      <version>${kotlinpoet.version}</version>
+-    </dependency>
+     <dependency>
+       <groupId>net.ltgt.gradle.incap</groupId>
+       <artifactId>incap</artifactId>
+@@ -54,6 +34,11 @@
+       <scope>provided</scope>
+       <optional>true</optional>
+     </dependency>
++    <dependency>
++      <groupId>com.google.auto</groupId>
++      <artifactId>auto-common</artifactId>
++      <version>${auto-common.version}</version>
++    </dependency>
+     <dependency>
+       <groupId>com.google.auto.service</groupId>
+       <artifactId>auto-service-annotations</artifactId>
+@@ -82,6 +67,10 @@
+       The Kotlin compiler usage must be near the end of the list because its .jar file includes an
+       obsolete version of Guava!
+     -->
++    <dependency>
++      <groupId>me.eugeniomarletti.kotlin.metadata</groupId>
++      <artifactId>kotlin-metadata</artifactId>
++    </dependency>
+     <dependency>
+       <groupId>com.github.tschuchortdev</groupId>
+       <artifactId>kotlin-compile-testing</artifactId>
+@@ -146,12 +135,6 @@
+             </goals>
+           </execution>
+         </executions>
+-        <configuration>
+-          <args>
+-            <!-- So we can declare ourselves as users of KotlinPoetMetadataPreview -->
+-            <arg>-Xuse-experimental=com.squareup.kotlinpoet.metadata.KotlinPoetMetadataPreview</arg>
+-          </args>
+-        </configuration>
+       </plugin>
+       <plugin>
+         <groupId>org.apache.maven.plugins</groupId>
+diff --git a/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/AppliedType.kt b/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/AppliedType.kt
+index 91d9de2a..a3e27e91 100644
+--- a/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/AppliedType.kt
++++ b/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/AppliedType.kt
+@@ -15,6 +15,10 @@
+  */
+ package com.squareup.moshi.kotlin.codegen
+ 
++import com.squareup.kotlinpoet.TypeName
++import com.squareup.kotlinpoet.TypeVariableName
++import com.squareup.kotlinpoet.asTypeName
++import com.squareup.moshi.kotlin.codegen.api.TypeResolver
+ import javax.lang.model.element.TypeElement
+ import javax.lang.model.type.DeclaredType
+ import javax.lang.model.util.Types
+@@ -25,6 +29,7 @@ import javax.lang.model.util.Types
+  */
+ internal class AppliedType private constructor(
+   val element: TypeElement,
++  val resolver: TypeResolver,
+   private val mirror: DeclaredType
+ ) {
+   /** Returns all supertypes of this, recursively. Includes both interface and class supertypes. */
+@@ -36,17 +41,32 @@ internal class AppliedType private constructor(
+     for (supertype in types.directSupertypes(mirror)) {
+       val supertypeDeclaredType = supertype as DeclaredType
+       val supertypeElement = supertypeDeclaredType.asElement() as TypeElement
+-      val appliedSupertype = AppliedType(supertypeElement, supertypeDeclaredType)
++      val appliedSupertype = AppliedType(supertypeElement,
++          resolver(supertypeElement, supertypeDeclaredType), supertypeDeclaredType)
+       appliedSupertype.supertypes(types, result)
+     }
+     return result
+   }
+ 
++  /** Returns a resolver that uses `element` and `mirror` to resolve type parameters. */
++  private fun resolver(element: TypeElement, mirror: DeclaredType): TypeResolver {
++    return object : TypeResolver() {
++      override fun resolveTypeVariable(typeVariable: TypeVariableName): TypeName {
++        val index = element.typeParameters.indexOfFirst {
++          it.simpleName.toString() == typeVariable.name
++        }
++        check(index != -1) { "Unexpected type variable $typeVariable in $mirror" }
++        val argument = mirror.typeArguments[index]
++        return argument.asTypeName()
++      }
++    }
++  }
++
+   override fun toString() = mirror.toString()
+ 
+   companion object {
+     fun get(typeElement: TypeElement): AppliedType {
+-      return AppliedType(typeElement, typeElement.asType() as DeclaredType)
++      return AppliedType(typeElement, TypeResolver(), typeElement.asType() as DeclaredType)
+     }
+   }
+-}
++}
+\ No newline at end of file
+diff --git a/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/JsonClassCodegenProcessor.kt b/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/JsonClassCodegenProcessor.kt
+index a5e19f8c..75176963 100644
+--- a/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/JsonClassCodegenProcessor.kt
++++ b/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/JsonClassCodegenProcessor.kt
+@@ -16,25 +16,22 @@
+ package com.squareup.moshi.kotlin.codegen
+ 
+ import com.google.auto.service.AutoService
+-import com.squareup.kotlinpoet.AnnotationSpec
+ import com.squareup.kotlinpoet.asClassName
+-import com.squareup.kotlinpoet.metadata.KotlinPoetMetadataPreview
+ import com.squareup.moshi.JsonClass
+ import com.squareup.moshi.kotlin.codegen.api.AdapterGenerator
+ import com.squareup.moshi.kotlin.codegen.api.PropertyGenerator
++import me.eugeniomarletti.kotlin.metadata.KotlinMetadataUtils
++import me.eugeniomarletti.kotlin.processing.KotlinAbstractProcessor
+ import net.ltgt.gradle.incap.IncrementalAnnotationProcessor
+ import net.ltgt.gradle.incap.IncrementalAnnotationProcessorType.ISOLATING
+-import javax.annotation.processing.AbstractProcessor
+-import javax.annotation.processing.Filer
+-import javax.annotation.processing.Messager
+ import javax.annotation.processing.ProcessingEnvironment
+ import javax.annotation.processing.Processor
+ import javax.annotation.processing.RoundEnvironment
+ import javax.lang.model.SourceVersion
++import javax.lang.model.element.Element
+ import javax.lang.model.element.TypeElement
+-import javax.lang.model.util.Elements
+-import javax.lang.model.util.Types
+-import javax.tools.Diagnostic
++import javax.lang.model.element.VariableElement
++import javax.tools.Diagnostic.Kind.ERROR
+ 
+ /**
+  * An annotation processor that reads Kotlin data classes and generates Moshi JsonAdapters for them.
+@@ -43,11 +40,13 @@ import javax.tools.Diagnostic
+  *
+  * The generated class will match the visibility of the given data class (i.e. if it's internal, the
+  * adapter will also be internal).
++ *
++ * If you define a companion object, a jsonAdapter() extension function will be generated onto it.
++ * If you don't want this though, you can use the runtime [JsonClass] factory implementation.
+  */
+-@KotlinPoetMetadataPreview
+ @AutoService(Processor::class)
+ @IncrementalAnnotationProcessor(ISOLATING)
+-class JsonClassCodegenProcessor : AbstractProcessor() {
++class JsonClassCodegenProcessor : KotlinAbstractProcessor(), KotlinMetadataUtils {
+ 
+   companion object {
+     /**
+@@ -66,10 +65,6 @@ class JsonClassCodegenProcessor : AbstractProcessor() {
+     )
+   }
+ 
+-  private lateinit var types: Types
+-  private lateinit var elements: Elements
+-  private lateinit var filer: Filer
+-  private lateinit var messager: Messager
+   private val annotation = JsonClass::class.java
+   private var generatedType: TypeElement? = null
+ 
+@@ -88,37 +83,16 @@ class JsonClassCodegenProcessor : AbstractProcessor() {
+       }
+       processingEnv.elementUtils.getTypeElement(it)
+     }
+-    this.types = processingEnv.typeUtils
+-    this.elements = processingEnv.elementUtils
+-    this.filer = processingEnv.filer
+-    this.messager = processingEnv.messager
+   }
+ 
+   override fun process(annotations: Set<TypeElement>, roundEnv: RoundEnvironment): Boolean {
+     for (type in roundEnv.getElementsAnnotatedWith(annotation)) {
+-      if (type !is TypeElement) {
+-        messager.printMessage(
+-            Diagnostic.Kind.ERROR, "@JsonClass can't be applied to $type: must be a Kotlin class",
+-            type)
+-        continue
+-      }
+       val jsonClass = type.getAnnotation(annotation)
+       if (jsonClass.generateAdapter && jsonClass.generator.isEmpty()) {
+         val generator = adapterGenerator(type) ?: continue
+         generator
+-            .generateFile {
++            .generateFile(generatedType?.asClassName()) {
+               it.toBuilder()
+-                  .apply {
+-                    generatedType?.asClassName()?.let { generatedClassName ->
+-                      addAnnotation(
+-                          AnnotationSpec.builder(generatedClassName)
+-                              .addMember("value = [%S]",
+-                                  JsonClassCodegenProcessor::class.java.canonicalName)
+-                              .addMember("comments = %S", "https://github.com/square/moshi")
+-                              .build()
+-                      )
+-                    }
+-                  }
+                   .addOriginatingElement(type)
+                   .build()
+             }
+@@ -129,12 +103,12 @@ class JsonClassCodegenProcessor : AbstractProcessor() {
+     return false
+   }
+ 
+-  private fun adapterGenerator(element: TypeElement): AdapterGenerator? {
+-    val type = targetType(messager, elements, types, element) ?: return null
++  private fun adapterGenerator(element: Element): AdapterGenerator? {
++    val type = targetType(messager, elementUtils, typeUtils, element) ?: return null
+ 
+     val properties = mutableMapOf<String, PropertyGenerator>()
+     for (property in type.properties.values) {
+-      val generator = property.generator(messager, element, elements)
++      val generator = property.generator(messager)
+       if (generator != null) {
+         properties[property.name] = generator
+       }
+@@ -143,9 +117,7 @@ class JsonClassCodegenProcessor : AbstractProcessor() {
+     for ((name, parameter) in type.constructor.parameters) {
+       if (type.properties[parameter.name] == null && !parameter.hasDefault) {
+         messager.printMessage(
+-            Diagnostic.Kind.ERROR,
+-            "No property for required constructor parameter $name",
+-            element)
++            ERROR, "No property for required constructor parameter $name", parameter.tag<VariableElement>())
+         return null
+       }
+     }
+diff --git a/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/api/AdapterGenerator.kt b/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/api/AdapterGenerator.kt
+index 3ea13edc..90b884f6 100644
+--- a/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/api/AdapterGenerator.kt
++++ b/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/api/AdapterGenerator.kt
+@@ -17,6 +17,7 @@ package com.squareup.moshi.kotlin.codegen.api
+ 
+ import com.squareup.kotlinpoet.ARRAY
+ import com.squareup.kotlinpoet.AnnotationSpec
++import com.squareup.kotlinpoet.ClassName
+ import com.squareup.kotlinpoet.CodeBlock
+ import com.squareup.kotlinpoet.FileSpec
+ import com.squareup.kotlinpoet.FunSpec
+@@ -35,6 +36,7 @@ import com.squareup.moshi.JsonReader
+ import com.squareup.moshi.JsonWriter
+ import com.squareup.moshi.Moshi
+ import com.squareup.moshi.internal.Util
++import com.squareup.moshi.kotlin.codegen.JsonClassCodegenProcessor
+ import java.lang.reflect.Constructor
+ import java.lang.reflect.Type
+ 
+@@ -81,8 +83,7 @@ internal class AdapterGenerator(
+       nameAllocator.newName("options"), JsonReader.Options::class.asTypeName(),
+       KModifier.PRIVATE)
+       .initializer("%T.of(${nonTransientProperties.joinToString(", ") {
+-        // We manually put in quotes because we know the jsonName is already escaped
+-        CodeBlock.of("\"%L\"", it.jsonName).toString()
++        CodeBlock.of("%S", it.jsonName).toString()
+       }})", JsonReader.Options::class.asTypeName())
+       .build()
+ 
+@@ -95,20 +96,27 @@ internal class AdapterGenerator(
+       .initializer("null")
+       .build()
+ 
+-  fun generateFile(typeHook: (TypeSpec) -> TypeSpec = { it }): FileSpec {
++  fun generateFile(generatedOption: ClassName?, typeHook: (TypeSpec) -> TypeSpec = { it }): FileSpec {
+     for (property in nonTransientProperties) {
+       property.allocateNames(nameAllocator)
+     }
+ 
+     val result = FileSpec.builder(className.packageName, adapterName)
+     result.addComment("Code generated by moshi-kotlin-codegen. Do not edit.")
+-    result.addType(generateType().let(typeHook))
++    result.addType(generateType(generatedOption).let(typeHook))
+     return result.build()
+   }
+ 
+-  private fun generateType(): TypeSpec {
++  private fun generateType(generatedOption: ClassName?): TypeSpec {
+     val result = TypeSpec.classBuilder(adapterName)
+ 
++    generatedOption?.let {
++      result.addAnnotation(AnnotationSpec.builder(it)
++          .addMember("value = [%S]", JsonClassCodegenProcessor::class.java.canonicalName)
++          .addMember("comments = %S", "https://github.com/square/moshi")
++          .build())
++    }
++
+     result.superclass(jsonAdapterTypeName)
+ 
+     if (typeVariables.isNotEmpty()) {
+@@ -358,8 +366,7 @@ internal class AdapterGenerator(
+ 
+     result.addStatement("%N.beginObject()", writerParam)
+     nonTransientProperties.forEach { property ->
+-      // We manually put in quotes because we know the jsonName is already escaped
+-      result.addStatement("%N.name(\"%L\")", writerParam, property.jsonName)
++      result.addStatement("%N.name(%S)", writerParam, property.jsonName)
+       result.addStatement("%N.toJson(%N, %N.%N)",
+           nameAllocator[property.delegateKey], writerParam, valueParam, property.name)
+     }
+diff --git a/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/api/TargetParameter.kt b/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/api/TargetParameter.kt
+index b9e10bd5..9c077076 100644
+--- a/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/api/TargetParameter.kt
++++ b/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/api/TargetParameter.kt
+@@ -16,6 +16,7 @@
+ package com.squareup.moshi.kotlin.codegen.api
+ 
+ import com.squareup.kotlinpoet.AnnotationSpec
++import kotlin.reflect.KClass
+ 
+ /** A parameter in user code that should be populated by generated code. */
+ internal data class TargetParameter(
+@@ -23,5 +24,15 @@ internal data class TargetParameter(
+   val index: Int,
+   val hasDefault: Boolean,
+   val jsonName: String = name,
+-  val qualifiers: Set<AnnotationSpec>? = null
+-)
++  val qualifiers: Set<AnnotationSpec>? = null,
++  private val tags: Map<KClass<*>, Any>
++) {
++  /** Returns the tag attached with [type] as a key, or null if no tag is attached with that key. */
++  fun <T : Any> tag(type: KClass<out T>): T? {
++    @Suppress("UNCHECKED_CAST")
++    return tags[type] as T?
++  }
++
++  /** Returns the tag attached with [T] as a key, or null if no tag is attached with that key. */
++  inline fun <reified T : Any> tag(): T? = tag(T::class)
++}
+diff --git a/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/api/TargetProperty.kt b/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/api/TargetProperty.kt
+index 1c141d4f..20c59584 100644
+--- a/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/api/TargetProperty.kt
++++ b/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/api/TargetProperty.kt
+@@ -15,19 +15,23 @@
+  */
+ package com.squareup.moshi.kotlin.codegen.api
+ 
++import com.squareup.kotlinpoet.FunSpec
+ import com.squareup.kotlinpoet.KModifier
+ import com.squareup.kotlinpoet.PropertySpec
+ import com.squareup.kotlinpoet.TypeName
+ 
+ /** A property in user code that maps to JSON. */
+ internal data class TargetProperty(
+-  val propertySpec: PropertySpec,
++  val name: String,
++  val type: TypeName,
+   val parameter: TargetParameter?,
++  val annotationHolder: FunSpec?,
++  val field: PropertySpec?,
++  val setter: FunSpec?,
++  val getter: FunSpec?,
+   val visibility: KModifier,
+   val jsonName: String
+ ) {
+-  val name: String get() = propertySpec.name
+-  val type: TypeName get() = propertySpec.type
+   val parameterIndex get() = parameter?.index ?: -1
+   val hasDefault get() = parameter?.hasDefault ?: true
+ 
+diff --git a/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/api/TypeResolver.kt b/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/api/TypeResolver.kt
+new file mode 100644
+index 00000000..c956702c
+--- /dev/null
++++ b/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/api/TypeResolver.kt
+@@ -0,0 +1,63 @@
++/*
++ * Copyright (C) 2018 Square, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package com.squareup.moshi.kotlin.codegen.api
++
++import com.squareup.kotlinpoet.ClassName
++import com.squareup.kotlinpoet.ParameterizedTypeName
++import com.squareup.kotlinpoet.ParameterizedTypeName.Companion.parameterizedBy
++import com.squareup.kotlinpoet.TypeName
++import com.squareup.kotlinpoet.TypeVariableName
++import com.squareup.kotlinpoet.WildcardTypeName
++
++/**
++ * Resolves type parameters against a type declaration. Use this to fill in type variables with
++ * their actual type parameters.
++ */
++open class TypeResolver {
++  open fun resolveTypeVariable(typeVariable: TypeVariableName): TypeName = typeVariable
++
++  fun resolve(typeName: TypeName): TypeName {
++    return when (typeName) {
++      is ClassName -> typeName
++
++      is ParameterizedTypeName -> {
++            typeName.rawType.parameterizedBy(*(typeName.typeArguments.map { resolve(it) }.toTypedArray()))
++            .copy(nullable = typeName.isNullable)
++      }
++
++      is WildcardTypeName -> {
++        when {
++          typeName.inTypes.size == 1 -> {
++            WildcardTypeName.consumerOf(resolve(typeName.inTypes[0]))
++                .copy(nullable = typeName.isNullable)
++          }
++          typeName.outTypes.size == 1 -> {
++            WildcardTypeName.producerOf(resolve(typeName.outTypes[0]))
++                .copy(nullable = typeName.isNullable)
++          }
++          else -> {
++            throw IllegalArgumentException(
++                "Unrepresentable wildcard type. Cannot have more than one bound: $typeName")
++          }
++        }
++      }
++
++      is TypeVariableName -> resolveTypeVariable(typeName)
++
++      else -> throw IllegalArgumentException("Unrepresentable type: $typeName")
++    }
++  }
++}
+diff --git a/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/metadata.kt b/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/metadata.kt
+index ef1b8327..6d87af55 100644
+--- a/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/metadata.kt
++++ b/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/metadata.kt
+@@ -15,23 +15,26 @@
+  */
+ package com.squareup.moshi.kotlin.codegen
+ 
++import com.google.auto.common.AnnotationMirrors
++import com.google.auto.common.MoreTypes
+ import com.squareup.kotlinpoet.AnnotationSpec
+ import com.squareup.kotlinpoet.ClassName
++import com.squareup.kotlinpoet.CodeBlock
++import com.squareup.kotlinpoet.FunSpec
+ import com.squareup.kotlinpoet.KModifier
+-import com.squareup.kotlinpoet.TypeSpec
++import com.squareup.kotlinpoet.KModifier.PUBLIC
++import com.squareup.kotlinpoet.KModifier.VARARG
++import com.squareup.kotlinpoet.ParameterSpec
++import com.squareup.kotlinpoet.ParameterizedTypeName.Companion.parameterizedBy
++import com.squareup.kotlinpoet.PropertySpec
++import com.squareup.kotlinpoet.STAR
++import com.squareup.kotlinpoet.TypeName
++import com.squareup.kotlinpoet.TypeVariableName
++import com.squareup.kotlinpoet.WildcardTypeName
+ import com.squareup.kotlinpoet.asClassName
+ import com.squareup.kotlinpoet.asTypeName
+-import com.squareup.kotlinpoet.classinspector.elements.ElementsClassInspector
+-import com.squareup.kotlinpoet.metadata.KotlinPoetMetadataPreview
+-import com.squareup.kotlinpoet.metadata.isAbstract
+-import com.squareup.kotlinpoet.metadata.isClass
+-import com.squareup.kotlinpoet.metadata.isEnum
+-import com.squareup.kotlinpoet.metadata.isInner
+-import com.squareup.kotlinpoet.metadata.isLocal
+-import com.squareup.kotlinpoet.metadata.isSealed
+-import com.squareup.kotlinpoet.metadata.specs.ClassInspector
+-import com.squareup.kotlinpoet.metadata.specs.toTypeSpec
+-import com.squareup.kotlinpoet.metadata.toImmutableKmClass
++import com.squareup.kotlinpoet.asTypeVariableName
++import com.squareup.kotlinpoet.tag
+ import com.squareup.moshi.Json
+ import com.squareup.moshi.JsonQualifier
+ import com.squareup.moshi.kotlin.codegen.api.DelegateKey
+@@ -40,125 +43,264 @@ import com.squareup.moshi.kotlin.codegen.api.TargetConstructor
+ import com.squareup.moshi.kotlin.codegen.api.TargetParameter
+ import com.squareup.moshi.kotlin.codegen.api.TargetProperty
+ import com.squareup.moshi.kotlin.codegen.api.TargetType
++import com.squareup.moshi.kotlin.codegen.api.TypeResolver
++import me.eugeniomarletti.kotlin.metadata.KotlinClassMetadata
++import me.eugeniomarletti.kotlin.metadata.KotlinMetadata
++import me.eugeniomarletti.kotlin.metadata.classKind
++import me.eugeniomarletti.kotlin.metadata.declaresDefaultValue
++import me.eugeniomarletti.kotlin.metadata.getPropertyOrNull
++import me.eugeniomarletti.kotlin.metadata.isDataClass
++import me.eugeniomarletti.kotlin.metadata.isInnerClass
++import me.eugeniomarletti.kotlin.metadata.isPrimary
++import me.eugeniomarletti.kotlin.metadata.jvm.getJvmConstructorSignature
++import me.eugeniomarletti.kotlin.metadata.kotlinMetadata
++import me.eugeniomarletti.kotlin.metadata.modality
++import me.eugeniomarletti.kotlin.metadata.shadow.metadata.ProtoBuf.Class
++import me.eugeniomarletti.kotlin.metadata.shadow.metadata.ProtoBuf.Modality.ABSTRACT
++import me.eugeniomarletti.kotlin.metadata.shadow.metadata.ProtoBuf.Modality.SEALED
++import me.eugeniomarletti.kotlin.metadata.shadow.metadata.ProtoBuf.Type
++import me.eugeniomarletti.kotlin.metadata.shadow.metadata.ProtoBuf.TypeParameter
++import me.eugeniomarletti.kotlin.metadata.shadow.metadata.ProtoBuf.TypeParameter.Variance
++import me.eugeniomarletti.kotlin.metadata.shadow.metadata.ProtoBuf.Visibility
++import me.eugeniomarletti.kotlin.metadata.shadow.metadata.ProtoBuf.Visibility.INTERNAL
++import me.eugeniomarletti.kotlin.metadata.shadow.metadata.ProtoBuf.Visibility.LOCAL
++import me.eugeniomarletti.kotlin.metadata.shadow.metadata.ProtoBuf.Visibility.PRIVATE
++import me.eugeniomarletti.kotlin.metadata.shadow.metadata.ProtoBuf.Visibility.PRIVATE_TO_THIS
++import me.eugeniomarletti.kotlin.metadata.shadow.metadata.ProtoBuf.Visibility.PROTECTED
++import me.eugeniomarletti.kotlin.metadata.shadow.metadata.deserialization.NameResolver
++import me.eugeniomarletti.kotlin.metadata.shadow.util.capitalizeDecapitalize.decapitalizeAsciiOnly
++import me.eugeniomarletti.kotlin.metadata.visibility
+ import java.lang.annotation.ElementType
+ import java.lang.annotation.Retention
+ import java.lang.annotation.RetentionPolicy
+ import java.lang.annotation.Target
+ import javax.annotation.processing.Messager
++import javax.lang.model.element.AnnotationMirror
++import javax.lang.model.element.Element
+ import javax.lang.model.element.ElementKind
++import javax.lang.model.element.ExecutableElement
++import javax.lang.model.element.Modifier
++import javax.lang.model.element.Modifier.DEFAULT
++import javax.lang.model.element.Modifier.FINAL
++import javax.lang.model.element.Modifier.NATIVE
++import javax.lang.model.element.Modifier.STATIC
++import javax.lang.model.element.Modifier.SYNCHRONIZED
++import javax.lang.model.element.Modifier.TRANSIENT
++import javax.lang.model.element.Modifier.VOLATILE
+ import javax.lang.model.element.TypeElement
++import javax.lang.model.element.VariableElement
++import javax.lang.model.type.TypeVariable
+ import javax.lang.model.util.Elements
+ import javax.lang.model.util.Types
+ import javax.tools.Diagnostic
++import javax.tools.Diagnostic.Kind.ERROR
++import kotlin.reflect.KClass
+ 
+-private val JSON_QUALIFIER = JsonQualifier::class.java
+-private val JSON = Json::class.asClassName()
+-private val OBJECT_CLASS = ClassName("java.lang", "Object")
+-private val VISIBILITY_MODIFIERS = setOf(
+-    KModifier.INTERNAL,
+-    KModifier.PRIVATE,
+-    KModifier.PROTECTED,
+-    KModifier.PUBLIC
+-)
+-
+-private fun Collection<KModifier>.visibility(): KModifier {
+-  return find { it in VISIBILITY_MODIFIERS } ?: KModifier.PUBLIC
++private fun TypeParameter.asTypeName(
++    nameResolver: NameResolver,
++    getTypeParameter: (index: Int) -> TypeParameter,
++    resolveAliases: Boolean = false
++): TypeVariableName {
++  val possibleBounds = upperBoundList.map {
++    it.asTypeName(nameResolver, getTypeParameter, resolveAliases)
++  }
++  return if (possibleBounds.isEmpty()) {
++    TypeVariableName(
++        name = nameResolver.getString(name),
++        variance = variance.asKModifier())
++  } else {
++    TypeVariableName(
++        name = nameResolver.getString(name),
++        bounds = *possibleBounds.toTypedArray(),
++        variance = variance.asKModifier())
++  }
++}
++
++private fun TypeParameter.Variance.asKModifier(): KModifier? {
++  return when (this) {
++    Variance.IN -> KModifier.IN
++    Variance.OUT -> KModifier.OUT
++    Variance.INV -> null
++  }
++}
++
++private fun Visibility?.asKModifier(): KModifier {
++  return when (this) {
++    INTERNAL -> KModifier.INTERNAL
++    PRIVATE -> KModifier.PRIVATE
++    PROTECTED -> KModifier.PROTECTED
++    Visibility.PUBLIC -> KModifier.PUBLIC
++    PRIVATE_TO_THIS -> KModifier.PRIVATE
++    LOCAL -> KModifier.PRIVATE
++    else -> PUBLIC
++  }
+ }
+ 
+-@KotlinPoetMetadataPreview
+-internal fun primaryConstructor(kotlinApi: TypeSpec, elements: Elements): TargetConstructor? {
+-  val primaryConstructor = kotlinApi.primaryConstructor ?: return null
++/**
++ * Returns the TypeName of this type as it would be seen in the source code, including nullability
++ * and generic type parameters.
++ *
++ * @param [nameResolver] a [NameResolver] instance from the source proto
++ * @param [getTypeParameter] a function that returns the type parameter for the given index. **Only
++ *     called if [ProtoBuf.Type.hasTypeParameter] is true!**
++ */
++private fun Type.asTypeName(
++    nameResolver: NameResolver,
++    getTypeParameter: (index: Int) -> TypeParameter,
++    useAbbreviatedType: Boolean = true
++): TypeName {
++
++  val argumentList = when {
++    useAbbreviatedType && hasAbbreviatedType() -> abbreviatedType.argumentList
++    else -> argumentList
++  }
++
++  if (hasFlexibleUpperBound()) {
++    return WildcardTypeName.producerOf(
++        flexibleUpperBound.asTypeName(nameResolver, getTypeParameter, useAbbreviatedType))
++        .copy(nullable = nullable)
++  } else if (hasOuterType()) {
++    return WildcardTypeName.consumerOf(
++        outerType.asTypeName(nameResolver, getTypeParameter, useAbbreviatedType))
++        .copy(nullable = nullable)
++  }
++
++  val realType = when {
++    hasTypeParameter() -> return getTypeParameter(typeParameter)
++        .asTypeName(nameResolver, getTypeParameter, useAbbreviatedType)
++        .copy(nullable = nullable)
++    hasTypeParameterName() -> typeParameterName
++    useAbbreviatedType && hasAbbreviatedType() -> abbreviatedType.typeAliasName
++    else -> className
++  }
++
++  var typeName: TypeName =
++      ClassName.bestGuess(nameResolver.getString(realType)
++          .replace("/", "."))
++
++  if (argumentList.isNotEmpty()) {
++    val remappedArgs: Array<TypeName> = argumentList.map { argumentType ->
++      val nullableProjection = if (argumentType.hasProjection()) {
++        argumentType.projection
++      } else null
++      if (argumentType.hasType()) {
++        argumentType.type.asTypeName(nameResolver, getTypeParameter, useAbbreviatedType)
++            .let { argumentTypeName ->
++              nullableProjection?.let { projection ->
++                when (projection) {
++                  Type.Argument.Projection.IN -> WildcardTypeName.consumerOf(argumentTypeName)
++                  Type.Argument.Projection.OUT -> WildcardTypeName.producerOf(argumentTypeName)
++                  Type.Argument.Projection.STAR -> STAR
++                  Type.Argument.Projection.INV -> TODO("INV projection is unsupported")
++                }
++              } ?: argumentTypeName
++            }
++      } else {
++        STAR
++      }
++    }.toTypedArray()
++    typeName = (typeName as ClassName).parameterizedBy(*remappedArgs)
++  }
++
++  return typeName.copy(nullable = nullable)
++}
++
++internal fun primaryConstructor(metadata: KotlinClassMetadata,
++    elements: Elements): TargetConstructor {
++  val (nameResolver, classProto) = metadata.data
++
++  // TODO allow custom constructor
++  val proto = classProto.constructorList
++      .single { it.isPrimary }
++  val constructorJvmSignature = proto.getJvmConstructorSignature(
++      nameResolver, classProto.typeTable)
++  val element = classProto.fqName
++      .let(nameResolver::getString)
++      .replace('/', '.')
++      .let(elements::getTypeElement)
++      .enclosedElements
++      .mapNotNull {
++        it.takeIf { it.kind == ElementKind.CONSTRUCTOR }?.let { it as ExecutableElement }
++      }
++      .first()
++  // TODO Temporary until JVM method signature matching is better
++  //  .single { it.jvmMethodSignature == constructorJvmSignature }
+ 
+   val parameters = mutableMapOf<String, TargetParameter>()
+-  for ((index, parameter) in primaryConstructor.parameters.withIndex()) {
+-    val name = parameter.name
++  for (parameter in proto.valueParameterList) {
++    val name = nameResolver.getString(parameter.name)
++    val index = proto.valueParameterList.indexOf(parameter)
++    val paramElement = element.parameters[index]
+     parameters[name] = TargetParameter(
+         name = name,
+         index = index,
+-        hasDefault = parameter.defaultValue != null,
+-        qualifiers = parameter.annotations.qualifiers(elements),
+-        jsonName = parameter.annotations.jsonName() ?: name.escapeDollarSigns()
++        hasDefault = parameter.declaresDefaultValue,
++        qualifiers = paramElement.qualifiers.mapTo(mutableSetOf(), AnnotationMirror::asAnnotationSpec),
++        jsonName = paramElement.jsonName ?: name,
++        tags = mapOf(VariableElement::class to paramElement)
+     )
+   }
+ 
+-  return TargetConstructor(parameters, primaryConstructor.modifiers.visibility())
++  return TargetConstructor(parameters,
++      proto.visibility.asKModifier())
+ }
+ 
++private val OBJECT_CLASS = ClassName("java.lang", "Object")
++
+ /** Returns a target type for `element`, or null if it cannot be used with code gen. */
+-@KotlinPoetMetadataPreview
+ internal fun targetType(messager: Messager,
+     elements: Elements,
+     types: Types,
+-    element: TypeElement): TargetType? {
+-  val typeMetadata = element.getAnnotation(Metadata::class.java)
+-  if (typeMetadata == null) {
++    element: Element): TargetType? {
++  val typeMetadata: KotlinMetadata? = element.kotlinMetadata
++  if (element !is TypeElement || typeMetadata !is KotlinClassMetadata) {
+     messager.printMessage(
+-        Diagnostic.Kind.ERROR, "@JsonClass can't be applied to $element: must be a Kotlin class",
+-        element)
+-    return null
+-  }
+-
+-  val kmClass = try {
+-    typeMetadata.toImmutableKmClass()
+-  } catch (e: UnsupportedOperationException) {
+-    messager.printMessage(
+-        Diagnostic.Kind.ERROR, "@JsonClass can't be applied to $element: must be a Class type",
+-        element)
++        ERROR, "@JsonClass can't be applied to $element: must be a Kotlin class", element)
+     return null
+   }
+ 
++  val proto = typeMetadata.data.classProto
+   when {
+-    kmClass.isEnum -> {
++    proto.classKind == Class.Kind.ENUM_CLASS -> {
+       messager.printMessage(
+-          Diagnostic.Kind.ERROR,
++          ERROR,
+           "@JsonClass with 'generateAdapter = \"true\"' can't be applied to $element: code gen for enums is not supported or necessary",
+           element)
+       return null
+     }
+-    !kmClass.isClass -> {
++    proto.classKind != Class.Kind.CLASS -> {
+       messager.printMessage(
+-          Diagnostic.Kind.ERROR, "@JsonClass can't be applied to $element: must be a Kotlin class",
+-          element)
++          ERROR, "@JsonClass can't be applied to $element: must be a Kotlin class", element)
+       return null
+     }
+-    kmClass.isInner -> {
++    proto.isInnerClass -> {
+       messager.printMessage(
+-          Diagnostic.Kind.ERROR,
+-          "@JsonClass can't be applied to $element: must not be an inner class", element)
++          ERROR, "@JsonClass can't be applied to $element: must not be an inner class", element)
+       return null
+     }
+-    kmClass.isSealed -> {
++    proto.modality == SEALED -> {
+       messager.printMessage(
+-          Diagnostic.Kind.ERROR, "@JsonClass can't be applied to $element: must not be sealed", element)
++          ERROR, "@JsonClass can't be applied to $element: must not be sealed", element)
+       return null
+     }
+-    kmClass.isAbstract -> {
++    proto.modality == ABSTRACT -> {
+       messager.printMessage(
+-          Diagnostic.Kind.ERROR, "@JsonClass can't be applied to $element: must not be abstract",
+-          element)
++          ERROR, "@JsonClass can't be applied to $element: must not be abstract", element)
+       return null
+     }
+-    kmClass.isLocal -> {
++    proto.visibility == LOCAL -> {
+       messager.printMessage(
+-          Diagnostic.Kind.ERROR, "@JsonClass can't be applied to $element: must not be local",
+-          element)
++          ERROR, "@JsonClass can't be applied to $element: must not be local", element)
+       return null
+     }
+   }
+ 
+-  val elementHandler = ElementsClassInspector.create(elements, types)
+-  val kotlinApi = kmClass.toTypeSpec(elementHandler)
+-  val typeVariables = kotlinApi.typeVariables
++  val typeVariables = genericTypeNames(proto, typeMetadata.data.nameResolver)
+   val appliedType = AppliedType.get(element)
+ 
+-  val constructor = primaryConstructor(kotlinApi, elements)
+-  if (constructor == null) {
+-    messager.printMessage(Diagnostic.Kind.ERROR, "No primary constructor found on $element",
+-        element)
+-    return null
+-  }
++  val constructor = primaryConstructor(typeMetadata, elements)
+   if (constructor.visibility != KModifier.INTERNAL && constructor.visibility != KModifier.PUBLIC) {
+-    messager.printMessage(Diagnostic.Kind.ERROR, "@JsonClass can't be applied to $element: " +
++    messager.printMessage(ERROR, "@JsonClass can't be applied to $element: " +
+         "primary constructor is not internal or public", element)
+     return null
+   }
+@@ -171,19 +313,14 @@ internal fun targetType(messager: Messager,
+     if (supertype.element.kind != ElementKind.CLASS) {
+       continue // Don't load properties for interface types.
+     }
+-    if (supertype.element.getAnnotation(Metadata::class.java) == null) {
+-      messager.printMessage(Diagnostic.Kind.ERROR,
++    if (supertype.element.kotlinMetadata == null) {
++      messager.printMessage(ERROR,
+           "@JsonClass can't be applied to $element: supertype $supertype is not a Kotlin type",
+           element)
+       return null
+     }
+-    val supertypeProperties = if (supertype.element == element) {
+-      // We've already parsed this api above, reuse it
+-      declaredProperties(supertype.element, constructor, elementHandler, kotlinApi)
+-    } else {
+-      declaredProperties(
+-          supertype.element, constructor, elementHandler)
+-    }
++    val supertypeProperties = declaredProperties(
++        supertype.element, supertype.resolver, constructor)
+     for ((name, property) in supertypeProperties) {
+       properties.putIfAbsent(name, property)
+     }
+@@ -193,37 +330,224 @@ internal fun targetType(messager: Messager,
+       constructor = constructor,
+       properties = properties,
+       typeVariables = typeVariables,
+-      isDataClass = KModifier.DATA in kotlinApi.modifiers,
+-      visibility = kotlinApi.modifiers.visibility())
++      isDataClass = proto.isDataClass,
++      visibility = proto.visibility.asKModifier())
+ }
+ 
+ /** Returns the properties declared by `typeElement`. */
+-@KotlinPoetMetadataPreview
+ private fun declaredProperties(
+     typeElement: TypeElement,
+-    constructor: TargetConstructor,
+-    elementHandler: ClassInspector,
+-    kotlinApi: TypeSpec = typeElement.toTypeSpec(elementHandler)
++    typeResolver: TypeResolver,
++    constructor: TargetConstructor
+ ): Map<String, TargetProperty> {
++  val typeMetadata: KotlinClassMetadata = typeElement.kotlinMetadata as KotlinClassMetadata
++  val nameResolver = typeMetadata.data.nameResolver
++  val classProto = typeMetadata.data.classProto
++
++  val annotationHolders = mutableMapOf<String, ExecutableElement>()
++  val fields = mutableMapOf<String, VariableElement>()
++  val setters = mutableMapOf<String, ExecutableElement>()
++  val getters = mutableMapOf<String, ExecutableElement>()
++  for (element in typeElement.enclosedElements) {
++    if (element is VariableElement) {
++      fields[element.name] = element
++    } else if (element is ExecutableElement) {
++      when {
++        element.name.startsWith("get") -> {
++          val name = element.name.substring("get".length).decapitalizeAsciiOnly()
++          getters[name] = element
++        }
++        element.name.startsWith("is") -> {
++          val name = element.name.substring("is".length).decapitalizeAsciiOnly()
++          getters[name] = element
++        }
++        element.name.startsWith("set") -> {
++          val name = element.name.substring("set".length).decapitalizeAsciiOnly()
++          setters[name] = element
++        }
++      }
++
++      val propertyProto = typeMetadata.data.getPropertyOrNull(element)
++      if (propertyProto != null) {
++        val name = nameResolver.getString(propertyProto.name)
++        annotationHolders[name] = element
++      }
++    }
++  }
+ 
+   val result = mutableMapOf<String, TargetProperty>()
+-  for (property in kotlinApi.propertySpecs) {
+-    val name = property.name
++  for (property in classProto.propertyList) {
++    val name = nameResolver.getString(property.name)
++    val type = typeResolver.resolve(property.returnType.asTypeName(
++        nameResolver, classProto::getTypeParameter, false))
+     val parameter = constructor.parameters[name]
+-    result[name] = TargetProperty(
+-        propertySpec = property,
++    val fieldElement = fields[name]
++    val annotationHolder = annotationHolders[name]
++    // Used for setter/getter/is lookups. Guaranteed to be safe because kotlin doesn't allow you to
++    // have both "AAA" and "aAA".
++    val decapitalizedName = name.decapitalizeAsciiOnly()
++    result[name] = TargetProperty(name = name,
++        type = type,
+         parameter = parameter,
+-        visibility = property.modifiers.visibility(),
+-        jsonName = parameter?.jsonName ?: property.annotations.jsonName()
+-        ?: name.escapeDollarSigns()
++        annotationHolder = annotationHolder?.asFunSpec(),
++        field = fieldElement?.asPropertySpec(),
++        setter = setters[decapitalizedName]?.asFunSpec(),
++        getter = getters[decapitalizedName]?.asFunSpec(),
++        visibility = property.visibility.asKModifier(),
++        jsonName = jsonName(
++            fieldElement = fieldElement,
++            parameter = parameter,
++            annotationHolder = annotationHolder,
++            name = name
++        )
+     )
+   }
+ 
+   return result
+ }
+ 
+-private val TargetProperty.isTransient get() = propertySpec.annotations.any { it.className == Transient::class.asClassName() }
+-private val TargetProperty.isSettable get() = propertySpec.mutable || parameter != null
++/** Returns the @Json name of this property, or this property's name if none is provided. */
++private fun jsonName(
++    fieldElement: Element?,
++    parameter: TargetParameter?,
++    annotationHolder: ExecutableElement?,
++    name: String): String {
++  val fieldJsonName = fieldElement.jsonName
++  val annotationHolderJsonName = annotationHolder.jsonName
++  val parameterJsonName = parameter?.jsonName
++
++  return when {
++    fieldJsonName != null -> fieldJsonName
++    annotationHolderJsonName != null -> annotationHolderJsonName
++    parameterJsonName != null -> parameterJsonName
++    else -> name
++  }
++}
++
++private val Element.name get() = simpleName.toString()
++
++private fun genericTypeNames(proto: Class, nameResolver: NameResolver): List<TypeVariableName> {
++  return proto.typeParameterList.map { typeParameter ->
++    val possibleBounds = typeParameter.upperBoundList
++        .map { it.asTypeName(nameResolver, proto::getTypeParameter, false) }
++    val typeVar = if (possibleBounds.isEmpty()) {
++      TypeVariableName(
++          name = nameResolver.getString(typeParameter.name),
++          variance = typeParameter.varianceModifier)
++    } else {
++      TypeVariableName(
++          name = nameResolver.getString(typeParameter.name),
++          bounds = *possibleBounds.toTypedArray(),
++          variance = typeParameter.varianceModifier)
++    }
++    return@map typeVar.copy(reified = typeParameter.reified)
++  }
++}
++
++private val TypeParameter.varianceModifier: KModifier?
++  get() {
++    return variance.asKModifier().let {
++      // We don't redeclare out variance here
++      if (it == KModifier.OUT) {
++        null
++      } else {
++        it
++      }
++    }
++  }
++
++/**
++ * Returns a new [PropertySpec] representation of [this].
++ *
++ * This will copy its name, type, visibility modifiers, constant value, and annotations. Note that
++ * Java modifiers that correspond to annotations in kotlin will be added as well (`volatile`,
++ * `transient`, etc`.
++ *
++ * The original `field` ([this]) is stored in [PropertySpec.tag].
++ */
++internal fun VariableElement.asPropertySpec(asJvmField: Boolean = false): PropertySpec {
++  require(kind == ElementKind.FIELD) {
++    "Must be a field!"
++  }
++  val modifiers: Set<Modifier> = modifiers
++  val fieldName = simpleName.toString()
++  val propertyBuilder = PropertySpec.builder(fieldName, asType().asTypeName())
++  propertyBuilder.addModifiers(*modifiers.mapNotNull { it.asKModifier() }.toTypedArray())
++  constantValue?.let {
++    if (it is String) {
++      propertyBuilder.initializer(CodeBlock.of("%S", it))
++    } else {
++      propertyBuilder.initializer(CodeBlock.of("%L", it))
++    }
++  }
++  propertyBuilder.addAnnotations(annotationMirrors.map(AnnotationMirror::asAnnotationSpec))
++  propertyBuilder.addAnnotations(modifiers.mapNotNull { it.asAnnotation() })
++  propertyBuilder.tag(this)
++  if (asJvmField && KModifier.PRIVATE !in propertyBuilder.modifiers) {
++    propertyBuilder.addAnnotation(JvmField::class)
++  }
++  return propertyBuilder.build()
++}
++
++/**
++ * Returns a new [AnnotationSpec] representation of [this].
++ *
++ * Identical and delegates to [AnnotationSpec.get], but the original `mirror` is also stored
++ * in [AnnotationSpec.tag].
++ */
++internal fun AnnotationMirror.asAnnotationSpec(): AnnotationSpec {
++  return AnnotationSpec.get(this)
++      .toBuilder()
++      .tag(MoreTypes.asTypeElement(annotationType))
++      .build()
++}
++
++/**
++ * Returns a new [FunSpec] representation of [this].
++ *
++ * This will copy its visibility modifiers, type parameters, return type, name, parameters, and
++ * throws declarations.
++ *
++ * The original `method` ([this]) is stored in [FunSpec.tag].
++ *
++ * Nearly identical to [FunSpec.overriding], but no override modifier is added nor are checks around
++ * overridability done
++ */
++internal fun ExecutableElement.asFunSpec(): FunSpec {
++  var modifiers: Set<Modifier> = modifiers
++  val methodName = simpleName.toString()
++  val funBuilder = FunSpec.builder(methodName)
++
++  modifiers = modifiers.toMutableSet()
++  funBuilder.jvmModifiers(modifiers)
++
++  typeParameters
++      .map { it.asType() as TypeVariable }
++      .map { it.asTypeVariableName() }
++      .forEach { funBuilder.addTypeVariable(it) }
++
++  funBuilder.returns(returnType.asTypeName())
++  funBuilder.addParameters(ParameterSpec.parametersOf(this))
++  if (isVarArgs) {
++    funBuilder.parameters[funBuilder.parameters.lastIndex] = funBuilder.parameters.last()
++        .toBuilder()
++        .addModifiers(VARARG)
++        .build()
++  }
++
++  if (thrownTypes.isNotEmpty()) {
++    val throwsValueString = thrownTypes.joinToString { "%T::class" }
++    funBuilder.addAnnotation(AnnotationSpec.builder(Throws::class)
++        .addMember(throwsValueString, *thrownTypes.toTypedArray())
++        .build())
++  }
++
++  funBuilder.tag(this)
++  return funBuilder.build()
++}
++
++private val TargetProperty.isTransient get() = field != null && field.annotations.any { it.className == Transient::class.asClassName() }
++private val TargetProperty.isSettable get() = setter != null || parameter != null
+ private val TargetProperty.isVisible: Boolean
+   get() {
+     return visibility == KModifier.INTERNAL
+@@ -235,24 +559,26 @@ private val TargetProperty.isVisible: Boolean
+  * Returns a generator for this property, or null if either there is an error and this property
+  * cannot be used with code gen, or if no codegen is necessary for this property.
+  */
+-internal fun TargetProperty.generator(
+-    messager: Messager,
+-    sourceElement: TypeElement,
+-    elements: Elements
+-): PropertyGenerator? {
++internal fun TargetProperty.generator(messager: Messager): PropertyGenerator? {
++  val element = field?.tag<VariableElement>() ?: setter?.tag<ExecutableElement>()
++  ?: getter!!.tag<ExecutableElement>()
+   if (isTransient) {
+     if (!hasDefault) {
+-      messager.printMessage(
+-          Diagnostic.Kind.ERROR, "No default value for transient property $name",
+-          sourceElement)
++      element?.let {
++        messager.printMessage(
++            Diagnostic.Kind.ERROR, "No default value for transient property ${this}",
++            it)
++      }
+       return null
+     }
+     return PropertyGenerator(this, DelegateKey(type, emptyList()), true)
+   }
+ 
+   if (!isVisible) {
+-    messager.printMessage(Diagnostic.Kind.ERROR, "property $name is not visible",
+-        sourceElement)
++    element?.let {
++      messager.printMessage(Diagnostic.Kind.ERROR, "property ${this} is not visible",
++          it)
++    }
+     return null
+   }
+ 
+@@ -260,12 +586,10 @@ internal fun TargetProperty.generator(
+     return null // This property is not settable. Ignore it.
+   }
+ 
+-  // Merge parameter and property annotations
+-  val qualifiers = parameter?.qualifiers.orEmpty() + propertySpec.annotations.qualifiers(elements)
+-  for (jsonQualifier in qualifiers) {
++  val jsonQualifierMirrors = jsonQualifiers(element)
++  for (jsonQualifier in jsonQualifierMirrors) {
+     // Check Java types since that covers both Java and Kotlin annotations.
+-    val annotationElement = elements.getTypeElement(jsonQualifier.className.canonicalName)
+-        ?: continue
++    val annotationElement = jsonQualifier.tag<TypeElement>() ?: continue
+     annotationElement.getAnnotation(Retention::class.java)?.let {
+       if (it.value != RetentionPolicy.RUNTIME) {
+         messager.printMessage(Diagnostic.Kind.ERROR,
+@@ -280,7 +604,7 @@ internal fun TargetProperty.generator(
+     }
+   }
+ 
+-  val jsonQualifierSpecs = qualifiers.map {
++  val jsonQualifierSpecs = jsonQualifierMirrors.map {
+     it.toBuilder()
+         .useSiteTarget(AnnotationSpec.UseSiteTarget.FIELD)
+         .build()
+@@ -290,21 +614,57 @@ internal fun TargetProperty.generator(
+       DelegateKey(type, jsonQualifierSpecs))
+ }
+ 
+-private fun List<AnnotationSpec>?.qualifiers(elements: Elements): Set<AnnotationSpec> {
+-  if (this == null) return setOf()
+-  return filterTo(mutableSetOf()) {
+-    elements.getTypeElement(it.className.toString()).getAnnotation(JSON_QUALIFIER) != null
++/** Returns the JsonQualifiers on the field and parameter of this property. */
++private fun TargetProperty.jsonQualifiers(element: Element?): Set<AnnotationSpec> {
++  val elementQualifiers = element.qualifiers
++  val annotationHolderQualifiers = annotationHolder?.tag<ExecutableElement>().qualifiers
++  val parameterQualifiers = parameter?.qualifiers.orEmpty()
++
++  // TODO(jwilson): union the qualifiers somehow?
++  return when {
++    elementQualifiers.isNotEmpty() -> elementQualifiers.mapTo(mutableSetOf(), AnnotationMirror::asAnnotationSpec)
++    annotationHolderQualifiers.isNotEmpty() -> annotationHolderQualifiers.mapTo(
++        mutableSetOf(), AnnotationMirror::asAnnotationSpec)
++    parameterQualifiers.isNotEmpty() -> parameterQualifiers
++    else -> setOf()
++  }
++}
++
++private fun Modifier.asKModifier(): KModifier? {
++  return when (this) {
++    Modifier.PUBLIC -> KModifier.PUBLIC
++    Modifier.PROTECTED -> KModifier.PROTECTED
++    Modifier.PRIVATE -> KModifier.PRIVATE
++    Modifier.ABSTRACT -> KModifier.ABSTRACT
++    FINAL -> KModifier.FINAL
++    else -> null
+   }
+ }
+ 
+-/** Gross, but we can't extract values from AnnotationSpecs by member names alone. */
+-private fun List<AnnotationSpec>?.jsonName(): String? {
+-  if (this == null) return null
+-  return find { it.className == JSON }?.let {
+-    it.members[0].toString().removePrefix("name = \"").removeSuffix("\"")
++private fun Modifier.asAnnotation(): AnnotationSpec? {
++  return when (this) {
++    DEFAULT -> JvmDefault::class.asAnnotationSpec()
++    STATIC -> JvmStatic::class.asAnnotationSpec()
++    TRANSIENT -> Transient::class.asAnnotationSpec()
++    VOLATILE -> Volatile::class.asAnnotationSpec()
++    SYNCHRONIZED -> Synchronized::class.asAnnotationSpec()
++    NATIVE -> JvmDefault::class.asAnnotationSpec()
++    else -> null
+   }
+ }
+ 
+-private fun String.escapeDollarSigns(): String {
+-  return replace("\$", "\${\'\$\'}")
++private fun <T : Annotation> KClass<T>.asAnnotationSpec(): AnnotationSpec {
++  return AnnotationSpec.builder(this).build()
+ }
++
++private val Element?.qualifiers: Set<AnnotationMirror>
++  get() {
++    if (this == null) return setOf()
++    return AnnotationMirrors.getAnnotatedAnnotations(this, JsonQualifier::class.java)
++  }
++
++private val Element?.jsonName: String?
++  get() {
++    if (this == null) return null
++    return getAnnotation(Json::class.java)?.name
++  }
+diff --git a/kotlin/codegen/src/test/java/com/squareup/moshi/kotlin/codegen/JsonClassCodegenProcessorTest.kt b/kotlin/codegen/src/test/java/com/squareup/moshi/kotlin/codegen/JsonClassCodegenProcessorTest.kt
+index cb216062..f60200cd 100644
+--- a/kotlin/codegen/src/test/java/com/squareup/moshi/kotlin/codegen/JsonClassCodegenProcessorTest.kt
++++ b/kotlin/codegen/src/test/java/com/squareup/moshi/kotlin/codegen/JsonClassCodegenProcessorTest.kt
+@@ -18,7 +18,6 @@ package com.squareup.moshi.kotlin.codegen
+ import com.tschuchort.compiletesting.KotlinCompilation
+ import com.tschuchort.compiletesting.SourceFile
+ import com.tschuchort.compiletesting.SourceFile.Companion.kotlin
+-import com.squareup.kotlinpoet.metadata.KotlinPoetMetadataPreview
+ import org.assertj.core.api.Assertions.assertThat
+ import org.junit.Ignore
+ import org.junit.Rule
+@@ -26,7 +25,6 @@ import org.junit.Test
+ import org.junit.rules.TemporaryFolder
+ 
+ /** Execute kotlinc to confirm that either files are generated or errors are printed. */
+-@UseExperimental(KotlinPoetMetadataPreview::class)
+ class JsonClassCodegenProcessorTest {
+   @Rule @JvmField var temporaryFolder: TemporaryFolder = TemporaryFolder()
+ 
+diff --git a/kotlin/codegen/src/test/java/com/squareup/moshi/kotlin/codegen/TypeResolverTest.kt b/kotlin/codegen/src/test/java/com/squareup/moshi/kotlin/codegen/TypeResolverTest.kt
+new file mode 100644
+index 00000000..8d1c3399
+--- /dev/null
++++ b/kotlin/codegen/src/test/java/com/squareup/moshi/kotlin/codegen/TypeResolverTest.kt
+@@ -0,0 +1,47 @@
++/*
++ * Copyright (C) 2018 Square, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package com.squareup.moshi.kotlin.codegen
++
++import com.google.common.truth.Truth.assertThat
++import com.squareup.kotlinpoet.ParameterizedTypeName.Companion.plusParameter
++import com.squareup.kotlinpoet.WildcardTypeName
++import com.squareup.kotlinpoet.asClassName
++import com.squareup.moshi.kotlin.codegen.api.TypeResolver
++import org.junit.Test
++
++class TypeResolverTest {
++  private val resolver = TypeResolver()
++
++  @Test
++  fun ensureClassNameNullabilityIsPreserved() {
++    assertThat(resolver.resolve(Int::class.asClassName().copy(nullable = true)).isNullable).isTrue()
++  }
++
++  @Test
++  fun ensureParameterizedNullabilityIsPreserved() {
++    val nullableTypeName = List::class.plusParameter(String::class).copy(nullable = true)
++
++    assertThat(resolver.resolve(nullableTypeName).isNullable).isTrue()
++  }
++
++  @Test
++  fun ensureWildcardNullabilityIsPreserved() {
++    val nullableTypeName = WildcardTypeName.producerOf(List::class.asClassName())
++        .copy(nullable = true)
++
++    assertThat(resolver.resolve(nullableTypeName).isNullable).isTrue()
++  }
++}
+diff --git a/pom.xml b/pom.xml
+index ba58ee30..501a2e9f 100644
+--- a/pom.xml
++++ b/pom.xml
+@@ -31,13 +31,15 @@
+     <java.version>1.7</java.version>
+ 
+     <!-- Dependencies -->
++    <auto-common.version>0.10</auto-common.version>
+     <auto-service.version>1.0-rc5</auto-service.version>
+     <dokka.version>0.9.17</dokka.version>
+     <incap.version>0.2</incap.version>
+     <okio.version>1.16.0</okio.version>
+     <okio2.version>2.1.0</okio2.version>
+     <kotlin.version>1.3.40</kotlin.version>
+-    <kotlinpoet.version>1.4.0</kotlinpoet.version>
++    <kotlinpoet.version>1.3.0</kotlinpoet.version>
++    <kotlin-metadata.version>1.4.0</kotlin-metadata.version>
+     <maven-assembly.version>3.1.0</maven-assembly.version>
+ 
+     <!-- Test Dependencies -->
+@@ -116,6 +118,11 @@
+         <artifactId>kotlin-annotation-processing-embeddable</artifactId>
+         <version>${kotlin.version}</version>
+       </dependency>
++      <dependency>
++        <groupId>me.eugeniomarletti.kotlin.metadata</groupId>
++        <artifactId>kotlin-metadata</artifactId>
++        <version>${kotlin-metadata.version}</version>
++      </dependency>
+       <dependency>
+         <groupId>com.google.testing.compile</groupId>
+         <artifactId>compile-testing</artifactId>

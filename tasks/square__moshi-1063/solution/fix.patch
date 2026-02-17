@@ -1,0 +1,133 @@
+diff --git a/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/api/AdapterGenerator.kt b/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/api/AdapterGenerator.kt
+index 58d2bc4c..2614a8db 100644
+--- a/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/api/AdapterGenerator.kt
++++ b/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/api/AdapterGenerator.kt
+@@ -18,6 +18,7 @@ package com.squareup.moshi.kotlin.codegen.api
+ import com.squareup.kotlinpoet.ARRAY
+ import com.squareup.kotlinpoet.AnnotationSpec
+ import com.squareup.kotlinpoet.CodeBlock
++import com.squareup.kotlinpoet.CodeBlock.Companion
+ import com.squareup.kotlinpoet.FileSpec
+ import com.squareup.kotlinpoet.FunSpec
+ import com.squareup.kotlinpoet.INT
+@@ -125,7 +126,11 @@ internal class AdapterGenerator(
+           "%T.of(%L)",
+           JsonReader.Options::class.asTypeName(),
+           nonTransientProperties
+-              .map { CodeBlock.of("%S", it.jsonName) }
++              .map {
++                // We manually put in quotes because we know the jsonName is already escaped.
++                val whitespaceSafeName = it.jsonName.replace(" ", "·")
++                CodeBlock.of("\"$whitespaceSafeName\"")
++              }
+               .joinToCode(", ")
+       )
+       .build()
+@@ -158,6 +163,22 @@ internal class AdapterGenerator(
+ 
+     if (typeVariables.isNotEmpty()) {
+       result.addTypeVariables(typeVariables.map { it.stripTypeVarVariance() as TypeVariableName })
++      // require(types.size == 1) {
++      //   "TypeVariable mismatch: Expecting 1 type(s) for generic type variables [T], but received ${types.size} with values $types"
++      // }
++      result.addInitializerBlock(CodeBlock.builder()
++          .beginControlFlow("require(types.size == %L)", typeVariables.size)
++          .addStatement(
++              "buildString·{·append(%S).append(%L).append(%S).append(%S).append(%S).append(%L)·}",
++              "TypeVariable mismatch: Expecting ",
++              typeVariables.size,
++              " ${if (typeVariables.size == 1) "type" else "types"} for generic type variables [",
++              typeVariables.joinToString(", ") { it.name },
++              "], but received ",
++              "${typesParam.name}.size"
++          )
++          .endControlFlow()
++          .build())
+     }
+ 
+     // TODO make this configurable. Right now it just matches the source model
+@@ -491,7 +512,7 @@ internal class AdapterGenerator(
+     result.addStatement("%N.beginObject()", writerParam)
+     nonTransientProperties.forEach { property ->
+       // We manually put in quotes because we know the jsonName is already escaped
+-      result.addStatement("%N.name(%S)", writerParam, property.jsonName)
++      result.addStatement("%N.name(\"%L\")", writerParam, property.jsonName)
+       result.addStatement("%N.toJson(%N, %N.%N)",
+           nameAllocator[property.delegateKey], writerParam, valueParam, property.name)
+     }
+diff --git a/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/metadata.kt b/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/metadata.kt
+index b0204927..e2cfe52d 100644
+--- a/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/metadata.kt
++++ b/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/metadata.kt
+@@ -48,7 +48,6 @@ import java.lang.annotation.RetentionPolicy
+ import java.lang.annotation.Target
+ import java.util.TreeSet
+ import javax.annotation.processing.Messager
+-import javax.lang.model.element.AnnotationMirror
+ import javax.lang.model.element.Element
+ import javax.lang.model.element.ElementKind
+ import javax.lang.model.element.TypeElement
+@@ -329,13 +328,11 @@ private fun List<AnnotationSpec>?.qualifiers(elements: Elements): Set<Annotation
+   }
+ }
+ 
++/** Gross, but we can't extract values from AnnotationSpecs by member names alone. */
+ private fun List<AnnotationSpec>?.jsonName(): String? {
+   if (this == null) return null
+-  return find { it.className == JSON }?.let { annotation ->
+-    val mirror = requireNotNull(annotation.tag<AnnotationMirror>()) {
+-      "Could not get the annotation mirror from the annotation spec"
+-    }
+-    mirror.elementValues.entries.single { it.key.simpleName.contentEquals("name") }.value.value as String
++  return find { it.className == JSON }?.let {
++    it.members[0].toString().removePrefix("name = \"").removeSuffix("\"")
+   }
+ }
+ 
+diff --git a/moshi/src/main/java/com/squareup/moshi/internal/Util.java b/moshi/src/main/java/com/squareup/moshi/internal/Util.java
+index 423b289a..b9367645 100644
+--- a/moshi/src/main/java/com/squareup/moshi/internal/Util.java
++++ b/moshi/src/main/java/com/squareup/moshi/internal/Util.java
+@@ -517,9 +517,10 @@ public final class Util {
+       return null;
+     }
+     String adapterClassName = Types.generatedJsonAdapterName(rawType.getName());
++    Class<? extends JsonAdapter<?>> adapterClass = null;
+     try {
+-      @SuppressWarnings("unchecked") // We generate types to match.
+-          Class<? extends JsonAdapter<?>> adapterClass = (Class<? extends JsonAdapter<?>>)
++      //noinspection unchecked - We generate types to match.
++      adapterClass = (Class<? extends JsonAdapter<?>>)
+           Class.forName(adapterClassName, true, rawType.getClassLoader());
+       Constructor<? extends JsonAdapter<?>> constructor;
+       Object[] args;
+@@ -547,16 +548,24 @@ public final class Util {
+       return constructor.newInstance(args).nullSafe();
+     } catch (ClassNotFoundException e) {
+       throw new RuntimeException(
+-          "Failed to find the generated JsonAdapter class for " + rawType, e);
++          "Failed to find the generated JsonAdapter class for " + type, e);
+     } catch (NoSuchMethodException e) {
+-      throw new RuntimeException(
+-          "Failed to find the generated JsonAdapter constructor for " + rawType, e);
++      if (!(type instanceof ParameterizedType) && adapterClass.getTypeParameters().length != 0) {
++        throw new RuntimeException(
++            "Failed to find the generated JsonAdapter constructor for '" + type
++            + "'. Suspiciously, the type was not parameterized but the target class '"
++            + adapterClass.getCanonicalName() + "' is generic. Consider using "
++            + "Types#newParameterizedType() to define these missing type variables.", e);
++      } else {
++        throw new RuntimeException(
++            "Failed to find the generated JsonAdapter constructor for " + type, e);
++      }
+     } catch (IllegalAccessException e) {
+       throw new RuntimeException(
+-          "Failed to access the generated JsonAdapter for " + rawType, e);
++          "Failed to access the generated JsonAdapter for " + type, e);
+     } catch (InstantiationException e) {
+       throw new RuntimeException(
+-          "Failed to instantiate the generated JsonAdapter for " + rawType, e);
++          "Failed to instantiate the generated JsonAdapter for " + type, e);
+     } catch (InvocationTargetException e) {
+       throw rethrowCause(e);
+     }

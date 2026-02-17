@@ -42,8 +42,8 @@ RUN echo "org.gradle.jvmargs=-Xms512m -Xmx1536m -XX:MaxMetaspaceSize=512m -XX:+H
 # Download dependencies and compile the relevant modules
 # This may take a while on first run as Gradle downloads dependencies
 # Also compile core modules that these tests depend on
-RUN ./gradlew :ktor-client:ktor-client-core:compileKotlinJvm --no-daemon || true
-RUN ./gradlew :ktor-client:ktor-client-core:compileTestKotlinJvm --no-daemon || true
+RUN ./gradlew :ktor-client-core:compileKotlinJvm --no-daemon || true
+RUN ./gradlew :ktor-client-core:compileTestKotlinJvm --no-daemon || true
 
 # If install/build steps touched tracked files, reset them so bug.patch applies cleanly,
 RUN git reset --hard
@@ -56,8 +56,8 @@ RUN patch -p1 < /tmp/bug.patch && rm /tmp/bug.patch
 RUN echo "org.gradle.jvmargs=-Xms512m -Xmx1536m -XX:MaxMetaspaceSize=512m -XX:+HeapDumpOnOutOfMemoryError -XX:+UseParallelGC" >> gradle.properties
 
 # Rebuild after applying bug.patch (Kotlin needs recompilation)
-RUN ./gradlew :ktor-client:ktor-client-core:compileKotlinJvm --no-daemon || true
-RUN ./gradlew :ktor-client:ktor-client-core:compileTestKotlinJvm --no-daemon || true
+RUN ./gradlew :ktor-client-core:compileKotlinJvm --no-daemon || true
+RUN ./gradlew :ktor-client-core:compileTestKotlinJvm --no-daemon || true
 
 RUN rm -rf /app/src/.git
 

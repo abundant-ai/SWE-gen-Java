@@ -1,0 +1,812 @@
+diff --git a/moshi/japicmp/build.gradle.kts b/moshi/japicmp/build.gradle.kts
+index 98f21f1a..949ee341 100644
+--- a/moshi/japicmp/build.gradle.kts
++++ b/moshi/japicmp/build.gradle.kts
+@@ -31,9 +31,10 @@ val japicmp = tasks.register<JapicmpTask>("japicmp") {
+     "com.squareup.moshi.internal.Util", // Internal.
+     "com.squareup.moshi.StandardJsonAdapters", // Package-private
+     "com.squareup.moshi.RecordJsonAdapter\$ComponentBinding", // Package-private
++    "com.squareup.moshi.AdapterMethodsFactory", // Internal.
+   )
+   methodExcludes = listOf(
+-    "com.squareup.moshi.JsonAdapter#indent(java.lang.String)" // Was unintentionally open before
++    "com.squareup.moshi.JsonAdapter#indent(java.lang.String)", // Was unintentionally open before
+   )
+   fieldExcludes = listOf(
+     "com.squareup.moshi.CollectionJsonAdapter#FACTORY", // False-positive, class is not public anyway
+diff --git a/moshi/src/main/java/com/squareup/moshi/AdapterMethodsFactory.java b/moshi/src/main/java/com/squareup/moshi/AdapterMethodsFactory.java
+deleted file mode 100644
+index 90ef6825..00000000
+--- a/moshi/src/main/java/com/squareup/moshi/AdapterMethodsFactory.java
++++ /dev/null
+@@ -1,404 +0,0 @@
+-/*
+- * Copyright (C) 2015 Square, Inc.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *    https://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-package com.squareup.moshi;
+-
+-import static com.squareup.moshi.internal.Util.canonicalize;
+-import static com.squareup.moshi.internal.Util.getJsonAnnotations;
+-import static com.squareup.moshi.internal.Util.toStringWithAnnotations;
+-
+-import com.squareup.moshi.internal.Util;
+-import java.io.IOException;
+-import java.lang.annotation.Annotation;
+-import java.lang.reflect.InvocationTargetException;
+-import java.lang.reflect.Method;
+-import java.lang.reflect.ParameterizedType;
+-import java.lang.reflect.Type;
+-import java.util.ArrayList;
+-import java.util.List;
+-import java.util.Set;
+-import javax.annotation.Nullable;
+-
+-final class AdapterMethodsFactory implements JsonAdapter.Factory {
+-  private final List<AdapterMethod> toAdapters;
+-  private final List<AdapterMethod> fromAdapters;
+-
+-  AdapterMethodsFactory(List<AdapterMethod> toAdapters, List<AdapterMethod> fromAdapters) {
+-    this.toAdapters = toAdapters;
+-    this.fromAdapters = fromAdapters;
+-  }
+-
+-  @Override
+-  public @Nullable JsonAdapter<?> create(
+-      final Type type, final Set<? extends Annotation> annotations, final Moshi moshi) {
+-    final AdapterMethod toAdapter = get(toAdapters, type, annotations);
+-    final AdapterMethod fromAdapter = get(fromAdapters, type, annotations);
+-    if (toAdapter == null && fromAdapter == null) return null;
+-
+-    final JsonAdapter<Object> delegate;
+-    if (toAdapter == null || fromAdapter == null) {
+-      try {
+-        delegate = moshi.nextAdapter(this, type, annotations);
+-      } catch (IllegalArgumentException e) {
+-        String missingAnnotation = toAdapter == null ? "@ToJson" : "@FromJson";
+-        throw new IllegalArgumentException(
+-            "No "
+-                + missingAnnotation
+-                + " adapter for "
+-                + toStringWithAnnotations(type, annotations),
+-            e);
+-      }
+-    } else {
+-      delegate = null;
+-    }
+-
+-    if (toAdapter != null) toAdapter.bind(moshi, this);
+-    if (fromAdapter != null) fromAdapter.bind(moshi, this);
+-
+-    return new JsonAdapter<Object>() {
+-      @Override
+-      public void toJson(JsonWriter writer, @Nullable Object value) throws IOException {
+-        if (toAdapter == null) {
+-          delegate.toJson(writer, value);
+-        } else if (!toAdapter.nullable && value == null) {
+-          writer.nullValue();
+-        } else {
+-          try {
+-            toAdapter.toJson(moshi, writer, value);
+-          } catch (InvocationTargetException e) {
+-            Throwable cause = e.getCause();
+-            if (cause instanceof IOException) throw (IOException) cause;
+-            throw new JsonDataException(cause + " at " + writer.getPath(), cause);
+-          }
+-        }
+-      }
+-
+-      @Override
+-      public @Nullable Object fromJson(JsonReader reader) throws IOException {
+-        if (fromAdapter == null) {
+-          return delegate.fromJson(reader);
+-        } else if (!fromAdapter.nullable && reader.peek() == JsonReader.Token.NULL) {
+-          reader.nextNull();
+-          return null;
+-        } else {
+-          try {
+-            return fromAdapter.fromJson(moshi, reader);
+-          } catch (InvocationTargetException e) {
+-            Throwable cause = e.getCause();
+-            if (cause instanceof IOException) throw (IOException) cause;
+-            throw new JsonDataException(cause + " at " + reader.getPath(), cause);
+-          }
+-        }
+-      }
+-
+-      @Override
+-      public String toString() {
+-        return "JsonAdapter" + annotations + "(" + type + ")";
+-      }
+-    };
+-  }
+-
+-  public static AdapterMethodsFactory get(Object adapter) {
+-    List<AdapterMethod> toAdapters = new ArrayList<>();
+-    List<AdapterMethod> fromAdapters = new ArrayList<>();
+-
+-    for (Class<?> c = adapter.getClass(); c != Object.class; c = c.getSuperclass()) {
+-      for (Method m : c.getDeclaredMethods()) {
+-        if (m.isAnnotationPresent(ToJson.class)) {
+-          AdapterMethod toAdapter = toAdapter(adapter, m);
+-          AdapterMethod conflicting = get(toAdapters, toAdapter.type, toAdapter.annotations);
+-          if (conflicting != null) {
+-            throw new IllegalArgumentException(
+-                "Conflicting @ToJson methods:\n"
+-                    + "    "
+-                    + conflicting.method
+-                    + "\n"
+-                    + "    "
+-                    + toAdapter.method);
+-          }
+-          toAdapters.add(toAdapter);
+-        }
+-
+-        if (m.isAnnotationPresent(FromJson.class)) {
+-          AdapterMethod fromAdapter = fromAdapter(adapter, m);
+-          AdapterMethod conflicting = get(fromAdapters, fromAdapter.type, fromAdapter.annotations);
+-          if (conflicting != null) {
+-            throw new IllegalArgumentException(
+-                "Conflicting @FromJson methods:\n"
+-                    + "    "
+-                    + conflicting.method
+-                    + "\n"
+-                    + "    "
+-                    + fromAdapter.method);
+-          }
+-          fromAdapters.add(fromAdapter);
+-        }
+-      }
+-    }
+-
+-    if (toAdapters.isEmpty() && fromAdapters.isEmpty()) {
+-      throw new IllegalArgumentException(
+-          "Expected at least one @ToJson or @FromJson method on " + adapter.getClass().getName());
+-    }
+-
+-    return new AdapterMethodsFactory(toAdapters, fromAdapters);
+-  }
+-
+-  /**
+-   * Returns an object that calls a {@code method} method on {@code adapter} in service of
+-   * converting an object to JSON.
+-   */
+-  static AdapterMethod toAdapter(Object adapter, Method method) {
+-    method.setAccessible(true);
+-    final Type returnType = method.getGenericReturnType();
+-    final Type[] parameterTypes = method.getGenericParameterTypes();
+-    final Annotation[][] parameterAnnotations = method.getParameterAnnotations();
+-
+-    if (parameterTypes.length >= 2
+-        && parameterTypes[0] == JsonWriter.class
+-        && returnType == void.class
+-        && parametersAreJsonAdapters(2, parameterTypes)) {
+-      // void pointToJson(JsonWriter jsonWriter, Point point) {
+-      // void pointToJson(JsonWriter jsonWriter, Point point, JsonAdapter<?> adapter, ...) {
+-      Set<? extends Annotation> qualifierAnnotations = getJsonAnnotations(parameterAnnotations[1]);
+-      return new AdapterMethod(
+-          parameterTypes[1],
+-          qualifierAnnotations,
+-          adapter,
+-          method,
+-          parameterTypes.length,
+-          2,
+-          true) {
+-        @Override
+-        public void toJson(Moshi moshi, JsonWriter writer, @Nullable Object value)
+-            throws IOException, InvocationTargetException {
+-          invoke(writer, value);
+-        }
+-      };
+-
+-    } else if (parameterTypes.length == 1 && returnType != void.class) {
+-      // List<Integer> pointToJson(Point point) {
+-      final Set<? extends Annotation> returnTypeAnnotations = Util.getJsonAnnotations(method);
+-      final Set<? extends Annotation> qualifierAnnotations =
+-          getJsonAnnotations(parameterAnnotations[0]);
+-      boolean nullable = Util.getHasNullable(parameterAnnotations[0]);
+-      return new AdapterMethod(
+-          parameterTypes[0],
+-          qualifierAnnotations,
+-          adapter,
+-          method,
+-          parameterTypes.length,
+-          1,
+-          nullable) {
+-        private JsonAdapter<Object> delegate;
+-
+-        @Override
+-        public void bind(Moshi moshi, JsonAdapter.Factory factory) {
+-          super.bind(moshi, factory);
+-          delegate =
+-              Types.equals(parameterTypes[0], returnType)
+-                      && qualifierAnnotations.equals(returnTypeAnnotations)
+-                  ? moshi.nextAdapter(factory, returnType, returnTypeAnnotations)
+-                  : moshi.adapter(returnType, returnTypeAnnotations);
+-        }
+-
+-        @Override
+-        public void toJson(Moshi moshi, JsonWriter writer, @Nullable Object value)
+-            throws IOException, InvocationTargetException {
+-          Object intermediate = invoke(value);
+-          delegate.toJson(writer, intermediate);
+-        }
+-      };
+-
+-    } else {
+-      throw new IllegalArgumentException(
+-          "Unexpected signature for "
+-              + method
+-              + ".\n"
+-              + "@ToJson method signatures may have one of the following structures:\n"
+-              + "    <any access modifier> void toJson(JsonWriter writer, T value) throws <any>;\n"
+-              + "    <any access modifier> void toJson(JsonWriter writer, T value,"
+-              + " JsonAdapter<any> delegate, <any more delegates>) throws <any>;\n"
+-              + "    <any access modifier> R toJson(T value) throws <any>;\n");
+-    }
+-  }
+-
+-  /** Returns true if {@code parameterTypes[offset..]} contains only JsonAdapters. */
+-  private static boolean parametersAreJsonAdapters(int offset, Type[] parameterTypes) {
+-    for (int i = offset, length = parameterTypes.length; i < length; i++) {
+-      if (!(parameterTypes[i] instanceof ParameterizedType)) return false;
+-      if (((ParameterizedType) parameterTypes[i]).getRawType() != JsonAdapter.class) return false;
+-    }
+-    return true;
+-  }
+-
+-  /**
+-   * Returns an object that calls a {@code method} method on {@code adapter} in service of
+-   * converting an object from JSON.
+-   */
+-  static AdapterMethod fromAdapter(Object adapter, Method method) {
+-    method.setAccessible(true);
+-    final Type returnType = method.getGenericReturnType();
+-    final Set<? extends Annotation> returnTypeAnnotations = Util.getJsonAnnotations(method);
+-    final Type[] parameterTypes = method.getGenericParameterTypes();
+-    Annotation[][] parameterAnnotations = method.getParameterAnnotations();
+-
+-    if (parameterTypes.length >= 1
+-        && parameterTypes[0] == JsonReader.class
+-        && returnType != void.class
+-        && parametersAreJsonAdapters(1, parameterTypes)) {
+-      // Point pointFromJson(JsonReader jsonReader) {
+-      // Point pointFromJson(JsonReader jsonReader, JsonAdapter<?> adapter, ...) {
+-      return new AdapterMethod(
+-          returnType, returnTypeAnnotations, adapter, method, parameterTypes.length, 1, true) {
+-        @Override
+-        public Object fromJson(Moshi moshi, JsonReader reader)
+-            throws IOException, InvocationTargetException {
+-          return invoke(reader);
+-        }
+-      };
+-
+-    } else if (parameterTypes.length == 1 && returnType != void.class) {
+-      // Point pointFromJson(List<Integer> o) {
+-      final Set<? extends Annotation> qualifierAnnotations =
+-          getJsonAnnotations(parameterAnnotations[0]);
+-      boolean nullable = Util.getHasNullable(parameterAnnotations[0]);
+-      return new AdapterMethod(
+-          returnType, returnTypeAnnotations, adapter, method, parameterTypes.length, 1, nullable) {
+-        JsonAdapter<Object> delegate;
+-
+-        @Override
+-        public void bind(Moshi moshi, JsonAdapter.Factory factory) {
+-          super.bind(moshi, factory);
+-          delegate =
+-              Types.equals(parameterTypes[0], returnType)
+-                      && qualifierAnnotations.equals(returnTypeAnnotations)
+-                  ? moshi.nextAdapter(factory, parameterTypes[0], qualifierAnnotations)
+-                  : moshi.adapter(parameterTypes[0], qualifierAnnotations);
+-        }
+-
+-        @Override
+-        public Object fromJson(Moshi moshi, JsonReader reader)
+-            throws IOException, InvocationTargetException {
+-          Object intermediate = delegate.fromJson(reader);
+-          return invoke(intermediate);
+-        }
+-      };
+-
+-    } else {
+-      throw new IllegalArgumentException(
+-          "Unexpected signature for "
+-              + method
+-              + ".\n"
+-              + "@FromJson method signatures may have one of the following structures:\n"
+-              + "    <any access modifier> R fromJson(JsonReader jsonReader) throws <any>;\n"
+-              + "    <any access modifier> R fromJson(JsonReader jsonReader,"
+-              + " JsonAdapter<any> delegate, <any more delegates>) throws <any>;\n"
+-              + "    <any access modifier> R fromJson(T value) throws <any>;\n");
+-    }
+-  }
+-
+-  /** Returns the matching adapter method from the list. */
+-  private static @Nullable AdapterMethod get(
+-      List<AdapterMethod> adapterMethods, Type type, Set<? extends Annotation> annotations) {
+-    for (int i = 0, size = adapterMethods.size(); i < size; i++) {
+-      AdapterMethod adapterMethod = adapterMethods.get(i);
+-      if (Types.equals(adapterMethod.type, type) && adapterMethod.annotations.equals(annotations)) {
+-        return adapterMethod;
+-      }
+-    }
+-    return null;
+-  }
+-
+-  abstract static class AdapterMethod {
+-    final Type type;
+-    final Set<? extends Annotation> annotations;
+-    final Object adapter;
+-    final Method method;
+-    final int adaptersOffset;
+-    final JsonAdapter<?>[] jsonAdapters;
+-    final boolean nullable;
+-
+-    AdapterMethod(
+-        Type type,
+-        Set<? extends Annotation> annotations,
+-        Object adapter,
+-        Method method,
+-        int parameterCount,
+-        int adaptersOffset,
+-        boolean nullable) {
+-      this.type = canonicalize(type);
+-      this.annotations = annotations;
+-      this.adapter = adapter;
+-      this.method = method;
+-      this.adaptersOffset = adaptersOffset;
+-      this.jsonAdapters = new JsonAdapter[parameterCount - adaptersOffset];
+-      this.nullable = nullable;
+-    }
+-
+-    public void bind(Moshi moshi, JsonAdapter.Factory factory) {
+-      if (jsonAdapters.length > 0) {
+-        Type[] parameterTypes = method.getGenericParameterTypes();
+-        Annotation[][] parameterAnnotations = method.getParameterAnnotations();
+-        for (int i = adaptersOffset, size = parameterTypes.length; i < size; i++) {
+-          Type type = ((ParameterizedType) parameterTypes[i]).getActualTypeArguments()[0];
+-          Set<? extends Annotation> jsonAnnotations = getJsonAnnotations(parameterAnnotations[i]);
+-          jsonAdapters[i - adaptersOffset] =
+-              Types.equals(this.type, type) && annotations.equals(jsonAnnotations)
+-                  ? moshi.nextAdapter(factory, type, jsonAnnotations)
+-                  : moshi.adapter(type, jsonAnnotations);
+-        }
+-      }
+-    }
+-
+-    public void toJson(Moshi moshi, JsonWriter writer, @Nullable Object value)
+-        throws IOException, InvocationTargetException {
+-      throw new AssertionError();
+-    }
+-
+-    public @Nullable Object fromJson(Moshi moshi, JsonReader reader)
+-        throws IOException, InvocationTargetException {
+-      throw new AssertionError();
+-    }
+-
+-    /** Invoke the method with one fixed argument, plus any number of JSON adapter arguments. */
+-    protected @Nullable Object invoke(@Nullable Object a1) throws InvocationTargetException {
+-      Object[] args = new Object[1 + jsonAdapters.length];
+-      args[0] = a1;
+-      System.arraycopy(jsonAdapters, 0, args, 1, jsonAdapters.length);
+-
+-      try {
+-        return method.invoke(adapter, args);
+-      } catch (IllegalAccessException e) {
+-        throw new AssertionError();
+-      }
+-    }
+-
+-    /** Invoke the method with two fixed arguments, plus any number of JSON adapter arguments. */
+-    protected Object invoke(@Nullable Object a1, @Nullable Object a2)
+-        throws InvocationTargetException {
+-      Object[] args = new Object[2 + jsonAdapters.length];
+-      args[0] = a1;
+-      args[1] = a2;
+-      System.arraycopy(jsonAdapters, 0, args, 2, jsonAdapters.length);
+-
+-      try {
+-        return method.invoke(adapter, args);
+-      } catch (IllegalAccessException e) {
+-        throw new AssertionError();
+-      }
+-    }
+-  }
+-}
+diff --git a/moshi/src/main/java/com/squareup/moshi/AdapterMethodsFactory.kt b/moshi/src/main/java/com/squareup/moshi/AdapterMethodsFactory.kt
+new file mode 100644
+index 00000000..48c54442
+--- /dev/null
++++ b/moshi/src/main/java/com/squareup/moshi/AdapterMethodsFactory.kt
+@@ -0,0 +1,362 @@
++/*
++ * Copyright (C) 2015 Square, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *    https://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package com.squareup.moshi
++
++import com.squareup.moshi.internal.canonicalize
++import com.squareup.moshi.internal.hasNullable
++import com.squareup.moshi.internal.jsonAnnotations
++import com.squareup.moshi.internal.knownNotNull
++import com.squareup.moshi.internal.checkNull
++import com.squareup.moshi.internal.toStringWithAnnotations
++import java.io.IOException
++import java.lang.reflect.InvocationTargetException
++import java.lang.reflect.Method
++import java.lang.reflect.ParameterizedType
++import java.lang.reflect.Type
++
++internal class AdapterMethodsFactory(
++  private val toAdapters: List<AdapterMethod>,
++  private val fromAdapters: List<AdapterMethod>
++) : JsonAdapter.Factory {
++  override fun create(
++    type: Type,
++    annotations: Set<Annotation>,
++    moshi: Moshi
++  ): JsonAdapter<*>? {
++    val toAdapter = get(toAdapters, type, annotations)
++    val fromAdapter = get(fromAdapters, type, annotations)
++    if (toAdapter == null && fromAdapter == null) return null
++
++    val delegate: JsonAdapter<Any>? = if (toAdapter == null || fromAdapter == null) {
++      try {
++        moshi.nextAdapter(this, type, annotations)
++      } catch (e: IllegalArgumentException) {
++        val missingAnnotation = if (toAdapter == null) "@ToJson" else "@FromJson"
++        throw IllegalArgumentException(
++          "No $missingAnnotation adapter for ${type.toStringWithAnnotations(annotations)}",
++          e
++        )
++      }
++    } else {
++      null
++    }
++
++    toAdapter?.bind(moshi, this)
++    fromAdapter?.bind(moshi, this)
++
++    return object : JsonAdapter<Any>() {
++      override fun toJson(writer: JsonWriter, value: Any?) {
++        when {
++          toAdapter == null -> knownNotNull(delegate).toJson(writer, value)
++          !toAdapter.nullable && value == null -> writer.nullValue()
++          else -> {
++            try {
++              toAdapter.toJson(moshi, writer, value)
++            } catch (e: InvocationTargetException) {
++              val cause = e.cause
++              if (cause is IOException) throw cause
++              throw JsonDataException("$cause at ${writer.path}", cause)
++            }
++          }
++        }
++      }
++
++      override fun fromJson(reader: JsonReader): Any? {
++        return when {
++          fromAdapter == null -> knownNotNull(delegate).fromJson(reader)
++          !fromAdapter.nullable && reader.peek() == JsonReader.Token.NULL -> reader.nextNull<Any>()
++          else -> {
++            try {
++              fromAdapter.fromJson(moshi, reader)
++            } catch (e: InvocationTargetException) {
++              val cause = e.cause
++              if (cause is IOException) throw cause
++              throw JsonDataException("$cause at ${reader.path}", cause)
++            }
++          }
++        }
++      }
++
++      override fun toString() = "JsonAdapter$annotations($type)"
++    }
++  }
++
++  companion object {
++    fun get(adapter: Any): AdapterMethodsFactory {
++      val toAdapters = mutableListOf<AdapterMethod>()
++      val fromAdapters = mutableListOf<AdapterMethod>()
++
++      val classAndSuperclasses = generateSequence(adapter.javaClass) { it.superclass }.iterator()
++      while (classAndSuperclasses.hasNext()) {
++        val clazz = classAndSuperclasses.next()
++        for (declaredMethod in clazz.declaredMethods) {
++          if (declaredMethod.isAnnotationPresent(ToJson::class.java)) {
++            val toAdapter = toAdapter(adapter, declaredMethod)
++            val conflicting = get(toAdapters, toAdapter.type, toAdapter.annotations)
++            checkNull(conflicting) {
++              "Conflicting @ToJson methods:\n    ${it.method}\n    ${toAdapter.method}"
++            }
++            toAdapters.add(toAdapter)
++          }
++          if (declaredMethod.isAnnotationPresent(FromJson::class.java)) {
++            val fromAdapter = fromAdapter(adapter, declaredMethod)
++            val conflicting = get(fromAdapters, fromAdapter.type, fromAdapter.annotations)
++            checkNull(conflicting) {
++              "Conflicting @FromJson methods:\n    ${it.method}\n    ${fromAdapter.method}"
++            }
++            fromAdapters.add(fromAdapter)
++          }
++        }
++      }
++
++      require(toAdapters.isNotEmpty() || fromAdapters.isNotEmpty()) {
++        "Expected at least one @ToJson or @FromJson method on ${adapter.javaClass.name}"
++      }
++      return AdapterMethodsFactory(toAdapters, fromAdapters)
++    }
++
++    /**
++     * Returns an object that calls a `method` method on `adapter` in service of
++     * converting an object to JSON.
++     */
++    fun toAdapter(adapter: Any, method: Method): AdapterMethod {
++      method.isAccessible = true
++      val returnType = method.genericReturnType
++      val parameterTypes = method.genericParameterTypes
++      val parameterAnnotations = method.parameterAnnotations
++      val methodSignatureIncludesJsonWriterAndJsonAdapter = parameterTypes.size >= 2 &&
++        parameterTypes[0] == JsonWriter::class.java &&
++        returnType == Void.TYPE &&
++        parametersAreJsonAdapters(2, parameterTypes)
++      return when {
++        methodSignatureIncludesJsonWriterAndJsonAdapter -> {
++          // void pointToJson(JsonWriter jsonWriter, Point point) {
++          // void pointToJson(JsonWriter jsonWriter, Point point, JsonAdapter<?> adapter, ...) {
++          val qualifierAnnotations = parameterAnnotations[1].jsonAnnotations
++          object : AdapterMethod(
++            adaptersOffset = 2,
++            type = parameterTypes[1],
++            parameterCount = parameterTypes.size,
++            annotations = qualifierAnnotations,
++            adapter = adapter,
++            method = method,
++            nullable = true
++          ) {
++            override fun toJson(moshi: Moshi, writer: JsonWriter, value: Any?) {
++              invoke(writer, value)
++            }
++          }
++        }
++        parameterTypes.size == 1 && returnType != Void.TYPE -> {
++          // List<Integer> pointToJson(Point point) {
++          val returnTypeAnnotations = method.jsonAnnotations
++          val qualifierAnnotations = parameterAnnotations[0].jsonAnnotations
++          val nullable = parameterAnnotations[0].hasNullable
++          object : AdapterMethod(
++            adaptersOffset = 1,
++            type = parameterTypes[0],
++            parameterCount = parameterTypes.size,
++            annotations = qualifierAnnotations,
++            adapter = adapter,
++            method = method,
++            nullable = nullable
++          ) {
++            private lateinit var delegate: JsonAdapter<Any>
++            override fun bind(moshi: Moshi, factory: JsonAdapter.Factory) {
++              super.bind(moshi, factory)
++              delegate = if (Types.equals(parameterTypes[0], returnType) && qualifierAnnotations == returnTypeAnnotations) {
++                moshi.nextAdapter(factory, returnType, returnTypeAnnotations)
++              } else {
++                moshi.adapter(returnType, returnTypeAnnotations)
++              }
++            }
++
++            override fun toJson(moshi: Moshi, writer: JsonWriter, value: Any?) {
++              val intermediate = invoke(value)
++              delegate.toJson(writer, intermediate)
++            }
++          }
++        }
++        else -> {
++          throw IllegalArgumentException("""Unexpected signature for $method.
++@ToJson method signatures may have one of the following structures:
++    <any access modifier> void toJson(JsonWriter writer, T value) throws <any>;
++    <any access modifier> void toJson(JsonWriter writer, T value, JsonAdapter<any> delegate, <any more delegates>) throws <any>;
++    <any access modifier> R toJson(T value) throws <any>;
++""")
++        }
++      }
++    }
++
++    /** Returns true if `parameterTypes[offset]` contains only JsonAdapters. */
++    private fun parametersAreJsonAdapters(offset: Int, parameterTypes: Array<Type>): Boolean {
++      for (i in offset until parameterTypes.size) {
++        val parameterType = parameterTypes[i]
++        if (parameterType !is ParameterizedType) return false
++        if (parameterType.rawType != JsonAdapter::class.java) return false
++      }
++      return true
++    }
++
++    /**
++     * Returns an object that calls a `method` method on `adapter` in service of
++     * converting an object from JSON.
++     */
++    fun fromAdapter(adapter: Any, method: Method): AdapterMethod {
++      method.isAccessible = true
++      val returnType = method.genericReturnType
++      val returnTypeAnnotations = method.jsonAnnotations
++      val parameterTypes = method.genericParameterTypes
++      val parameterAnnotations = method.parameterAnnotations
++      val methodSignatureIncludesJsonReaderAndJsonAdapter = parameterTypes.isNotEmpty() &&
++        parameterTypes[0] == JsonReader::class.java &&
++        returnType != Void.TYPE &&
++        parametersAreJsonAdapters(1, parameterTypes)
++      return when {
++        methodSignatureIncludesJsonReaderAndJsonAdapter -> {
++          // Point pointFromJson(JsonReader jsonReader) {
++          // Point pointFromJson(JsonReader jsonReader, JsonAdapter<?> adapter, ...) {
++          object : AdapterMethod(
++            adaptersOffset = 1,
++            type = returnType,
++            parameterCount = parameterTypes.size,
++            annotations = returnTypeAnnotations,
++            adapter = adapter,
++            method = method,
++            nullable = true
++          ) {
++            override fun fromJson(moshi: Moshi, reader: JsonReader) = invoke(reader)
++          }
++        }
++        parameterTypes.size == 1 && returnType != Void.TYPE -> {
++          // Point pointFromJson(List<Integer> o) {
++          val qualifierAnnotations = parameterAnnotations[0].jsonAnnotations
++          val nullable = parameterAnnotations[0].hasNullable
++          object : AdapterMethod(
++            adaptersOffset = 1,
++            type = returnType,
++            parameterCount = parameterTypes.size,
++            annotations = returnTypeAnnotations,
++            adapter = adapter,
++            method = method,
++            nullable = nullable
++          ) {
++            lateinit var delegate: JsonAdapter<Any>
++
++            override fun bind(moshi: Moshi, factory: JsonAdapter.Factory) {
++              super.bind(moshi, factory)
++              delegate = if (Types.equals(parameterTypes[0], returnType) && qualifierAnnotations == returnTypeAnnotations) {
++                moshi.nextAdapter(factory, parameterTypes[0], qualifierAnnotations)
++              } else {
++                moshi.adapter(parameterTypes[0], qualifierAnnotations)
++              }
++            }
++
++            override fun fromJson(moshi: Moshi, reader: JsonReader): Any? {
++              val intermediate = delegate.fromJson(reader)
++              return invoke(intermediate)
++            }
++          }
++        }
++        else -> {
++          throw IllegalArgumentException("""Unexpected signature for $method.
++@FromJson method signatures may have one of the following structures:
++    <any access modifier> R fromJson(JsonReader jsonReader) throws <any>;
++    <any access modifier> R fromJson(JsonReader jsonReader, JsonAdapter<any> delegate, <any more delegates>) throws <any>;
++    <any access modifier> R fromJson(T value) throws <any>;
++""")
++        }
++      }
++    }
++
++    /** Returns the matching adapter method from the list. */
++    private fun get(
++      adapterMethods: List<AdapterMethod>,
++      type: Type,
++      annotations: Set<Annotation>
++    ): AdapterMethod? {
++      for (adapterMethod in adapterMethods) {
++        if (Types.equals(adapterMethod.type, type) && adapterMethod.annotations == annotations) {
++          return adapterMethod
++        }
++      }
++      return null
++    }
++  }
++
++  internal abstract class AdapterMethod(
++    private val adaptersOffset: Int,
++    type: Type,
++    parameterCount: Int,
++    val annotations: Set<Annotation>,
++    val adapter: Any,
++    val method: Method,
++    val nullable: Boolean
++  ) {
++    val type = type.canonicalize()
++    private val jsonAdapters: Array<JsonAdapter<*>?> = arrayOfNulls(parameterCount - adaptersOffset)
++
++    open fun bind(moshi: Moshi, factory: JsonAdapter.Factory) {
++      if (jsonAdapters.isNotEmpty()) {
++        val parameterTypes = method.genericParameterTypes
++        val parameterAnnotations = method.parameterAnnotations
++        for (i in adaptersOffset until parameterTypes.size) {
++          val type = (parameterTypes[i] as ParameterizedType).actualTypeArguments[0]
++          val jsonAnnotations = parameterAnnotations[i].jsonAnnotations
++          jsonAdapters[i - adaptersOffset] =
++            if (Types.equals(this.type, type) && annotations == jsonAnnotations) {
++              moshi.nextAdapter(
++                factory, type, jsonAnnotations
++              )
++            } else {
++              moshi.adapter<Any>(type, jsonAnnotations)
++            }
++        }
++      }
++    }
++
++    open fun toJson(moshi: Moshi, writer: JsonWriter, value: Any?): Unit = throw AssertionError()
++
++    open fun fromJson(moshi: Moshi, reader: JsonReader): Any? = throw AssertionError()
++
++    /** Invoke the method with one fixed argument, plus any number of JSON adapter arguments. */
++    protected fun invoke(initialFixedArgumentForAdapterMethod: Any?): Any? {
++      val args = arrayOfNulls<Any>(1 + jsonAdapters.size)
++      args[0] = initialFixedArgumentForAdapterMethod
++      jsonAdapters.copyInto(args, 1, 0, jsonAdapters.size)
++
++      return try {
++        method.invoke(adapter, *args)
++      } catch (e: IllegalAccessException) {
++        throw AssertionError()
++      }
++    }
++
++    /** Invoke the method with two fixed arguments, plus any number of JSON adapter arguments. */
++    protected fun invoke(fixedArgument1: Any?, fixedArgument2: Any?): Any? {
++      val args = arrayOfNulls<Any>(2 + jsonAdapters.size)
++      args[0] = fixedArgument1
++      args[1] = fixedArgument2
++      jsonAdapters.copyInto(args, 2, 0, jsonAdapters.size)
++
++      return try {
++        method.invoke(adapter, *args)
++      } catch (e: IllegalAccessException) {
++        throw AssertionError()
++      }
++    }
++  }
++}
+diff --git a/moshi/src/main/java/com/squareup/moshi/internal/Util.kt b/moshi/src/main/java/com/squareup/moshi/internal/Util.kt
+index a48be094..1789ed72 100644
+--- a/moshi/src/main/java/com/squareup/moshi/internal/Util.kt
++++ b/moshi/src/main/java/com/squareup/moshi/internal/Util.kt
+@@ -499,6 +499,13 @@ public fun <T> Class<T>.boxIfPrimitive(): Class<T> {
+   return wrapped ?: this
+ }
+ 
++internal inline fun <T : Any> checkNull(value: T?, lazyMessage: (T) -> Any) {
++  if (value != null) {
++    val message = lazyMessage(value)
++    throw IllegalStateException(message.toString())
++  }
++}
++
+ internal class ParameterizedTypeImpl private constructor(
+   private val ownerType: Type?,
+   private val rawType: Type,

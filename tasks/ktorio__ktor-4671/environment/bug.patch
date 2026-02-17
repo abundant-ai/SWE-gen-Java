@@ -1,0 +1,152 @@
+diff --git a/ktor-client/ktor-client-cio/common/src/io/ktor/client/engine/cio/CIOEngine.kt b/ktor-client/ktor-client-cio/common/src/io/ktor/client/engine/cio/CIOEngine.kt
+index e44c25445..3439cf2a4 100644
+--- a/ktor-client/ktor-client-cio/common/src/io/ktor/client/engine/cio/CIOEngine.kt
++++ b/ktor-client/ktor-client-cio/common/src/io/ktor/client/engine/cio/CIOEngine.kt
+@@ -66,6 +66,7 @@ internal class CIOEngine(
+                 requestJob.join()
+             } finally {
+                 selector.close()
++                selector.coroutineContext[Job]!!.join()
+             }
+         }
+     }
+diff --git a/ktor-network/nix/src/io/ktor/network/selector/SelectUtilsNix.kt b/ktor-network/nix/src/io/ktor/network/selector/SelectUtilsNix.kt
+index b0a4e70b7..517934619 100644
+--- a/ktor-network/nix/src/io/ktor/network/selector/SelectUtilsNix.kt
++++ b/ktor-network/nix/src/io/ktor/network/selector/SelectUtilsNix.kt
+@@ -48,7 +48,7 @@ internal actual class SelectorHelper {
+     }
+ 
+     actual fun start(scope: CoroutineScope): Job {
+-        return scope.launch {
++        return scope.launch(CoroutineName("selector")) {
+             selectionLoop()
+         }
+     }
+@@ -67,7 +67,7 @@ internal actual class SelectorHelper {
+     }
+ 
+     @OptIn(ExperimentalForeignApi::class, InternalAPI::class)
+-    private suspend fun selectionLoop() {
++    private fun selectionLoop() {
+         val completed = mutableSetOf<EventInfo>()
+         val watchSet = mutableSetOf<EventInfo>()
+         val closeSet = mutableSetOf<Int>()
+@@ -81,8 +81,6 @@ internal actual class SelectorHelper {
+                 watchSet.add(wakeupSignalEvent)
+                 val maxDescriptor = fillHandlersOrClose(watchSet, completed, closeSet, readSet, writeSet, errorSet)
+ 
+-                yield()
+-
+                 try {
+                     selector_pselect(maxDescriptor + 1, readSet, writeSet, errorSet)
+                         .check(posixFunctionName = "pselect")
+diff --git a/ktor-network/nix/test/io/ktor/network/sockets/tests/TcpSocketTestNix.kt b/ktor-network/nix/test/io/ktor/network/sockets/tests/TcpSocketTestNix.kt
+index 14b16b1b7..6fcb0eff4 100644
+--- a/ktor-network/nix/test/io/ktor/network/sockets/tests/TcpSocketTestNix.kt
++++ b/ktor-network/nix/test/io/ktor/network/sockets/tests/TcpSocketTestNix.kt
+@@ -26,7 +26,7 @@ class TcpSocketTestNix {
+         socket.close()
+         selector.close()
+ 
+-        socket.awaitClosed()
++        selector.coroutineContext[Job]?.join()
+ 
+         val isDescriptorValid = fcntl(descriptor, F_GETFL) != -1 || errno != EBADF
+         check(!isDescriptorValid) { "Descriptor was not closed" }
+@@ -59,9 +59,7 @@ class TcpSocketTestNix {
+         server.close()
+         selector.close()
+ 
+-        serverConnection.awaitClosed()
+-        clientConnection.awaitClosed()
+-        server.awaitClosed()
++        selector.coroutineContext[Job]?.join()
+ 
+         val isServerDescriptorValid = fcntl(serverDescriptor, F_GETFL) != -1 || errno != EBADF
+         check(!isServerDescriptorValid) { "Server descriptor was not closed" }
+diff --git a/ktor-network/nix/test/io/ktor/network/sockets/tests/UdpSocketTestNix.kt b/ktor-network/nix/test/io/ktor/network/sockets/tests/UdpSocketTestNix.kt
+index 787e50aa3..034074019 100644
+--- a/ktor-network/nix/test/io/ktor/network/sockets/tests/UdpSocketTestNix.kt
++++ b/ktor-network/nix/test/io/ktor/network/sockets/tests/UdpSocketTestNix.kt
+@@ -24,7 +24,7 @@ class UdpSocketTestNix {
+         socket.close()
+         selector.close()
+ 
+-        socket.awaitClosed()
++        selector.coroutineContext[Job]?.join()
+ 
+         val isDescriptorValid = fcntl(descriptor, F_GETFL) != -1 || errno != EBADF
+         check(!isDescriptorValid) { "Descriptor was not closed" }
+diff --git a/ktor-network/posix/src/io/ktor/network/selector/SelectorManager.kt b/ktor-network/posix/src/io/ktor/network/selector/SelectorManager.kt
+index cd3f184d8..407e6f51e 100644
+--- a/ktor-network/posix/src/io/ktor/network/selector/SelectorManager.kt
++++ b/ktor-network/posix/src/io/ktor/network/selector/SelectorManager.kt
+@@ -11,7 +11,7 @@ import kotlin.coroutines.*
+ 
+ public actual fun SelectorManager(
+     dispatcher: CoroutineContext
+-): SelectorManager = WorkerSelectorManager(dispatcher)
++): SelectorManager = WorkerSelectorManager()
+ 
+ public actual interface SelectorManager : CoroutineScope, Closeable {
+     /**
+diff --git a/ktor-network/posix/src/io/ktor/network/selector/WorkerSelectorManager.kt b/ktor-network/posix/src/io/ktor/network/selector/WorkerSelectorManager.kt
+index 9dc6fb9aa..1acf499d3 100644
+--- a/ktor-network/posix/src/io/ktor/network/selector/WorkerSelectorManager.kt
++++ b/ktor-network/posix/src/io/ktor/network/selector/WorkerSelectorManager.kt
+@@ -8,8 +8,12 @@ import kotlinx.coroutines.*
+ import kotlinx.io.*
+ import kotlin.coroutines.*
+ 
+-internal class WorkerSelectorManager(context: CoroutineContext) : SelectorManager {
+-    override val coroutineContext: CoroutineContext = context + CoroutineName("selector")
++@OptIn(ExperimentalCoroutinesApi::class)
++internal class WorkerSelectorManager : SelectorManager {
++    @OptIn(DelicateCoroutinesApi::class)
++    private val selectorContext = newSingleThreadContext("WorkerSelectorManager")
++    private val job = Job()
++    override val coroutineContext: CoroutineContext = selectorContext + job
+ 
+     private val selector = SelectorHelper()
+ 
+@@ -35,5 +39,7 @@ internal class WorkerSelectorManager(context: CoroutineContext) : SelectorManage
+ 
+     override fun close() {
+         selector.requestTermination()
++        selectorContext.close()
++        job.cancel()
+     }
+ }
+diff --git a/ktor-network/windows/src/io/ktor/network/selector/SelectUtilsWindows.kt b/ktor-network/windows/src/io/ktor/network/selector/SelectUtilsWindows.kt
+index d4bbf1a87..0f6623e25 100644
+--- a/ktor-network/windows/src/io/ktor/network/selector/SelectUtilsWindows.kt
++++ b/ktor-network/windows/src/io/ktor/network/selector/SelectUtilsWindows.kt
+@@ -30,7 +30,7 @@ internal actual class SelectorHelper {
+     }
+ 
+     actual fun start(scope: CoroutineScope): Job {
+-        return scope.launch {
++        return scope.launch(CoroutineName("selector")) {
+             selectionLoop()
+         }
+     }
+@@ -49,7 +49,7 @@ internal actual class SelectorHelper {
+     }
+ 
+     @OptIn(ExperimentalForeignApi::class, InternalAPI::class)
+-    private suspend fun selectionLoop() {
++    private fun selectionLoop() {
+         val completed = mutableSetOf<EventInfo>()
+         val watchSet = mutableSetOf<EventInfo>()
+         val closeSet = mutableSetOf<Int>()
+@@ -57,9 +57,6 @@ internal actual class SelectorHelper {
+         try {
+             while (!interestQueue.isClosed) {
+                 val wsaEvents = fillHandlersOrClose(watchSet, completed, closeSet)
+-
+-                yield()
+-
+                 val index = memScoped {
+                     val length = wsaEvents.size + 1
+                     val wsaEventsWithWake = allocArray<CPointerVarOf<COpaquePointer>>(length).apply {

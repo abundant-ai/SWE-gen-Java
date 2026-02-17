@@ -1,0 +1,308 @@
+diff --git a/buildSrc/src/main/kotlin/Dependencies.kt b/buildSrc/src/main/kotlin/Dependencies.kt
+index aeba4f5d..aae1f542 100644
+--- a/buildSrc/src/main/kotlin/Dependencies.kt
++++ b/buildSrc/src/main/kotlin/Dependencies.kt
+@@ -36,6 +36,7 @@ object Dependencies {
+
+   object Kotlin {
+     const val version = "1.4.10"
++    const val stdlib = "org.jetbrains.kotlin:kotlin-stdlib:$version"
+     const val metadata = "org.jetbrains.kotlinx:kotlinx-metadata-jvm:0.1.0"
+   }
+
+diff --git a/kotlin/codegen/build.gradle.kts b/kotlin/codegen/build.gradle.kts
+index 88a41bd2..d8aa2fa1 100644
+--- a/kotlin/codegen/build.gradle.kts
++++ b/kotlin/codegen/build.gradle.kts
+@@ -25,6 +25,11 @@ plugins {
+   id("com.github.johnrengelman.shadow") version "6.0.0"
+ }
+ 
++configure<JavaPluginExtension> {
++  sourceCompatibility = JavaVersion.VERSION_1_8
++  targetCompatibility = JavaVersion.VERSION_1_8
++}
++
+ tasks.withType<KotlinCompile>().configureEach {
+   kotlinOptions {
+     jvmTarget = "1.8"
+diff --git a/kotlin/reflect/src/main/java/com/squareup/moshi/kotlin/reflect/KotlinJsonAdapter.kt b/kotlin/reflect/src/main/java/com/squareup/moshi/kotlin/reflect/KotlinJsonAdapter.kt
+index 3b310ab1..cdf3b1cb 100644
+--- a/kotlin/reflect/src/main/java/com/squareup/moshi/kotlin/reflect/KotlinJsonAdapter.kt
++++ b/kotlin/reflect/src/main/java/com/squareup/moshi/kotlin/reflect/KotlinJsonAdapter.kt
+@@ -21,10 +21,10 @@ import com.squareup.moshi.JsonDataException
+ import com.squareup.moshi.JsonReader
+ import com.squareup.moshi.JsonWriter
+ import com.squareup.moshi.Moshi
+-import com.squareup.moshi.Types
+ import com.squareup.moshi.internal.Util
+ import com.squareup.moshi.internal.Util.generatedAdapter
+ import com.squareup.moshi.internal.Util.resolve
++import com.squareup.moshi.rawType
+ import java.lang.reflect.Modifier
+ import java.lang.reflect.Type
+ import java.util.AbstractMap.SimpleEntry
+@@ -184,7 +184,7 @@ class KotlinJsonAdapterFactory : JsonAdapter.Factory {
+     JsonAdapter<*>? {
+       if (annotations.isNotEmpty()) return null
+ 
+-      val rawType = Types.getRawType(type)
++      val rawType = type.rawType
+       if (rawType.isInterface) return null
+       if (rawType.isEnum) return null
+       if (!rawType.isAnnotationPresent(KOTLIN_METADATA)) return null
+diff --git a/moshi/build.gradle.kts b/moshi/build.gradle.kts
+index 6b691673..1ea5be5f 100644
+--- a/moshi/build.gradle.kts
++++ b/moshi/build.gradle.kts
+@@ -14,15 +14,30 @@
+  * limitations under the License.
+  */
+ 
++import org.jetbrains.kotlin.gradle.tasks.KotlinCompile
++
+ plugins {
+-  `java-library`
++  kotlin("jvm")
+   id("com.vanniktech.maven.publish")
+ }
+ 
++tasks.withType<KotlinCompile>()
++  .matching { it.name.contains("test", true) }
++  .configureEach {
++    kotlinOptions {
++      @Suppress("SuspiciousCollectionReassignment") // It's not suspicious
++      freeCompilerArgs += listOf(
++        "-Xopt-in=kotlin.ExperimentalStdlibApi"
++      )
++    }
++  }
++
+ dependencies {
+   compileOnly(Dependencies.jsr305)
++  compileOnly(Dependencies.Kotlin.stdlib)
+   api(Dependencies.okio)
+ 
++  testImplementation(Dependencies.Kotlin.stdlib)
+   testCompileOnly(Dependencies.jsr305)
+   testImplementation(Dependencies.Testing.junit)
+   testImplementation(Dependencies.Testing.truth)
+diff --git a/moshi/gradle.properties b/moshi/gradle.properties
+index 4938af0a..b84f977f 100644
+--- a/moshi/gradle.properties
++++ b/moshi/gradle.properties
+@@ -18,3 +18,7 @@ POM_NAME=Moshi
+ POM_ARTIFACT_ID=moshi
+ POM_PACKAGING=jar
+ AUTOMATIC_MODULE_NAME=com.squareup.moshi
++
++# Kotlin adds the stdlib dep by default in 1.4.0+, but we want to effectively make it compileOnly
++# for our case to avoid imposing it on consumers.
++kotlin.stdlib.default.dependency=false
+diff --git a/moshi/src/main/java/com/squareup/moshi/-MoshiKotlinExtensions.kt b/moshi/src/main/java/com/squareup/moshi/-MoshiKotlinExtensions.kt
+new file mode 100644
+index 00000000..3a5989a0
+--- /dev/null
++++ b/moshi/src/main/java/com/squareup/moshi/-MoshiKotlinExtensions.kt
+@@ -0,0 +1,49 @@
++/*
++ * Copyright (C) 2019 Square, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *    https://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package com.squareup.moshi
++
++import com.squareup.moshi.internal.NonNullJsonAdapter
++import com.squareup.moshi.internal.NullSafeJsonAdapter
++import kotlin.reflect.KType
++import kotlin.reflect.javaType
++import kotlin.reflect.typeOf
++
++/**
++ * @return a [JsonAdapter] for [T], creating it if necessary. Note that while nullability of [T]
++ *         itself is handled, nested types (such as in generics) are not resolved.
++ */
++@ExperimentalStdlibApi
++inline fun <reified T> Moshi.adapter(): JsonAdapter<T> = adapter(typeOf<T>())
++
++@ExperimentalStdlibApi
++inline fun <reified T> Moshi.Builder.addAdapter(adapter: JsonAdapter<T>): Moshi.Builder = add(typeOf<T>().javaType, adapter)
++
++/**
++ * @return a [JsonAdapter] for [ktype], creating it if necessary. Note that while nullability of
++ *         [ktype] itself is handled, nested types (such as in generics) are not resolved.
++ */
++@ExperimentalStdlibApi
++fun <T> Moshi.adapter(ktype: KType): JsonAdapter<T> {
++  val adapter = adapter<T>(ktype.javaType)
++  return if (adapter is NullSafeJsonAdapter || adapter is NonNullJsonAdapter) {
++    // TODO CR - Assume that these know what they're doing? Or should we defensively avoid wrapping for matching nullability?
++    adapter
++  } else if (ktype.isMarkedNullable) {
++    adapter.nullSafe()
++  } else {
++    adapter.nonNull()
++  }
++}
+diff --git a/moshi/src/main/java/com/squareup/moshi/-MoshiKotlinTypesExtensions.kt b/moshi/src/main/java/com/squareup/moshi/-MoshiKotlinTypesExtensions.kt
+new file mode 100644
+index 00000000..6bfd38eb
+--- /dev/null
++++ b/moshi/src/main/java/com/squareup/moshi/-MoshiKotlinTypesExtensions.kt
+@@ -0,0 +1,71 @@
++/*
++ * Copyright (C) 2020 Square, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *    https://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package com.squareup.moshi
++
++import com.squareup.moshi.internal.Util
++import java.lang.reflect.GenericArrayType
++import java.lang.reflect.Type
++import java.lang.reflect.WildcardType
++import kotlin.reflect.KClass
++import kotlin.reflect.KType
++import kotlin.reflect.javaType
++import kotlin.reflect.typeOf
++
++/** Returns the raw [Class] type of this type. */
++val Type.rawType: Class<*> get() = Types.getRawType(this)
++
++/**
++ * Checks if [this] contains [T]. Returns the subset of [this] without [T], or null if
++ * [this] does not contain [T].
++ */
++inline fun <reified T : Annotation> Set<Annotation>.nextAnnotations(): Set<Annotation>? = Types.nextAnnotations(this, T::class.java)
++
++/**
++ * Returns a type that represents an unknown type that extends [T]. For example, if
++ * [T] is [CharSequence], this returns `out CharSequence`. If
++ * [T] is [Any], this returns `*`, which is shorthand for `out Any?`.
++ */
++@ExperimentalStdlibApi
++inline fun <reified T> subtypeOf(): WildcardType {
++  var type = typeOf<T>().javaType
++  if (type is Class<*>) {
++    type = Util.boxIfPrimitive(type)
++  }
++  return Types.subtypeOf(type)
++}
++
++/**
++ * Returns a type that represents an unknown supertype of [T] bound. For example, if [T] is
++ * [String], this returns `in String`.
++ */
++@ExperimentalStdlibApi
++inline fun <reified T> supertypeOf(): WildcardType {
++  var type = typeOf<T>().javaType
++  if (type is Class<*>) {
++    type = Util.boxIfPrimitive(type)
++  }
++  return Types.supertypeOf(type)
++}
++
++/** Returns a [GenericArrayType] with [this] as its [GenericArrayType.getGenericComponentType]. */
++@ExperimentalStdlibApi
++fun KType.asArrayType(): GenericArrayType = javaType.asArrayType()
++
++/** Returns a [GenericArrayType] with [this] as its [GenericArrayType.getGenericComponentType]. */
++fun KClass<*>.asArrayType(): GenericArrayType = java.asArrayType()
++
++/** Returns a [GenericArrayType] with [this] as its [GenericArrayType.getGenericComponentType]. */
++fun Type.asArrayType(): GenericArrayType = Types.arrayOf(this)
+diff --git a/moshi/src/main/java/com/squareup/moshi/internal/Util.java b/moshi/src/main/java/com/squareup/moshi/internal/Util.java
+index 44126653..b517c98c 100644
+--- a/moshi/src/main/java/com/squareup/moshi/internal/Util.java
++++ b/moshi/src/main/java/com/squareup/moshi/internal/Util.java
+@@ -39,7 +39,9 @@ import java.lang.reflect.WildcardType;
+ import java.util.Arrays;
+ import java.util.Collection;
+ import java.util.Collections;
++import java.util.LinkedHashMap;
+ import java.util.LinkedHashSet;
++import java.util.Map;
+ import java.util.NoSuchElementException;
+ import java.util.Set;
+ import javax.annotation.Nullable;
+@@ -50,6 +52,9 @@ public final class Util {
+   @Nullable public static final Class<?> DEFAULT_CONSTRUCTOR_MARKER;
+   @Nullable private static final Class<? extends Annotation> METADATA;
+ 
++  /** A map from primitive types to their corresponding wrapper types. */
++  private static final Map<Class<?>, Class<?>> PRIMITIVE_TO_WRAPPER_TYPE;
++
+   static {
+     Class<? extends Annotation> metadata = null;
+     try {
+@@ -67,6 +72,20 @@ public final class Util {
+     } catch (ClassNotFoundException ignored) {
+     }
+     DEFAULT_CONSTRUCTOR_MARKER = defaultConstructorMarker;
++
++    Map<Class<?>, Class<?>> primToWrap = new LinkedHashMap<>(16);
++
++    primToWrap.put(boolean.class, Boolean.class);
++    primToWrap.put(byte.class, Byte.class);
++    primToWrap.put(char.class, Character.class);
++    primToWrap.put(double.class, Double.class);
++    primToWrap.put(float.class, Float.class);
++    primToWrap.put(int.class, Integer.class);
++    primToWrap.put(long.class, Long.class);
++    primToWrap.put(short.class, Short.class);
++    primToWrap.put(void.class, Void.class);
++
++    PRIMITIVE_TO_WRAPPER_TYPE = Collections.unmodifiableMap(primToWrap);
+   }
+ 
+   // Extracted as a method with a keep rule to prevent R8 from keeping Kotlin Metada
+@@ -182,14 +201,14 @@ public final class Util {
+   }
+ 
+   public static Type resolve(Type context, Class<?> contextRawType, Type toResolve) {
+-    return resolve(context, contextRawType, toResolve, new LinkedHashSet<TypeVariable>());
++    return resolve(context, contextRawType, toResolve, new LinkedHashSet<TypeVariable<?>>());
+   }
+ 
+   private static Type resolve(
+       Type context,
+       Class<?> contextRawType,
+       Type toResolve,
+-      Collection<TypeVariable> visitedTypeVariables) {
++      Collection<TypeVariable<?>> visitedTypeVariables) {
+     // This implementation is made a little more complicated in an attempt to avoid object-creation.
+     while (true) {
+       if (toResolve instanceof TypeVariable) {
+@@ -643,4 +662,12 @@ public final class Util {
+     }
+     return new JsonDataException(message);
+   }
++
++  // Public due to inline access in MoshiKotlinTypesExtensions
++  public static <T> Class<T> boxIfPrimitive(Class<T> type) {
++    // cast is safe: long.class and Long.class are both of type Class<Long>
++    @SuppressWarnings("unchecked")
++    Class<T> wrapped = (Class<T>) PRIMITIVE_TO_WRAPPER_TYPE.get(type);
++    return (wrapped == null) ? type : wrapped;
++  }
+ }

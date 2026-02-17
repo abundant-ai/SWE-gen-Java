@@ -1,0 +1,253 @@
+diff --git a/moshi/src/main/java/com/squareup/moshi/JsonReader.java b/moshi/src/main/java/com/squareup/moshi/JsonReader.java
+index d21d5690..00f37ce2 100644
+--- a/moshi/src/main/java/com/squareup/moshi/JsonReader.java
++++ b/moshi/src/main/java/com/squareup/moshi/JsonReader.java
+@@ -422,6 +422,49 @@ public abstract class JsonReader implements Closeable {
+    */
+   public abstract int nextInt() throws IOException;
+ 
++  /**
++   * Returns the next value as a stream of UTF-8 bytes and consumes it.
++   *
++   * <p>The following program demonstrates how JSON bytes are returned from an enclosing stream as
++   * their original bytes, including their original whitespace:
++   *
++   * <pre>{@code
++   * String json = "{\"a\": [4,  5  ,6.0, {\"x\":7}, 8], \"b\": 9}";
++   * JsonReader reader = JsonReader.of(new Buffer().writeUtf8(json));
++   * reader.beginObject();
++   * assertThat(reader.nextName()).isEqualTo("a");
++   * try (BufferedSource bufferedSource = reader.valueSource()) {
++   *   assertThat(bufferedSource.readUtf8()).isEqualTo("[4,  5  ,6.0, {\"x\":7}, 8]");
++   * }
++   * assertThat(reader.nextName()).isEqualTo("b");
++   * assertThat(reader.nextInt()).isEqualTo(9);
++   * reader.endObject();
++   * }</pre>
++   *
++   * <p>This reads an entire value: composite objects like arrays and objects are returned in their
++   * entirety. The stream starts with the first character of the value (typically {@code [}, <code>{
++   * </code>, or {@code "}) and ends with the last character of the object (typically {@code ]},
++   * <code>}</code>, or {@code "}).
++   *
++   * <p>The returned source may not be used after any other method on this {@code JsonReader} is
++   * called. For example, the following code crashes with an exception:
++   *
++   * <pre>{@code
++   * JsonReader reader = ...
++   * reader.beginArray();
++   * BufferedSource source = reader.valueSource();
++   * reader.endArray();
++   * source.readUtf8(); // Crash!
++   * }</pre>
++   *
++   * <p>The returned bytes are not validated. This method assumes the stream is well-formed JSON and
++   * only attempts to find the value's boundary in the byte stream. It is the caller's
++   * responsibility to check that the returned byte stream is a valid JSON value.
++   *
++   * <p>Closing the returned source <strong>does not</strong> close this reader.
++   */
++  public abstract BufferedSource nextSource() throws IOException;
++
+   /**
+    * Skips the next value recursively. If it is an object or array, all nested elements are skipped.
+    * This method is intended for use when the JSON token stream contains unrecognized or unhandled
+diff --git a/moshi/src/main/java/com/squareup/moshi/JsonUtf8Reader.java b/moshi/src/main/java/com/squareup/moshi/JsonUtf8Reader.java
+index 0b8e5675..c0f7d2d1 100644
+--- a/moshi/src/main/java/com/squareup/moshi/JsonUtf8Reader.java
++++ b/moshi/src/main/java/com/squareup/moshi/JsonUtf8Reader.java
+@@ -22,6 +22,7 @@ import javax.annotation.Nullable;
+ import okio.Buffer;
+ import okio.BufferedSource;
+ import okio.ByteString;
++import okio.Okio;
+ 
+ final class JsonUtf8Reader extends JsonReader {
+   private static final long MIN_INCOMPLETE_INTEGER = Long.MIN_VALUE / 10;
+@@ -89,6 +90,13 @@ final class JsonUtf8Reader extends JsonReader {
+    */
+   private @Nullable String peekedString;
+ 
++  /**
++   * If non-null, the most recent value read was {@link #readJsonValue()}. The caller may be
++   * mid-stream so it is necessary to call {@link JsonValueSource#discard} to get to the end of the
++   * current JSON value before proceeding.
++   */
++  private @Nullable JsonValueSource valueSource;
++
+   JsonUtf8Reader(BufferedSource source) {
+     if (source == null) {
+       throw new NullPointerException("source == null");
+@@ -233,6 +241,10 @@ final class JsonUtf8Reader extends JsonReader {
+   }
+ 
+   private int doPeek() throws IOException {
++    if (valueSource != null) {
++      valueSource.discard();
++      valueSource = null;
++    }
+     int peekStack = scopes[stackSize - 1];
+     if (peekStack == JsonScope.EMPTY_ARRAY) {
+       scopes[stackSize - 1] = JsonScope.NONEMPTY_ARRAY;
+@@ -1013,6 +1025,55 @@ final class JsonUtf8Reader extends JsonReader {
+     pathNames[stackSize - 1] = "null";
+   }
+ 
++  @Override
++  public BufferedSource nextSource() throws IOException {
++    int p = peeked;
++    if (p == PEEKED_NONE) {
++      p = doPeek();
++    }
++
++    int valueSourceStackSize = 0;
++    Buffer prefix = new Buffer();
++    ByteString state = JsonValueSource.STATE_END_OF_JSON;
++    if (p == PEEKED_BEGIN_ARRAY) {
++      prefix.writeUtf8("[");
++      state = JsonValueSource.STATE_JSON;
++      valueSourceStackSize++;
++    } else if (p == PEEKED_BEGIN_OBJECT) {
++      prefix.writeUtf8("{");
++      state = JsonValueSource.STATE_JSON;
++      valueSourceStackSize++;
++    } else if (p == PEEKED_DOUBLE_QUOTED) {
++      prefix.writeUtf8("\"");
++      state = JsonValueSource.STATE_DOUBLE_QUOTED;
++    } else if (p == PEEKED_SINGLE_QUOTED) {
++      prefix.writeUtf8("'");
++      state = JsonValueSource.STATE_SINGLE_QUOTED;
++    } else if (p == PEEKED_NUMBER || p == PEEKED_LONG || p == PEEKED_UNQUOTED) {
++      prefix.writeUtf8(nextString());
++    } else if (p == PEEKED_TRUE) {
++      prefix.writeUtf8("true");
++    } else if (p == PEEKED_FALSE) {
++      prefix.writeUtf8("false");
++    } else if (p == PEEKED_NULL) {
++      prefix.writeUtf8("null");
++    } else if (p == PEEKED_BUFFERED) {
++      String string = nextString();
++      try (JsonWriter jsonWriter = JsonWriter.of(prefix)) {
++        jsonWriter.value(string);
++      }
++    } else {
++      throw new JsonDataException("Expected a value but was " + peek() + " at path " + getPath());
++    }
++
++    valueSource = new JsonValueSource(source, prefix, state, valueSourceStackSize);
++    peeked = PEEKED_NONE;
++    pathIndices[stackSize - 1]++;
++    pathNames[stackSize - 1] = "null";
++
++    return Okio.buffer(valueSource);
++  }
++
+   /**
+    * Returns the next character in the stream that is neither whitespace nor a part of a comment.
+    * When this returns, the returned character is always at {@code buffer.getByte(0)}.
+diff --git a/moshi/src/main/java/com/squareup/moshi/JsonValueReader.java b/moshi/src/main/java/com/squareup/moshi/JsonValueReader.java
+index bc0f6c5c..1ffc6aaf 100644
+--- a/moshi/src/main/java/com/squareup/moshi/JsonValueReader.java
++++ b/moshi/src/main/java/com/squareup/moshi/JsonValueReader.java
+@@ -24,6 +24,8 @@ import java.util.Iterator;
+ import java.util.List;
+ import java.util.Map;
+ import javax.annotation.Nullable;
++import okio.Buffer;
++import okio.BufferedSource;
+ 
+ /**
+  * This class reads a JSON document by traversing a Java object comprising maps, lists, and JSON
+@@ -343,6 +345,16 @@ final class JsonValueReader extends JsonReader {
+     }
+   }
+ 
++  @Override
++  public BufferedSource nextSource() throws IOException {
++    Object value = readJsonValue();
++    Buffer result = new Buffer();
++    try (JsonWriter jsonWriter = JsonWriter.of(result)) {
++      jsonWriter.jsonValue(value);
++    }
++    return result;
++  }
++
+   @Override
+   public JsonReader peekJson() {
+     return new JsonValueReader(this);
+diff --git a/moshi/src/main/java/com/squareup/moshi/JsonValueSource.java b/moshi/src/main/java/com/squareup/moshi/JsonValueSource.java
+index 0365d7c6..4bc895ae 100644
+--- a/moshi/src/main/java/com/squareup/moshi/JsonValueSource.java
++++ b/moshi/src/main/java/com/squareup/moshi/JsonValueSource.java
+@@ -32,37 +32,47 @@ import okio.Timeout;
+  * unspecified.
+  */
+ final class JsonValueSource implements Source {
+-  private static final ByteString STATE_JSON = ByteString.encodeUtf8("[]{}\"'/#");
+-  private static final ByteString STATE_SINGLE_QUOTED = ByteString.encodeUtf8("'\\");
+-  private static final ByteString STATE_DOUBLE_QUOTED = ByteString.encodeUtf8("\"\\");
+-  private static final ByteString STATE_END_OF_LINE_COMMENT = ByteString.encodeUtf8("\r\n");
+-  private static final ByteString STATE_C_STYLE_COMMENT = ByteString.encodeUtf8("*");
+-  private static final ByteString STATE_END_OF_JSON = ByteString.EMPTY;
++  static final ByteString STATE_JSON = ByteString.encodeUtf8("[]{}\"'/#");
++  static final ByteString STATE_SINGLE_QUOTED = ByteString.encodeUtf8("'\\");
++  static final ByteString STATE_DOUBLE_QUOTED = ByteString.encodeUtf8("\"\\");
++  static final ByteString STATE_END_OF_LINE_COMMENT = ByteString.encodeUtf8("\r\n");
++  static final ByteString STATE_C_STYLE_COMMENT = ByteString.encodeUtf8("*");
++  static final ByteString STATE_END_OF_JSON = ByteString.EMPTY;
+ 
+   private final BufferedSource source;
+   private final Buffer buffer;
+ 
++  /** If non-empty, data from this should be returned before data from {@link #source}. */
++  private final Buffer prefix;
++
+   /**
+    * The state indicates what kind of data is readable at {@link #limit}. This also serves
+    * double-duty as the type of bytes we're interested in while in this state.
+    */
+-  private ByteString state = STATE_JSON;
++  private ByteString state;
+ 
+   /**
+    * The level of nesting of arrays and objects. When the end of string, array, or object is
+    * reached, this should be compared against 0. If it is zero, then we've read a complete value and
+    * this source is exhausted.
+    */
+-  private int stackSize = 0;
++  private int stackSize;
+ 
+   /** The number of bytes immediately returnable to the caller. */
+   private long limit = 0;
+ 
+   private boolean closed = false;
+ 
+-  public JsonValueSource(BufferedSource source) {
++  JsonValueSource(BufferedSource source) {
++    this(source, new Buffer(), STATE_JSON, 0);
++  }
++
++  JsonValueSource(BufferedSource source, Buffer prefix, ByteString state, int stackSize) {
+     this.source = source;
+     this.buffer = source.getBuffer();
++    this.prefix = prefix;
++    this.state = state;
++    this.stackSize = stackSize;
+   }
+ 
+   /**
+@@ -182,6 +192,14 @@ final class JsonValueSource implements Source {
+     if (closed) throw new IllegalStateException("closed");
+     if (byteCount == 0) return 0L;
+ 
++    // If this stream has a prefix, consume that first.
++    if (!prefix.exhausted()) {
++      long prefixResult = prefix.read(sink, byteCount);
++      byteCount -= prefixResult;
++      long suffixResult = read(sink, byteCount);
++      return suffixResult != -1L ? suffixResult + prefixResult : prefixResult;
++    }
++
+     advanceLimit(byteCount);
+ 
+     if (limit == 0) {

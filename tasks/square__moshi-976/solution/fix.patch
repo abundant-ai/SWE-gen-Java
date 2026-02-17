@@ -1,0 +1,192 @@
+diff --git a/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/api/AdapterGenerator.kt b/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/api/AdapterGenerator.kt
+index c4939cde..a4c9e075 100644
+--- a/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/api/AdapterGenerator.kt
++++ b/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/api/AdapterGenerator.kt
+@@ -20,6 +20,7 @@ import com.squareup.kotlinpoet.AnnotationSpec
+ import com.squareup.kotlinpoet.CodeBlock
+ import com.squareup.kotlinpoet.FileSpec
+ import com.squareup.kotlinpoet.FunSpec
++import com.squareup.kotlinpoet.INT
+ import com.squareup.kotlinpoet.KModifier
+ import com.squareup.kotlinpoet.MemberName
+ import com.squareup.kotlinpoet.NameAllocator
+@@ -31,6 +32,7 @@ import com.squareup.kotlinpoet.TypeSpec
+ import com.squareup.kotlinpoet.TypeVariableName
+ import com.squareup.kotlinpoet.asClassName
+ import com.squareup.kotlinpoet.asTypeName
++import com.squareup.kotlinpoet.joinToCode
+ import com.squareup.moshi.JsonAdapter
+ import com.squareup.moshi.JsonReader
+ import com.squareup.moshi.JsonWriter
+@@ -48,6 +50,14 @@ internal class AdapterGenerator(
+     target: TargetType,
+     private val propertyList: List<PropertyGenerator>
+ ) {
++
++  companion object {
++    private val DEFAULT_CONSTRUCTOR_EXTRA_PARAMS = arrayOf(
++        CodeBlock.of("%T::class.javaPrimitiveType", INT),
++        CodeBlock.of("%T.DEFAULT_CONSTRUCTOR_MARKER", Util::class)
++    )
++  }
++
+   private val nonTransientProperties = propertyList.filterNot { it.isTransient }
+   private val className = target.typeName.rawType()
+   private val visibility = target.visibility
+@@ -56,6 +66,7 @@ internal class AdapterGenerator(
+   private val nameAllocator = NameAllocator()
+   private val adapterName = "${className.simpleNames.joinToString(separator = "_")}JsonAdapter"
+   private val originalTypeName = target.typeName
++  private val originalRawTypeName = originalTypeName.rawType()
+ 
+   private val moshiParam = ParameterSpec.builder(
+       nameAllocator.newName("moshi"),
+@@ -158,7 +169,7 @@ internal class AdapterGenerator(
+   }
+ 
+   private fun generateToStringFun(): FunSpec {
+-    val name = originalTypeName.rawType().simpleNames.joinToString(".")
++    val name = originalRawTypeName.simpleNames.joinToString(".")
+     val size = TO_STRING_SIZE_BASE + name.length
+     return FunSpec.builder("toString")
+         .addModifiers(KModifier.OVERRIDE)
+@@ -201,10 +212,12 @@ internal class AdapterGenerator(
+     // JsonReader.Options.
+     var propertyIndex = 0
+     var maskIndex = 0
++    val constructorPropertyTypes = mutableListOf<CodeBlock>()
+     for (property in propertyList) {
+       if (property.isTransient) {
+         if (property.hasConstructorParameter) {
+           maskIndex++
++          constructorPropertyTypes += property.target.type.asTypeBlock()
+         }
+         continue
+       }
+@@ -238,6 +251,9 @@ internal class AdapterGenerator(
+               exception)
+         }
+       }
++      if (property.hasConstructorParameter) {
++        constructorPropertyTypes += property.target.type.asTypeBlock()
++      }
+       propertyIndex++
+       maskIndex++
+     }
+@@ -267,12 +283,13 @@ internal class AdapterGenerator(
+     if (useDefaultsConstructor) {
+       classBuilder.addProperty(constructorProperty)
+       // Dynamic default constructor call
+-      val rawOriginalTypeName = originalTypeName.rawType()
+       val nonNullConstructorType = constructorProperty.type.copy(nullable = false)
++      val args = constructorPropertyTypes.plus(DEFAULT_CONSTRUCTOR_EXTRA_PARAMS)
++          .joinToCode(", ")
+       val coreLookupBlock = CodeBlock.of(
+-          "%T.lookupDefaultsConstructor(%T::class.java)",
+-          MOSHI_UTIL,
+-          rawOriginalTypeName
++          "%T::class.java.getDeclaredConstructor(%L)",
++          originalRawTypeName,
++          args
+       )
+       val lookupBlock = if (originalTypeName is ParameterizedTypeName) {
+         CodeBlock.of("(%L·as·%T)", coreLookupBlock, nonNullConstructorType)
+@@ -280,7 +297,7 @@ internal class AdapterGenerator(
+         coreLookupBlock
+       }
+       val initializerBlock = CodeBlock.of(
+-          "this.%1N ?:·%2L.also·{ this.%1N·= it }",
++          "this.%1N·?: %2L.also·{ this.%1N·= it }",
+           constructorProperty,
+           lookupBlock
+       )
+@@ -310,7 +327,7 @@ internal class AdapterGenerator(
+           // We have to use the default primitive for the available type in order for
+           // invokeDefaultConstructor to properly invoke it. Just using "null" isn't safe because
+           // the transient type may be a primitive type.
+-          result.addCode(property.target.type.defaultPrimitiveValue())
++          result.addCode(property.target.type.rawType().defaultPrimitiveValue())
+         } else {
+           result.addCode("%N", property.localName)
+         }
+diff --git a/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/api/kotlintypes.kt b/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/api/kotlintypes.kt
+index ab01df5b..6c806c90 100644
+--- a/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/api/kotlintypes.kt
++++ b/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/api/kotlintypes.kt
+@@ -15,6 +15,8 @@
+  */
+ package com.squareup.moshi.kotlin.codegen.api
+ 
++import com.squareup.kotlinpoet.ANY
++import com.squareup.kotlinpoet.ARRAY
+ import com.squareup.kotlinpoet.BOOLEAN
+ import com.squareup.kotlinpoet.BYTE
+ import com.squareup.kotlinpoet.CHAR
+@@ -25,9 +27,11 @@ import com.squareup.kotlinpoet.FLOAT
+ import com.squareup.kotlinpoet.INT
+ import com.squareup.kotlinpoet.KModifier
+ import com.squareup.kotlinpoet.LONG
++import com.squareup.kotlinpoet.NOTHING
+ import com.squareup.kotlinpoet.ParameterizedTypeName
+ import com.squareup.kotlinpoet.SHORT
+ import com.squareup.kotlinpoet.TypeName
++import com.squareup.kotlinpoet.TypeVariableName
+ import com.squareup.kotlinpoet.UNIT
+ import com.squareup.kotlinpoet.asTypeName
+ 
+@@ -49,10 +53,41 @@ internal fun TypeName.defaultPrimitiveValue(): CodeBlock =
+       FLOAT -> CodeBlock.of("0f")
+       LONG -> CodeBlock.of("0L")
+       DOUBLE -> CodeBlock.of("0.0")
+-      UNIT, Void::class.asTypeName() -> throw IllegalStateException("Parameter with void or Unit type is illegal")
++      UNIT, Void::class.asTypeName(), NOTHING -> throw IllegalStateException("Parameter with void, Unit, or Nothing type is illegal")
+       else -> CodeBlock.of("null")
+     }
+ 
++internal fun TypeName.asTypeBlock(): CodeBlock {
++  when (this) {
++    is ParameterizedTypeName -> {
++      return if (rawType == ARRAY) {
++        CodeBlock.of("%T::class.java", copy(nullable = false))
++      } else {
++        rawType.asTypeBlock()
++      }
++    }
++    is TypeVariableName -> {
++      val bound = bounds.firstOrNull() ?: ANY
++      return bound.asTypeBlock()
++    }
++    is ClassName -> {
++      return when (this) {
++        BOOLEAN, CHAR, BYTE, SHORT, INT, FLOAT, LONG, DOUBLE -> {
++          if (isNullable) {
++            // Remove nullable but keep the java object type
++            CodeBlock.of("%T::class.javaObjectType", copy(nullable = false))
++          } else {
++            CodeBlock.of("%T::class.javaPrimitiveType", this)
++          }
++        }
++        UNIT, Void::class.asTypeName(), NOTHING -> throw IllegalStateException("Parameter with void, Unit, or Nothing type is illegal")
++        else -> CodeBlock.of("%T::class.java", copy(nullable = false))
++      }
++    }
++    else -> throw UnsupportedOperationException("Parameter with type '${javaClass.simpleName}' is illegal. Only classes, parameterized types, or type variables are allowed.")
++  }
++}
++
+ internal fun KModifier.checkIsVisibility() {
+   require(ordinal <= ordinal) {
+     "Visibility must be one of ${(0..ordinal).joinToString { KModifier.values()[it].name }}. Is $name"
+diff --git a/moshi/src/main/java/com/squareup/moshi/internal/Util.java b/moshi/src/main/java/com/squareup/moshi/internal/Util.java
+index babd6e90..08c56ee7 100644
+--- a/moshi/src/main/java/com/squareup/moshi/internal/Util.java
++++ b/moshi/src/main/java/com/squareup/moshi/internal/Util.java
+@@ -47,7 +47,7 @@ import static com.squareup.moshi.Types.supertypeOf;
+ public final class Util {
+   public static final Set<Annotation> NO_ANNOTATIONS = Collections.emptySet();
+   public static final Type[] EMPTY_TYPE_ARRAY = new Type[] {};
+-  @Nullable private static final Class<?> DEFAULT_CONSTRUCTOR_MARKER;
++  @Nullable public static final Class<?> DEFAULT_CONSTRUCTOR_MARKER;
+   @Nullable private static final Class<? extends Annotation> METADATA;
+ 
+   static {

@@ -1,0 +1,512 @@
+diff --git a/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/AdapterGenerator.kt b/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/AdapterGenerator.kt
+index 0deba31f..2d3b6b9e 100644
+--- a/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/AdapterGenerator.kt
++++ b/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/AdapterGenerator.kt
+@@ -29,24 +29,28 @@ import com.squareup.kotlinpoet.TypeSpec
+ import com.squareup.kotlinpoet.TypeVariableName
+ import com.squareup.kotlinpoet.asClassName
+ import com.squareup.kotlinpoet.asTypeName
++import com.squareup.kotlinpoet.joinToCode
+ import com.squareup.moshi.JsonAdapter
+ import com.squareup.moshi.JsonDataException
+ import com.squareup.moshi.JsonReader
+ import com.squareup.moshi.JsonWriter
+ import com.squareup.moshi.Moshi
+-import me.eugeniomarletti.kotlin.metadata.isDataClass
++import com.squareup.moshi.internal.Util
+ import me.eugeniomarletti.kotlin.metadata.shadow.metadata.ProtoBuf.Visibility
+ import me.eugeniomarletti.kotlin.metadata.visibility
++import java.lang.reflect.Constructor
+ import java.lang.reflect.Type
+ import javax.lang.model.element.TypeElement
+ 
++private val MOSHI_UTIL = Util::class.asClassName()
++
+ /** Generates a JSON adapter for a target type. */
+ internal class AdapterGenerator(
+-  target: TargetType,
+-  private val propertyList: List<PropertyGenerator>
++    target: TargetType,
++    private val propertyList: List<PropertyGenerator>
+ ) {
++  private val nonTransientProperties = propertyList.filterNot { it.isTransient }
+   private val className = target.name
+-  private val isDataClass = target.proto.isDataClass
+   private val visibility = target.proto.visibility!!
+   private val typeVariables = target.typeVariables
+ 
+@@ -74,19 +78,29 @@ internal class AdapterGenerator(
+       nameAllocator.newName("value"),
+       originalTypeName.copy(nullable = true))
+       .build()
+-  private val jsonAdapterTypeName = JsonAdapter::class.asClassName().parameterizedBy(originalTypeName)
++  private val jsonAdapterTypeName = JsonAdapter::class.asClassName().parameterizedBy(
++      originalTypeName)
+ 
+   // selectName() API setup
+   private val optionsProperty = PropertySpec.builder(
+       nameAllocator.newName("options"), JsonReader.Options::class.asTypeName(),
+       KModifier.PRIVATE)
+-      .initializer("%T.of(${propertyList.joinToString(", ") {
++      .initializer("%T.of(${nonTransientProperties.joinToString(", ") {
+         CodeBlock.of("%S", it.jsonName).toString()
+       }})", JsonReader.Options::class.asTypeName())
+       .build()
+ 
++  private val constructorProperty = PropertySpec.builder(
++      nameAllocator.newName("constructorRef"),
++      Constructor::class.asClassName().parameterizedBy(originalTypeName).copy(nullable = true),
++      KModifier.PRIVATE)
++      .addAnnotation(Volatile::class)
++      .mutable(true)
++      .initializer("null")
++      .build()
++
+   fun generateFile(generatedOption: TypeElement?): FileSpec {
+-    for (property in propertyList) {
++    for (property in nonTransientProperties) {
+       property.allocateNames(nameAllocator)
+     }
+ 
+@@ -129,7 +143,8 @@ internal class AdapterGenerator(
+     }
+ 
+     result.addProperty(optionsProperty)
+-    for (uniqueAdapter in propertyList.distinctBy { it.delegateKey }) {
++    result.addProperty(constructorProperty)
++    for (uniqueAdapter in nonTransientProperties.distinctBy { it.delegateKey }) {
+       result.addProperty(uniqueAdapter.delegateKey.generateProperty(
+           nameAllocator, typeRenderer, moshiParam, uniqueAdapter.name))
+     }
+@@ -162,26 +177,24 @@ internal class AdapterGenerator(
+   }
+ 
+   private fun jsonDataException(
+-    description: String,
+-    identifier: String,
+-    condition: String,
+-    reader: ParameterSpec
++      description: String,
++      identifier: String,
++      condition: String,
++      reader: ParameterSpec
+   ): CodeBlock {
+     return CodeBlock.of("%T(%T(%S).append(%S).append(%S).append(%N.path).toString())",
+         JsonDataException::class, StringBuilder::class, description, identifier, condition, reader)
+   }
+ 
+   private fun generateFromJsonFun(): FunSpec {
+-    val resultName = nameAllocator.newName("result")
+-
+     val result = FunSpec.builder("fromJson")
+         .addModifiers(KModifier.OVERRIDE)
+         .addParameter(readerParam)
+         .returns(originalTypeName)
+ 
+-    for (property in propertyList) {
++    for (property in nonTransientProperties) {
+       result.addCode("%L", property.generateLocalProperty())
+-      if (property.differentiateAbsentFromNull) {
++      if (property.hasLocalIsPresentName) {
+         result.addCode("%L", property.generateLocalIsPresentProperty())
+       }
+     }
+@@ -190,8 +203,8 @@ internal class AdapterGenerator(
+     result.beginControlFlow("while (%N.hasNext())", readerParam)
+     result.beginControlFlow("when (%N.selectName(%N))", readerParam, optionsProperty)
+ 
+-    propertyList.forEachIndexed { index, property ->
+-      if (property.differentiateAbsentFromNull) {
++    nonTransientProperties.forEachIndexed { index, property ->
++      if (property.hasLocalIsPresentName) {
+         result.beginControlFlow("%L -> ", index)
+         if (property.delegateKey.nullable) {
+           result.addStatement("%N = %N.fromJson(%N)",
+@@ -228,65 +241,81 @@ internal class AdapterGenerator(
+     result.endControlFlow() // while
+     result.addStatement("%N.endObject()", readerParam)
+ 
+-    // Call the constructor providing only required parameters.
+-    var hasOptionalParameters = false
+-    result.addCode("«var %N = %T(", resultName, originalTypeName)
+     var separator = "\n"
+-    for (property in propertyList) {
+-      if (!property.hasConstructorParameter) {
+-        continue
+-      }
+-      if (property.hasDefault) {
+-        hasOptionalParameters = true
+-        continue
+-      }
++    var useDefaultsConstructor = false
++    val parameterProperties = propertyList.asSequence()
++        .filter { it.hasConstructorParameter }
++        .onEach {
++          useDefaultsConstructor = useDefaultsConstructor || it.hasDefault
++        }
++        .toList()
++
++    val resultName = nameAllocator.newName("result")
++    val hasNonConstructorProperties = nonTransientProperties.any { !it.hasConstructorParameter }
++    val returnOrResultAssignment = if (hasNonConstructorProperties) {
++      // Save the result var for reuse
++      CodeBlock.of("val %N = ", resultName)
++    } else {
++      CodeBlock.of("return·")
++    }
++    val maskName = nameAllocator.newName("mask")
++    val localConstructorName = nameAllocator.newName("localConstructor")
++    if (useDefaultsConstructor) {
++      // Dynamic default constructor call
++      val booleanArrayBlock = parameterProperties.map { param ->
++        when {
++          param.isTransient -> CodeBlock.of("false")
++          param.hasLocalIsPresentName -> CodeBlock.of(param.localIsPresentName)
++          else -> CodeBlock.of("true")
++        }
++      }.joinToCode(", ")
++      result.addStatement(
++          "val %1L·= this.%2N ?: %3T.lookupDefaultsConstructor(%4T::class.java).also·{ this.%2N·= it }",
++          localConstructorName,
++          constructorProperty,
++          MOSHI_UTIL,
++          originalTypeName
++      )
++      result.addStatement("val %L = %T.createDefaultValuesParametersMask(%L)",
++          maskName, MOSHI_UTIL, booleanArrayBlock)
++      result.addCode(
++          "«%L%T.invokeDefaultConstructor(%T::class.java, %L, %L, ",
++          returnOrResultAssignment,
++          MOSHI_UTIL,
++          originalTypeName,
++          localConstructorName,
++          maskName
++      )
++    } else {
++      // Standard constructor call
++      result.addCode("«%L%T(", returnOrResultAssignment, originalTypeName)
++    }
++
++    for (property in parameterProperties) {
+       result.addCode(separator)
+-      result.addCode("%N = %N", property.name, property.localName)
+-      if (property.isRequired) {
++      if (useDefaultsConstructor) {
++        if (property.isTransient) {
++          // We have to use the default primitive for the available type in order for
++          // invokeDefaultConstructor to properly invoke it. Just using "null" isn't safe because
++          // the transient type may be a primitive type.
++          result.addCode(property.target.type.defaultPrimitiveValue())
++        } else {
++          result.addCode("%N", property.localName)
++        }
++      } else {
++        result.addCode("%N = %N", property.name, property.localName)
++      }
++      if (!property.isTransient && property.isRequired) {
+         result.addCode(" ?: throw·%L", jsonDataException(
+             "Required property '", property.localName, "' missing at ", readerParam))
+       }
+       separator = ",\n"
+     }
+-    result.addCode(")»\n", originalTypeName)
+-
+-    // Call either the constructor again, or the copy() method, this time providing any optional
+-    // parameters that we have.
+-    if (hasOptionalParameters) {
+-      if (isDataClass) {
+-        result.addCode("«%1N = %1N.copy(", resultName)
+-      } else {
+-        result.addCode("«%1N = %2T(", resultName, originalTypeName)
+-      }
+-      separator = "\n"
+-      for (property in propertyList) {
+-        if (!property.hasConstructorParameter) {
+-          continue // No constructor parameter for this property.
+-        }
+-        if (isDataClass && !property.hasDefault) {
+-          continue // Property already assigned.
+-        }
+ 
+-        result.addCode(separator)
+-        when {
+-          property.differentiateAbsentFromNull -> {
+-            result.addCode("%2N = if (%3N) %4N else %1N.%2N",
+-                resultName, property.name, property.localIsPresentName, property.localName)
+-          }
+-          property.isRequired -> {
+-            result.addCode("%1N = %2N", property.name, property.localName)
+-          }
+-          else -> {
+-            result.addCode("%2N = %3N ?: %1N.%2N", resultName, property.name, property.localName)
+-          }
+-        }
+-        separator = ",\n"
+-      }
+-      result.addCode("»)\n")
+-    }
++    result.addCode("\n»)\n")
+ 
+     // Assign properties not present in the constructor.
+-    for (property in propertyList) {
++    for (property in nonTransientProperties) {
+       if (property.hasConstructorParameter) {
+         continue // Property already handled.
+       }
+@@ -299,7 +328,9 @@ internal class AdapterGenerator(
+       }
+     }
+ 
+-    result.addStatement("return %1N", resultName)
++    if (hasNonConstructorProperties) {
++      result.addStatement("return·%1N", resultName)
++    }
+     return result.build()
+   }
+ 
+@@ -315,7 +346,7 @@ internal class AdapterGenerator(
+     result.endControlFlow()
+ 
+     result.addStatement("%N.beginObject()", writerParam)
+-    propertyList.forEach { property ->
++    nonTransientProperties.forEach { property ->
+       result.addStatement("%N.name(%S)", writerParam, property.jsonName)
+       result.addStatement("%N.toJson(%N, %N.%L)",
+           nameAllocator[property.delegateKey], writerParam, valueParam, property.name)
+diff --git a/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/PropertyGenerator.kt b/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/PropertyGenerator.kt
+index 69d6317d..75e30682 100644
+--- a/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/PropertyGenerator.kt
++++ b/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/PropertyGenerator.kt
+@@ -22,7 +22,8 @@ import com.squareup.kotlinpoet.PropertySpec
+ /** Generates functions to encode and decode a property as JSON. */
+ internal class PropertyGenerator(
+   val target: TargetProperty,
+-  val delegateKey: DelegateKey
++  val delegateKey: DelegateKey,
++  val isTransient: Boolean = false
+ ) {
+   val name = target.name
+   val jsonName = target.jsonName()
+@@ -38,6 +39,16 @@ internal class PropertyGenerator(
+   /** We prefer to use 'null' to mean absent, but for some properties those are distinct. */
+   val differentiateAbsentFromNull get() = delegateKey.nullable && hasDefault
+ 
++  /**
++   * IsPresent is required if the following conditions are met:
++   * - Is not transient
++   * - Has a default and one of the below
++   *   - Is a constructor property
++   *   - Is a nullable non-constructor property
++   */
++  val hasLocalIsPresentName = !isTransient && hasDefault &&
++      (hasConstructorParameter || delegateKey.nullable)
++
+   fun allocateNames(nameAllocator: NameAllocator) {
+     localName = nameAllocator.newName(name)
+     localIsPresentName = nameAllocator.newName("${name}Set")
+@@ -46,7 +57,13 @@ internal class PropertyGenerator(
+   fun generateLocalProperty(): PropertySpec {
+     return PropertySpec.builder(localName, target.type.copy(nullable = true))
+         .mutable(true)
+-        .initializer("null")
++        .apply {
++          if (hasLocalIsPresentName) {
++            initializer(target.type.defaultPrimitiveValue())
++          } else {
++            initializer("null")
++          }
++        }
+         .build()
+   }
+ 
+diff --git a/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/TargetProperty.kt b/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/TargetProperty.kt
+index e14f608e..2d6daddd 100644
+--- a/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/TargetProperty.kt
++++ b/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/TargetProperty.kt
+@@ -80,7 +80,7 @@ internal data class TargetProperty(
+             Diagnostic.Kind.ERROR, "No default value for transient property ${this}", element)
+         return null
+       }
+-      return null // This property is transient and has a default value. Ignore it.
++      return PropertyGenerator(this, DelegateKey(type, emptyList()), true)
+     }
+ 
+     if (!isVisible) {
+diff --git a/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/kotlintypes.kt b/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/kotlintypes.kt
+index 5387b604..a9537be8 100644
+--- a/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/kotlintypes.kt
++++ b/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/kotlintypes.kt
+@@ -15,9 +15,20 @@
+  */
+ package com.squareup.moshi.kotlin.codegen
+ 
++import com.squareup.kotlinpoet.BOOLEAN
++import com.squareup.kotlinpoet.BYTE
++import com.squareup.kotlinpoet.CHAR
+ import com.squareup.kotlinpoet.ClassName
++import com.squareup.kotlinpoet.CodeBlock
++import com.squareup.kotlinpoet.DOUBLE
++import com.squareup.kotlinpoet.FLOAT
++import com.squareup.kotlinpoet.INT
++import com.squareup.kotlinpoet.LONG
+ import com.squareup.kotlinpoet.ParameterizedTypeName
++import com.squareup.kotlinpoet.SHORT
+ import com.squareup.kotlinpoet.TypeName
++import com.squareup.kotlinpoet.UNIT
++import com.squareup.kotlinpoet.asTypeName
+ 
+ internal fun TypeName.rawType(): ClassName {
+   return when (this) {
+@@ -26,3 +37,17 @@ internal fun TypeName.rawType(): ClassName {
+     else -> throw IllegalArgumentException("Cannot get raw type from $this")
+   }
+ }
++
++internal fun TypeName.defaultPrimitiveValue(): CodeBlock =
++    when (this) {
++      BOOLEAN -> CodeBlock.of("false")
++      CHAR -> CodeBlock.of("0.toChar()")
++      BYTE -> CodeBlock.of("0.toByte()")
++      SHORT -> CodeBlock.of("0.toShort()")
++      INT -> CodeBlock.of("0")
++      FLOAT -> CodeBlock.of("0f")
++      LONG -> CodeBlock.of("0L")
++      DOUBLE -> CodeBlock.of("0.0")
++      UNIT, Void::class.asTypeName() -> throw IllegalStateException("Parameter with void or Unit type is illegal")
++      else -> CodeBlock.of("null")
++    }
+diff --git a/moshi/src/main/java/com/squareup/moshi/internal/Util.java b/moshi/src/main/java/com/squareup/moshi/internal/Util.java
+index 572c998f..e1b9e73e 100644
+--- a/moshi/src/main/java/com/squareup/moshi/internal/Util.java
++++ b/moshi/src/main/java/com/squareup/moshi/internal/Util.java
+@@ -44,6 +44,17 @@ import static com.squareup.moshi.Types.supertypeOf;
+ public final class Util {
+   public static final Set<Annotation> NO_ANNOTATIONS = Collections.emptySet();
+   public static final Type[] EMPTY_TYPE_ARRAY = new Type[] {};
++  @Nullable private static final Class<?> DEFAULT_CONSTRUCTOR_MARKER;
++
++  static {
++    Class<?> clazz;
++    try {
++      clazz = Class.forName("kotlin.jvm.internal.DefaultConstructorMarker");
++    } catch (ClassNotFoundException e) {
++      clazz = null;
++    }
++    DEFAULT_CONSTRUCTOR_MARKER = clazz;
++  }
+ 
+   private Util() {
+   }
+@@ -520,4 +531,91 @@ public final class Util {
+       throw rethrowCause(e);
+     }
+   }
++
++  /**
++   * Reflectively looks up the defaults constructor of a kotlin class.
++   *
++   * @param targetClass the target kotlin class to instantiate.
++   * @param <T> the type of {@code targetClass}.
++   * @return the instantiated {@code targetClass} instance.
++   * @see #createDefaultValuesParametersMask(boolean...)
++   */
++  public static <T> Constructor<T> lookupDefaultsConstructor(Class<T> targetClass) {
++    if (DEFAULT_CONSTRUCTOR_MARKER == null) {
++      throw new IllegalStateException("DefaultConstructorMarker not on classpath. Make sure the "
++          + "Kotlin stdlib is on the classpath.");
++    }
++    Constructor<T> defaultConstructor = findConstructor(targetClass);
++    defaultConstructor.setAccessible(true);
++    return defaultConstructor;
++  }
++
++  /**
++   * Reflectively invokes the defaults constructor of a kotlin class. This allows indicating which
++   * arguments are "set" or not, and thus recreate the behavior of named a arguments invocation
++   * dynamically.
++   *
++   * @param targetClass the target kotlin class to instantiate.
++   * @param defaultsConstructor the target class's defaults constructor in kotlin invoke.
++   * @param mask an int mask indicating which {@code args} are present.
++   * @param args the constructor arguments, including "unset" values (set to null or the primitive
++   *             default).
++   * @param <T> the type of {@code targetClass}.
++   * @return the instantiated {@code targetClass} instance.
++   * @see #createDefaultValuesParametersMask(boolean...)
++   */
++  public static <T> T invokeDefaultConstructor(
++      Class<T> targetClass,
++      Constructor<T> defaultsConstructor,
++      int mask,
++      Object... args) {
++    Object[] finalArgs = Arrays.copyOf(args, args.length + 2);
++    finalArgs[finalArgs.length - 2] = mask;
++    finalArgs[finalArgs.length - 1] = null; // DefaultConstructorMarker param
++    try {
++      return defaultsConstructor.newInstance(finalArgs);
++    } catch (InstantiationException e) {
++      throw new IllegalStateException("Could not instantiate instance of " + targetClass);
++    } catch (IllegalAccessException e) {
++      throw new IllegalStateException("Could not access defaults constructor of " + targetClass);
++    } catch (InvocationTargetException e) {
++      Throwable cause = e.getCause();
++      if (cause instanceof RuntimeException) throw (RuntimeException) cause;
++      if (cause instanceof Error) throw (Error) cause;
++      throw new RuntimeException("Could not invoke defaults constructor of " + targetClass, cause);
++    }
++  }
++
++  private static <T> Constructor<T> findConstructor(Class<T> targetClass) {
++    for (Constructor<?> constructor : targetClass.getDeclaredConstructors()) {
++      Class<?>[] paramTypes = constructor.getParameterTypes();
++      if (paramTypes.length != 0
++          && paramTypes[paramTypes.length - 1].equals(DEFAULT_CONSTRUCTOR_MARKER)) {
++        //noinspection unchecked
++        return (Constructor<T>) constructor;
++      }
++    }
++
++    throw new IllegalStateException("No defaults constructor found for " + targetClass);
++  }
++
++  /**
++   * Creates an mask with bits set to indicate which indices of a default constructor's parameters
++   * are set.
++   *
++   * @param argPresentValues vararg of all present values (set or unset). Max allowable size is 32.
++   * @return the created mask.
++   */
++  public static int createDefaultValuesParametersMask(boolean... argPresentValues) {
++    if (argPresentValues.length > 32) {
++      throw new IllegalArgumentException("Arg present values exceeds max allowable 32.");
++    }
++    int mask = 0;
++    for (int i = 0; i < argPresentValues.length; ++i) {
++      if (!argPresentValues[i]) {
++        mask = mask | (1 << i);
++      }
++    }
++    return mask;
++  }
+ }
+diff --git a/moshi/src/main/resources/META-INF/proguard/moshi.pro b/moshi/src/main/resources/META-INF/proguard/moshi.pro
+index 30febf77..b3498273 100644
+--- a/moshi/src/main/resources/META-INF/proguard/moshi.pro
++++ b/moshi/src/main/resources/META-INF/proguard/moshi.pro
+@@ -16,6 +16,16 @@
+ # The name of @JsonClass types is used to look up the generated adapter.
+ -keepnames @com.squareup.moshi.JsonClass class *
+ 
++# Retain generated target class's synthetic defaults constructor and keep DefaultConstructorMarker's
++# name. We will look this up reflectively to invoke the type's constructor.
++#
++# We can't _just_ keep the defaults constructor because Proguard/R8's spec doesn't allow wildcard
++# matching preceding parameters.
++-keepnames class kotlin.jvm.internal.DefaultConstructorMarker
++-keepclassmembers @com.squareup.moshi.JsonClass class * {
++    <init>(...);
++}
++
+ # Retain generated JsonAdapters if annotated type is retained.
+ -if @com.squareup.moshi.JsonClass class *
+ -keep class <1>JsonAdapter {
