@@ -1,0 +1,596 @@
+diff --git a/alleycats-core/src/main/scala/alleycats/std/map.scala b/alleycats-core/src/main/scala/alleycats/std/map.scala
+index ee8e545ce..f7da50e9e 100644
+--- a/alleycats-core/src/main/scala/alleycats/std/map.scala
++++ b/alleycats-core/src/main/scala/alleycats/std/map.scala
+@@ -2,7 +2,6 @@ package alleycats
+ package std
+ 
+ import cats._
+-import cats.data.Chain
+ 
+ object map extends MapInstances
+ 
+@@ -12,12 +11,17 @@ trait MapInstances {
+   implicit def alleycatsStdInstancesForMap[K]: Traverse[Map[K, *]] =
+     new Traverse[Map[K, *]] {
+ 
+-      def traverse[G[_], A, B](fa: Map[K, A])(f: A => G[B])(implicit G: Applicative[G]): G[Map[K, B]] =
+-        if (fa.isEmpty) G.pure(Map.empty[K, B])
+-        else
+-          G.map(Chain.traverseViaChain(fa.iterator) {
+-            case (k, a) => G.map(f(a))((k, _))
+-          }) { chain => chain.foldLeft(Map.empty[K, B]) { case (m, (k, b)) => m.updated(k, b) } }
++      def traverse[G[_], A, B](fa: Map[K, A])(f: A => G[B])(implicit G: Applicative[G]): G[Map[K, B]] = {
++        val gba: Eval[G[Map[K, B]]] = Always(G.pure(Map.empty))
++        val gbb = Foldable
++          .iterateRight(fa, gba) { (kv, lbuf) =>
++            G.map2Eval(f(kv._2), lbuf) { (b, buf) =>
++              buf + (kv._1 -> b)
++            }
++          }
++          .value
++        G.map(gbb)(_.toMap)
++      }
+ 
+       override def map[A, B](fa: Map[K, A])(f: A => B): Map[K, B] =
+         fa.map { case (k, a) => (k, f(a)) }
+@@ -59,15 +63,15 @@ trait MapInstances {
+     new TraverseFilter[Map[K, *]] {
+       def traverse: Traverse[Map[K, *]] = alleycatsStdInstancesForMap
+ 
+-      def traverseFilter[G[_], A, B](fa: Map[K, A])(f: A => G[Option[B]])(implicit G: Applicative[G]): G[Map[K, B]] =
+-        if (fa.isEmpty) G.pure(Map.empty[K, B])
+-        else
+-          G.map(Chain.traverseFilterViaChain(fa.iterator) {
+-            case (k, a) =>
+-              G.map(f(a)) { optB =>
+-                if (optB.isDefined) Some((k, optB.get))
+-                else None
+-              }
+-          }) { chain => chain.foldLeft(Map.empty[K, B]) { case (m, (k, b)) => m.updated(k, b) } }
++      def traverseFilter[G[_], A, B](fa: Map[K, A])(f: A => G[Option[B]])(implicit G: Applicative[G]): G[Map[K, B]] = {
++        val gba: Eval[G[Map[K, B]]] = Always(G.pure(Map.empty))
++        Foldable
++          .iterateRight(fa, gba) { (kv, lbuf) =>
++            G.map2Eval(f(kv._2), lbuf) { (ob, buf) =>
++              ob.fold(buf)(b => buf + (kv._1 -> b))
++            }
++          }
++          .value
++      }
+     }
+ }
+diff --git a/alleycats-tests/shared/src/test/scala/alleycats/tests/MapSuite.scala b/alleycats-tests/shared/src/test/scala/alleycats/tests/MapSuite.scala
+index f53217f99..caf4a09c0 100644
+--- a/alleycats-tests/shared/src/test/scala/alleycats/tests/MapSuite.scala
++++ b/alleycats-tests/shared/src/test/scala/alleycats/tests/MapSuite.scala
+@@ -11,15 +11,4 @@ class MapSuite extends AlleycatsSuite {
+   checkAll("TraverseFilter[Map[Int, *]]", TraverseFilterTests[Map[Int, *]].traverseFilter[Int, Int, Int])
+ 
+   checkAll("Map[Int, *]", ShortCircuitingTests[Map[Int, *]].traverseFilter[Int])
+-
+-  test("traverse is stack-safe") {
+-    val items = Map((0 until 100000).map { i => (i.toString, i) }: _*)
+-    val sumAll = Traverse[Map[String, *]]
+-      .traverse(items) { i => () => i }
+-      .apply
+-      .values
+-      .sum
+-
+-    assert(sumAll == items.values.sum)
+-  }
+ }
+diff --git a/core/src/main/scala/cats/data/Chain.scala b/core/src/main/scala/cats/data/Chain.scala
+index 27be28652..5b4a1dbb1 100644
+--- a/core/src/main/scala/cats/data/Chain.scala
++++ b/core/src/main/scala/cats/data/Chain.scala
+@@ -629,106 +629,6 @@ object Chain extends ChainInstances {
+   def apply[A](as: A*): Chain[A] =
+     fromSeq(as)
+ 
+-  def traverseViaChain[G[_], A, B](iter: Iterator[A])(f: A => G[B])(implicit G: Applicative[G]): G[Chain[B]] =
+-    if (!iter.hasNext) G.pure(Chain.nil)
+-    else {
+-      // we branch out by this factor
+-      val width = 128
+-      val as = collection.mutable.Buffer[A]()
+-      as ++= iter
+-      // By making a tree here we don't blow the stack
+-      // even if the List is very long
+-      // by construction, this is never called with start == end
+-      def loop(start: Int, end: Int): Eval[G[Chain[B]]] =
+-        if (end - start <= width) {
+-          // Here we are at the leafs of the trees
+-          // we don't use map2Eval since it is always
+-          // at most width in size.
+-          var flist = Eval.later(G.map(f(as(end - 1)))(_ :: Nil))
+-          var idx = end - 2
+-          while (start <= idx) {
+-            val a = as(idx)
+-            // don't capture a var in the defer
+-            val right = flist
+-            flist = Eval.defer(G.map2Eval(f(a), right)(_ :: _))
+-            idx = idx - 1
+-          }
+-          flist.map { glist => G.map(glist)(Chain.fromSeq(_)) }
+-        } else {
+-          // we have width + 1 or more nodes left
+-          val step = (end - start) / width
+-
+-          var fchain = Eval.defer(loop(start, start + step))
+-          var start0 = start + step
+-          var end0 = start0 + step
+-
+-          while (start0 < end) {
+-            val end1 = math.min(end, end0)
+-            val right = loop(start0, end1)
+-            fchain = fchain.flatMap(G.map2Eval(_, right)(_.concat(_)))
+-            start0 = start0 + step
+-            end0 = end0 + step
+-          }
+-          fchain
+-        }
+-
+-      loop(0, as.size).value
+-    }
+-
+-  def traverseFilterViaChain[G[_], A, B](
+-    iter: Iterator[A]
+-  )(f: A => G[Option[B]])(implicit G: Applicative[G]): G[Chain[B]] =
+-    if (!iter.hasNext) G.pure(Chain.nil)
+-    else {
+-      // we branch out by this factor
+-      val width = 128
+-      val as = collection.mutable.Buffer[A]()
+-      as ++= iter
+-      // By making a tree here we don't blow the stack
+-      // even if the List is very long
+-      // by construction, this is never called with start == end
+-      def loop(start: Int, end: Int): Eval[G[Chain[B]]] =
+-        if (end - start <= width) {
+-          // Here we are at the leafs of the trees
+-          // we don't use map2Eval since it is always
+-          // at most width in size.
+-          var flist = Eval.later(G.map(f(as(end - 1))) { optB =>
+-            if (optB.isDefined) optB.get :: Nil
+-            else Nil
+-          })
+-          var idx = end - 2
+-          while (start <= idx) {
+-            val a = as(idx)
+-            // don't capture a var in the defer
+-            val right = flist
+-            flist = Eval.defer(G.map2Eval(f(a), right) { (optB, tail) =>
+-              if (optB.isDefined) optB.get :: tail
+-              else tail
+-            })
+-            idx = idx - 1
+-          }
+-          flist.map { glist => G.map(glist)(Chain.fromSeq(_)) }
+-        } else {
+-          // we have width + 1 or more nodes left
+-          val step = (end - start) / width
+-
+-          var fchain = Eval.defer(loop(start, start + step))
+-          var start0 = start + step
+-          var end0 = start0 + step
+-
+-          while (start0 < end) {
+-            val end1 = math.min(end, end0)
+-            val right = loop(start0, end1)
+-            fchain = fchain.flatMap(G.map2Eval(_, right)(_.concat(_)))
+-            start0 = start0 + step
+-            end0 = end0 + step
+-          }
+-          fchain
+-        }
+-
+-      loop(0, as.size).value
+-    }
+-
+   // scalastyle:off null
+   private class ChainIterator[A](self: Chain[A]) extends Iterator[A] {
+     private[this] var c: Chain[A] = if (self.isEmpty) null else self
+@@ -861,9 +761,9 @@ sealed abstract private[data] class ChainInstances extends ChainInstances1 {
+       }
+ 
+       def traverse[G[_], A, B](fa: Chain[A])(f: A => G[B])(implicit G: Applicative[G]): G[Chain[B]] =
+-        if (fa.isEmpty) G.pure(Chain.nil)
+-        else traverseViaChain(fa.iterator)(f)
+-
++        foldRight[A, G[Chain[B]]](fa, Always(G.pure(nil))) { (a, lglb) =>
++          G.map2Eval(f(a), lglb)(_ +: _)
++        }.value
+       def empty[A]: Chain[A] = Chain.nil
+       def combineK[A](c: Chain[A], c2: Chain[A]): Chain[A] = Chain.concat(c, c2)
+       def pure[A](a: A): Chain[A] = Chain.one(a)
+@@ -962,8 +862,9 @@ sealed abstract private[data] class ChainInstances extends ChainInstances1 {
+     override def flattenOption[A](fa: Chain[Option[A]]): Chain[A] = fa.collect { case Some(a) => a }
+ 
+     def traverseFilter[G[_], A, B](fa: Chain[A])(f: A => G[Option[B]])(implicit G: Applicative[G]): G[Chain[B]] =
+-      if (fa.isEmpty) G.pure(Chain.nil)
+-      else traverseFilterViaChain(fa.iterator)(f)
++      traverse
++        .foldRight(fa, Eval.now(G.pure(Chain.empty[B])))((x, xse) => G.map2Eval(f(x), xse)((i, o) => i.fold(o)(_ +: o)))
++        .value
+ 
+     override def filterA[G[_], A](fa: Chain[A])(f: A => G[Boolean])(implicit G: Applicative[G]): G[Chain[A]] =
+       traverse
+diff --git a/core/src/main/scala/cats/instances/list.scala b/core/src/main/scala/cats/instances/list.scala
+index 7d59d5413..a0b271920 100644
+--- a/core/src/main/scala/cats/instances/list.scala
++++ b/core/src/main/scala/cats/instances/list.scala
+@@ -1,7 +1,7 @@
+ package cats
+ package instances
+ 
+-import cats.data.{Chain, ZipList}
++import cats.data.ZipList
+ import cats.syntax.show._
+ 
+ import scala.annotation.tailrec
+@@ -83,9 +83,14 @@ trait ListInstances extends cats.kernel.instances.ListInstances {
+         loop(fa).value
+       }
+ 
+-      def traverse[G[_], A, B](fa: List[A])(f: A => G[B])(implicit G: Applicative[G]): G[List[B]] =
+-        if (fa.isEmpty) G.pure(Nil)
+-        else G.map(Chain.traverseViaChain(fa.iterator)(f))(_.toList)
++      def traverse[G[_], A, B](fa: List[A])(f: A => G[B])(implicit G: Applicative[G]): G[List[B]] = {
++        def loop(fa: List[A]): Eval[G[List[B]]] =
++          fa match {
++            case h :: t => G.map2Eval(f(h), Eval.defer(loop(t)))(_ :: _)
++            case Nil    => Eval.now(G.pure(Nil))
++          }
++        loop(fa).value
++      }
+ 
+       def functor: Functor[List] = this
+ 
+@@ -209,8 +214,9 @@ private[instances] trait ListInstancesBinCompat0 {
+     override def flattenOption[A](fa: List[Option[A]]): List[A] = fa.flatten
+ 
+     def traverseFilter[G[_], A, B](fa: List[A])(f: (A) => G[Option[B]])(implicit G: Applicative[G]): G[List[B]] =
+-      if (fa.isEmpty) G.pure(Nil)
+-      else G.map(Chain.traverseFilterViaChain(fa.iterator)(f))(_.toList)
++      traverse
++        .foldRight(fa, Eval.now(G.pure(List.empty[B])))((x, xse) => G.map2Eval(f(x), xse)((i, o) => i.fold(o)(_ :: o)))
++        .value
+ 
+     override def filterA[G[_], A](fa: List[A])(f: (A) => G[Boolean])(implicit G: Applicative[G]): G[List[A]] =
+       traverse
+diff --git a/core/src/main/scala/cats/instances/queue.scala b/core/src/main/scala/cats/instances/queue.scala
+index c75761d25..c65efa056 100644
+--- a/core/src/main/scala/cats/instances/queue.scala
++++ b/core/src/main/scala/cats/instances/queue.scala
+@@ -1,7 +1,6 @@
+ package cats
+ package instances
+ 
+-import cats.data.Chain
+ import cats.syntax.show._
+ import scala.annotation.tailrec
+ import scala.collection.immutable.Queue
+@@ -80,11 +79,9 @@ trait QueueInstances extends cats.kernel.instances.QueueInstances {
+         B.combineAll(fa.iterator.map(f))
+ 
+       def traverse[G[_], A, B](fa: Queue[A])(f: A => G[B])(implicit G: Applicative[G]): G[Queue[B]] =
+-        if (fa.isEmpty) G.pure(Queue.empty[B])
+-        else
+-          G.map(Chain.traverseViaChain(fa.iterator)(f)) { chain =>
+-            chain.foldLeft(Queue.empty[B])(_ :+ _)
+-          }
++        foldRight[A, G[Queue[B]]](fa, Always(G.pure(Queue.empty))) { (a, lglb) =>
++          G.map2Eval(f(a), lglb)(_ +: _)
++        }.value
+ 
+       override def mapWithIndex[A, B](fa: Queue[A])(f: (A, Int) => B): Queue[B] = {
+         val b = Queue.newBuilder[B]
+@@ -175,11 +172,9 @@ private object QueueInstances {
+     override def flattenOption[A](fa: Queue[Option[A]]): Queue[A] = fa.flatten
+ 
+     def traverseFilter[G[_], A, B](fa: Queue[A])(f: (A) => G[Option[B]])(implicit G: Applicative[G]): G[Queue[B]] =
+-      if (fa.isEmpty) G.pure(Queue.empty[B])
+-      else
+-        G.map(Chain.traverseFilterViaChain(fa.iterator)(f)) { chain =>
+-          chain.foldLeft(Queue.empty[B])(_ :+ _)
+-        }
++      traverse
++        .foldRight(fa, Eval.now(G.pure(Queue.empty[B])))((x, xse) => G.map2Eval(f(x), xse)((i, o) => i.fold(o)(_ +: o)))
++        .value
+ 
+     override def filterA[G[_], A](fa: Queue[A])(f: (A) => G[Boolean])(implicit G: Applicative[G]): G[Queue[A]] =
+       traverse
+diff --git a/core/src/main/scala/cats/instances/sortedMap.scala b/core/src/main/scala/cats/instances/sortedMap.scala
+index 6d24ccf8d..108f38cf9 100644
+--- a/core/src/main/scala/cats/instances/sortedMap.scala
++++ b/core/src/main/scala/cats/instances/sortedMap.scala
+@@ -1,7 +1,7 @@
+ package cats.instances
+ 
+ import cats._
+-import cats.data.{Chain, Ior}
++import cats.data.Ior
+ import cats.kernel.{CommutativeMonoid, CommutativeSemigroup}
+ 
+ import scala.annotation.tailrec
+@@ -32,12 +32,14 @@ trait SortedMapInstances extends SortedMapInstances2 {
+     new Traverse[SortedMap[K, *]] with FlatMap[SortedMap[K, *]] with Align[SortedMap[K, *]] {
+ 
+       def traverse[G[_], A, B](fa: SortedMap[K, A])(f: A => G[B])(implicit G: Applicative[G]): G[SortedMap[K, B]] = {
+-        implicit val ordering: Ordering[K] = fa.ordering
+-        if (fa.isEmpty) G.pure(SortedMap.empty[K, B])
+-        else
+-          G.map(Chain.traverseViaChain(fa.iterator) {
+-            case (k, a) => G.map(f(a))((k, _))
+-          }) { chain => chain.foldLeft(SortedMap.empty[K, B]) { case (m, (k, b)) => m.updated(k, b) } }
++        val gba: Eval[G[SortedMap[K, B]]] = Always(G.pure(SortedMap.empty(fa.ordering)))
++        Foldable
++          .iterateRight(fa, gba) { (kv, lbuf) =>
++            G.map2Eval(f(kv._2), lbuf) { (b, buf) =>
++              buf + (kv._1 -> b)
++            }
++          }
++          .value
+       }
+ 
+       def flatMap[A, B](fa: SortedMap[K, A])(f: A => SortedMap[K, B]): SortedMap[K, B] = {
+@@ -191,16 +193,14 @@ private[instances] trait SortedMapInstancesBinCompat0 {
+       override def traverseFilter[G[_], A, B](
+         fa: SortedMap[K, A]
+       )(f: A => G[Option[B]])(implicit G: Applicative[G]): G[SortedMap[K, B]] = {
+-        implicit val ordering: Ordering[K] = fa.ordering
+-        if (fa.isEmpty) G.pure(SortedMap.empty[K, B])
+-        else
+-          G.map(Chain.traverseFilterViaChain(fa.iterator) {
+-            case (k, a) =>
+-              G.map(f(a)) { optB =>
+-                if (optB.isDefined) Some((k, optB.get))
+-                else None
+-              }
+-          }) { chain => chain.foldLeft(SortedMap.empty[K, B]) { case (m, (k, b)) => m.updated(k, b) } }
++        val gba: Eval[G[SortedMap[K, B]]] = Always(G.pure(SortedMap.empty(fa.ordering)))
++        Foldable
++          .iterateRight(fa, gba) { (kv, lbuf) =>
++            G.map2Eval(f(kv._2), lbuf) { (ob, buf) =>
++              ob.fold(buf)(b => buf + (kv._1 -> b))
++            }
++          }
++          .value
+       }
+ 
+       override def mapFilter[A, B](fa: SortedMap[K, A])(f: A => Option[B]): SortedMap[K, B] = {
+diff --git a/core/src/main/scala/cats/instances/vector.scala b/core/src/main/scala/cats/instances/vector.scala
+index a07669834..e5828c9f7 100644
+--- a/core/src/main/scala/cats/instances/vector.scala
++++ b/core/src/main/scala/cats/instances/vector.scala
+@@ -1,7 +1,7 @@
+ package cats
+ package instances
+ 
+-import cats.data.{Chain, ZipVector}
++import cats.data.ZipVector
+ import cats.syntax.show._
+ 
+ import scala.annotation.tailrec
+@@ -90,53 +90,11 @@ trait VectorInstances extends cats.kernel.instances.VectorInstances {
+         loop(0).value
+       }
+ 
+-      final override def traverse[G[_], A, B](fa: Vector[A])(f: A => G[B])(implicit G: Applicative[G]): G[Vector[B]] =
+-        if (fa.isEmpty) G.pure(empty)
+-        else {
+-          // this is a specialized version of Chain.traverseViaChain since
+-          // we don't need to materialize the Vector first
+-
+-          // we branch out by this factor
+-          val width = 128
+-          // By making a tree here we don't blow the stack
+-          // even if the List is very long
+-          // by construction, this is never called with start == end
+-          def loop(start: Int, end: Int): Eval[G[Chain[B]]] =
+-            if (end - start <= width) {
+-              // Here we are at the leafs of the trees
+-              // we don't use map2Eval since it is always
+-              // at most width in size.
+-              val aend = fa(end - 1)
+-              var flist = Eval.later(G.map(f(aend))(_ :: Nil))
+-              var idx = end - 2
+-              while (start <= idx) {
+-                val a = fa(idx)
+-                // don't capture a var in the defer
+-                val right = flist
+-                flist = Eval.defer(G.map2Eval(f(a), right)(_ :: _))
+-                idx = idx - 1
+-              }
+-              flist.map { glist => G.map(glist)(Chain.fromSeq(_)) }
+-            } else {
+-              // we have width + 1 or more nodes left
+-              val step = (end - start) / width
+-
+-              var fchain = Eval.defer(loop(start, start + step))
+-              var start0 = start + step
+-              var end0 = start0 + step
+-
+-              while (start0 < end) {
+-                val end1 = math.min(end, end0)
+-                val right = loop(start0, end1)
+-                fchain = fchain.flatMap(G.map2Eval(_, right)(_.concat(_)))
+-                start0 = start0 + step
+-                end0 = end0 + step
+-              }
+-              fchain
+-            }
+-
+-          G.map(loop(0, fa.size).value)(_.toVector)
+-        }
++      final override def traverse[G[_], A, B](fa: Vector[A])(f: A => G[B])(implicit G: Applicative[G]): G[Vector[B]] = {
++        def loop(i: Int): Eval[G[List[B]]] =
++          if (i < fa.length) G.map2Eval(f(fa(i)), Eval.defer(loop(i + 1)))(_ :: _) else Eval.now(G.pure(Nil))
++        G.map(loop(0).value)(_.toVector)
++      }
+ 
+       override def mapWithIndex[A, B](fa: Vector[A])(f: (A, Int) => B): Vector[B] =
+         fa.iterator.zipWithIndex.map(ai => f(ai._1, ai._2)).toVector
+@@ -223,55 +181,11 @@ private[instances] trait VectorInstancesBinCompat0 {
+     override def flattenOption[A](fa: Vector[Option[A]]): Vector[A] = fa.flatten
+ 
+     def traverseFilter[G[_], A, B](fa: Vector[A])(f: (A) => G[Option[B]])(implicit G: Applicative[G]): G[Vector[B]] =
+-      if (fa.isEmpty) G.pure(Vector.empty[B])
+-      else {
+-        // we branch out by this factor
+-        val width = 128
+-        // By making a tree here we don't blow the stack
+-        // even if the List is very long
+-        // by construction, this is never called with start == end
+-        def loop(start: Int, end: Int): Eval[G[Chain[B]]] =
+-          if (end - start <= width) {
+-            // Here we are at the leafs of the trees
+-            // we don't use map2Eval since it is always
+-            // at most width in size.
+-            val aend = fa(end - 1)
+-            var flist = Eval.later(G.map(f(aend)) { optB =>
+-              if (optB.isDefined) optB.get :: Nil
+-              else Nil
+-            })
+-            var idx = end - 2
+-            while (start <= idx) {
+-              val a = fa(idx)
+-              // don't capture a var in the defer
+-              val right = flist
+-              flist = Eval.defer(G.map2Eval(f(a), right) { (optB, tail) =>
+-                if (optB.isDefined) optB.get :: tail
+-                else tail
+-              })
+-              idx = idx - 1
+-            }
+-            flist.map { glist => G.map(glist)(Chain.fromSeq(_)) }
+-          } else {
+-            // we have width + 1 or more nodes left
+-            val step = (end - start) / width
+-
+-            var fchain = Eval.defer(loop(start, start + step))
+-            var start0 = start + step
+-            var end0 = start0 + step
+-
+-            while (start0 < end) {
+-              val end1 = math.min(end, end0)
+-              val right = loop(start0, end1)
+-              fchain = fchain.flatMap(G.map2Eval(_, right)(_.concat(_)))
+-              start0 = start0 + step
+-              end0 = end0 + step
+-            }
+-            fchain
+-          }
+-
+-        G.map(loop(0, fa.size).value)(_.toVector)
+-      }
++      traverse
++        .foldRight(fa, Eval.now(G.pure(Vector.empty[B])))((x, xse) =>
++          G.map2Eval(f(x), xse)((i, o) => i.fold(o)(_ +: o))
++        )
++        .value
+ 
+     override def filterA[G[_], A](fa: Vector[A])(f: (A) => G[Boolean])(implicit G: Applicative[G]): G[Vector[A]] =
+       traverse
+diff --git a/tests/src/test/scala/cats/tests/ChainSuite.scala b/tests/src/test/scala/cats/tests/ChainSuite.scala
+index 3aa1604d6..c216928ef 100644
+--- a/tests/src/test/scala/cats/tests/ChainSuite.scala
++++ b/tests/src/test/scala/cats/tests/ChainSuite.scala
+@@ -290,14 +290,4 @@ class ChainSuite extends CatsSuite {
+     }
+   }
+ 
+-  test("traverse is stack-safe") {
+-    val chain = (0 until 100000).map(Chain.one).reduce(_.concat(_))
+-    val sumAll = Traverse[Chain]
+-      .traverse(chain) { i => () => i }
+-      .apply
+-      .iterator
+-      .sum
+-
+-    assert(sumAll == chain.iterator.sum)
+-  }
+ }
+diff --git a/tests/src/test/scala/cats/tests/ListSuite.scala b/tests/src/test/scala/cats/tests/ListSuite.scala
+index b8b7c1486..a2c7c6309 100644
+--- a/tests/src/test/scala/cats/tests/ListSuite.scala
++++ b/tests/src/test/scala/cats/tests/ListSuite.scala
+@@ -76,16 +76,6 @@ class ListSuite extends CatsSuite {
+       l.show should ===(l.toString)
+     }
+   }
+-
+-  test("traverse is stack-safe") {
+-    val lst = (0 until 100000).toList
+-    val sumAll = Traverse[List]
+-      .traverse(lst) { i => () => i }
+-      .apply
+-      .sum
+-
+-    assert(sumAll == lst.sum)
+-  }
+ }
+ 
+ final class ListInstancesSuite extends AnyFunSuiteLike {
+diff --git a/tests/src/test/scala/cats/tests/QueueSuite.scala b/tests/src/test/scala/cats/tests/QueueSuite.scala
+index 99334e309..2c6cd379d 100644
+--- a/tests/src/test/scala/cats/tests/QueueSuite.scala
++++ b/tests/src/test/scala/cats/tests/QueueSuite.scala
+@@ -40,15 +40,4 @@ class QueueSuite extends CatsSuite {
+     Queue(1, 2, 3).show should ===("Queue(1, 2, 3)")
+     Queue.empty[Int].show should ===("Queue()")
+   }
+-
+-  test("traverse is stack-safe") {
+-    val queue = (0 until 100000).foldLeft(Queue.empty[Int])(_ :+ _)
+-    val sumAll = Traverse[Queue]
+-      .traverse(queue) { i => () => i }
+-      .apply
+-      .iterator
+-      .sum
+-
+-    assert(sumAll == queue.sum)
+-  }
+ }
+diff --git a/tests/src/test/scala/cats/tests/SortedMapSuite.scala b/tests/src/test/scala/cats/tests/SortedMapSuite.scala
+index 0bf714ee4..6e6087b3a 100644
+--- a/tests/src/test/scala/cats/tests/SortedMapSuite.scala
++++ b/tests/src/test/scala/cats/tests/SortedMapSuite.scala
+@@ -62,15 +62,4 @@ class SortedMapSuite extends CatsSuite {
+ 
+   checkAll("SortedMap[String, String]", MonoidKTests[SortedMap[String, *]].monoidK[String])
+   checkAll("MonoidK[SortedMap[String, *]]", SerializableTests.serializable(MonoidK[SortedMap[String, *]]))
+-
+-  test("traverse is stack-safe") {
+-    val items = SortedMap((0 until 100000).map { i => (i.toString, i) }: _*)
+-    val sumAll = Traverse[SortedMap[String, *]]
+-      .traverse(items) { i => () => i }
+-      .apply
+-      .values
+-      .sum
+-
+-    assert(sumAll == items.values.sum)
+-  }
+ }
+diff --git a/tests/src/test/scala/cats/tests/VectorSuite.scala b/tests/src/test/scala/cats/tests/VectorSuite.scala
+index aae4aee0a..4fdd04815 100644
+--- a/tests/src/test/scala/cats/tests/VectorSuite.scala
++++ b/tests/src/test/scala/cats/tests/VectorSuite.scala
+@@ -65,16 +65,6 @@ class VectorSuite extends CatsSuite {
+   test("toNev on empty vector returns None") {
+     assert(Vector.empty[Int].toNev == None)
+   }
+-
+-  test("traverse is stack-safe") {
+-    val vec = (0 until 100000).toVector
+-    val sumAll = Traverse[Vector]
+-      .traverse(vec) { i => () => i }
+-      .apply
+-      .sum
+-
+-    assert(sumAll == vec.sum)
+-  }
+ }
+ 
+ final class VectorInstancesSuite extends AnyFunSuiteLike {

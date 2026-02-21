@@ -1,0 +1,487 @@
+diff --git a/src/main/java/tools/jackson/databind/ser/jdk/EnumSerializer.java b/src/main/java/tools/jackson/databind/ser/jdk/EnumSerializer.java
+index 3a892924a..a44768c9c 100644
+--- a/src/main/java/tools/jackson/databind/ser/jdk/EnumSerializer.java
++++ b/src/main/java/tools/jackson/databind/ser/jdk/EnumSerializer.java
+@@ -1,7 +1,6 @@
+ package tools.jackson.databind.ser.jdk;
+ 
+ import java.util.LinkedHashSet;
+-import java.util.List;
+ import java.util.Objects;
+ import java.util.Set;
+ 
+@@ -12,13 +11,12 @@ import tools.jackson.core.*;
+ import tools.jackson.databind.*;
+ import tools.jackson.databind.annotation.JacksonStdImpl;
+ import tools.jackson.databind.cfg.EnumFeature;
+-import tools.jackson.databind.cfg.MapperConfig;
++import tools.jackson.databind.introspect.AnnotatedClass;
++import tools.jackson.databind.introspect.EnumNamingStrategyFactory;
+ import tools.jackson.databind.jsonFormatVisitors.JsonFormatVisitorWrapper;
+ import tools.jackson.databind.jsonFormatVisitors.JsonStringFormatVisitor;
+ import tools.jackson.databind.ser.std.StdScalarSerializer;
+-import tools.jackson.databind.util.EnumDefinition;
+ import tools.jackson.databind.util.EnumValues;
+-import tools.jackson.databind.util.EnumValuesToWrite;
+ 
+ /**
+  * Standard serializer used for {@link java.lang.Enum} types.
+@@ -31,9 +29,10 @@ public class EnumSerializer
+     extends StdScalarSerializer<Enum<?>>
+ {
+     /**
+-     * Container for dynamically resolved serializations for the type.
++     * This map contains pre-resolved values (since there are ways to customize
++     * actual String constants to use) to use as serializations.
+      */
+-    protected final EnumValuesToWrite _enumValuesToWrite;
++    protected final EnumValues _values;
+ 
+     /**
+      * Flag that is set if we statically know serialization choice between
+@@ -41,35 +40,51 @@ public class EnumSerializer
+      */
+     protected final Boolean _serializeAsIndex;
+ 
++    /**
++     * Map with key as converted property class defined implementation of {@link EnumNamingStrategy}
++     * and with value as Enum names collected using <code>Enum.name()</code>.
++     */
++    protected final EnumValues _valuesByEnumNaming;
++
++    /**
++     * Map that contains pre-resolved values for {@link Enum#toString} to use for serialization,
++     * while respecting {@link com.fasterxml.jackson.annotation.JsonProperty}
++     * and {@link tools.jackson.databind.cfg.EnumFeature#WRITE_ENUMS_TO_LOWERCASE}.
++     */
++    protected final EnumValues _valuesByToString;
++
+     /*
+     /**********************************************************************
+     /* Life-cycle
+     /**********************************************************************
+      */
+ 
+-    public EnumSerializer(EnumValuesToWrite enumValuesToWrite, Boolean serializeAsIndex)
++    public EnumSerializer(EnumValues v, Boolean serializeAsIndex, EnumValues valuesByEnumNaming,
++            EnumValues valuesByToString)
+     {
+-        super(enumValuesToWrite.enumClass(), false);
+-        _enumValuesToWrite = enumValuesToWrite;
++        super(v.getEnumClass(), false);
++        _values = v;
+         _serializeAsIndex = serializeAsIndex;
++        _valuesByEnumNaming = valuesByEnumNaming;
++        _valuesByToString = valuesByToString;
+     }
+ 
+     /**
+      * Factory method used by {@link tools.jackson.databind.ser.BasicSerializerFactory}
+      * for constructing serializer instance of Enum types.
+      */
++    @SuppressWarnings("unchecked")
+     public static EnumSerializer construct(Class<?> enumClass, SerializationConfig config,
+             BeanDescription beanDesc, JsonFormat.Value format)
+     {
+         // 08-Apr-2015, tatu: As per [databind#749], we cannot statically determine
+         //   between name() and toString(), need to construct `EnumValues` with names,
+         //   handle toString() case dynamically (for example)
+-        // 26-Nov-2025, tatu: Further refactoring post-[databind#5432] to deprecate
+-        //   `EnumValues`, replaced with `EnumValuesToWrite`
+-        EnumValuesToWrite writer = EnumDefinition.construct(config, beanDesc.getClassInfo())
+-                .valuesToWrite(config);
++        EnumValues v = EnumValues.constructFromName(config, beanDesc.getClassInfo());
++        EnumValues valuesByEnumNaming = constructEnumNamingStrategyValues(config, (Class<Enum<?>>) enumClass, beanDesc.getClassInfo());
++        EnumValues valuesByToString = EnumValues.constructFromToString(config, beanDesc.getClassInfo());
+         Boolean serializeAsIndex = _isShapeWrittenUsingIndex(enumClass, format, true, null);
+-        return new EnumSerializer(writer, serializeAsIndex);
++        return new EnumSerializer(v, serializeAsIndex, valuesByEnumNaming, valuesByToString);
+     }
+ 
+     /**
+@@ -88,7 +103,8 @@ public class EnumSerializer
+             Boolean serializeAsIndex = _isShapeWrittenUsingIndex(type,
+                     format, false, _serializeAsIndex);
+             if (!Objects.equals(serializeAsIndex, _serializeAsIndex)) {
+-                return new EnumSerializer(_enumValuesToWrite, serializeAsIndex);
++                return new EnumSerializer(_values, serializeAsIndex,
++                        _valuesByEnumNaming, _valuesByToString);
+             }
+         }
+         return this;
+@@ -100,12 +116,7 @@ public class EnumSerializer
+     /**********************************************************************
+      */
+ 
+-    @Deprecated // @since 3.1
+-    public EnumValues getEnumValues() {
+-        // 26-Nov-2025, tatu: Unfortunate, but can't really support getting
+-        //    such value, so better fail flamboyantly instead of quietly 
+-        throw new UnsupportedOperationException();
+-    }
++    public EnumValues getEnumValues() { return _values; }
+ 
+     /*
+     /**********************************************************************
+@@ -117,17 +128,21 @@ public class EnumSerializer
+     public final void serialize(Enum<?> en, JsonGenerator g, SerializationContext ctxt)
+         throws JacksonException
+     {
++        if (_valuesByEnumNaming != null) {
++            g.writeString(_valuesByEnumNaming.serializedValueFor(en));
++            return;
++        }
+         // Serialize as index?
+         if (_serializeAsIndex(ctxt)) {
+             g.writeNumber(en.ordinal());
+             return;
+         }
+-        final MapperConfig<?> config = ctxt.getConfig();
++        // [databind#749]: or via toString()?
+         if (ctxt.isEnabled(EnumFeature.WRITE_ENUMS_USING_TO_STRING)) {
+-            g.writeString(_enumValuesToWrite.enumValueFromToString(config, en));
++            g.writeString(_valuesByToString.serializedValueFor(en));
+             return;
+-        } 
+-        g.writeString(_enumValuesToWrite.enumValueFromName(config, en));
++        }
++        g.writeString(_values.serializedValueFor(en));
+     }
+ 
+     /*
+@@ -139,30 +154,28 @@ public class EnumSerializer
+     @Override
+     public void acceptJsonFormatVisitor(JsonFormatVisitorWrapper visitor, JavaType typeHint)
+     {
+-        SerializationContext ctxt = visitor.getContext();
+-        if (_serializeAsIndex(ctxt)) {
++        SerializationContext serializers = visitor.getContext();
++        if (_serializeAsIndex(serializers)) {
+             visitIntFormat(visitor, typeHint, JsonParser.NumberType.INT);
+             return;
+         }
+         JsonStringFormatVisitor stringVisitor = visitor.expectStringFormat(typeHint);
+         if (stringVisitor != null) {
+-            Set<String> enumStrings = new LinkedHashSet<>();
++            Set<String> enums = new LinkedHashSet<String>();
+ 
+-            List<Enum<?>> enums = _enumValuesToWrite.enums();
+-            if (_serializeAsIndex(ctxt)) {
+-                for (Enum<?> en : enums) {
+-                    enumStrings.add(String.valueOf(en.ordinal()));
++            // Use toString()?
++            if ((serializers != null) &&
++                    serializers.isEnabled(EnumFeature.WRITE_ENUMS_USING_TO_STRING)) {
++                for (SerializableString value : _valuesByToString.values()) {
++                    enums.add(value.getValue());
+                 }
+             } else {
+-                final MapperConfig<?> config = ctxt.getConfig();
+-                SerializableString[] values = ctxt.isEnabled(EnumFeature.WRITE_ENUMS_USING_TO_STRING)
+-                        ? _enumValuesToWrite.allEnumValuesFromToString(config)
+-                        : _enumValuesToWrite.allEnumValuesFromName(config);
+-                for (SerializableString sstr : values) {
+-                    enumStrings.add(sstr.getValue());
++                // No, serialize using name() or explicit overrides
++                for (SerializableString value : _values.values()) {
++                    enums.add(value.getValue());
+                 }
+             }
+-            stringVisitor.enumTypes(enumStrings);
++            stringVisitor.enumTypes(enums);
+         }
+     }
+ 
+@@ -209,4 +222,17 @@ public class EnumSerializer
+                 "Unsupported serialization shape (%s) for Enum %s, not supported as %s annotation",
+                     shape, enumClass.getName(), (fromClass? "class" : "property")));
+     }
++
++    /**
++     * Factory method used to resolve an instance of {@link EnumValues}
++     * with {@link EnumNamingStrategy} applied for the target class.
++     */
++    protected static EnumValues constructEnumNamingStrategyValues(SerializationConfig config, Class<Enum<?>> enumClass,
++            AnnotatedClass annotatedClass) {
++        Object namingDef = config.getAnnotationIntrospector().findEnumNamingStrategy(config, annotatedClass);
++        EnumNamingStrategy enumNamingStrategy = EnumNamingStrategyFactory.createEnumNamingStrategyInstance(
++            namingDef, config.canOverrideAccessModifiers(), config.getEnumNamingStrategy());
++        return enumNamingStrategy == null ? null : EnumValues.constructUsingEnumNamingStrategy(
++            config, annotatedClass, enumNamingStrategy);
++    }
+ }
+diff --git a/src/main/java/tools/jackson/databind/ser/jdk/JDKKeySerializers.java b/src/main/java/tools/jackson/databind/ser/jdk/JDKKeySerializers.java
+index 833f004b1..dbcc6f824 100644
+--- a/src/main/java/tools/jackson/databind/ser/jdk/JDKKeySerializers.java
++++ b/src/main/java/tools/jackson/databind/ser/jdk/JDKKeySerializers.java
+@@ -287,11 +287,12 @@ public abstract class JDKKeySerializers
+             // 26-Nov-2025, tatu: In 3.0 order was opposite (TO_STRING first,
+             //    then INDEX); changed in 3.1
+             if (ctxt.isEnabled(EnumFeature.WRITE_ENUM_KEYS_USING_INDEX)) {
++                // 14-Sep-2019, tatu: [databind#2129] Use this specific feature
+                 g.writeName(String.valueOf(en.ordinal()));
+             } else if (ctxt.isEnabled(EnumFeature.WRITE_ENUMS_USING_TO_STRING)) {
+-                g.writeName(_valuesToWrite.enumValueFromToString(ctxt.getConfig(), en));
++                    g.writeName(_valuesToWrite.fromToString(ctxt.getConfig(), en)); 
+             } else {
+-                g.writeName(_valuesToWrite.enumValueFromName(ctxt.getConfig(), en));
++                g.writeName(_valuesToWrite.fromName(ctxt.getConfig(), en)); 
+             }
+         }
+     }
+diff --git a/src/main/java/tools/jackson/databind/util/EnumValues.java b/src/main/java/tools/jackson/databind/util/EnumValues.java
+index 42eacdbb5..229e70cbf 100644
+--- a/src/main/java/tools/jackson/databind/util/EnumValues.java
++++ b/src/main/java/tools/jackson/databind/util/EnumValues.java
+@@ -10,11 +10,8 @@ import tools.jackson.databind.introspect.AnnotatedClass;
+ 
+ /**
+  * Helper class used for storing String serializations of {@code Enum}s,
+- * to match to external representations.
+- *
+- * @deprecated Since 3.1 should no longer be used (replaced by {@link EnumValuesToWrite}).
++ * to match to/from external representations.
+  */
+-@Deprecated
+ public final class EnumValues
+     implements java.io.Serializable
+ {
+@@ -34,6 +31,14 @@ public final class EnumValues
+         _textual = textual;
+     }
+ 
++    /**
++     * NOTE: do NOT call this if configuration may change, and choice between toString()
++     *   and name() might change dynamically.
++     *
++     * @deprecated Since 3.1 call {@link #constructFromName} or {@link #constructFromToString}
++     *   instead.
++     */
++    @Deprecated // since 3.1
+     public static EnumValues construct(SerializationConfig config, AnnotatedClass enumClass) {
+         if (config.isEnabled(EnumFeature.WRITE_ENUMS_USING_TO_STRING)) {
+             return constructFromToString(config, enumClass);
+diff --git a/src/main/java/tools/jackson/databind/util/EnumValuesToWrite.java b/src/main/java/tools/jackson/databind/util/EnumValuesToWrite.java
+index 4af14fa9d..d6e2aafdd 100644
+--- a/src/main/java/tools/jackson/databind/util/EnumValuesToWrite.java
++++ b/src/main/java/tools/jackson/databind/util/EnumValuesToWrite.java
+@@ -1,7 +1,5 @@
+ package tools.jackson.databind.util;
+ 
+-import java.util.Arrays;
+-import java.util.List;
+ import java.util.function.Function;
+ 
+ import tools.jackson.core.SerializableString;
+@@ -49,21 +47,7 @@ public class EnumValuesToWrite
+                 enumNamingStrategy, enumConstants, explicitNames);
+     }
+ 
+-    @SuppressWarnings("unchecked")
+-    public Class<Enum<?>> enumClass() {
+-        Class<?> cls = _annotatedClass.getRawType();
+-        return (Class<Enum<?>>) cls;
+-    }
+-
+-    public List<Enum<?>> enums() {
+-        return Arrays.asList(_enumConstants);
+-    }
+-
+-    public SerializableString enumValueFromName(MapperConfig<?> config, Enum<?> en) {
+-        return allEnumValuesFromName(config)[en.ordinal()];
+-    }
+-
+-    public SerializableString[] allEnumValuesFromName(MapperConfig<?> config) {
++    public SerializableString fromName(MapperConfig<?> config, Enum<?> en) {
+         SerializableString[] strs;
+         if (config.isEnabled(EnumFeature.WRITE_ENUMS_TO_LOWERCASE)) {
+             if ((strs = _enumNamesLC) == null) {
+@@ -78,29 +62,21 @@ public class EnumValuesToWrite
+                         false);
+             }
+         }
+-        return strs;
+-    }
+-
+-    public SerializableString enumValueFromToString(MapperConfig<?> config, Enum<?> en) {
+-        return allEnumValuesFromToString(config)[en.ordinal()];
++        return strs[en.ordinal()];
+     }
+ 
+-    public SerializableString[] allEnumValuesFromToString(MapperConfig<?> config) {
++    public SerializableString fromToString(MapperConfig<?> config, Enum<?> en) {
+         SerializableString[] strs;
+         if (config.isEnabled(EnumFeature.WRITE_ENUMS_TO_LOWERCASE)) {
+             if ((strs = _enumToStringsLC) == null) {
+-                _enumToStringsLC = strs = _fetch(config,
+-                        e -> _toStringWithStrategy(config, e),
+-                        true);
++                _enumToStringsLC = strs = _fetch(config, Enum::toString, true);
+             }
+         } else {
+             if ((strs = _enumToStrings) == null) {
+-                _enumToStrings = strs = _fetch(config,
+-                        e -> _toStringWithStrategy(config, e),
+-                        false);
++                _enumToStrings = strs = _fetch(config, Enum::toString, false);
+             }
+         }
+-        return strs;
++        return strs[en.ordinal()];
+     }
+ 
+     private String _nameWithStrategy(MapperConfig<?> config, Enum<?> en) {
+@@ -111,14 +87,6 @@ public class EnumValuesToWrite
+         return str;
+     }
+ 
+-    private String _toStringWithStrategy(MapperConfig<?> config, Enum<?> en) {
+-        String str = en.toString();
+-        if (_enumNamingStrategy != null) {
+-            str = _enumNamingStrategy.convertEnumToExternalName(config, _annotatedClass, str);
+-        }
+-        return str;
+-    }
+-
+     private SerializableString[] _fetch(MapperConfig<?> config,
+             Function<Enum<?>,String> accessor, boolean lowerCase) {
+         final int len = _enumConstants.length;
+diff --git a/src/test/java/tools/jackson/databind/jsonschema/NewSchemaTest.java b/src/test/java/tools/jackson/databind/jsonschema/NewSchemaTest.java
+index a75b2877d..69c19d784 100644
+--- a/src/test/java/tools/jackson/databind/jsonschema/NewSchemaTest.java
++++ b/src/test/java/tools/jackson/databind/jsonschema/NewSchemaTest.java
+@@ -228,7 +228,7 @@ public class NewSchemaTest extends DatabindTestUtil
+     @Test
+     public void testSimpleEnum() throws Exception
+     {
+-        final Set<String> values = new TreeSet<>();
++        final Set<String> values = new TreeSet<String>();
+         ObjectWriter w = MAPPER.writer(EnumFeature.WRITE_ENUMS_USING_TO_STRING);
+ 
+         w.acceptJsonFormatVisitor(TestEnum.class, new JsonFormatVisitorWrapper.Base() {
+@@ -247,7 +247,7 @@ public class NewSchemaTest extends DatabindTestUtil
+         });
+ 
+         assertEquals(3, values.size());
+-        TreeSet<String> exp = new TreeSet<>(Arrays.asList(
++        TreeSet<String> exp = new TreeSet<String>(Arrays.asList(
+                         "ToString:A",
+                         "ToString:B",
+                         "ToString:C"
+diff --git a/src/test/java/tools/jackson/databind/ser/enums/EnumNamingSerializationTest.java b/src/test/java/tools/jackson/databind/ser/enums/EnumNamingSerializationTest.java
+index d8967f633..651c4d867 100644
+--- a/src/test/java/tools/jackson/databind/ser/enums/EnumNamingSerializationTest.java
++++ b/src/test/java/tools/jackson/databind/ser/enums/EnumNamingSerializationTest.java
+@@ -23,7 +23,7 @@ public class EnumNamingSerializationTest extends DatabindTestUtil
+             .build();
+ 
+     @EnumNaming(EnumNamingStrategies.LowerCamelCaseStrategy.class)
+-    enum EnumFlavorA {
++    static enum EnumFlavorA {
+         CHOCOLATE_CHIPS,
+         HOT_CHEETOS;
+ 
+@@ -34,26 +34,26 @@ public class EnumNamingSerializationTest extends DatabindTestUtil
+     }
+ 
+     @EnumNaming(EnumNamingStrategies.LowerCamelCaseStrategy.class)
+-    enum EnumSauceB {
++    static enum EnumSauceB {
+         KETCH_UP,
+         MAYO_NEZZ;
+     }
+ 
+     @EnumNaming(EnumNamingStrategy.class)
+-    enum EnumSauceC {
++    static enum EnumSauceC {
+         BARBEQ_UE,
+         SRIRACHA_MAYO;
+     }
+ 
+     @EnumNaming(EnumNamingStrategies.LowerCamelCaseStrategy.class)
+-    enum EnumFlavorD {
++    static enum EnumFlavorD {
+         _PEANUT_BUTTER,
+         PEANUT__BUTTER,
+         PEANUT_BUTTER
+     }
+ 
+     @EnumNaming(EnumNamingStrategies.LowerCamelCaseStrategy.class)
+-    enum EnumFlavorE {
++    static enum EnumFlavorE {
+         PEANUT_BUTTER,
+         @JsonProperty("almond")
+         ALMOND_BUTTER
+@@ -75,30 +75,28 @@ public class EnumNamingSerializationTest extends DatabindTestUtil
+     */
+ 
+     @Test
+-    public void enumNamingShouldOverrideToStringFeature() throws Exception {
++    public void testEnumNamingShouldOverrideToStringFeatue() throws Exception {
+         String resultStr = MAPPER.writer()
+             .with(EnumFeature.WRITE_ENUMS_USING_TO_STRING)
+             .writeValueAsString(EnumFlavorA.CHOCOLATE_CHIPS);
+ 
+-        // 26-Nov-2025, tatu: Before 3.1, test assumed that "WRITE_ENUMS_USING_TO_STRING"
+-        //    prevents use of EnumNamingStrategy -- not so with 3.1 and later
+-        assertEquals(q("hotChocolateCheetosAndChips"), resultStr);
++        assertEquals(q("chocolateChips"), resultStr);
+     }
+ 
+     @Test
+-    public void enumNamingStrategyNotApplied() throws Exception {
++    public void testEnumNamingStrategyNotApplied() throws Exception {
+         String resultString = MAPPER.writeValueAsString(EnumSauceC.SRIRACHA_MAYO);
+         assertEquals(q("SRIRACHA_MAYO"), resultString);
+     }
+ 
+     @Test
+-    public void enumNamingStrategyStartingUnderscoreBecomesUpperCase() throws Exception {
++    public void testEnumNamingStrategyStartingUnderscoreBecomesUpperCase() throws Exception {
+         String flavor = MAPPER.writeValueAsString(EnumFlavorD._PEANUT_BUTTER);
+         assertEquals(q("PeanutButter"), flavor);
+     }
+ 
+     @Test
+-    public void enumNamingStrategyNonPrefixContiguousUnderscoresBecomeOne() throws Exception {
++    public void testEnumNamingStrategyNonPrefixContiguousUnderscoresBecomeOne() throws Exception {
+         String flavor1 = MAPPER.writeValueAsString(EnumFlavorD.PEANUT__BUTTER);
+         assertEquals(q("peanutButter"), flavor1);
+ 
+@@ -107,13 +105,13 @@ public class EnumNamingSerializationTest extends DatabindTestUtil
+     }
+ 
+     @Test
+-    public void enumSetWrite() throws Exception {
++    public void testEnumSet() throws Exception {
+         final EnumSet<EnumSauceB> value = EnumSet.of(EnumSauceB.KETCH_UP);
+         assertEquals("[\"ketchUp\"]", MAPPER.writeValueAsString(value));
+     }
+ 
+     @Test
+-    public void enumMapWrite() throws Exception {
++    public void testEnumWithEnumMap() throws Exception {
+         EnumMap<EnumSauceB, String> enums = new EnumMap<>(EnumSauceB.class);
+         enums.put(EnumSauceB.MAYO_NEZZ, "value");
+ 
+@@ -125,7 +123,7 @@ public class EnumNamingSerializationTest extends DatabindTestUtil
+     }
+ 
+     @Test
+-    public void enumNamingStrategyWithOverride() throws Exception {
++    public void testEnumNamingStrategyWithOverride() throws Exception {
+         String almond = MAPPER.writeValueAsString(EnumFlavorE.ALMOND_BUTTER);
+         assertEquals(q("almond"), almond);
+ 
+diff --git a/src/test/java/tools/jackson/databind/util/EnumValuesTest.java b/src/test/java/tools/jackson/databind/util/EnumValuesTest.java
+index 9fa8e94f5..543d0053b 100644
+--- a/src/test/java/tools/jackson/databind/util/EnumValuesTest.java
++++ b/src/test/java/tools/jackson/databind/util/EnumValuesTest.java
+@@ -14,7 +14,6 @@ import tools.jackson.databind.testutil.DatabindTestUtil;
+ import static org.junit.jupiter.api.Assertions.assertEquals;
+ import static org.junit.jupiter.api.Assertions.assertNull;
+ 
+-@Deprecated // @since 3.1 along with EnumValues type itself
+ public class EnumValuesTest extends DatabindTestUtil
+ {
+     enum ABC {

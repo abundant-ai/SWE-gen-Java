@@ -1,0 +1,244 @@
+diff --git a/adapters/src/main/java/com/squareup/moshi/adapters/RuntimeJsonAdapterFactory.java b/adapters/src/main/java/com/squareup/moshi/adapters/RuntimeJsonAdapterFactory.java
+index 7ff47b1b..0cb5f690 100644
+--- a/adapters/src/main/java/com/squareup/moshi/adapters/RuntimeJsonAdapterFactory.java
++++ b/adapters/src/main/java/com/squareup/moshi/adapters/RuntimeJsonAdapterFactory.java
+@@ -103,7 +103,7 @@ final class RuntimeJsonAdapterFactory<T> implements JsonAdapter.Factory {
+       return null;
+     }
+ 
+-    List<JsonAdapter<Object>> jsonAdapters = new ArrayList<>();
++    List<JsonAdapter<Object>> jsonAdapters = new ArrayList<>(subtypes.size());
+     for (int i = 0, size = subtypes.size(); i < size; i++) {
+       jsonAdapters.add(moshi.adapter(subtypes.get(i)));
+     }
+diff --git a/moshi/src/main/java/com/squareup/moshi/JsonUtf8Writer.java b/moshi/src/main/java/com/squareup/moshi/JsonUtf8Writer.java
+index 7a7a727a..5aa749a8 100644
+--- a/moshi/src/main/java/com/squareup/moshi/JsonUtf8Writer.java
++++ b/moshi/src/main/java/com/squareup/moshi/JsonUtf8Writer.java
+@@ -83,7 +83,7 @@ final class JsonUtf8Writer extends JsonWriter {
+           "Array cannot be used as a map key in JSON at path " + getPath());
+     }
+     writeDeferredName();
+-    return open(EMPTY_ARRAY, "[");
++    return open(EMPTY_ARRAY, NONEMPTY_ARRAY, "[");
+   }
+ 
+   @Override public JsonWriter endArray() throws IOException {
+@@ -96,7 +96,7 @@ final class JsonUtf8Writer extends JsonWriter {
+           "Object cannot be used as a map key in JSON at path " + getPath());
+     }
+     writeDeferredName();
+-    return open(EMPTY_OBJECT, "{");
++    return open(EMPTY_OBJECT, NONEMPTY_OBJECT, "{");
+   }
+ 
+   @Override public JsonWriter endObject() throws IOException {
+@@ -108,7 +108,13 @@ final class JsonUtf8Writer extends JsonWriter {
+    * Enters a new scope by appending any necessary whitespace and the given
+    * bracket.
+    */
+-  private JsonWriter open(int empty, String openBracket) throws IOException {
++  private JsonWriter open(int empty, int nonempty, String openBracket) throws IOException {
++    if (stackSize == flattenStackSize
++        && (scopes[stackSize - 1] == empty || scopes[stackSize - 1] == nonempty)) {
++      // Cancel this open. Invert the flatten stack size until this is closed.
++      flattenStackSize = ~flattenStackSize;
++      return this;
++    }
+     beforeValue();
+     checkStack();
+     pushScope(empty);
+@@ -129,6 +135,11 @@ final class JsonUtf8Writer extends JsonWriter {
+     if (deferredName != null) {
+       throw new IllegalStateException("Dangling name: " + deferredName);
+     }
++    if (stackSize == ~flattenStackSize) {
++      // Cancel this close. Restore the flattenStackSize so we're ready to flatten again!
++      flattenStackSize = ~flattenStackSize;
++      return this;
++    }
+ 
+     stackSize--;
+     pathNames[stackSize] = null; // Free the last path name so that it can be garbage collected!
+diff --git a/moshi/src/main/java/com/squareup/moshi/JsonValueWriter.java b/moshi/src/main/java/com/squareup/moshi/JsonValueWriter.java
+index 64878efd..6ab79eee 100644
+--- a/moshi/src/main/java/com/squareup/moshi/JsonValueWriter.java
++++ b/moshi/src/main/java/com/squareup/moshi/JsonValueWriter.java
+@@ -52,6 +52,11 @@ final class JsonValueWriter extends JsonWriter {
+       throw new IllegalStateException(
+           "Array cannot be used as a map key in JSON at path " + getPath());
+     }
++    if (stackSize == flattenStackSize && scopes[stackSize - 1] == EMPTY_ARRAY) {
++      // Cancel this open. Invert the flatten stack size until this is closed.
++      flattenStackSize = ~flattenStackSize;
++      return this;
++    }
+     checkStack();
+     List<Object> list = new ArrayList<>();
+     add(list);
+@@ -65,6 +70,11 @@ final class JsonValueWriter extends JsonWriter {
+     if (peekScope() != EMPTY_ARRAY) {
+       throw new IllegalStateException("Nesting problem.");
+     }
++    if (stackSize == ~flattenStackSize) {
++      // Cancel this close. Restore the flattenStackSize so we're ready to flatten again!
++      flattenStackSize = ~flattenStackSize;
++      return this;
++    }
+     stackSize--;
+     stack[stackSize] = null;
+     pathIndices[stackSize - 1]++;
+@@ -76,6 +86,11 @@ final class JsonValueWriter extends JsonWriter {
+       throw new IllegalStateException(
+           "Object cannot be used as a map key in JSON at path " + getPath());
+     }
++    if (stackSize == flattenStackSize && scopes[stackSize - 1] == EMPTY_OBJECT) {
++      // Cancel this open. Invert the flatten stack size until this is closed.
++      flattenStackSize = ~flattenStackSize;
++      return this;
++    }
+     checkStack();
+     Map<String, Object> map = new LinkedHashTreeMap<>();
+     add(map);
+@@ -91,6 +106,11 @@ final class JsonValueWriter extends JsonWriter {
+     if (deferredName != null) {
+       throw new IllegalStateException("Dangling name: " + deferredName);
+     }
++    if (stackSize == ~flattenStackSize) {
++      // Cancel this close. Restore the flattenStackSize so we're ready to flatten again!
++      flattenStackSize = ~flattenStackSize;
++      return this;
++    }
+     promoteValueToName = false;
+     stackSize--;
+     stack[stackSize] = null;
+diff --git a/moshi/src/main/java/com/squareup/moshi/JsonWriter.java b/moshi/src/main/java/com/squareup/moshi/JsonWriter.java
+index 678171ce..fa4137bb 100644
+--- a/moshi/src/main/java/com/squareup/moshi/JsonWriter.java
++++ b/moshi/src/main/java/com/squareup/moshi/JsonWriter.java
+@@ -24,7 +24,9 @@ import javax.annotation.Nullable;
+ import okio.BufferedSink;
+ import okio.BufferedSource;
+ 
++import static com.squareup.moshi.JsonScope.EMPTY_ARRAY;
+ import static com.squareup.moshi.JsonScope.EMPTY_OBJECT;
++import static com.squareup.moshi.JsonScope.NONEMPTY_ARRAY;
+ import static com.squareup.moshi.JsonScope.NONEMPTY_OBJECT;
+ 
+ /**
+@@ -140,6 +142,26 @@ public abstract class JsonWriter implements Closeable, Flushable {
+   boolean serializeNulls;
+   boolean promoteValueToName;
+ 
++  /**
++   * Controls the deepest stack size that has begin/end pairs flattened:
++   *
++   * <ul>
++   *     <li>If -1, no begin/end pairs are being suppressed.
++   *     <li>If positive, this is the deepest stack size whose begin/end pairs are eligible to be
++   *         flattened.
++   *     <li>If negative, it is the bitwise inverse (~) of the deepest stack size whose begin/end
++   *         pairs have been flattened.
++   * </ul>
++   *
++   * <p>We differentiate between what layer would be flattened (positive) from what layer is being
++   * flattened (negative) so that we don't double-flatten.
++   *
++   * <p>To accommodate nested flattening we require callers to track the previous state when they
++   * provide a new state. The previous state is returned from {@link #beginFlatten} and restored
++   * with {@link #endFlatten}.
++   */
++  int flattenStackSize = -1;
++
+   /** Returns a new instance that writes UTF-8 encoded JSON to {@code sink}. */
+   @CheckReturnValue public static JsonWriter of(BufferedSink sink) {
+     return new JsonUtf8Writer(sink);
+@@ -357,6 +379,88 @@ public abstract class JsonWriter implements Closeable, Flushable {
+     promoteValueToName = true;
+   }
+ 
++  /**
++   * Cancels immediately-nested calls to {@link #beginArray()} or {@link #beginObject()} and their
++   * matching calls to {@link #endArray} or {@link #endObject()}. Use this to compose JSON adapters
++   * without nesting.
++   *
++   * <p>For example, the following creates JSON with nested arrays: {@code [1,[2,3,4],5]}.
++   *
++   * <pre>{@code
++   *
++   *   JsonAdapter<List<Integer>> integersAdapter = ...
++   *
++   *   public void writeNumbers(JsonWriter writer) {
++   *     writer.beginArray();
++   *     writer.value(1);
++   *     integersAdapter.toJson(writer, Arrays.asList(2, 3, 4));
++   *     writer.value(5);
++   *     writer.endArray();
++   *   }
++   * }</pre>
++   *
++   * <p>With flattening we can create JSON with a single array {@code [1,2,3,4,5]}:
++   *
++   * <pre>{@code
++   *
++   *   JsonAdapter<List<Integer>> integersAdapter = ...
++   *
++   *   public void writeNumbers(JsonWriter writer) {
++   *     writer.beginArray();
++   *     int token = writer.beginFlatten();
++   *     writer.value(1);
++   *     integersAdapter.toJson(writer, Arrays.asList(2, 3, 4));
++   *     writer.value(5);
++   *     writer.endFlatten(token);
++   *     writer.endArray();
++   *   }
++   * }</pre>
++   *
++   * <p>This method flattens arrays within arrays:
++   *
++   * <pre>{@code
++   *
++   *   Emit:       [1, [2, 3, 4], 5]
++   *   To produce: [1, 2, 3, 4, 5]
++   * }</pre>
++   *
++   * It also flattens objects within objects. Do not call {@link #name} before writing a flattened
++   * object.
++   *
++   * <pre>{@code
++   *
++   *   Emit:       {"a": 1, {"b": 2}, "c": 3}
++   *   To Produce: {"a": 1, "b": 2, "c": 3}
++   * }</pre>
++   *
++   * Other combinations are permitted but do not perform flattening. For example, objects inside of
++   * arrays are not flattened:
++   *
++   * <pre>{@code
++   *
++   *   Emit:       [1, {"b": 2}, 3, [4, 5], 6]
++   *   To Produce: [1, {"b": 2}, 3, 4, 5, 6]
++   * }</pre>
++   *
++   * <p>This method returns an opaque token. Callers must match all calls to this method with a call
++   * to {@link #endFlatten} with the matching token.
++   */
++  public final int beginFlatten() {
++    int context = peekScope();
++    if (context != NONEMPTY_OBJECT && context != EMPTY_OBJECT
++        && context != NONEMPTY_ARRAY && context != EMPTY_ARRAY) {
++      throw new IllegalStateException("Nesting problem.");
++    }
++    int token = flattenStackSize;
++    flattenStackSize = stackSize;
++    return token;
++  }
++
++  /** Ends nested call flattening created by {@link #beginFlatten}. */
++  public final void endFlatten(int token) {
++    flattenStackSize = token;
++  }
++
+   /**
+    * Returns a <a href="http://goessner.net/articles/JsonPath/">JsonPath</a> to
+    * the current location in the JSON value.

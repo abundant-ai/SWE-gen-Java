@@ -1,0 +1,321 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index bf3985ccd..d88574ab0 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -28,6 +28,7 @@ Currently the versioning policy of this project follows [Semantic Versioning v2.
+ - Fix `US_USELESS_SUPPRESSION_ON_FIELD`/`UUF_UNUSED_FIELD` false positive ([#3496](https://github.com/spotbugs/spotbugs/pull/3496))
+ - Make the osgi manifest of the annotations jar Java 8 compatible  ([#3498](https://github.com/spotbugs/spotbugs/pull/3498)) ([#3500](https://github.com/spotbugs/spotbugs/pull/3500))
+ - `TextUICommandLine` supports all options encoded in Eclipse preferences file ([#3520](https://github.com/spotbugs/spotbugs/issues/3520))
++- Unnecessary suppressions fix for records headers ([#3471](https://github.com/spotbugs/spotbugs/issues/3471))
+ 
+ ### Added
+ - Added the unnecessary annotation to the `US_USELESS_SUPPRESSION_ON_*` messages ([#3395](https://github.com/spotbugs/spotbugs/issues/3395))
+diff --git a/gradle/libs.versions.toml b/gradle/libs.versions.toml
+index 8bd886dbc..a5ad1f8a7 100644
+--- a/gradle/libs.versions.toml
++++ b/gradle/libs.versions.toml
+@@ -1,7 +1,7 @@
+ [versions]
+ asm = "9.8"
+ guice = "5.1.0"
+-log4j = "2.25.1"
++log4j = "2.25.0"
+ 
+ [libraries]
+ asm = { module = "org.ow2.asm:asm", version.ref = "asm" }
+diff --git a/spotbugs/src/main/java/edu/umd/cs/findbugs/SuppressionMatcher.java b/spotbugs/src/main/java/edu/umd/cs/findbugs/SuppressionMatcher.java
+index fef39ee8b..99bfad1c2 100644
+--- a/spotbugs/src/main/java/edu/umd/cs/findbugs/SuppressionMatcher.java
++++ b/spotbugs/src/main/java/edu/umd/cs/findbugs/SuppressionMatcher.java
+@@ -70,6 +70,9 @@ public class SuppressionMatcher implements Matcher {
+                     if (w.match(b)) {
+                         count++;
+                         matched.add(w);
++                        // Also mark the alternate suppressors as matched, see: NoteSuppressedWarnings
++                        matched.addAll(w.getAlternateSuppressors());
++
+                         return true;
+                     }
+                 }
+diff --git a/spotbugs/src/main/java/edu/umd/cs/findbugs/WarningSuppressor.java b/spotbugs/src/main/java/edu/umd/cs/findbugs/WarningSuppressor.java
+index 44e44174a..e35eb845e 100644
+--- a/spotbugs/src/main/java/edu/umd/cs/findbugs/WarningSuppressor.java
++++ b/spotbugs/src/main/java/edu/umd/cs/findbugs/WarningSuppressor.java
+@@ -1,9 +1,14 @@
+ package edu.umd.cs.findbugs;
+ 
+ import java.io.IOException;
++import java.util.Collection;
++import java.util.Collections;
++import java.util.HashSet;
++import java.util.Set;
+ import java.util.regex.Pattern;
+ 
+ import edu.umd.cs.findbugs.annotations.SuppressMatchType;
++import edu.umd.cs.findbugs.detect.NoteSuppressedWarnings;
+ import edu.umd.cs.findbugs.detect.UselessSuppressionDetector;
+ import edu.umd.cs.findbugs.filter.Matcher;
+ import edu.umd.cs.findbugs.xml.XMLOutput;
+@@ -18,6 +23,8 @@ public abstract class WarningSuppressor implements Matcher {
+     protected final String bugPattern;
+     protected final SuppressMatchType matchType;
+ 
++    private Set<WarningSuppressor> alternateSuppressors = Collections.emptySet();
++
+     protected WarningSuppressor(String bugPattern, SuppressMatchType matchType) {
+         this.bugPattern = bugPattern;
+ 
+@@ -82,7 +89,9 @@ public abstract class WarningSuppressor implements Matcher {
+     /**
+      * @return true if useless suppressions should be reported.
+      */
+-    public abstract boolean isUselessSuppressionReportable();
++    public boolean isUselessSuppressionReportable() {
++        return true;
++    }
+ 
+     public abstract BugInstance buildUselessSuppressionBugInstance(UselessSuppressionDetector detector);
+ 
+@@ -90,4 +99,20 @@ public abstract class WarningSuppressor implements Matcher {
+     public void writeXML(XMLOutput xmlOutput, boolean disabled) throws IOException {
+         // no-op; these aren't saved to XML
+     }
++
++    public void addAlternateSuppressors(Collection<WarningSuppressor> additionalSuppressors) {
++        if (alternateSuppressors.isEmpty()) {
++            alternateSuppressors = new HashSet<>(additionalSuppressors);
++        } else {
++            alternateSuppressors.addAll(additionalSuppressors);
++        }
++    }
++
++    /**
++     * @return The alternate suppressors that might have been generated from a single <code>SuppressWarnings</code> annotation.
++     * See {@link NoteSuppressedWarnings}
++     */
++    public Collection<WarningSuppressor> getAlternateSuppressors() {
++        return Collections.unmodifiableCollection(alternateSuppressors);
++    }
+ }
+diff --git a/spotbugs/src/main/java/edu/umd/cs/findbugs/detect/NoteSuppressedWarnings.java b/spotbugs/src/main/java/edu/umd/cs/findbugs/detect/NoteSuppressedWarnings.java
+index eb2df2be6..a1986524f 100644
+--- a/spotbugs/src/main/java/edu/umd/cs/findbugs/detect/NoteSuppressedWarnings.java
++++ b/spotbugs/src/main/java/edu/umd/cs/findbugs/detect/NoteSuppressedWarnings.java
+@@ -19,14 +19,24 @@
+ 
+ package edu.umd.cs.findbugs.detect;
+ 
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.Collection;
++import java.util.HashMap;
+ import java.util.HashSet;
++import java.util.List;
+ import java.util.Map;
++import java.util.Objects;
+ import java.util.Set;
++import java.util.stream.Collectors;
++import java.util.stream.Stream;
+ 
+-import edu.umd.cs.findbugs.util.ClassName;
++import org.apache.bcel.Const;
+ import org.apache.bcel.Repository;
+ import org.apache.bcel.classfile.ElementValue;
++import org.apache.bcel.classfile.Field;
+ import org.apache.bcel.classfile.JavaClass;
++import org.apache.bcel.classfile.Method;
+ 
+ import edu.umd.cs.findbugs.BugReporter;
+ import edu.umd.cs.findbugs.ClassAnnotation;
+@@ -40,18 +50,32 @@ import edu.umd.cs.findbugs.NonReportingDetector;
+ import edu.umd.cs.findbugs.PackageWarningSuppressor;
+ import edu.umd.cs.findbugs.ParameterWarningSuppressor;
+ import edu.umd.cs.findbugs.SuppressionMatcher;
++import edu.umd.cs.findbugs.WarningSuppressor;
+ import edu.umd.cs.findbugs.annotations.SuppressMatchType;
+ import edu.umd.cs.findbugs.ba.AnalysisContext;
+ import edu.umd.cs.findbugs.ba.ClassContext;
++import edu.umd.cs.findbugs.ba.ch.Subtypes2;
+ import edu.umd.cs.findbugs.bcel.BCELUtil;
+ import edu.umd.cs.findbugs.bytecode.MemberUtils;
+ import edu.umd.cs.findbugs.internalAnnotations.DottedClassName;
++import edu.umd.cs.findbugs.util.ClassName;
+ import edu.umd.cs.findbugs.visitclass.AnnotationVisitor;
+ 
+ public class NoteSuppressedWarnings extends AnnotationVisitor implements Detector, NonReportingDetector {
+ 
+     private final Set<String> packages = new HashSet<>();
+ 
++    /**
++     * For records the header is compiled into fields, accessor methods and a canonical constructor.
++     * A <code>SuppressWarnings</code> annotation in the header is applied to the corresponding field, accessor method and parameter of the canonical constructor.
++     * In the end we want to report unnecessary suppressions, however when only one of the three suppressors is matched we do not want to report the two others as unnecessary.
++     * We link the suppressors together so we can detect whether at least one of them was matched in {@link SuppressionMatcher#match(edu.umd.cs.findbugs.BugInstance)}
++     */
++    private boolean isRecord;
++    private boolean visitingCanonicalRecordConstructor;
++    private final List<RecordComponentSuppressors> recordComponents = new ArrayList<>();
++    private final Map<String, RecordComponentSuppressors> recordComponentsByName = new HashMap<>();
++
+     private final SuppressionMatcher suppressionMatcher;
+ 
+     public NoteSuppressedWarnings(BugReporter bugReporter) {
+@@ -60,6 +84,8 @@ public class NoteSuppressedWarnings extends AnnotationVisitor implements Detecto
+ 
+     @Override
+     public void visitClassContext(ClassContext classContext) {
++        isRecord = Subtypes2.isRecord(classContext.getJavaClass());
++
+         JavaClass javaClass = classContext.getJavaClass();
+         if (!BCELUtil.preTiger(javaClass)) {
+             @DottedClassName
+@@ -83,6 +109,44 @@ public class NoteSuppressedWarnings extends AnnotationVisitor implements Detecto
+         }
+     }
+ 
++    @Override
++    public void visitField(Field field) {
++        if (isRecord) {
++            // We first visit the records fields and track them by name and index
++            RecordComponentSuppressors suppressors = new RecordComponentSuppressors(field);
++
++            recordComponents.add(suppressors);
++            recordComponentsByName.put(field.getName(), suppressors);
++        }
++    }
++
++    @Override
++    public void visitMethod(Method method) {
++        // When we visit a record constructor with args types identical to the fields it is the canonical constructor
++        visitingCanonicalRecordConstructor = isRecord
++                && isConstructor(method)
++                && Arrays.equals(method.getArgumentTypes(), recordComponents.stream().map(c -> c.field.getType()).toArray());
++    }
++
++    private static boolean isConstructor(Method method) {
++        return Const.CONSTRUCTOR_NAME.equals(method.getName());
++    }
++
++    @Override
++    public void visitAfter(JavaClass obj) {
++        // If we have found some suppressors on a record component link the parameter, field and method suppressors
++        for (RecordComponentSuppressors suppressors : recordComponents) {
++            Collection<WarningSuppressor> componentSuppressors = suppressors.getSuppressors();
++            if (componentSuppressors.size() > 1) {
++                for (WarningSuppressor suppressor : componentSuppressors) {
++                    suppressor.addAlternateSuppressors(componentSuppressors);
++                }
++            }
++        }
++
++        recordComponents.clear();
++    }
++
+     @Override
+     public void visitAnnotation(String annotationClass, Map<String, ElementValue> map, boolean runtimeVisible) {
+         if (!isSuppressWarnings(annotationClass)) {
+@@ -110,7 +174,10 @@ public class NoteSuppressedWarnings extends AnnotationVisitor implements Detecto
+         if (!isSuppressWarnings(annotationClass)) {
+             return;
+         }
+-        if (!getMethod().isStatic()) {
++
++        Method method = getMethod();
++        if (!method.isStatic() && !isConstructor(method)) {
++            // There's the additional 'this' parameter for non-static, non-constructor methods
+             p++;
+         }
+ 
+@@ -118,15 +185,15 @@ public class NoteSuppressedWarnings extends AnnotationVisitor implements Detecto
+         SuppressMatchType matchType = getAnnotationParameterAsEnum(map, "matchType", SuppressMatchType.class);
+ 
+         if (suppressed == null || suppressed.length == 0) {
+-            suppressWarning(p, null, matchType);
++            suppressParameterWarning(p, null, matchType);
+         } else {
+             for (String s : suppressed) {
+-                suppressWarning(p, s, matchType);
++                suppressParameterWarning(p, s, matchType);
+             }
+         }
+     }
+ 
+-    private void suppressWarning(int parameter, String pattern, SuppressMatchType matchType) {
++    private void suppressParameterWarning(int parameter, String pattern, SuppressMatchType matchType) {
+         String className = getDottedClassName();
+         ClassAnnotation clazz = new ClassAnnotation(className);
+         ParameterWarningSuppressor suppressor = new ParameterWarningSuppressor(
+@@ -139,6 +206,9 @@ public class NoteSuppressedWarnings extends AnnotationVisitor implements Detecto
+ 
+         suppressionMatcher.addSuppressor(suppressor);
+ 
++        if (visitingCanonicalRecordConstructor) {
++            recordComponents.get(parameter).canonicalConstructorSuppressor = suppressor;
++        }
+     }
+ 
+     private void suppressWarning(String pattern, SuppressMatchType matchType) {
+@@ -162,6 +232,11 @@ public class NoteSuppressedWarnings extends AnnotationVisitor implements Detecto
+                     MemberUtils.isUserGenerated(getMethod()) && MemberUtils.isUserGenerated(getXClass()));
+ 
+             suppressionMatcher.addSuppressor(suppressor);
++
++            if (isRecord) {
++                RecordComponentSuppressors suppressors = recordComponentsByName.get(getMethodName());
++                suppressors.accessorMethodSuppressor = suppressor;
++            }
+         } else if (visitingField()) {
+             FieldWarningSuppressor suppressor = new FieldWarningSuppressor(
+                     pattern,
+@@ -172,6 +247,11 @@ public class NoteSuppressedWarnings extends AnnotationVisitor implements Detecto
+                     MemberUtils.isUserGenerated(getField()) && MemberUtils.isUserGenerated(getXClass()));
+ 
+             suppressionMatcher.addSuppressor(suppressor);
++
++            if (isRecord) {
++                RecordComponentSuppressors suppressors = recordComponentsByName.get(getFieldName());
++                suppressors.fieldSuppressor = suppressor;
++            }
+         } else {
+             ClassWarningSuppressor suppressor = new ClassWarningSuppressor(
+                     pattern,
+@@ -188,4 +268,21 @@ public class NoteSuppressedWarnings extends AnnotationVisitor implements Detecto
+ 
+     }
+ 
++    private static class RecordComponentSuppressors {
++        private final Field field;
++
++        private WarningSuppressor canonicalConstructorSuppressor;
++        private WarningSuppressor accessorMethodSuppressor;
++        private WarningSuppressor fieldSuppressor;
++
++        public RecordComponentSuppressors(Field field) {
++            this.field = field;
++        }
++
++        private Collection<WarningSuppressor> getSuppressors() {
++            return Stream.of(canonicalConstructorSuppressor, accessorMethodSuppressor, fieldSuppressor)
++                    .filter(Objects::nonNull)
++                    .collect(Collectors.toList());
++        }
++    }
+ }
+diff --git a/spotbugsTestCases/src/java17/Issue3471.java b/spotbugsTestCases/src/java17/Issue3471.java
+new file mode 100644
+index 000000000..79f362b4c
+--- /dev/null
++++ b/spotbugsTestCases/src/java17/Issue3471.java
+@@ -0,0 +1,12 @@
++import java.util.List;
++
++import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
++
++public class Issue3471 {
++	
++	public record Issue3471Suppressed(String name, @SuppressFBWarnings({"EI_EXPOSE_REP"}) List<String> values) {
++	}
++
++	public record Issue3471ExposeRep(String name, List<String> values) {
++	}
++}

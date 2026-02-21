@@ -1,9 +1,0 @@
-When using the StatusPages plugin, response headers set on an OutgoingContent produced during error handling (or otherwise present on the response body) are not visible/available inside StatusPages status handlers. This makes it impossible for a StatusPages handler to reliably inspect or propagate headers that were attached to the outgoing response content.
-
-Reproduction scenario: install StatusPages with a status handler such as `status(HttpStatusCode.NotFound) { call, code -> ... }`. In a route, respond with a status response that includes content (for example `call.respond(HttpStatusCode.NotFound, "Not found")`, which produces an `HttpStatusCodeContent` OutgoingContent). Inside the StatusPages handler, attempt to read or depend on headers that are part of the outgoing content/response body. Currently, those OutgoingContent headers are not appended to the response headers at the time the status handler runs, so the handler cannot see them.
-
-Expected behavior: by the time a StatusPages status handler is invoked (e.g., the handler registered via `StatusPages { status(HttpStatusCode.NotFound) { ... } }`), any headers carried by the `OutgoingContent` that is about to be sent should already be reflected in the response headers accessible from the call. In other words, headers associated with the response body must be available in status handlers so they can be inspected or preserved.
-
-Actual behavior: the outgoing content’s headers are only applied later in the response pipeline, so StatusPages handlers run before those headers are appended; as a result, they appear missing within the handler.
-
-Fix the StatusPages/server response pipeline so that OutgoingContent headers are appended earlier (before StatusPages status handlers execute), ensuring header visibility/consistency in status handlers for responses like `HttpStatusCodeContent` and similar OutgoingContent types.

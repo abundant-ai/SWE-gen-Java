@@ -1,0 +1,64 @@
+diff --git a/release-notes/VERSION-2.x b/release-notes/VERSION-2.x
+index 573d73675..10eb9d929 100644
+--- a/release-notes/VERSION-2.x
++++ b/release-notes/VERSION-2.x
+@@ -19,6 +19,9 @@ Project: jackson-databind
+   customizability
+  (contributed by @wrongwrong)
+ #5361: Fix Maven SBOM publishing
++#5368: Optimize performance of `ObjectMapper.convertValue()` when `TokenBuffer`
++  passed as `fromValue`
++ (requested by @qsLI)
+ #5398: `@JsonProperty.value` + `@JsonIgnore` on setter does not work
+   anymore since 2.18.4
+  (reported by @victor-noel-pfx)
+diff --git a/src/main/java/com/fasterxml/jackson/databind/ObjectMapper.java b/src/main/java/com/fasterxml/jackson/databind/ObjectMapper.java
+index 102607f0d..2f38b5904 100644
+--- a/src/main/java/com/fasterxml/jackson/databind/ObjectMapper.java
++++ b/src/main/java/com/fasterxml/jackson/databind/ObjectMapper.java
+@@ -4693,21 +4693,33 @@ public class ObjectMapper
+     protected Object _convert(Object fromValue, JavaType toValueType)
+         throws IllegalArgumentException
+     {
+-        // inlined 'writeValue' with minor changes:
+-        // first: disable wrapping when writing
+-        final SerializationConfig config = getSerializationConfig().without(SerializationFeature.WRAP_ROOT_VALUE);
+-        final DefaultSerializerProvider context = _serializerProvider(config);
++        // [databind#5368]: Optimize case where fromValue is already a TokenBuffer
++        // TokenBuffer has no read state, so safe to reuse directly via asParser()
++        TokenBuffer buf;
++        if (fromValue != null && fromValue.getClass() == TokenBuffer.class) {
++            // Already a TokenBuffer, reuse it directly
++            buf = (TokenBuffer) fromValue;
++        } else {
++            // inlined 'writeValue' with minor changes:
++            // first: disable wrapping when writing
++            final SerializationConfig config = getSerializationConfig().without(SerializationFeature.WRAP_ROOT_VALUE);
++            final DefaultSerializerProvider context = _serializerProvider(config);
+ 
+-        // Then create TokenBuffer to use as JsonGenerator
+-        TokenBuffer buf = context.bufferForValueConversion(this);
+-        if (isEnabled(DeserializationFeature.USE_BIG_DECIMAL_FOR_FLOATS)) {
+-            buf = buf.forceUseOfBigDecimal(true);
++            // Then create TokenBuffer to use as JsonGenerator
++            buf = context.bufferForValueConversion(this);
++            if (isEnabled(DeserializationFeature.USE_BIG_DECIMAL_FOR_FLOATS)) {
++                buf = buf.forceUseOfBigDecimal(true);
++            }
++            try {
++                // no need to check for closing of TokenBuffer
++                context.serializeValue(buf, fromValue);
++            } catch (IOException e) { // should not occur, no real i/o...
++                throw new IllegalArgumentException(e.getMessage(), e);
++            }
+         }
+-        try {
+-            // no need to check for closing of TokenBuffer
+-            context.serializeValue(buf, fromValue);
+ 
+-            // then matching read, inlined 'readValue' with minor mods:
++        // then matching read, inlined 'readValue' with minor mods:
++        try {
+             final JsonParser p = buf.asParser();
+             Object result;
+             // ok to pass in existing feature flags; unwrapping handled by mapper

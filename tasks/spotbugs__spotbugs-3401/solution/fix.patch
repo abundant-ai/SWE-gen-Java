@@ -1,0 +1,179 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 11963d8df..0108bd17b 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -12,6 +12,7 @@ Currently the versioning policy of this project follows [Semantic Versioning v2.
+ - Do not report `US_USELESS_SUPPRESSION_ON_METHOD` on generated methods ([#3350](https://github.com/spotbugs/spotbugs/issues/3350))
+ - Rewrite some member in `ResourceValueFrame.java` to Enum ([#2061](https://github.com/spotbugs/spotbugs/issues/2061))
+ - Ignore non-interpreted text when looking for `FS_BAD_DATE_FORMAT_FLAG_COMBO` ([#3387](https://github.com/spotbugs/spotbugs/issues/3387))
++- Fix IllegalArgumentException thrown from `FindNoSideEffectMethods` detector ([#3320](https://github.com/spotbugs/spotbugs/issues/3320))
+ 
+ ## 4.9.3 - 2025-03-14
+ ### Added
+diff --git a/spotbugs/src/main/java/edu/umd/cs/findbugs/ba/JavaClassAndMethod.java b/spotbugs/src/main/java/edu/umd/cs/findbugs/ba/JavaClassAndMethod.java
+index f31bde73b..721ef4a35 100644
+--- a/spotbugs/src/main/java/edu/umd/cs/findbugs/ba/JavaClassAndMethod.java
++++ b/spotbugs/src/main/java/edu/umd/cs/findbugs/ba/JavaClassAndMethod.java
+@@ -63,7 +63,8 @@ public class JavaClassAndMethod {
+ 
+         this.javaClass = Repository.lookupClass(method.getClassName());
+         for (Method m : javaClass.getMethods()) {
+-            if (m.getName().equals(method.getName()) && m.getSignature().equals(method.getSignature())
++            if (m.getName().equals(method.getName())
++                    && (m.getSignature().equals(method.getSignature()) || method.hasPolymorphicSignature())
+                     && m.isStatic() == method.isStatic()) {
+                 this.method = m;
+                 return;
+diff --git a/spotbugs/src/main/java/edu/umd/cs/findbugs/classfile/analysis/ClassInfo.java b/spotbugs/src/main/java/edu/umd/cs/findbugs/classfile/analysis/ClassInfo.java
+index 3b8581917..5c803c95f 100644
+--- a/spotbugs/src/main/java/edu/umd/cs/findbugs/classfile/analysis/ClassInfo.java
++++ b/spotbugs/src/main/java/edu/umd/cs/findbugs/classfile/analysis/ClassInfo.java
+@@ -20,6 +20,7 @@
+ package edu.umd.cs.findbugs.classfile.analysis;
+ 
+ import java.lang.annotation.ElementType;
++import java.lang.invoke.MethodHandle;
+ import java.util.Arrays;
+ import java.util.Collection;
+ import java.util.HashMap;
+@@ -82,6 +83,13 @@ public class ClassInfo extends ClassNameAndSuperclassInfo implements XClass {
+ 
+     private boolean containingScopeCached;
+ 
++    /**
++     * The class' polymorphic methods, indexed by name and signature.
++     * See {@link MethodHandle} which is a special case where a method has multiple signatures.
++     * The methods are assumed to be non-static.
++     */
++    private final Map<String, Map<String, MethodInfo>> polymorphicMethods;
++
+     public static class Builder extends ClassNameAndSuperclassInfo.Builder {
+         private List<FieldInfo> fieldInfoList = new LinkedList<>();
+ 
+@@ -172,7 +180,7 @@ public class ClassInfo extends ClassNameAndSuperclassInfo implements XClass {
+             return new ClassInfo(classDescriptor, classSourceSignature, superclassDescriptor, interfaceDescriptorList,
+                     codeBaseEntry, accessFlags, source, majorVersion, minorVersion, referencedClassDescriptorList,
+                     calledClassDescriptors, classAnnotations, fields, methods, immediateEnclosingClass, usesConcurrency,
+-                    hasStubs);
++                    hasStubs, new HashMap<>());
+         }
+ 
+         public void setSource(String source) {
+@@ -278,7 +286,7 @@ public class ClassInfo extends ClassNameAndSuperclassInfo implements XClass {
+             int majorVersion, int minorVersion, Collection<ClassDescriptor> referencedClassDescriptorList,
+             Set<ClassDescriptor> calledClassDescriptors, Map<ClassDescriptor, AnnotationValue> classAnnotations,
+             FieldInfo[] fieldDescriptorList, MethodInfo[] methodInfoList, ClassDescriptor immediateEnclosingClass,
+-            boolean usesConcurrency, boolean hasStubs) {
++            boolean usesConcurrency, boolean hasStubs, Map<String, Map<String, MethodInfo>> polymorphicMethods) {
+         super(classDescriptor, superclassDescriptor, interfaceDescriptorList, codeBaseEntry, accessFlags,
+                 referencedClassDescriptorList, calledClassDescriptors, majorVersion, minorVersion);
+         this.source = source;
+@@ -293,15 +301,7 @@ public class ClassInfo extends ClassNameAndSuperclassInfo implements XClass {
+         this.usesConcurrency = usesConcurrency;
+         this.hasStubs = hasStubs;
+         this.methodsInCallOrder = computeMethodsInCallOrder();
+-        /*
+-        if (false) {
+-            System.out.println("Methods in call order for " + classDescriptor);
+-            for (MethodInfo m : methodsInCallOrder) {
+-                System.out.println("  " + m);
+-            }
+-            System.out.println();
+-        }
+-         */
++        this.polymorphicMethods = polymorphicMethods;
+     }
+ 
+     @Override
+@@ -322,10 +322,13 @@ public class ClassInfo extends ClassNameAndSuperclassInfo implements XClass {
+     public XMethod findMethod(String methodName, String methodSig, boolean isStatic) {
+         int hash = FieldOrMethodDescriptor.getNameSigHashCode(methodName, methodSig);
+         for (MethodInfo mInfo : xMethods) {
+-            if (mInfo.getName().equals(methodName)
+-                    && mInfo.isStatic() == isStatic
+-                    && ((mInfo.getNameSigHashCode() == hash && mInfo.getSignature().equals(methodSig)) || mInfo.hasPolymorphicSignature())) {
+-                return mInfo;
++            if (mInfo.getName().equals(methodName) && mInfo.isStatic() == isStatic) {
++                if (mInfo.getNameSigHashCode() == hash && mInfo.getSignature().equals(methodSig)) {
++                    return mInfo;
++                } else if (mInfo.hasPolymorphicSignature()) {
++                    Map<String, MethodInfo> methods = polymorphicMethods.computeIfAbsent(methodName, n -> new HashMap<>());
++                    return methods.computeIfAbsent(methodSig, s -> mInfo.withSignature(s));
++                }
+             }
+         }
+         return null;
+diff --git a/spotbugs/src/main/java/edu/umd/cs/findbugs/classfile/analysis/MethodInfo.java b/spotbugs/src/main/java/edu/umd/cs/findbugs/classfile/analysis/MethodInfo.java
+index 02aa61ac1..35317f435 100644
+--- a/spotbugs/src/main/java/edu/umd/cs/findbugs/classfile/analysis/MethodInfo.java
++++ b/spotbugs/src/main/java/edu/umd/cs/findbugs/classfile/analysis/MethodInfo.java
+@@ -713,4 +713,30 @@ public class MethodInfo extends MethodDescriptor implements XMethod {
+     public boolean hasPolymorphicSignature() {
+         return hasPolymorphicSignature;
+     }
++
++    /**
++     * @param otherMethodSignature A method signature, for instance ()Ljava/lang/Object;
++     * @return a new {@link MethodInfo} with the given signature
++     */
++    public MethodInfo withSignature(String otherMethodSignature) {
++        return new MethodInfo(getSlashedClassName(),
++                getName(),
++                otherMethodSignature,
++                otherMethodSignature,
++                accessFlags,
++                getUnconditionalthrowers().containsKey(this),
++                getUnconditionalthrowers().containsKey(this),
++                usesConcurrency,
++                hasBackBranch,
++                isStub,
++                getIdentitymethods().containsKey(this),
++                getInvokeDynamicMethods().containsKey(this),
++                methodCallCount,
++                exceptions,
++                getAccessmethodformethod().get(this),
++                getAccessmethodforfield().get(this),
++                methodAnnotations,
++                methodParameterAnnotations,
++                variableIsSynthetic);
++    }
+ }
+diff --git a/spotbugsTestCases/src/java/ghIssues/Issue3320.java b/spotbugsTestCases/src/java/ghIssues/Issue3320.java
+new file mode 100644
+index 000000000..d3493bb21
+--- /dev/null
++++ b/spotbugsTestCases/src/java/ghIssues/Issue3320.java
+@@ -0,0 +1,33 @@
++package ghIssues;
++
++import java.lang.invoke.MethodHandles;
++import java.lang.invoke.MethodHandle;
++import java.lang.invoke.MethodType;
++
++// reproducer from https://github.com/ben-manes/caffeine/blob/master/caffeine/src/jmh/java/com/github/benmanes/caffeine/FactoryBenchmark.java
++public class Issue3320 {
++    static final class MethodHandleFactory {
++
++        private final MethodHandle methodHandle;
++
++        MethodHandleFactory() {
++            try {
++                methodHandle = MethodHandles.lookup().findConstructor(Alpha.class, MethodType.methodType(void.class));
++            } catch (Throwable e) {
++                throw new IllegalStateException(e);
++            }
++        }
++
++        Alpha invoke() {
++            try {
++                return (Alpha) methodHandle.invoke();
++            } catch (Throwable e) {
++                throw new IllegalStateException(e);
++            }
++        }
++    }
++
++    static final class Alpha {
++        public Alpha() {}
++    }
++}

@@ -1,0 +1,343 @@
+diff --git a/core/src/main/scala-2.x/src/main/scala/cats/arrow/FunctionKMacros.scala b/core/src/main/scala-2.x/src/main/scala/cats/arrow/FunctionKMacros.scala
+index 6a9bbc7d4..6e79d704e 100644
+--- a/core/src/main/scala-2.x/src/main/scala/cats/arrow/FunctionKMacros.scala
++++ b/core/src/main/scala-2.x/src/main/scala/cats/arrow/FunctionKMacros.scala
+@@ -2,10 +2,9 @@ package cats
+ package arrow
+ 
+ import scala.language.experimental.macros
+-import scala.reflect.macros.blackbox
++import scala.reflect.macros.blackbox.Context
+ 
+ private[arrow] class FunctionKMacroMethods {
+-  protected type τ[F[_], G[_]]
+ 
+   /**
+    * Lifts function `f` of `F[A] => G[A]` into a `FunctionK[F, G]`.
+@@ -28,61 +27,76 @@ private[arrow] class FunctionKMacroMethods {
+    */
+   def lift[F[_], G[_]](f: (F[α] => G[α]) forSome { type α }): FunctionK[F, G] =
+     macro FunctionKMacros.lift[F, G]
+-
+-  /**
+-   * Lifts function `f` of `F[A] => G[A]` into a `FunctionK[F, G]`.
+-   *
+-   * {{{
+-   *   def headOption[A](list: List[A]): Option[A] = list.headOption
+-   *   val lifted = FunctionK.liftFunction[List, Option](headOption)
+-   * }}}
+-   *
+-   * Note: The weird `τ[F, G]` parameter is there to compensate for
+-   * the lack of polymorphic function types in Scala 2.
+-   */
+-  def liftFunction[F[_], G[_]](f: F[τ[F, G]] => G[τ[F, G]]): FunctionK[F, G] =
+-    new FunctionK[F, G] {
+-      def apply[A](fa: F[A]): G[A] = f.asInstanceOf[F[A] => G[A]](fa)
+-    }
+ }
+ 
+ private[arrow] object FunctionKMacros {
+ 
+-  def lift[F[_], G[_]](c: blackbox.Context)(
++  def lift[F[_], G[_]](c: Context)(
+     f: c.Expr[(F[α] => G[α]) forSome { type α }]
+-  )(implicit evF: c.WeakTypeTag[F[Any]], evG: c.WeakTypeTag[G[Any]]): c.Expr[FunctionK[F, G]] =
++  )(implicit
++    evF: c.WeakTypeTag[F[_]],
++    evG: c.WeakTypeTag[G[_]]
++  ): c.Expr[FunctionK[F, G]] =
+     c.Expr[FunctionK[F, G]](new Lifter[c.type](c).lift[F, G](f.tree))
++  // ^^note: extra space after c.type to appease scalastyle
+ 
+-  private class Lifter[C <: blackbox.Context](val c: C) {
++  private[this] class Lifter[C <: Context](val c: C) {
+     import c.universe._
+ 
+-    def lift[F[_], G[_]](tree: Tree)(implicit evF: c.WeakTypeTag[F[Any]], evG: c.WeakTypeTag[G[Any]]): Tree = {
+-      def liftFunction(function: Tree): Tree =
+-        function match {
+-          case q"($param) => $trans[..$typeArgs]($arg)" if param.symbol == arg.symbol =>
+-            for (typeArg @ TypeTree() <- typeArgs) if (typeArg.original != null) {
+-              c.abort(
+-                typeArg.pos,
+-                s"type parameter $typeArg must not be supplied when lifting function $trans to FunctionK"
++    def lift[F[_], G[_]](tree: Tree)(implicit
++      evF: c.WeakTypeTag[F[_]],
++      evG: c.WeakTypeTag[G[_]]
++    ): Tree =
++      unblock(tree) match {
++        case q"($param) => $trans[..$typeArgs](${arg: Ident})" if param.name == arg.name =>
++          typeArgs
++            .collect { case tt: TypeTree => tt }
++            .find(tt => Option(tt.original).isDefined)
++            .foreach { param =>
++              c.abort(param.pos,
++                      s"type parameter $param must not be supplied when lifting function $trans to FunctionK"
+               )
+             }
+ 
+-            val F = typeConstructorOf[F[Any]]
+-            val G = typeConstructorOf[G[Any]]
+-            q"${reify(FunctionK)}.liftFunction[$F, $G]($trans(_))"
++          val F = punchHole(evF.tpe)
++          val G = punchHole(evG.tpe)
+ 
+-          case other =>
+-            c.abort(other.pos, s"Unexpected tree $other when lifting to FunctionK")
++          q"""
++        new _root_.cats.arrow.FunctionK[$F, $G] {
++          def apply[A](fa: $F[A]): $G[A] = $trans(fa)
+         }
++       """
++        case other =>
++          c.abort(other.pos, s"Unexpected tree $other when lifting to FunctionK")
++      }
+ 
++    private[this] def unblock(tree: Tree): Tree =
+       tree match {
+-        case Block(Nil, expr)   => liftFunction(expr)
+-        case Block(stats, expr) => Block(stats, liftFunction(expr))
+-        case other              => liftFunction(other)
++        case Block(Nil, expr) => expr
++        case _                => tree
++      }
++
++    private[this] def punchHole(tpe: Type): Tree =
++      tpe match {
++        case PolyType(undet :: Nil, underlying: TypeRef) =>
++          val α = TypeName("α")
++          def rebind(typeRef: TypeRef): Tree =
++            if (typeRef.sym == undet) tq"$α"
++            else {
++              val args = typeRef.args.map {
++                case ref: TypeRef => rebind(ref)
++                case arg          => tq"$arg"
++              }
++              tq"${typeRef.sym}[..$args]"
++            }
++          val rebound = rebind(underlying)
++          tq"""({type λ[$α] = $rebound})#λ"""
++        case TypeRef(pre, sym, Nil) =>
++          tq"$sym"
++        case _ =>
++          c.abort(c.enclosingPosition, s"Unexpected type $tpe when lifting to FunctionK")
+       }
+-    }
+ 
+-    private def typeConstructorOf[A: WeakTypeTag]: Type =
+-      weakTypeOf[A].typeConstructor.etaExpand
+   }
++
+ }
+diff --git a/core/src/main/scala/cats/arrow/FunctionK.scala b/core/src/main/scala/cats/arrow/FunctionK.scala
+index 4f513f0ac..4ede968fa 100644
+--- a/core/src/main/scala/cats/arrow/FunctionK.scala
++++ b/core/src/main/scala/cats/arrow/FunctionK.scala
+@@ -77,4 +77,5 @@ object FunctionK extends FunctionKMacroMethods {
+    * The identity transformation of `F` to `F`
+    */
+   def id[F[_]]: FunctionK[F, F] = new FunctionK[F, F] { def apply[A](fa: F[A]): F[A] = fa }
++
+ }
+diff --git a/tests/src/test/scala-2.x/cats/tests/FunctionKSuite.scala b/tests/src/test/scala-2.x/cats/tests/FunctionKSuite.scala
+deleted file mode 100644
+index 3fc74b655..000000000
+--- a/tests/src/test/scala-2.x/cats/tests/FunctionKSuite.scala
++++ /dev/null
+@@ -1,123 +0,0 @@
+-package cats.tests
+-
+-import cats.arrow.FunctionK
+-import cats.data.{EitherK, NonEmptyList}
+-import cats.laws.discipline.arbitrary._
+-import cats.syntax.eq._
+-import cats.{Applicative, Id}
+-import org.scalacheck.Prop._
+-
+-class FunctionKSuite extends CatsSuite {
+-  type OptionOfNel[+A] = Option[NonEmptyList[A]]
+-
+-  val listToOption = new FunctionK[List, Option] { def apply[A](a: List[A]): Option[A] = a.headOption }
+-  val listToVector = new FunctionK[List, Vector] { def apply[A](a: List[A]): Vector[A] = a.toVector }
+-  val optionToList = new FunctionK[Option, List] { def apply[A](a: Option[A]): List[A] = a.toList }
+-
+-  sealed trait Test1Algebra[A] {
+-    def v: A
+-  }
+-
+-  case class Test1[A](v: A) extends Test1Algebra[A]
+-
+-  sealed trait Test2Algebra[A] {
+-    def v: A
+-  }
+-
+-  case class Test2[A](v: A) extends Test2Algebra[A]
+-
+-  val Test1FK = new FunctionK[Test1Algebra, Id] { def apply[A](a: Test1Algebra[A]): A = a.v }
+-  val Test2FK = new FunctionK[Test2Algebra, Id] { def apply[A](a: Test2Algebra[A]): A = a.v }
+-
+-  test("compose") {
+-    forAll { (list: List[Int]) =>
+-      val listToList = optionToList.compose(listToOption)
+-      assert(listToList(list) === list.take(1))
+-    }
+-  }
+-
+-  test("andThen") {
+-    forAll { (list: List[Int]) =>
+-      val listToList = listToOption.andThen(optionToList)
+-      assert(listToList(list) === list.take(1))
+-    }
+-  }
+-
+-  test("id is identity") {
+-    forAll { (list: List[Int]) =>
+-      assert(FunctionK.id[List].apply(list) === list)
+-    }
+-  }
+-
+-  test("or") {
+-    val combinedInterpreter = Test1FK.or(Test2FK)
+-    forAll { (a: Int, b: Int) =>
+-      assert(combinedInterpreter(EitherK.left(Test1(a))) === a)
+-      assert(combinedInterpreter(EitherK.right(Test2(b))) === b)
+-    }
+-  }
+-
+-  test("and") {
+-    val combinedInterpreter = listToOption.and(listToVector)
+-    forAll { (list: List[Int]) =>
+-      val prod = combinedInterpreter(list)
+-      assert(prod.first === list.headOption)
+-      assert(prod.second === list.toVector)
+-    }
+-  }
+-
+-  test("lift simple unary") {
+-    def optionToList[A](option: Option[A]): List[A] = option.toList
+-    val fOptionToList = FunctionK.lift(optionToList _)
+-    forAll { (a: Option[Int]) =>
+-      assert(fOptionToList(a) === optionToList(a))
+-    }
+-
+-    val fO2I: FunctionK[Option, Iterable] = FunctionK.lift(Option.option2Iterable _)
+-    forAll { (a: Option[String]) =>
+-      assert(fO2I(a).toList === Option.option2Iterable(a).toList)
+-    }
+-
+-    val fNelFromListUnsafe = FunctionK.lift(NonEmptyList.fromListUnsafe _)
+-    forAll { (a: NonEmptyList[Int]) =>
+-      assert(fNelFromListUnsafe(a.toList) === NonEmptyList.fromListUnsafe(a.toList))
+-    }
+-  }
+-
+-  test("hygiene") {
+-    trait FunctionK
+-    def optionToList[A](option: Option[A]): List[A] = option.toList
+-    val fOptionToList = cats.arrow.FunctionK.lift(optionToList _)
+-    forAll { (a: Option[Int]) =>
+-      assert(fOptionToList(a) === optionToList(a))
+-    }
+-  }
+-
+-  test("lift compound unary") {
+-    val fNelFromList = FunctionK.lift[List, OptionOfNel](NonEmptyList.fromList)
+-    forAll { (a: List[String]) =>
+-      assert(fNelFromList(a) === NonEmptyList.fromList(a))
+-    }
+-  }
+-
+-  test("lift eta-expanded function") {
+-    val fSomeNel = FunctionK.lift[NonEmptyList, OptionOfNel](Applicative[Option].pure)
+-    forAll { (a: NonEmptyList[Int]) =>
+-      assert(fSomeNel(a) === Some(a))
+-    }
+-  }
+-
+-  test("lift a function directly") {
+-    def headOption[A](list: List[A]): Option[A] = list.headOption
+-    val fHeadOption = FunctionK.liftFunction[List, Option](headOption)
+-    forAll { (a: List[Int]) =>
+-      assert(fHeadOption(a) === a.headOption)
+-    }
+-  }
+-
+-  { // lifting concrete types should fail to compile
+-    def sample[A](option: Option[A]): List[A] = option.toList
+-    assert(compileErrors("FunctionK.lift(sample[String])").nonEmpty)
+-    assert(compileErrors("FunctionK.lift(sample[Nothing])").nonEmpty)
+-  }
+-}
+diff --git a/tests/src/test/scala/cats/tests/FunctionKSuite.scala b/tests/src/test/scala/cats/tests/FunctionKSuite.scala
+new file mode 100644
+index 000000000..b42a32603
+--- /dev/null
++++ b/tests/src/test/scala/cats/tests/FunctionKSuite.scala
+@@ -0,0 +1,67 @@
++package cats.tests
++
++import cats.Id
++import cats.arrow.FunctionK
++import cats.data.EitherK
++import cats.syntax.eq._
++import org.scalacheck.Prop._
++
++class FunctionKSuite extends CatsSuite {
++
++  val listToOption = new FunctionK[List, Option] { def apply[A](a: List[A]): Option[A] = a.headOption }
++  val listToVector = new FunctionK[List, Vector] { def apply[A](a: List[A]): Vector[A] = a.toVector }
++  val optionToList = new FunctionK[Option, List] { def apply[A](a: Option[A]): List[A] = a.toList }
++
++  sealed trait Test1Algebra[A] {
++    def v: A
++  }
++
++  case class Test1[A](v: A) extends Test1Algebra[A]
++
++  sealed trait Test2Algebra[A] {
++    def v: A
++  }
++
++  case class Test2[A](v: A) extends Test2Algebra[A]
++
++  val Test1FK = new FunctionK[Test1Algebra, Id] { def apply[A](a: Test1Algebra[A]): A = a.v }
++  val Test2FK = new FunctionK[Test2Algebra, Id] { def apply[A](a: Test2Algebra[A]): A = a.v }
++
++  test("compose") {
++    forAll { (list: List[Int]) =>
++      val listToList = optionToList.compose(listToOption)
++      assert(listToList(list) === (list.take(1)))
++    }
++  }
++
++  test("andThen") {
++    forAll { (list: List[Int]) =>
++      val listToList = listToOption.andThen(optionToList)
++      assert(listToList(list) === (list.take(1)))
++    }
++  }
++
++  test("id is identity") {
++    forAll { (list: List[Int]) =>
++      assert(FunctionK.id[List].apply(list) === list)
++    }
++  }
++
++  test("or") {
++    val combinedInterpreter = Test1FK.or(Test2FK)
++    forAll { (a: Int, b: Int) =>
++      assert(combinedInterpreter(EitherK.left(Test1(a))) === a)
++      assert(combinedInterpreter(EitherK.right(Test2(b))) === b)
++    }
++  }
++
++  test("and") {
++    val combinedInterpreter = listToOption.and(listToVector)
++    forAll { (list: List[Int]) =>
++      val prod = combinedInterpreter(list)
++      assert(prod.first === (list.headOption))
++      assert(prod.second === (list.toVector))
++    }
++  }
++
++}

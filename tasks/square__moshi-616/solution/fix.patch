@@ -1,0 +1,126 @@
+diff --git a/moshi/src/main/java/com/squareup/moshi/ClassJsonAdapter.java b/moshi/src/main/java/com/squareup/moshi/ClassJsonAdapter.java
+index aee6d55b..71d45349 100644
+--- a/moshi/src/main/java/com/squareup/moshi/ClassJsonAdapter.java
++++ b/moshi/src/main/java/com/squareup/moshi/ClassJsonAdapter.java
+@@ -95,14 +95,15 @@ final class ClassJsonAdapter<T> extends JsonAdapter<T> {
+         // Look up a type adapter for this type.
+         Type fieldType = resolve(type, rawType, field.getGenericType());
+         Set<? extends Annotation> annotations = Util.jsonAnnotations(field);
+-        JsonAdapter<Object> adapter = moshi.adapter(fieldType, annotations);
++        String fieldName = field.getName();
++        JsonAdapter<Object> adapter = moshi.adapter(fieldType, annotations, fieldName);
+ 
+         // Create the binding between field and JSON.
+         field.setAccessible(true);
+ 
+         // Store it using the field's name. If there was already a field with this name, fail!
+         Json jsonAnnotation = field.getAnnotation(Json.class);
+-        String name = jsonAnnotation != null ? jsonAnnotation.name() : field.getName();
++        String name = jsonAnnotation != null ? jsonAnnotation.name() : fieldName;
+         FieldBinding<Object> fieldBinding = new FieldBinding<>(name, field, adapter);
+         FieldBinding<?> replaced = fieldBindings.put(name, fieldBinding);
+         if (replaced != null) {
+diff --git a/moshi/src/main/java/com/squareup/moshi/Moshi.java b/moshi/src/main/java/com/squareup/moshi/Moshi.java
+index 8d39c474..26db3162 100644
+--- a/moshi/src/main/java/com/squareup/moshi/Moshi.java
++++ b/moshi/src/main/java/com/squareup/moshi/Moshi.java
+@@ -90,8 +90,18 @@ public final class Moshi {
+   }
+ 
+   @CheckReturnValue
+-  @SuppressWarnings("unchecked") // Factories are required to return only matching JsonAdapters.
+   public <T> JsonAdapter<T> adapter(Type type, Set<? extends Annotation> annotations) {
++    return adapter(type, annotations, null);
++  }
++
++  /**
++   * @param fieldName An optional field name associated with this type. The field name is used as a
++   * hint for better adapter lookup error messages for nested structures.
++   */
++  @CheckReturnValue
++  @SuppressWarnings("unchecked") // Factories are required to return only matching JsonAdapters.
++  public <T> JsonAdapter<T> adapter(Type type, Set<? extends Annotation> annotations,
++      @Nullable String fieldName) {
+     if (type == null) {
+       throw new NullPointerException("type == null");
+     }
+@@ -123,8 +133,10 @@ public final class Moshi {
+     }
+ 
+     // Prepare for re-entrant calls, then ask each factory to create a type adapter.
+-    DeferredAdapter<T> deferredAdapter = new DeferredAdapter<>(cacheKey);
++    DeferredAdapter<T> deferredAdapter = new DeferredAdapter<>(type, fieldName, cacheKey);
++
+     deferredAdapters.add(deferredAdapter);
++    int lastIndex = deferredAdapters.size() - 1;
+     try {
+       for (int i = 0, size = factories.size(); i < size; i++) {
+         JsonAdapter<T> result = (JsonAdapter<T>) factories.get(i).create(type, annotations, this);
+@@ -133,12 +145,19 @@ public final class Moshi {
+           synchronized (adapterCache) {
+             adapterCache.put(cacheKey, result);
+           }
++          // Remove the type or field name only when we succeed in creating the adapter,
++          // so we have the full stack  at the top level.
++          deferredAdapters.remove(lastIndex);
+           return result;
+         }
+       }
++    } catch (IllegalArgumentException e) {
++      if (lastIndex == 0) { // Rewrite the exception at the top level.
++        e = errorWithFields(deferredAdapters, e);
++      }
++      throw e;
+     } finally {
+-      deferredAdapters.remove(deferredAdapters.size() - 1);
+-      if (deferredAdapters.isEmpty()) {
++      if (lastIndex == 0) {
+         reentrantCalls.remove();
+       }
+     }
+@@ -181,6 +200,27 @@ public final class Moshi {
+     return Arrays.asList(type, annotations);
+   }
+ 
++  static IllegalArgumentException errorWithFields(List<DeferredAdapter<?>> typesAndFieldNames,
++      IllegalArgumentException e) {
++    int size = typesAndFieldNames.size();
++    if (size == 1 && typesAndFieldNames.get(0).fieldName == null) {
++      return e;
++    }
++    StringBuilder errorMessageBuilder = new StringBuilder(e.getMessage());
++    for (int i = size - 1; i >= 0; i--) {
++      DeferredAdapter<?> deferredAdapter = typesAndFieldNames.get(i);
++      errorMessageBuilder
++          .append("\nfor ")
++          .append(deferredAdapter.type);
++      if (deferredAdapter.fieldName != null) {
++        errorMessageBuilder
++            .append(' ')
++            .append(deferredAdapter.fieldName);
++      }
++    }
++    return new IllegalArgumentException(errorMessageBuilder.toString(), e);
++  }
++
+   public static final class Builder {
+     final List<JsonAdapter.Factory> factories = new ArrayList<>();
+ 
+@@ -250,11 +290,15 @@ public final class Moshi {
+    * <p>Typically this is necessary in self-referential object models, such as an {@code Employee}
+    * class that has a {@code List<Employee>} field for an organization's management hierarchy.
+    */
+-  private static class DeferredAdapter<T> extends JsonAdapter<T> {
++  private static final class DeferredAdapter<T> extends JsonAdapter<T> {
++    final Type type;
++    final @Nullable String fieldName;
+     @Nullable Object cacheKey;
+     private @Nullable JsonAdapter<T> delegate;
+ 
+-    DeferredAdapter(Object cacheKey) {
++    DeferredAdapter(Type type, @Nullable String fieldName, Object cacheKey) {
++      this.type = type;
++      this.fieldName = fieldName;
+       this.cacheKey = cacheKey;
+     }
+ 

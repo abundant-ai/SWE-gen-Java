@@ -1,0 +1,683 @@
+diff --git a/platforms/core-configuration/configuration-cache/src/integTest/groovy/org/gradle/internal/cc/impl/ConfigurationCacheGracefulDegradationIntegrationTest.groovy b/platforms/core-configuration/configuration-cache/src/integTest/groovy/org/gradle/internal/cc/impl/ConfigurationCacheGracefulDegradationIntegrationTest.groovy
+index 5a6e271046d..e16142537fd 100644
+--- a/platforms/core-configuration/configuration-cache/src/integTest/groovy/org/gradle/internal/cc/impl/ConfigurationCacheGracefulDegradationIntegrationTest.groovy
++++ b/platforms/core-configuration/configuration-cache/src/integTest/groovy/org/gradle/internal/cc/impl/ConfigurationCacheGracefulDegradationIntegrationTest.groovy
+@@ -43,7 +43,7 @@ class ConfigurationCacheGracefulDegradationIntegrationTest extends AbstractConfi
+ 
+     def configurationCache = newConfigurationCacheFixture()
+ 
+-    def "a task can require CC degradation#mode"() {
++    def "a task can require CC degradation"() {
+         buildFile """
+             ${taskWithInjectedDegradationController()}
+             tasks.register("a", DegradingTask) { task ->
+@@ -55,7 +55,7 @@ class ConfigurationCacheGracefulDegradationIntegrationTest extends AbstractConfi
+         """
+ 
+         when:
+-        configurationCacheRun("a", *args)
++        configurationCacheRun "a"
+ 
+         then:
+         configurationCache.assertNoConfigurationCache()
+@@ -71,11 +71,6 @@ class ConfigurationCacheGracefulDegradationIntegrationTest extends AbstractConfi
+         and:
+         outputContains("Project path is :")
+         assertConfigurationCacheDegradation()
+-
+-        where:
+-        mode               | args
+-        ""                 | []
+-        " with IP enabled" | ["-Dorg.gradle.unsafe.isolated-projects=true"]
+     }
+ 
+     def "a task can require CC degradation for multiple reasons"() {
+diff --git a/platforms/core-configuration/configuration-cache/src/integTest/groovy/org/gradle/internal/cc/impl/isolated/IsolatedProjectsToolingApiGracefulDegradationIntegrationTest.groovy b/platforms/core-configuration/configuration-cache/src/integTest/groovy/org/gradle/internal/cc/impl/isolated/IsolatedProjectsToolingApiGracefulDegradationIntegrationTest.groovy
+deleted file mode 100644
+index 8661a1a270e..00000000000
+--- a/platforms/core-configuration/configuration-cache/src/integTest/groovy/org/gradle/internal/cc/impl/isolated/IsolatedProjectsToolingApiGracefulDegradationIntegrationTest.groovy
++++ /dev/null
+@@ -1,50 +0,0 @@
+-/*
+- * Copyright 2025 the original author or authors.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-package org.gradle.internal.cc.impl.isolated
+-
+-import org.gradle.api.internal.ConfigurationCacheDegradationController
+-import org.gradle.tooling.model.gradle.GradleBuild
+-
+-import javax.inject.Inject
+-
+-class IsolatedProjectsToolingApiGracefulDegradationIntegrationTest extends AbstractIsolatedProjectsToolingApiIntegrationTest {
+-
+-    def "CC graceful degradation requests aren't honored if models were requested"() {
+-        given:
+-        settingsFile << ""
+-        buildFile """
+-            abstract class DegradingTask extends DefaultTask {
+-                @${Inject.name}
+-                abstract ${ConfigurationCacheDegradationController.name} getDegradationController()
+-            }
+-            tasks.register("foo", DegradingTask) { task ->
+-               getDegradationController().requireConfigurationCacheDegradation(task, provider { "Because reasons" })
+-            }
+-        """
+-
+-        when:
+-        withIsolatedProjects()
+-        fetchModel(GradleBuild, "foo")
+-
+-        then:
+-        fixture.assertModelStored {
+-            runsTasks = true
+-            projectConfigured(":")
+-            buildModelCreated()
+-        }
+-    }
+-}
+diff --git a/platforms/core-configuration/configuration-cache/src/main/kotlin/org/gradle/internal/cc/impl/DefaultConfigurationCacheDegradationController.kt b/platforms/core-configuration/configuration-cache/src/main/kotlin/org/gradle/internal/cc/impl/DefaultConfigurationCacheDegradationController.kt
+index 55297b833b1..ac853980dac 100644
+--- a/platforms/core-configuration/configuration-cache/src/main/kotlin/org/gradle/internal/cc/impl/DefaultConfigurationCacheDegradationController.kt
++++ b/platforms/core-configuration/configuration-cache/src/main/kotlin/org/gradle/internal/cc/impl/DefaultConfigurationCacheDegradationController.kt
+@@ -22,7 +22,6 @@ import org.gradle.api.internal.ConfigurationCacheDegradationController
+ import org.gradle.api.internal.provider.ConfigurationTimeBarrier
+ import org.gradle.api.logging.Logging
+ import org.gradle.api.provider.Provider
+-import org.gradle.internal.buildtree.BuildModelParameters
+ import org.gradle.internal.service.scopes.Scope.BuildTree
+ import org.gradle.internal.service.scopes.ServiceScope
+ import org.gradle.vcs.internal.VcsMappingsStore
+@@ -31,14 +30,34 @@ import java.util.concurrent.ConcurrentHashMap
+ @ServiceScope(BuildTree::class)
+ internal class DefaultConfigurationCacheDegradationController(
+     private val configurationTimeBarrier: ConfigurationTimeBarrier,
+-    private val vcsMappingsStore: VcsMappingsStore,
+-    private val buildModelParameters: BuildModelParameters
++    private val vcsMappingsStore: VcsMappingsStore
+ ) : ConfigurationCacheDegradationController {
+ 
+     private val logger = Logging.getLogger(DefaultConfigurationCacheDegradationController::class.java)
+     private val tasksDegradationRequests = ConcurrentHashMap<Task, List<Provider<String>>>()
++    private var taskDegradationReasons = ImmutableMap.of<Task, List<String>>()
++    private var featureDegradationReasons = ImmutableMap.of<String, List<String>>()
+ 
+-    val degradationDecision by lazy { collectDegradationReasons() }
++    val hasDegradationReasons: Boolean
++        get() = taskDegradationReasons.isNotEmpty()
++            || featureDegradationReasons.isNotEmpty()
++
++    val hasTaskDegradationReasons: Boolean
++        get() = taskDegradationReasons.isNotEmpty()
++
++    val degradedTaskCount: Int
++        get() = taskDegradationReasons.size
++
++    fun getDegradationReasonsForTask(task: Task): List<String>? =
++        taskDegradationReasons[task]
++
++    fun visitDegradedTasks(consumer: (Task, List<String>) -> Unit) {
++        taskDegradationReasons.forEach(consumer)
++    }
++
++    fun visitDegradedFeatures(consumer: (String, List<String>) -> Unit) {
++        featureDegradationReasons.forEach(consumer)
++    }
+ 
+     override fun requireConfigurationCacheDegradation(task: Task, reason: Provider<String>) {
+         if (!configurationTimeBarrier.isAtConfigurationTime) {
+@@ -50,14 +69,12 @@ internal class DefaultConfigurationCacheDegradationController(
+         }
+     }
+ 
+-    private fun collectDegradationReasons(): DegradationDecision =
+-        if (buildModelParameters.isRequiresToolingModels) {
+-            DegradationDecision.shouldNotDegrade
+-        } else {
+-            DegradationDecision(collectTaskDegradationReasons(), collectFeatureDegradationReasons())
+-        }
++    fun collectDegradationReasons() {
++        collectFeatureDegradationReasons()
++        collectTaskDegradationReasons()
++    }
+ 
+-    private fun collectTaskDegradationReasons(): Map<Task, List<String>> =
++    private fun collectTaskDegradationReasons() {
+         if (tasksDegradationRequests.isNotEmpty()) {
+             val builder = ImmutableMap.builderWithExpectedSize<Task, List<String>>(tasksDegradationRequests.size)
+             for ((task, reasons) in tasksDegradationRequests) {
+@@ -71,43 +88,22 @@ internal class DefaultConfigurationCacheDegradationController(
+                     }
+                 }
+             }
+-            builder.build()
+-        } else emptyMap()
++            taskDegradationReasons = builder.build()
++        }
++    }
+ 
+-    private fun collectFeatureDegradationReasons(): Map<String, List<String>> =
++    private fun collectFeatureDegradationReasons() {
+         if (isSourceDependenciesUsed()) {
+-            ImmutableMap.of(
++            featureDegradationReasons = ImmutableMap.of(
+                 "source dependencies",
+                 listOf("Source dependencies are not compatible yet")
+             )
+-        } else emptyMap()
++        }
++    }
+ 
+     private fun workGraphContains(task: Task): Boolean =
+         task.project.gradle.taskGraph.hasTask(task)
+ 
+     private fun isSourceDependenciesUsed(): Boolean =
+         vcsMappingsStore.asResolver().hasRules()
+-
+-    internal data class DegradationDecision(
+-        private val taskDegradationReasons: Map<Task, List<String>>,
+-        private val featureDegradationReasons: Map<String, List<String>>
+-    ) {
+-        val shouldDegrade = taskDegradationReasons.isNotEmpty() || featureDegradationReasons.isNotEmpty()
+-
+-        val degradedTaskCount = taskDegradationReasons.size
+-
+-        fun degradationReasonForTask(task: Task): List<String>? = taskDegradationReasons[task]
+-
+-        fun onDegradedTask(consumer: (Task, List<String>) -> Unit) {
+-            taskDegradationReasons.forEach(consumer)
+-        }
+-
+-        fun onDegradedFeature(consumer: (String, List<String>) -> Unit) {
+-            featureDegradationReasons.forEach(consumer)
+-        }
+-
+-        companion object {
+-            val shouldNotDegrade = DegradationDecision(emptyMap(), emptyMap())
+-        }
+-    }
+ }
+diff --git a/platforms/core-configuration/configuration-cache/src/main/kotlin/org/gradle/internal/cc/impl/problems/ConfigurationCacheProblems.kt b/platforms/core-configuration/configuration-cache/src/main/kotlin/org/gradle/internal/cc/impl/problems/ConfigurationCacheProblems.kt
+index 974635e5fb8..7c2c9ae895a 100644
+--- a/platforms/core-configuration/configuration-cache/src/main/kotlin/org/gradle/internal/cc/impl/problems/ConfigurationCacheProblems.kt
++++ b/platforms/core-configuration/configuration-cache/src/main/kotlin/org/gradle/internal/cc/impl/problems/ConfigurationCacheProblems.kt
+@@ -184,14 +184,17 @@ class ConfigurationCacheProblems(
+     }
+ 
+     override fun forTask(task: Task): ProblemsListener {
+-        val degradationReasons = getDegradationDecision().degradationReasonForTask(task)
++        val degradationReasons = degradationController.getDegradationReasonsForTask(task)
+         return if (!degradationReasons.isNullOrEmpty()) {
+             onIncompatibleTask(locationForTask(task), degradationReasons.joinToString())
+             ErrorsAreProblemsProblemsListener(ProblemSeverity.SuppressedSilently)
+         } else this
+     }
+ 
+-    fun shouldDegradeGracefully(): Boolean = getDegradationDecision().shouldDegrade
++    fun shouldDegradeGracefully(): Boolean {
++        degradationController.collectDegradationReasons()
++        return degradationController.hasDegradationReasons
++    }
+ 
+     private
+     fun onIncompatibleTask(trace: PropertyTrace, reason: String) {
+@@ -316,18 +319,17 @@ class ConfigurationCacheProblems(
+         val outputDirectory = outputDirectoryFor(reportDir)
+         val details = detailsFor(summary)
+         val htmlReportFile = report.writeReportFileTo(outputDirectory, ProblemReportDetailsJsonSource(details))
+-        val areTaskDegradationReasonsPresent = getDegradationDecision().degradedTaskCount > 0
+         if (htmlReportFile == null) {
+             // there was nothing to report (no problems, no build configuration inputs)
+             require(summary.totalProblemCount == 0)
+-            require(!areTaskDegradationReasonsPresent)
++            require(!areTaskDegradationReasonsPresent())
+             return
+         }
+ 
+         when (val failure = queryFailure(summary, htmlReportFile)) {
+             null -> {
+                 val log: (String) -> Unit = when {
+-                    shouldDegradeGracefully() -> logger::warn
++                    areDegradationReasonsPresent() -> logger::warn
+                     hasNoProblemsForConsole && !startParameter.alwaysLogReportLinkAsWarning -> logger::info
+                     else -> logger::warn
+                 }
+@@ -339,7 +341,7 @@ class ConfigurationCacheProblems(
+     }
+ 
+     private fun addNotReportedDegradingTasks() {
+-        getDegradationDecision().onDegradedTask { task, reasons ->
++        degradationController.visitDegradedTasks { task, reasons ->
+             val trace = locationForTask(task)
+             if (!incompatibleTasks.contains(trace)) {
+                 reportIncompatibleTask(trace, reasons.joinToString())
+@@ -388,7 +390,7 @@ class ConfigurationCacheProblems(
+             when {
+                 seenSerializationErrorOnStore && deferredProblemCount == 0 -> log("Configuration cache entry discarded due to serialization error.")
+                 seenSerializationErrorOnStore -> log("Configuration cache entry discarded with {}.", problemCountString)
+-                cacheAction == Store && shouldDegradeGracefully() -> log("Configuration cache disabled${degradationSummary()}")
++                cacheAction == Store && areDegradationReasonsPresent() -> log("Configuration cache disabled${degradationSummary()}")
+                 cacheAction == Store && discardStateDueToProblems && !hasProblems -> log("Configuration cache entry discarded${incompatibleTasksSummary()}")
+                 cacheAction == Store && discardStateDueToProblems -> log("Configuration cache entry discarded with {}.", problemCountString)
+                 cacheAction == Store && hasTooManyProblems -> log("Configuration cache entry discarded with too many problems ({}).", problemCountString)
+@@ -405,17 +407,21 @@ class ConfigurationCacheProblems(
+         }
+     }
+ 
++    private
++    fun areDegradationReasonsPresent(): Boolean = degradationController.hasDegradationReasons
++
++    private
++    fun areTaskDegradationReasonsPresent(): Boolean = degradationController.hasTaskDegradationReasons
++
+     private
+     fun degradationSummary(): String {
+-        val degradingTaskCount = getDegradationDecision().degradedTaskCount
++        val degradingTaskCount = degradationController.degradedTaskCount
+         val degradingFeatures = buildList {
+-            getDegradationDecision().onDegradedFeature { feature, _ -> add(feature) }
++            degradationController.visitDegradedFeatures { feature, _ -> add(feature) }
+         }
+         return DegradationSummary(degradingFeatures, degradingTaskCount).render()
+     }
+ 
+-    private fun getDegradationDecision() = degradationController.degradationDecision
+-
+     @VisibleForTesting
+     internal
+     class DegradationSummary(private val degradingFeatures: List<String>, private val degradingTaskCount: Int) {
+@@ -429,9 +435,9 @@ class ConfigurationCacheProblems(
+                 when {
+                     degradingTaskCount == 1 && degradingFeatures.isEmpty() -> "task was"
+                     degradingTaskCount > 1 && degradingFeatures.isEmpty() -> "tasks were"
+-                    degradingTaskCount == 0 && degradingFeatures.isNotEmpty() -> "feature usage $featuresAsString was"
+-                    degradingTaskCount == 1 -> "task and feature usage $featuresAsString were"
+-                    else -> "tasks and feature usage $featuresAsString were"
++                    degradingTaskCount == 0 && degradingFeatures.isNotEmpty() -> "feature usage ${featuresAsString} was"
++                    degradingTaskCount == 1 -> "task and feature usage ${featuresAsString} were"
++                    else -> "tasks and feature usage ${featuresAsString} were"
+                 } + " found."
+         }
+     }
+@@ -444,7 +450,7 @@ class ConfigurationCacheProblems(
+ 
+     private
+     fun discardStateDueToProblems(summary: Summary) =
+-        incompatibleTasks.isNotEmpty() || shouldDegradeGracefully() ||
++        incompatibleTasks.isNotEmpty() || areDegradationReasonsPresent() ||
+             summary.reportableProblemCount > 0 && !isWarningMode
+ 
+     private
+diff --git a/platforms/core-configuration/configuration-cache/src/main/kotlin/org/gradle/internal/cc/impl/promo/ConfigurationCachePromoHandler.kt b/platforms/core-configuration/configuration-cache/src/main/kotlin/org/gradle/internal/cc/impl/promo/ConfigurationCachePromoHandler.kt
+index ae3e9831334..9e9cf2e1c1a 100644
+--- a/platforms/core-configuration/configuration-cache/src/main/kotlin/org/gradle/internal/cc/impl/promo/ConfigurationCachePromoHandler.kt
++++ b/platforms/core-configuration/configuration-cache/src/main/kotlin/org/gradle/internal/cc/impl/promo/ConfigurationCachePromoHandler.kt
+@@ -84,8 +84,8 @@ internal class ConfigurationCachePromoHandler(
+         if (!problems.arePresent()) {
+             // Collecting degradation reasons may be somewhat expensive, let's skip it if the build is already incompatible.
+             // We can only collect the reasons before the start of the execution phase. CC does that too.
+-            val hasDegradationReasons = degradationController.degradationDecision.shouldDegrade
+-            problems.addIfNeeded(hasDegradationReasons)
++            degradationController.collectDegradationReasons()
++            problems.addIfNeeded(degradationController.hasDegradationReasons)
+         }
+ 
+         // Checking task graph for compatibility may be even more expensive, so do it only after collecting the degradation reasons.
+diff --git a/platforms/core-configuration/kotlin-dsl-provider-plugins/src/main/kotlin/org/gradle/kotlin/dsl/provider/plugins/precompiled/DefaultPrecompiledScriptPluginsSupport.kt b/platforms/core-configuration/kotlin-dsl-provider-plugins/src/main/kotlin/org/gradle/kotlin/dsl/provider/plugins/precompiled/DefaultPrecompiledScriptPluginsSupport.kt
+index cd3dd3627a4..be19161f041 100644
+--- a/platforms/core-configuration/kotlin-dsl-provider-plugins/src/main/kotlin/org/gradle/kotlin/dsl/provider/plugins/precompiled/DefaultPrecompiledScriptPluginsSupport.kt
++++ b/platforms/core-configuration/kotlin-dsl-provider-plugins/src/main/kotlin/org/gradle/kotlin/dsl/provider/plugins/precompiled/DefaultPrecompiledScriptPluginsSupport.kt
+@@ -216,6 +216,12 @@ fun Project.enableScriptCompilationOf(
+             outputDir = compiledPluginsBlocks
+         )
+ 
++        val accessorsGenerationClasspath = configurations.resolvable("precompiledScriptPluginAccessorsGenerationClasspath") {
++            // We use both compile and runtime classpath to include compileOnly, implementation and runtimeOnly dependencies
++            it.extendsFrom(configurations["compileClasspath"])
++            it.extendsFrom(configurations["runtimeClasspath"])
++        }
++
+         val (generatePrecompiledScriptPluginAccessors, _) =
+             codeGenerationTask<GeneratePrecompiledScriptPluginAccessors>(
+                 "accessors",
+@@ -224,7 +230,7 @@ fun Project.enableScriptCompilationOf(
+             ) {
+                 dependsOn(compilePluginsBlocks)
+                 classPathFiles.from(compileClasspath)
+-                runtimeClassPathArtifactCollection.set(configurations["runtimeClasspath"].incoming.artifacts)
++                accessorsGenerationClassPathArtifactCollection.set(accessorsGenerationClasspath.get().incoming.artifacts)
+                 sourceCodeOutputDir.set(it)
+                 metadataOutputDir.set(accessorsMetadata)
+                 compiledPluginsBlocksDir.set(compiledPluginsBlocks)
+@@ -397,10 +403,11 @@ fun Task.validateKotlinCompilerArguments() {
+ 
+ private
+ fun configureKotlinCompilerArgumentsEagerly() {
+-    throw PrecompiledScriptException("Using the `kotlin-dsl` plugin together with Kotlin Gradle Plugin < 1.8.0. " +
+-        "Please let Gradle control the version of `kotlin-dsl` by removing any explicit `kotlin-dsl` version constraints from your build logic. " +
+-        "Or use version $expectedKotlinDslPluginsVersion which is the expected version for this Gradle release. " +
+-        "If you explicitly declare which version of the Kotlin Gradle Plugin to use for your build logic, update it to >= 1.8.0."
++    throw PrecompiledScriptException(
++        "Using the `kotlin-dsl` plugin together with Kotlin Gradle Plugin < 1.8.0. " +
++            "Please let Gradle control the version of `kotlin-dsl` by removing any explicit `kotlin-dsl` version constraints from your build logic. " +
++            "Or use version $expectedKotlinDslPluginsVersion which is the expected version for this Gradle release. " +
++            "If you explicitly declare which version of the Kotlin Gradle Plugin to use for your build logic, update it to >= 1.8.0."
+     )
+ }
+ 
+diff --git a/platforms/core-configuration/kotlin-dsl-provider-plugins/src/main/kotlin/org/gradle/kotlin/dsl/provider/plugins/precompiled/tasks/GeneratePrecompiledScriptPluginAccessors.kt b/platforms/core-configuration/kotlin-dsl-provider-plugins/src/main/kotlin/org/gradle/kotlin/dsl/provider/plugins/precompiled/tasks/GeneratePrecompiledScriptPluginAccessors.kt
+index 1dbdc0e5ef5..e8e83993213 100644
+--- a/platforms/core-configuration/kotlin-dsl-provider-plugins/src/main/kotlin/org/gradle/kotlin/dsl/provider/plugins/precompiled/tasks/GeneratePrecompiledScriptPluginAccessors.kt
++++ b/platforms/core-configuration/kotlin-dsl-provider-plugins/src/main/kotlin/org/gradle/kotlin/dsl/provider/plugins/precompiled/tasks/GeneratePrecompiledScriptPluginAccessors.kt
+@@ -113,15 +113,15 @@ abstract class GeneratePrecompiledScriptPluginAccessors @Inject internal constru
+ 
+     @get:InputFiles
+     @get:Classpath
+-    val runtimeClassPathFiles: FileCollection
+-        get() = runtimeClassPathArtifactCollection.get().artifactFiles
++    val accessorsGenerationClassPathFiles: FileCollection
++        get() = accessorsGenerationClassPathArtifactCollection.get().artifactFiles
+ 
+     /**
+-     * Tracked via [runtimeClassPathFiles].
++     * Tracked via [accessorsGenerationClassPathFiles].
+      */
+     @get:Internal
+     internal
+-    abstract val runtimeClassPathArtifactCollection: Property<ArtifactCollection>
++    abstract val accessorsGenerationClassPathArtifactCollection: Property<ArtifactCollection>
+ 
+     @get:OutputDirectory
+     abstract val metadataOutputDir: DirectoryProperty
+@@ -437,7 +437,7 @@ abstract class GeneratePrecompiledScriptPluginAccessors @Inject internal constru
+         configurations: ConfigurationContainer,
+         fileCollectionFactory: FileCollectionFactory
+     ): Configuration {
+-        val dependencies = runtimeClassPathArtifactCollection.get().artifacts.map {
++        val dependencies = accessorsGenerationClassPathArtifactCollection.get().artifacts.map {
+             when (val componentIdentifier = it.id.componentIdentifier) {
+                 is OpaqueComponentIdentifier -> DefaultFileCollectionDependency(
+                     componentIdentifier,
+diff --git a/platforms/documentation/docs/src/docs/release/notes.md b/platforms/documentation/docs/src/docs/release/notes.md
+index ad8af916af0..ca7b077a4d6 100644
+--- a/platforms/documentation/docs/src/docs/release/notes.md
++++ b/platforms/documentation/docs/src/docs/release/notes.md
+@@ -114,6 +114,30 @@ assert(bar.getAttribute(color) == "orange") // `color` gets overwritten again
+ assert(bar.getAttribute(shape) == "square") // `shape` remains the same
+ ```
+ 
++#### Accessors for `compileOnly` plugin dependencies in precompiled Kotlin scripts
++
++Previously, it was not possible to use a plugin coming from a `compileOnly` dependency in a [precompiled Kotlin script](userguide/implementing_gradle_plugins_precompiled.html).
++Now it is supported, and [​type-safe accessors​]​(​userguide/kotlin_dsl.html#type-safe-accessors​) for plugins from such dependencies are available in the precompiled Kotlin scripts.
++
++As an example, the following `buildSrc/build.gradle.kts` build script declares a `compileOnly` dependency to a third party plugin: 
++```kotlin
++plugins {
++    `kotlin-dsl`
++}
++dependencies {
++    compileOnly("com.android.tools.build:gradle:x.y.z")
++}
++```
++And a convention precompiled Kotlin script in `buildSrc/src/main/kotlin/my-convention-plugin.gradle.kts` applies it, and can now use type-safe accessors to configure the third party plugin:
++```kotlin
++plugins {
++    id("com.android.application")
++}
++android {
++    // The accessor to the `android` extension registered by the Android plugin is available
++}
++```
++
+ ### Configuration Improvements
+ 
+ #### Simpler target package configuration for Antlr 4
+diff --git a/platforms/documentation/docs/src/docs/userguide/best-practices/best_practices_index.adoc b/platforms/documentation/docs/src/docs/userguide/best-practices/best_practices_index.adoc
+index 2c005b8629e..076ed59e6fe 100644
+--- a/platforms/documentation/docs/src/docs/userguide/best-practices/best_practices_index.adoc
++++ b/platforms/documentation/docs/src/docs/userguide/best-practices/best_practices_index.adoc
+@@ -18,7 +18,7 @@
+ The table below provides a complete list of documented Gradle Best Practices.
+ 
+ ****
+-There are currently *22 Best Practices*.
++There are currently *21 Best Practices*.
+ ****
+ 
+ Use this as a quick reference to track newly added recommendations, check adoption status, or explore areas for improving your build:
+@@ -51,7 +51,6 @@ Use this as a quick reference to track newly added recommendations, check adopti
+ | <<best_practices_tasks.adoc#avoid_provider_get_outside_task_action,Do not call `get()` on a Provider outside a Task action>> | Task | 9.1.0
+ 
+ | <<best_practices_performance.adoc#use_utf8_encoding,Enable UTF‑8>> | Performance | 9.0.0
+-| <<best_practices_performance.adoc#avoid_computations_in_configuration_phase,Avoid Expensive Computations in Configuration Phase>> | Performance | 9.0.0
+ 
+ | <<best_practices_security.adoc#best_practices_for_security,Validate the Gradle Distribution SHA-256 Checksum>> | Security | 9.1.0
+ |===
+diff --git a/platforms/documentation/docs/src/docs/userguide/best-practices/best_practices_performance.adoc b/platforms/documentation/docs/src/docs/userguide/best-practices/best_practices_performance.adoc
+index 4a53201ec52..7a276bc81aa 100644
+--- a/platforms/documentation/docs/src/docs/userguide/best-practices/best_practices_performance.adoc
++++ b/platforms/documentation/docs/src/docs/userguide/best-practices/best_practices_performance.adoc
+@@ -42,55 +42,3 @@ NOTE: Do not rely on the default encoding of the underlying JVM or operating sys
+ === Tags
+ 
+ `<<tags_reference.adoc#tag:properties,#properties>>`, `<<tags_reference.adoc#tag:caching,#caching>>`
+-
+-[[avoid_computations_in_configuration_phase]]
+-== Avoid Expensive Computations in Configuration Phase
+-
+-Avoid expensive computations in the <<build_lifecycle.adoc#sec:build_phases,configuration phase>>, instead, move them to task actions.
+-
+-=== Explanation
+-
+-In order for Gradle to execute tasks it first needs to build the project task graph.
+-As part of discovering what tasks to include in the task graph, Gradle will configure all the tasks that are directly requested, any task dependencies of the requested tasks, and also any tasks that are not lazily registered.
+-This work is done in the configuration phase.
+-
+-Performing expensive or slow operations such as file or network I/O, or CPU-heavy calculations in the configuration phase forces these to run even when they might be unnecessary to complete the requested work of the invoked tasks.
+-It is better to move these operations to task actions so that they run only when required.
+-
+-=== Example
+-
+-==== Don't Do This
+-
+-====
+-include::sample[dir="snippets/bestPractices/avoidComputationInConfigurationPhase-avoid/kotlin",files="build.gradle.kts[tags=avoid-this]"]
+-include::sample[dir="snippets/bestPractices/avoidComputationInConfigurationPhase-avoid/groovy",files="build.gradle[tags=avoid-this]"]
+-====
+-
+-<1> Performing heavy computation during configuration phase.
+-==== Do This Instead
+-
+-++++
+-<div style="text-align: right;">
+-  <a class="download-project-link"
+-     data-base-path="https://github.com/gradle/gradle/tree/master/platforms/documentation/docs/src/snippets/bestPractices/avoidComputationInConfigurationPhase-do/"
+-     href="https://download-directory.github.io/?url=https://github.com/gradle/gradle/tree/master/platforms/documentation/docs/src/snippets/bestPractices/avoidComputationInConfigurationPhase-do/kotlin">
+-    <img src="https://img.shields.io/badge/Download%20Project-GitHub-blue?logo=github&style=flat" alt="Download"/>
+-  </a>
+-</div>
+-++++
+-
+-====
+-include::sample[dir="snippets/bestPractices/avoidComputationInConfigurationPhase-do/kotlin",files="build.gradle.kts[tags=do-this]"]
+-include::sample[dir="snippets/bestPractices/avoidComputationInConfigurationPhase-do/groovy",files="build.gradle[tags=do-this]"]
+-====
+-
+-<1> Performing heavy computation during execution phase in a task action.
+-
+-=== References
+-
+-- <<lazy_configuration.adoc#lazy_configuration,lazy configuration>>.
+-- <<build_lifecycle.adoc#build_lifecycle,Build Lifecycle>> >>
+-
+-=== Tags
+-
+-`<<tags_reference.adoc#tag:tasks,#tasks>>`
+diff --git a/platforms/documentation/docs/src/snippets/bestPractices/avoidComputationInConfigurationPhase-avoid/groovy/build.gradle b/platforms/documentation/docs/src/snippets/bestPractices/avoidComputationInConfigurationPhase-avoid/groovy/build.gradle
+deleted file mode 100644
+index 16e578a2889..00000000000
+--- a/platforms/documentation/docs/src/snippets/bestPractices/avoidComputationInConfigurationPhase-avoid/groovy/build.gradle
++++ /dev/null
+@@ -1,21 +0,0 @@
+-// tag::avoid-this[]
+-abstract class MyTask extends DefaultTask {
+-    @Input
+-    String computationResult
+-    @TaskAction
+-    void run() {
+-        logger.lifecycle(computationResult)
+-    }
+-}
+-
+-String heavyWork() {
+-    logger.lifecycle("Start heavy work")
+-    Thread.sleep(5000)
+-    logger.lifecycle("Finish heavy work")
+-    return "Heavy computation result"
+-}
+-
+-tasks.register("myTask", MyTask) {
+-    computationResult = heavyWork() // <1>
+-}
+-// end::avoid-this[]
+diff --git a/platforms/documentation/docs/src/snippets/bestPractices/avoidComputationInConfigurationPhase-avoid/groovy/settings.gradle b/platforms/documentation/docs/src/snippets/bestPractices/avoidComputationInConfigurationPhase-avoid/groovy/settings.gradle
+deleted file mode 100644
+index a231a0a095f..00000000000
+--- a/platforms/documentation/docs/src/snippets/bestPractices/avoidComputationInConfigurationPhase-avoid/groovy/settings.gradle
++++ /dev/null
+@@ -1 +0,0 @@
+-rootProject.name = "avoid-computation-in-configuration-phase-avoid"
+diff --git a/platforms/documentation/docs/src/snippets/bestPractices/avoidComputationInConfigurationPhase-avoid/kotlin/build.gradle.kts b/platforms/documentation/docs/src/snippets/bestPractices/avoidComputationInConfigurationPhase-avoid/kotlin/build.gradle.kts
+deleted file mode 100644
+index 744d185ba67..00000000000
+--- a/platforms/documentation/docs/src/snippets/bestPractices/avoidComputationInConfigurationPhase-avoid/kotlin/build.gradle.kts
++++ /dev/null
+@@ -1,21 +0,0 @@
+-// tag::avoid-this[]
+-abstract class MyTask : DefaultTask() {
+-    @get:Input
+-    lateinit var computationResult: String
+-    @TaskAction
+-    fun run() {
+-        logger.lifecycle(computationResult)
+-    }
+-}
+-
+-fun heavyWork(): String {
+-    println("Start heavy work")
+-    Thread.sleep(5000)
+-    println("Finish heavy work")
+-    return "Heavy computation result"
+-}
+-
+-tasks.register<MyTask>("myTask") {
+-    computationResult = heavyWork() // <1>
+-}
+-// end::avoid-this[]
+diff --git a/platforms/documentation/docs/src/snippets/bestPractices/avoidComputationInConfigurationPhase-avoid/kotlin/settings.gradle.kts b/platforms/documentation/docs/src/snippets/bestPractices/avoidComputationInConfigurationPhase-avoid/kotlin/settings.gradle.kts
+deleted file mode 100644
+index a231a0a095f..00000000000
+--- a/platforms/documentation/docs/src/snippets/bestPractices/avoidComputationInConfigurationPhase-avoid/kotlin/settings.gradle.kts
++++ /dev/null
+@@ -1 +0,0 @@
+-rootProject.name = "avoid-computation-in-configuration-phase-avoid"
+diff --git a/platforms/documentation/docs/src/snippets/bestPractices/avoidComputationInConfigurationPhase-do/groovy/build.gradle b/platforms/documentation/docs/src/snippets/bestPractices/avoidComputationInConfigurationPhase-do/groovy/build.gradle
+deleted file mode 100644
+index 32e81bcb45d..00000000000
+--- a/platforms/documentation/docs/src/snippets/bestPractices/avoidComputationInConfigurationPhase-do/groovy/build.gradle
++++ /dev/null
+@@ -1,16 +0,0 @@
+-// tag::do-this[]
+-abstract class MyTask extends DefaultTask {
+-    @TaskAction
+-    void run() {
+-        logger.lifecycle(heavyWork()) // <1>
+-    }
+-    String heavyWork() {
+-        logger.lifecycle("Start heavy work")
+-        Thread.sleep(5000)
+-        logger.lifecycle("Finish heavy work")
+-        return "Heavy computation result"
+-    }
+-}
+-
+-tasks.register("myTask", MyTask)
+-// end::do-this[]
+diff --git a/platforms/documentation/docs/src/snippets/bestPractices/avoidComputationInConfigurationPhase-do/groovy/settings.gradle b/platforms/documentation/docs/src/snippets/bestPractices/avoidComputationInConfigurationPhase-do/groovy/settings.gradle
+deleted file mode 100644
+index 1b42b50f46d..00000000000
+--- a/platforms/documentation/docs/src/snippets/bestPractices/avoidComputationInConfigurationPhase-do/groovy/settings.gradle
++++ /dev/null
+@@ -1 +0,0 @@
+-rootProject.name = "avoid-computation-in-configuration-phase-do"
+diff --git a/platforms/documentation/docs/src/snippets/bestPractices/avoidComputationInConfigurationPhase-do/kotlin/build.gradle.kts b/platforms/documentation/docs/src/snippets/bestPractices/avoidComputationInConfigurationPhase-do/kotlin/build.gradle.kts
+deleted file mode 100644
+index 04b91a1c616..00000000000
+--- a/platforms/documentation/docs/src/snippets/bestPractices/avoidComputationInConfigurationPhase-do/kotlin/build.gradle.kts
++++ /dev/null
+@@ -1,17 +0,0 @@
+-// tag::do-this[]
+-abstract class MyTask : DefaultTask() {
+-    @TaskAction
+-    fun run() {
+-        logger.lifecycle(heavyWork()) // <1>
+-    }
+-
+-    fun heavyWork(): String {
+-        logger.lifecycle("Start heavy work")
+-        Thread.sleep(5000)
+-        logger.lifecycle("Finish heavy work")
+-        return "Heavy computation result"
+-    }
+-}
+-
+-tasks.register<MyTask>("myTask")
+-// end::do-this[]
+diff --git a/platforms/documentation/docs/src/snippets/bestPractices/avoidComputationInConfigurationPhase-do/kotlin/settings.gradle.kts b/platforms/documentation/docs/src/snippets/bestPractices/avoidComputationInConfigurationPhase-do/kotlin/settings.gradle.kts
+deleted file mode 100644
+index 1b42b50f46d..00000000000
+--- a/platforms/documentation/docs/src/snippets/bestPractices/avoidComputationInConfigurationPhase-do/kotlin/settings.gradle.kts
++++ /dev/null
+@@ -1 +0,0 @@
+-rootProject.name = "avoid-computation-in-configuration-phase-do"
+diff --git a/released-versions.json b/released-versions.json
+index 725dd9bdf03..bb37349d59d 100644
+--- a/released-versions.json
++++ b/released-versions.json
+@@ -4,8 +4,8 @@
+     "buildTime": "20250711083226+0000"
+   },
+   "latestRc": {
+-    "version": "9.0.0-rc-2",
+-    "buildTime": "20250711152331+0000"
++    "version": "9.0.0-rc-1",
++    "buildTime": "20250618075324+0000"
+   },
+   "finalReleases": [
+     {
+diff --git a/testing/architecture-test/src/changes/archunit-store/explicit-properties.txt b/testing/architecture-test/src/changes/archunit-store/explicit-properties.txt
+index fbfb28d19b2..b66e70b565f 100644
+--- a/testing/architecture-test/src/changes/archunit-store/explicit-properties.txt
++++ b/testing/architecture-test/src/changes/archunit-store/explicit-properties.txt
+@@ -107,7 +107,7 @@ Method <org.gradle.kotlin.dsl.provider.plugins.precompiled.tasks.CompilePrecompi
+ Method <org.gradle.kotlin.dsl.provider.plugins.precompiled.tasks.CompilePrecompiledScriptPluginPlugins.getSourceFiles()> is not abstract
+ Method <org.gradle.kotlin.dsl.provider.plugins.precompiled.tasks.ExtractPrecompiledScriptPluginPlugins.getScriptFiles$kotlin_dsl_provider_plugins()> is not abstract
+ Method <org.gradle.kotlin.dsl.provider.plugins.precompiled.tasks.GenerateExternalPluginSpecBuilders.getPluginEntries()> is not abstract
+-Method <org.gradle.kotlin.dsl.provider.plugins.precompiled.tasks.GeneratePrecompiledScriptPluginAccessors.getRuntimeClassPathFiles()> is not abstract
++Method <org.gradle.kotlin.dsl.provider.plugins.precompiled.tasks.GeneratePrecompiledScriptPluginAccessors.getAccessorsGenerationClassPathFiles()> is not abstract
+ Method <org.gradle.kotlin.dsl.provider.plugins.precompiled.tasks.GeneratePrecompiledScriptPluginAccessors.getScriptFiles$kotlin_dsl_provider_plugins()> is not abstract
+ Method <org.gradle.kotlin.dsl.provider.plugins.precompiled.tasks.GenerateScriptPluginAdapters.getScriptFiles$kotlin_dsl_provider_plugins()> is not abstract
+ Method <org.gradle.kotlin.dsl.tooling.builders.GenerateSourceRootsFile.getDestinationFile()> is not abstract

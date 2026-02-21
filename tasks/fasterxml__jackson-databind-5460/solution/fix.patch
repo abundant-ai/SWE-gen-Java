@@ -1,0 +1,148 @@
+diff --git a/src/main/java/tools/jackson/databind/JavaType.java b/src/main/java/tools/jackson/databind/JavaType.java
+index 8d94fea71..1ab134273 100644
+--- a/src/main/java/tools/jackson/databind/JavaType.java
++++ b/src/main/java/tools/jackson/databind/JavaType.java
+@@ -305,11 +305,8 @@ public abstract class JavaType
+         return ClassUtil.isEnumType(_class) && (_class != Enum.class);
+     }
+ 
+-    /**
+-     * @since 2.12
+-     */
+     public final boolean isRecordType() {
+-        return ClassUtil.isRecordType(_class);
++        return _class.isRecord();
+     }
+ 
+     /**
+diff --git a/src/main/java/tools/jackson/databind/cfg/MapperConfigBase.java b/src/main/java/tools/jackson/databind/cfg/MapperConfigBase.java
+index c051e22f1..0f71834ce 100644
+--- a/src/main/java/tools/jackson/databind/cfg/MapperConfigBase.java
++++ b/src/main/java/tools/jackson/databind/cfg/MapperConfigBase.java
+@@ -622,7 +622,7 @@ public abstract class MapperConfigBase<CFG extends ConfigFeature,
+ 
+         if (ClassUtil.isJDKClass(baseType)) {
+             vc = VisibilityChecker.allPublicInstance();
+-        } else if (ClassUtil.isRecordType(baseType)) {
++        } else if (baseType.isRecord()) {
+             // 15-Jan-2023, tatu: [databind#3724] Records require slightly different defaults
+             vc = _configOverrides.getDefaultRecordVisibility();
+         } else {
+diff --git a/src/main/java/tools/jackson/databind/deser/bean/BeanDeserializer.java b/src/main/java/tools/jackson/databind/deser/bean/BeanDeserializer.java
+index 2a38ddcbe..81d17bcb7 100644
+--- a/src/main/java/tools/jackson/databind/deser/bean/BeanDeserializer.java
++++ b/src/main/java/tools/jackson/databind/deser/bean/BeanDeserializer.java
+@@ -564,9 +564,10 @@ public class BeanDeserializer
+             : creator.startBuilding(p, ctxt, _objectIdReader);
+         TokenBuffer unknown = null;
+         final Class<?> activeView = _needViewProcesing ? ctxt.getActiveView() : null;
+-
+         JsonToken t = p.currentToken();
+         List<BeanReferring> referrings = null;
++        final boolean isRecord = _beanType.isRecordType();
++
+         for (; t == JsonToken.PROPERTY_NAME; t = p.nextToken()) {
+             String propName = p.currentName();
+             p.nextToken(); // to point to value
+@@ -576,14 +577,6 @@ public class BeanDeserializer
+                 continue;
+             }
+ 
+-            // [databind#4629] Need to check for ignored properties BEFORE checking for Creator properties.
+-            // Records (and other creator-based types) will have a valid 'creatorProp', so if we don't
+-            // check for ignore first, the ignore configuration will be bypassed.
+-            if (IgnorePropertiesUtil.shouldIgnore(propName, _ignorableProps, _includableProps)) {
+-                handleIgnoredProperty(p, ctxt, handledType(), propName);
+-                continue;
+-            }
+-
+             // Creator property?
+             if (creatorProp != null) {
+                 if ((activeView != null) && !creatorProp.visibleInView(activeView)) {
+@@ -596,6 +589,13 @@ public class BeanDeserializer
+                     p.skipChildren();
+                     continue;
+                 }
++                // [databind#4629] Need to check for ignored properties for Creator properties since
++                // Records will have a valid 'creatorProp', so if we don't
++                // check for ignore first, the ignore configuration will be bypassed.
++                if (isRecord && IgnorePropertiesUtil.shouldIgnore(propName, _ignorableProps, _includableProps)) {
++                    handleIgnoredProperty(p, ctxt, handledType(), propName);
++                    continue;
++                }
+                 // Last creator property to set?
+                 // [databind#4690] cannot quit early as optimization any more
+                 // if (buffer.assignParameter(creatorProp, value)) { ... build ... }
+@@ -603,6 +603,7 @@ public class BeanDeserializer
+                         _deserializeWithErrorWrapping(p, ctxt, creatorProp));
+                 continue;
+             }
++
+             // regular property? needs buffering
+             int ix = _propNameMatcher.matchName(propName);
+             if (ix >= 0) {
+@@ -1017,6 +1018,7 @@ public class BeanDeserializer
+         TokenBuffer tokens = ctxt.bufferForInputBuffering(p);
+         tokens.writeStartObject();
+ 
++        final boolean isRecord = _beanType.isRecordType();
+         JsonToken t = p.currentToken();
+         for (; t == JsonToken.PROPERTY_NAME; t = p.nextToken()) {
+             String propName = p.currentName();
+@@ -1028,13 +1030,6 @@ public class BeanDeserializer
+                 continue;
+             }
+ 
+-            // Things marked as ignorable should not be passed to any setter
+-            // [databind#4629] Need to check for ignored properties BEFORE checking
+-            // for Creator properties.
+-            if (IgnorePropertiesUtil.shouldIgnore(propName, _ignorableProps, _includableProps)) {
+-                handleIgnoredProperty(p, ctxt, handledType(), propName);
+-                continue;
+-            }
+             if (creatorProp != null) {
+                 // [databind#1381]: if useInput=FALSE, skip deserialization from input
+                 if (creatorProp.isInjectionOnly()) {
+@@ -1042,7 +1037,13 @@ public class BeanDeserializer
+                     p.skipChildren();
+                     continue;
+                 }
+-
++                // [databind#4629] Need to check for ignored properties for Creator properties since
++                // Records will have a valid 'creatorProp', so if we don't
++                // check for ignore first, the ignore configuration will be bypassed.
++                if (isRecord && IgnorePropertiesUtil.shouldIgnore(propName, _ignorableProps, _includableProps)) {
++                    handleIgnoredProperty(p, ctxt, handledType(), propName);
++                    continue;
++                }
+                 // Last creator property to set?
+                 // [databind#4690] cannot quit early as optimization any more
+                 // if (buffer.assignParameter(creatorProp, value)) { ... build ... }
+diff --git a/src/main/java/tools/jackson/databind/util/ClassUtil.java b/src/main/java/tools/jackson/databind/util/ClassUtil.java
+index 9ad03040f..a234113da 100644
+--- a/src/main/java/tools/jackson/databind/util/ClassUtil.java
++++ b/src/main/java/tools/jackson/databind/util/ClassUtil.java
+@@ -238,7 +238,10 @@ public final class ClassUtil
+ 
+     /**
+      * Helper method for detecting Java14-added {@code Record} types
++     *
++     * @deprecated Since 3.1 Just call {@code Class.isRecord()}
+      */
++    @Deprecated
+     public static boolean isRecordType(Class<?> cls) {
+         return cls.isRecord();
+     }
+diff --git a/src/main/java/tools/jackson/databind/util/NativeImageUtil.java b/src/main/java/tools/jackson/databind/util/NativeImageUtil.java
+index d3975986e..c0f1756f3 100644
+--- a/src/main/java/tools/jackson/databind/util/NativeImageUtil.java
++++ b/src/main/java/tools/jackson/databind/util/NativeImageUtil.java
+@@ -60,7 +60,7 @@ public class NativeImageUtil {
+             return false;
+         }
+         // records list their fields but not other members
+-        return (cl.getDeclaredFields().length == 0 || ClassUtil.isRecordType(cl)) &&
++        return (cl.getDeclaredFields().length == 0 || cl.isRecord()) &&
+                 cl.getDeclaredMethods().length == 0 &&
+                 cl.getDeclaredConstructors().length == 0;
+     }

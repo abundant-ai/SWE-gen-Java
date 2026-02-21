@@ -1,0 +1,187 @@
+diff --git a/core/src/main/scala/cats/data/ContT.scala b/core/src/main/scala/cats/data/ContT.scala
+index efbc41c54..07f9b9807 100644
+--- a/core/src/main/scala/cats/data/ContT.scala
++++ b/core/src/main/scala/cats/data/ContT.scala
+@@ -47,8 +47,6 @@ sealed abstract class ContT[M[_], A, +B] extends Serializable {
+       M.defer(run(fn3))
+     }
+   }
+-
+-  final def eval(implicit M: Applicative[M], D: Defer[M], ev: B <:< A): M[A] = D.defer(run(b => M.pure(ev(b))))
+ }
+ 
+ object ContT {
+@@ -127,7 +125,7 @@ object ContT {
+    *
+    * }}}
+    */
+-  def callCC[M[_], A, B, C](f: (B => ContT[M, A, C]) => ContT[M, A, B])(implicit M: Defer[M]): ContT[M, A, B] =
++  def callCC[M[_], R, A, B](f: (A => ContT[M, R, B]) => ContT[M, R, A])(implicit M: Defer[M]): ContT[M, R, A] =
+     apply { cb =>
+       val cont = f { a =>
+         apply(_ => cb(a))
+@@ -190,58 +188,6 @@ object ContT {
+   def later[M[_], A, B](fn: => (B => M[A]) => M[A]): ContT[M, A, B] =
+     DeferCont(() => FromFn(AndThen(fn)))
+ 
+-  /*
+-   * Limits the continuation of any inner [[shiftT]]
+-   */
+-  def resetT[M[_]: Monad: Defer, A, B](contT: ContT[M, B, B]): ContT[M, A, B] =
+-    ContT.liftF(contT.eval)
+-
+-  /*
+-   * Captures the continuation up to the nearest enclosing [[resetT]] and passes
+-   * it to f.
+-   *
+-   * For example, in the following the continuation captured as k is
+-   * {{{ _.map(_ + 1) }}}
+-   * so the evaluation (modulo Eval) is 2 * (5 + 1)
+-   *
+-   * {{{
+-   *   val cont: Cont[Int, Int] = Cont.reset(
+-   *     Cont.shift((k: Int => Eval[Int]) =>
+-   *       Cont.liftF[Int, Int](k(5))
+-   *     ).map(_ + 1)
+-   *   ).map(_ * 2)
+-   *
+-   *   cont.eval.value === 12
+-   * }}}
+-   *
+-   *
+-   * For an example with IO, consider the evaluation order of this:
+-   * {{{
+-   *   for {
+-   *     _ <- ContT.resetT(
+-   *            for {
+-   *              _ <- ContT.liftF(IO.println("1"))
+-   *              _ <- ContT.shiftT { (k: Unit => IO[Unit]) =>
+-   *                     for {
+-   *                       _ <- ContT.liftF(IO.println("2"))
+-   *                       _ <- ContT.liftF(k(()))
+-   *                       _ <- ContT.liftF(IO.println("4"))
+-   *                     }
+-   *                   }
+-   *              _ <- ContT.liftF(IO.println("3"))
+-   *            } yield ()
+-   *         )
+-   *     _ <- ContT.liftF(IO.println("5"))
+-   *   } yield ()
+-   * }}}
+-   *
+-   * The continuation captured by k is {{{ >> ContT.liftF(IO.println("3")) }}}
+-   * which is why that is evaluated when {{{ k() }}} is invoked and
+-   * hence why it is printed before 4.
+-   */
+-  def shiftT[M[_]: Applicative: Defer, A, B](f: (B => M[A]) => ContT[M, A, A]): ContT[M, A, B] =
+-    apply(cb => f(cb).eval)
+-
+   def tailRecM[M[_], A, B, C](a: A)(fn: A => ContT[M, C, Either[A, B]])(implicit M: Defer[M]): ContT[M, C, B] =
+     ContT[M, C, B] { (cb: (B => M[C])) =>
+       def go(a: A): M[C] =
+diff --git a/core/src/main/scala/cats/data/package.scala b/core/src/main/scala/cats/data/package.scala
+index 96fbff90c..4561800bd 100644
+--- a/core/src/main/scala/cats/data/package.scala
++++ b/core/src/main/scala/cats/data/package.scala
+@@ -100,16 +100,5 @@ package object data extends ScalaVersionSpecificPackage {
+ 
+     def tailRecM[A, B, C](a: A)(f: A => Cont[C, Either[A, B]]): Cont[C, B] =
+       ContT.tailRecM(a)(f)
+-
+-    def liftF[A, B](b: Eval[B]): Cont[A, B] = ContT.liftF(b)
+-
+-    def callCC[A, B, C](f: (B => Cont[A, C]) => Cont[A, B]): Cont[A, B] =
+-      ContT.callCC(f)
+-
+-    def reset[A, B](cont: Cont[A, A]): Cont[B, A] =
+-      ContT.resetT(cont)
+-
+-    def shift[A, B](f: (B => Eval[A]) => Cont[A, A]): Cont[A, B] =
+-      ContT.shiftT(f)
+   }
+ }
+diff --git a/tests/src/test/scala/cats/tests/ContTSuite.scala b/tests/src/test/scala/cats/tests/ContTSuite.scala
+index fc104d24c..e86c85cc4 100644
+--- a/tests/src/test/scala/cats/tests/ContTSuite.scala
++++ b/tests/src/test/scala/cats/tests/ContTSuite.scala
+@@ -88,80 +88,6 @@ class ContTSuite extends CatsSuite {
+     }
+   }
+ 
+-  test("ContT.resetT and shiftT delimit continuations") {
+-    forAll { (cb: Unit => Eval[Unit]) =>
+-      val counter = new AtomicInteger(0)
+-      var a = 0
+-      var b = 0
+-      var c = 0
+-      var d = 0
+-
+-      val contT: ContT[Eval, Unit, Unit] = ContT
+-        .resetT(
+-          ContT.shiftT { (k: Unit => Eval[Unit]) =>
+-            ContT.defer[Eval, Unit, Unit] {
+-              a = counter.incrementAndGet()
+-            } >>
+-              ContT.liftF(k(())) >>
+-              ContT.defer[Eval, Unit, Unit] {
+-                b = counter.incrementAndGet()
+-              }
+-          }
+-            >> ContT.defer[Eval, Unit, Unit] {
+-              c = counter.incrementAndGet()
+-            }
+-        )
+-        .flatMap { _ =>
+-          ContT.defer[Eval, Unit, Unit] {
+-            d = counter.incrementAndGet()
+-          }
+-        }
+-
+-      contT.run(cb).value
+-      assert(a == 1)
+-      assert(b == 3)
+-      assert(c == 2)
+-      assert(d == 4)
+-    }
+-  }
+-  test("ContT.shiftT stack safety") {
+-    var counter = 0
+-    val maxIters = 50000
+-
+-    def contT: ContT[Eval, Int, Int] =
+-      ContT.shiftT { (k: Int => Eval[Int]) =>
+-        ContT
+-          .defer[Eval, Int, Int] {
+-            counter = counter + 1
+-            counter
+-          }
+-          .flatMap { n =>
+-            if (n === maxIters) ContT.liftF(k(n)) else contT
+-          }
+-      }
+-
+-    assert(contT.run(Eval.now(_)).value === maxIters)
+-  }
+-
+-  test("ContT.resetT stack safety") {
+-    var counter = 0
+-    val maxIters = 50000
+-
+-    def contT: ContT[Eval, Int, Int] =
+-      ContT.resetT(
+-        ContT
+-          .defer[Eval, Int, Int] {
+-            counter = counter + 1
+-            counter
+-          }
+-          .flatMap { n =>
+-            if (n === maxIters) ContT.pure[Eval, Int, Int](n) else contT
+-          }
+-      )
+-
+-    assert(contT.run(Eval.now(_)).value === maxIters)
+-  }
+-
+   test("ContT.flatMap stack safety") {
+     val maxIters = 20000
+     var counter = 0

@@ -1,0 +1,164 @@
+diff --git a/core/src/main/scala/cats/Foldable.scala b/core/src/main/scala/cats/Foldable.scala
+index 651a23346..4cb557eec 100644
+--- a/core/src/main/scala/cats/Foldable.scala
++++ b/core/src/main/scala/cats/Foldable.scala
+@@ -3,8 +3,7 @@ package cats
+ import scala.collection.mutable
+ import cats.kernel.CommutativeMonoid
+ import simulacrum.{noop, typeclass}
+-import Foldable.{sentinel, Source}
+-
++import Foldable.sentinel
+ import scala.annotation.implicitNotFound
+ 
+ /**
+@@ -99,7 +98,7 @@ import scala.annotation.implicitNotFound
+ 
+   def foldRightDefer[G[_]: Defer, A, B](fa: F[A], gb: G[B])(fn: (A, G[B]) => G[B]): G[B] =
+     Defer[G].defer(
+-      foldLeft(fa, (z: G[B]) => z) { (acc, elem) => z =>
++      this.foldLeft(fa, (z: G[B]) => z) { (acc, elem) => z =>
+         Defer[G].defer(acc(fn(elem, z)))
+       }(gb)
+     )
+@@ -110,19 +109,13 @@ import scala.annotation.implicitNotFound
+       case (None, a)    => Some(f(a))
+     }
+ 
+-  def reduceRightToOption[A, B](fa: F[A])(f: A => B)(g: (A, Eval[B]) => Eval[B]): Eval[Option[B]] = {
+-    Source.fromFoldable(fa)(self).uncons match {
+-      case Some((first, s)) =>
+-        def loop(now: A, source: Source[A]): Eval[B] =
+-          source.uncons match {
+-            case Some((next, s)) => g(now, Eval.defer(loop(next, s.value)))
+-            case None            => Eval.later(f(now))
+-          }
+-
+-        Eval.defer(loop(first, s.value).map(Some(_)))
+-      case None => Eval.now(None)
++  def reduceRightToOption[A, B](fa: F[A])(f: A => B)(g: (A, Eval[B]) => Eval[B]): Eval[Option[B]] =
++    foldRight(fa, Now(Option.empty[B])) { (a, lb) =>
++      lb.flatMap {
++        case Some(b) => g(a, Now(b)).map(Some(_))
++        case None    => Later(Some(f(a)))
++      }
+     }
+-  }
+ 
+   /**
+    * Reduce the elements of this structure down to a single value by applying
+diff --git a/core/src/main/scala/cats/Reducible.scala b/core/src/main/scala/cats/Reducible.scala
+index 60d2cf15d..805715e1d 100644
+--- a/core/src/main/scala/cats/Reducible.scala
++++ b/core/src/main/scala/cats/Reducible.scala
+@@ -1,6 +1,5 @@
+ package cats
+ 
+-import cats.Foldable.Source
+ import cats.data.{Ior, NonEmptyList}
+ import simulacrum.{noop, typeclass}
+ import scala.annotation.implicitNotFound
+@@ -387,18 +386,14 @@ abstract class NonEmptyReducible[F[_], G[_]](implicit G: Foldable[G]) extends Re
+     G.foldLeft(ga, f(a))((b, a) => g(b, a))
+   }
+ 
+-  def reduceRightTo[A, B](fa: F[A])(f: A => B)(g: (A, Eval[B]) => Eval[B]): Eval[B] = {
+-    def loop(now: A, source: Source[A]): Eval[B] =
+-      source.uncons match {
+-        case Some((next, s)) => g(now, Eval.defer(loop(next, s.value)))
+-        case None            => Eval.later(f(now))
+-      }
+-
++  def reduceRightTo[A, B](fa: F[A])(f: A => B)(g: (A, Eval[B]) => Eval[B]): Eval[B] =
+     Always(split(fa)).flatMap {
+       case (a, ga) =>
+-        Eval.defer(loop(a, Foldable.Source.fromFoldable(ga)))
++        G.reduceRightToOption(ga)(f)(g).flatMap {
++          case Some(b) => g(a, Now(b))
++          case None    => Later(f(a))
++        }
+     }
+-  }
+ 
+   override def size[A](fa: F[A]): Long = {
+     val (_, tail) = split(fa)
+diff --git a/core/src/main/scala/cats/data/NonEmptyChain.scala b/core/src/main/scala/cats/data/NonEmptyChain.scala
+index 08234ed68..12fa51e3e 100644
+--- a/core/src/main/scala/cats/data/NonEmptyChain.scala
++++ b/core/src/main/scala/cats/data/NonEmptyChain.scala
+@@ -2,6 +2,7 @@ package cats
+ package data
+ 
+ import NonEmptyChainImpl.create
++import cats.{Order, Semigroup}
+ import cats.kernel._
+ import scala.collection.immutable.SortedMap
+ 
+diff --git a/core/src/main/scala/cats/data/NonEmptyList.scala b/core/src/main/scala/cats/data/NonEmptyList.scala
+index 4272a5b79..334ecfd62 100644
+--- a/core/src/main/scala/cats/data/NonEmptyList.scala
++++ b/core/src/main/scala/cats/data/NonEmptyList.scala
+@@ -606,7 +606,7 @@ sealed abstract private[data] class NonEmptyListInstances extends NonEmptyListIn
+ 
+       override def nonEmptyPartition[A, B, C](
+         fa: NonEmptyList[A]
+-      )(f: A => Either[B, C]): Ior[NonEmptyList[B], NonEmptyList[C]] = {
++      )(f: (A) => Either[B, C]): Ior[NonEmptyList[B], NonEmptyList[C]] = {
+         val reversed = fa.reverse
+         val lastIor = f(reversed.head) match {
+           case Right(c) => Ior.right(NonEmptyList.one(c))
+diff --git a/core/src/main/scala/cats/instances/list.scala b/core/src/main/scala/cats/instances/list.scala
+index 75df77f92..a0b271920 100644
+--- a/core/src/main/scala/cats/instances/list.scala
++++ b/core/src/main/scala/cats/instances/list.scala
+@@ -116,7 +116,7 @@ trait ListInstances extends cats.kernel.instances.ListInstances {
+ 
+       override def partitionEither[A, B, C](
+         fa: List[A]
+-      )(f: A => Either[B, C])(implicit A: Alternative[List]): (List[B], List[C]) =
++      )(f: (A) => Either[B, C])(implicit A: Alternative[List]): (List[B], List[C]) =
+         fa.foldRight((List.empty[B], List.empty[C]))((a, acc) =>
+           f(a) match {
+             case Left(b)  => (b :: acc._1, acc._2)
+diff --git a/tests/src/test/scala/cats/tests/ReducibleSuite.scala b/tests/src/test/scala/cats/tests/ReducibleSuite.scala
+index 9df23f522..a3c3cc15d 100644
+--- a/tests/src/test/scala/cats/tests/ReducibleSuite.scala
++++ b/tests/src/test/scala/cats/tests/ReducibleSuite.scala
+@@ -10,8 +10,6 @@ import cats.syntax.option._
+ import cats.syntax.reducible._
+ import org.scalacheck.Arbitrary
+ 
+-import scala.collection.mutable
+-
+ class ReducibleSuiteAdditional extends CatsSuite {
+ 
+   test("Reducible[NonEmptyList].reduceLeftM stack safety") {
+@@ -24,12 +22,6 @@ class ReducibleSuiteAdditional extends CatsSuite {
+     actual should ===(Some(expected))
+   }
+ 
+-  test("Reducible[NonEmptyList].reduceRightTo stack safety") {
+-    val n = 100000L
+-    val actual = (1L to n).toList.toNel.get.reduceRightTo(identity) { case (a, r) => r.map(_ + a) }.value
+-    actual should ===((1L to n).sum)
+-  }
+-
+   // exists method written in terms of reduceRightTo
+   def contains[F[_]: Reducible, A: Eq](as: F[A], goal: A): Eval[Boolean] =
+     as.reduceRightTo(_ === goal) { (a, lb) =>
+@@ -84,15 +76,6 @@ class ReducibleSuiteAdditional extends CatsSuite {
+     assert(contains(large, 10000).value)
+   }
+ 
+-  test("Reducible[NonEmptyList].reduceMapA can breakout") {
+-    val notAllEven = NonEmptyList.of(2, 4, 6, 9, 10, 12, 14)
+-    val out = mutable.ListBuffer[Int]()
+-
+-    notAllEven.reduceMapA { a => out += a; if (a % 2 == 0) Some(a) else None }
+-
+-    out.toList should ===(List(2, 4, 6, 9))
+-  }
+-
+   // A simple non-empty stream with lazy `foldRight` and `reduceRightTo` implementations.
+   case class NES[A](h: A, t: Stream[A]) {
+     def toStream: Stream[A] = h #:: t

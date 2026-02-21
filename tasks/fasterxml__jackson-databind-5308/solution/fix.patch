@@ -1,0 +1,164 @@
+diff --git a/release-notes/VERSION b/release-notes/VERSION
+index f475082f2..11b443daa 100644
+--- a/release-notes/VERSION
++++ b/release-notes/VERSION
+@@ -16,6 +16,8 @@ Versions: 3.x (for earlier see VERSION-2.x)
+ #5314: Add `MapperFeature.DETECT_PARAMETER_NAMES` to allow disabling `parameter-names`
+   functionality
+  (fixed by Joo-Hyuk K)
++#5318: Allow auto-detection of Properties-based Constructor even if class has
++  no-parameters (default) Constructor
+ 
+ 3.0.0-rc9 (05-Sep-2025)
+ 
+diff --git a/src/main/java/tools/jackson/databind/cfg/ConstructorDetector.java b/src/main/java/tools/jackson/databind/cfg/ConstructorDetector.java
+index 695e759ef..f3b3ee55f 100644
+--- a/src/main/java/tools/jackson/databind/cfg/ConstructorDetector.java
++++ b/src/main/java/tools/jackson/databind/cfg/ConstructorDetector.java
+@@ -13,7 +13,14 @@ import tools.jackson.databind.util.ClassUtil;
+ public final class ConstructorDetector
+     implements java.io.Serializable
+ {
+-    private static final long serialVersionUID = 1L;
++    private static final long serialVersionUID = 3L;
++
++    /**
++     * See {@link #allowImplicitWithDefaultConstructor} for details.
++     *
++     * @since 3.0
++     */
++    public final static boolean DEFAULT_ALLOW_IMPLICIT_WITH_DEFAULT_CONSTRUCTOR = true;
+ 
+     /**
+      * Definition of alternate handling modes of single-argument constructors
+@@ -122,6 +129,12 @@ public final class ConstructorDetector
+      */
+     protected final boolean _allowJDKTypeCtors;
+ 
++    /**
++     * Whether implicit detection of Properties-based Constructors is allowed
++     * when there is the default (no-parameter) constructor available.
++     */
++    protected final boolean _allowImplicitWithDefaultConstructor;
++
+     /*
+     /**********************************************************************
+     /* Life-cycle
+@@ -130,11 +143,13 @@ public final class ConstructorDetector
+ 
+     protected ConstructorDetector(SingleArgConstructor singleArgMode,
+             boolean requireCtorAnnotation,
+-            boolean allowJDKTypeCtors)
++            boolean allowJDKTypeCtors,
++            boolean allowImplicitWithDefaultConstructor)
+     {
+         _singleArgMode = singleArgMode;
+         _requireCtorAnnotation = requireCtorAnnotation;
+         _allowJDKTypeCtors = allowJDKTypeCtors;
++        _allowImplicitWithDefaultConstructor = allowImplicitWithDefaultConstructor;
+     }
+ 
+     /**
+@@ -142,22 +157,37 @@ public final class ConstructorDetector
+      * by {@code _singleArgMode}
+      */
+     protected ConstructorDetector(SingleArgConstructor singleArgMode) {
+-        this(singleArgMode, false, false);
++        this(singleArgMode, false, false, DEFAULT_ALLOW_IMPLICIT_WITH_DEFAULT_CONSTRUCTOR);
+     }
+ 
+     public ConstructorDetector withSingleArgMode(SingleArgConstructor singleArgMode) {
+         return new ConstructorDetector(singleArgMode,
+-                _requireCtorAnnotation, _allowJDKTypeCtors);
++                _requireCtorAnnotation, _allowJDKTypeCtors,
++                _allowImplicitWithDefaultConstructor);
+     }
+ 
+     public ConstructorDetector withRequireAnnotation(boolean state) {
+         return new ConstructorDetector(_singleArgMode,
+-                state, _allowJDKTypeCtors);
++                state, _allowJDKTypeCtors,
++                _allowImplicitWithDefaultConstructor);
+     }
+ 
+     public ConstructorDetector withAllowJDKTypeConstructors(boolean state) {
+         return new ConstructorDetector(_singleArgMode,
+-                _requireCtorAnnotation, state);
++                _requireCtorAnnotation, state,
++                _allowImplicitWithDefaultConstructor);
++    }
++
++    /**
++     * Mutant factory method that can be used to change setting that
++     * {@link #allowImplicitWithDefaultConstructor} returns.
++     *
++     * @since 3.0
++     */
++    public ConstructorDetector withAllowImplicitWithDefaultConstructor(boolean state) {
++        return new ConstructorDetector(_singleArgMode,
++                _requireCtorAnnotation, _allowJDKTypeCtors,
++                state);
+     }
+ 
+     /*
+@@ -178,6 +208,19 @@ public final class ConstructorDetector
+         return _allowJDKTypeCtors;
+     }
+ 
++    /**
++     * Method that can be used to determine whether implicit detection of
++     * Properties-based Constructors is allowed when there is a default
++     * (no-parameter) constructor available.
++     * Note that this only matters if {@link #shouldIntrospectImplicitConstructors}
++     * returns {@code true}.
++     *
++     * @since 3.0
++     */
++    public boolean allowImplicitWithDefaultConstructor() {
++        return _allowImplicitWithDefaultConstructor;
++    }
++
+     public boolean singleArgCreatorDefaultsToDelegating() {
+         return _singleArgMode == SingleArgConstructor.DELEGATING;
+     }
+@@ -196,7 +239,7 @@ public final class ConstructorDetector
+      *
+      * @return True if implicit constructor detection should be enabled; false if not
+      */
+-    public boolean shouldIntrospectorImplicitConstructors(Class<?> rawType) {
++    public boolean shouldIntrospectImplicitConstructors(Class<?> rawType) {
+         // May not allow implicit creator introspection at all:
+         if (_requireCtorAnnotation) {
+             return false;
+diff --git a/src/main/java/tools/jackson/databind/deser/BasicDeserializerFactory.java b/src/main/java/tools/jackson/databind/deser/BasicDeserializerFactory.java
+index 0d16e0763..239d5dcf3 100644
+--- a/src/main/java/tools/jackson/databind/deser/BasicDeserializerFactory.java
++++ b/src/main/java/tools/jackson/databind/deser/BasicDeserializerFactory.java
+@@ -251,7 +251,7 @@ public abstract class BasicDeserializerFactory
+ 
+                 // 18-Sep-2020, tatu: Although by default implicit introspection is allowed, 2.12
+                 //   has settings to prevent that either generally, or at least for JDK types
+-                final boolean findImplicit = ctorDetector.shouldIntrospectorImplicitConstructors(beanDescRef.getBeanClass());
++                final boolean findImplicit = ctorDetector.shouldIntrospectImplicitConstructors(beanDescRef.getBeanClass());
+                 if (findImplicit) {
+                     _addImplicitDelegatingConstructors(ctxt, beanDescRef, vchecker,
+                             creators,
+diff --git a/src/main/java/tools/jackson/databind/introspect/POJOPropertiesCollector.java b/src/main/java/tools/jackson/databind/introspect/POJOPropertiesCollector.java
+index 4b85962ad..ee7263f7a 100644
+--- a/src/main/java/tools/jackson/databind/introspect/POJOPropertiesCollector.java
++++ b/src/main/java/tools/jackson/databind/introspect/POJOPropertiesCollector.java
+@@ -719,8 +719,12 @@ public class POJOPropertiesCollector
+                 && !ctorDetector.requireCtorAnnotation()) {
+             // But only if no Default (0-params) constructor available OR if we are configured
+             // to prefer properties-based Creators
+-            if ((_classDef.getDefaultConstructor() == null)
+-                    || ctorDetector.singleArgCreatorDefaultsToProperties()) {
++            // 19-Sep-2025, tatu: [databind#5318] Actually let's potentially allow
++            //  implicit constructor even if class also has 0-param ("default") constructor
++            //  (as long as it is not annotated)
++            if ((zeroParamsConstructor == null)
++                    || (!zeroParamsConstructor.isAnnotated()
++                            && ctorDetector.allowImplicitWithDefaultConstructor())) {
+                 _addImplicitConstructor(creators, constructors, props);
+             }
+         }

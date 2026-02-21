@@ -1,0 +1,164 @@
+diff --git a/release-notes/VERSION-2.x b/release-notes/VERSION-2.x
+index f835da2ff..4dbd3a040 100644
+--- a/release-notes/VERSION-2.x
++++ b/release-notes/VERSION-2.x
+@@ -10,7 +10,6 @@ Project: jackson-databind
+ #5045: If there is a no-parameter constructor marked as `JsonCreator` and
+   a constructor reported as `DefaultCreator`, latter is incorrectly used
+  (reported by  @wrongwrong)
+-#5203: Fix `null` handling of `EnumSetDeserializer`
+ #5293: Fix minor typo in `PropertyBindingException.getMessageSuffix()`
+  (reported by Johny L)
+ #5313: Expose `getConverter()` in `StdDelegatingSerializer` for improved
+diff --git a/src/main/java/com/fasterxml/jackson/databind/deser/std/EnumSetDeserializer.java b/src/main/java/com/fasterxml/jackson/databind/deser/std/EnumSetDeserializer.java
+index 9149851fe..d69a3e1ef 100644
+--- a/src/main/java/com/fasterxml/jackson/databind/deser/std/EnumSetDeserializer.java
++++ b/src/main/java/com/fasterxml/jackson/databind/deser/std/EnumSetDeserializer.java
+@@ -226,26 +226,17 @@ public class EnumSetDeserializer
+                 // passed it to EnumDeserializer, too, but in general nulls should never be passed
+                 // to non-container deserializers)
+                 Enum<?> value;
+-                if ((t == JsonToken.VALUE_NULL)
+-                        // [databind#5203]: Custom deserializer may return null for non-null token
+-                        || (value = _enumDeserializer.deserialize(p, ctxt)) == null) {
+-                    value = (Enum<?>) _nullProvider.getNullValue(ctxt);
+-                    if (value == null) {
+-                        if (_skipNullValues) {
+-                            continue;
+-                        }
+-                        // EnumSet does not accept nulls, so we need to report an error
+-                        // 05-Nov-2025, tatu: In case of no explicit Nulls handling; with 2.x,
+-                        //   let's just skip for backward compatibility; for 3.x, FAIL
+-                        /*
+-                        ctxt.handleUnexpectedToken(_enumType, JsonToken.VALUE_NULL, p,
+-                                "`EnumSet` of type %s does not accept `null` values",
+-                                ClassUtil.getTypeDescription(_enumType));
+-                                */
++                if (t == JsonToken.VALUE_NULL) {
++                    if (_skipNullValues) {
+                         continue;
+                     }
++                    value = (Enum<?>) _nullProvider.getNullValue(ctxt);
++                } else {
++                    value = _enumDeserializer.deserialize(p, ctxt);
++                }
++                if (value != null) {
++                    result.add(value);
+                 }
+-                result.add(value);
+             }
+         } catch (Exception e) {
+             throw JsonMappingException.wrapWithPath(e, result, result.size());
+diff --git a/src/test/java/com/fasterxml/jackson/databind/deser/jdk/EnumMapDeserializer5165Test.java b/src/test/java/com/fasterxml/jackson/databind/deser/jdk/EnumMapDeserializer5165Test.java
+index 5546e936e..adf48cd02 100644
+--- a/src/test/java/com/fasterxml/jackson/databind/deser/jdk/EnumMapDeserializer5165Test.java
++++ b/src/test/java/com/fasterxml/jackson/databind/deser/jdk/EnumMapDeserializer5165Test.java
+@@ -10,7 +10,9 @@ import com.fasterxml.jackson.core.type.TypeReference;
+ import com.fasterxml.jackson.databind.ObjectMapper;
+ import com.fasterxml.jackson.databind.exc.InvalidNullException;
+ import com.fasterxml.jackson.databind.json.JsonMapper;
++import org.opentest4j.AssertionFailedError;
+ 
++import static org.junit.jupiter.api.Assertions.assertFalse;
+ import static org.junit.jupiter.api.Assertions.assertTrue;
+ import static org.junit.jupiter.api.Assertions.assertThrows;
+ 
+diff --git a/src/test/java/com/fasterxml/jackson/databind/deser/enums/EnumSetDeserializer5203Test.java b/src/test/java/com/fasterxml/jackson/databind/tofix/EnumSetDeserializer5203Test.java
+similarity index 66%
+rename from src/test/java/com/fasterxml/jackson/databind/deser/enums/EnumSetDeserializer5203Test.java
+rename to src/test/java/com/fasterxml/jackson/databind/tofix/EnumSetDeserializer5203Test.java
+index b252fb14b..a421390ef 100644
+--- a/src/test/java/com/fasterxml/jackson/databind/deser/enums/EnumSetDeserializer5203Test.java
++++ b/src/test/java/com/fasterxml/jackson/databind/tofix/EnumSetDeserializer5203Test.java
+@@ -1,8 +1,9 @@
+-package com.fasterxml.jackson.databind.deser.enums;
++package com.fasterxml.jackson.databind.tofix;
+ 
+ import java.io.IOException;
+ import java.util.EnumSet;
+ 
++import com.fasterxml.jackson.databind.testutil.failure.JacksonTestFailureExpected;
+ import org.junit.jupiter.api.Test;
+ 
+ import com.fasterxml.jackson.annotation.JsonSetter;
+@@ -15,16 +16,14 @@ import com.fasterxml.jackson.databind.deser.std.StdDeserializer;
+ import com.fasterxml.jackson.databind.exc.InvalidNullException;
+ import com.fasterxml.jackson.databind.json.JsonMapper;
+ import com.fasterxml.jackson.databind.module.SimpleModule;
+-import com.fasterxml.jackson.databind.testutil.DatabindTestUtil;
+ 
+-import static org.junit.jupiter.api.Assertions.assertEquals;
+ import static org.junit.jupiter.api.Assertions.assertThrows;
++import static org.junit.jupiter.api.Assertions.assertTrue;
+ 
+ // For [databind#5203]
+ public class EnumSetDeserializer5203Test
+-    extends DatabindTestUtil
+ {
+-    enum MyEnum {
++    public enum MyEnum {
+         FOO
+     }
+ 
+@@ -58,45 +57,40 @@ public class EnumSetDeserializer5203Test
+         }
+     }
+ 
+-    @Test
+-    public void nullsDefaultTest() throws Exception {
+-        // In 2.x, default is to skip nulls (for backwards-compatibility)
+-        final ObjectMapper mapper = createMapperWithCustomDeserializer(Nulls.DEFAULT);
+-        _verifySkipResult(mapper);
++    private ObjectMapper createMapperWithCustomDeserializer() {
++        SimpleModule module = new SimpleModule();
++        module.addDeserializer(MyEnum.class, new EmptyStringToNullDeserializer());
++
++        return JsonMapper.builder()
++                .addModule(module)
++                .defaultSetterInfo(JsonSetter.Value.forContentNulls(Nulls.FAIL))
++                .build();
+     }
+ 
++    @JacksonTestFailureExpected
+     @Test
+-    public void nullsFailTest() throws Exception {
+-        final ObjectMapper mapper = createMapperWithCustomDeserializer(Nulls.FAIL);
++    public void nullsFailTest() {
++        ObjectMapper mapper = createMapperWithCustomDeserializer();
+ 
+         assertThrows(
+                 InvalidNullException.class,
+                 () -> mapper.readValue("{\"set\":[\"\"]}", new TypeReference<Dst>(){})
+         );
+     }
+-    
++
++    @JacksonTestFailureExpected
+     @Test
+     public void nullsSkipTest() throws Exception {
+-        final ObjectMapper mapper = createMapperWithCustomDeserializer(Nulls.SKIP);
+-        _verifySkipResult(mapper);
+-    }
+-
+-    private ObjectMapper createMapperWithCustomDeserializer(Nulls nullHandling) {
+         SimpleModule module = new SimpleModule();
+         module.addDeserializer(MyEnum.class, new EmptyStringToNullDeserializer());
+ 
+-        return JsonMapper.builder()
++        ObjectMapper mapper = JsonMapper.builder()
+                 .addModule(module)
+-                .defaultSetterInfo(JsonSetter.Value.forContentNulls(nullHandling))
++                .defaultSetterInfo(JsonSetter.Value.forContentNulls(Nulls.SKIP))
+                 .build();
+-    }
+ 
+-    private void _verifySkipResult(ObjectMapper mapper) throws Exception
+-    {
+         Dst dst = mapper.readValue("{\"set\":[\"FOO\",\"\"]}", new TypeReference<Dst>() {});
+ 
+-        // Null value (from empty string) should be skipped, but FOO should be present
+-        assertEquals(1, dst.getSet().size());
+-        assertEquals(MyEnum.FOO, dst.getSet().iterator().next());
++        assertTrue(dst.getSet().isEmpty(), "Null values should be skipped");
+     }
+ }

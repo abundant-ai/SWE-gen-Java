@@ -1,0 +1,370 @@
+diff --git a/kotlin-codegen/compiler/src/main/java/com/squareup/moshi/AdapterGenerator.kt b/kotlin-codegen/compiler/src/main/java/com/squareup/moshi/AdapterGenerator.kt
+index 8da9f594..c26ed2f6 100644
+--- a/kotlin-codegen/compiler/src/main/java/com/squareup/moshi/AdapterGenerator.kt
++++ b/kotlin-codegen/compiler/src/main/java/com/squareup/moshi/AdapterGenerator.kt
+@@ -34,7 +34,6 @@ import me.eugeniomarletti.kotlin.metadata.isDataClass
+ import me.eugeniomarletti.kotlin.metadata.shadow.metadata.ProtoBuf.Visibility
+ import me.eugeniomarletti.kotlin.metadata.visibility
+ import java.lang.reflect.Type
+-import javax.annotation.processing.Messager
+ import javax.lang.model.element.TypeElement
+ 
+ /** Generates a JSON adapter for a target type. */
+@@ -82,7 +81,7 @@ internal class AdapterGenerator(
+           .joinToString(", ") { "\"$it\"" }})", JsonReader.Options::class.asTypeName())
+       .build()
+ 
+-  fun generateFile(messager: Messager, generatedOption: TypeElement?): FileSpec {
++  fun generateFile(generatedOption: TypeElement?): FileSpec {
+     for (property in propertyList) {
+       property.allocateNames(nameAllocator)
+     }
+@@ -92,11 +91,11 @@ internal class AdapterGenerator(
+     if (hasCompanionObject) {
+       result.addFunction(generateJsonAdapterFun())
+     }
+-    result.addType(generateType(messager, generatedOption))
++    result.addType(generateType(generatedOption))
+     return result.build()
+   }
+ 
+-  private fun generateType(messager: Messager, generatedOption: TypeElement?): TypeSpec {
++  private fun generateType(generatedOption: TypeElement?): TypeSpec {
+     val result = TypeSpec.classBuilder(adapterName)
+ 
+     generatedOption?.let {
+@@ -130,7 +129,7 @@ internal class AdapterGenerator(
+     result.addProperty(optionsProperty)
+     for (uniqueAdapter in propertyList.distinctBy { it.delegateKey }) {
+       result.addProperty(uniqueAdapter.delegateKey.generateProperty(
+-          nameAllocator, typeRenderer, moshiParam, messager))
++          nameAllocator, typeRenderer, moshiParam))
+     }
+ 
+     result.addFunction(generateToStringFun())
+diff --git a/kotlin-codegen/compiler/src/main/java/com/squareup/moshi/DelegateKey.kt b/kotlin-codegen/compiler/src/main/java/com/squareup/moshi/DelegateKey.kt
+index 23024712..c39e3c1b 100644
+--- a/kotlin-codegen/compiler/src/main/java/com/squareup/moshi/DelegateKey.kt
++++ b/kotlin-codegen/compiler/src/main/java/com/squareup/moshi/DelegateKey.kt
+@@ -15,9 +15,6 @@
+  */
+ package com.squareup.moshi
+ 
+-import com.google.auto.common.MoreTypes
+-import com.squareup.kotlinpoet.AnnotationSpec
+-import com.squareup.kotlinpoet.AnnotationSpec.UseSiteTarget.FIELD
+ import com.squareup.kotlinpoet.ClassName
+ import com.squareup.kotlinpoet.CodeBlock
+ import com.squareup.kotlinpoet.KModifier
+@@ -29,11 +26,7 @@ import com.squareup.kotlinpoet.TypeName
+ import com.squareup.kotlinpoet.TypeVariableName
+ import com.squareup.kotlinpoet.WildcardTypeName
+ import com.squareup.kotlinpoet.asTypeName
+-import java.lang.annotation.ElementType
+-import java.lang.annotation.RetentionPolicy
+-import javax.annotation.processing.Messager
+ import javax.lang.model.element.AnnotationMirror
+-import javax.tools.Diagnostic.Kind.ERROR
+ 
+ /** A JsonAdapter that can be used to encode and decode a particular field. */
+ internal data class DelegateKey(
+@@ -46,24 +39,7 @@ internal data class DelegateKey(
+   fun generateProperty(
+     nameAllocator: NameAllocator,
+     typeRenderer: TypeRenderer,
+-    moshiParameter: ParameterSpec,
+-    messager: Messager): PropertySpec {
+-    fun AnnotationMirror.validate(): AnnotationMirror {
+-      // Check java types since that covers both java and kotlin annotations
+-      val annotationElement = MoreTypes.asTypeElement(annotationType)
+-      annotationElement.getAnnotation(java.lang.annotation.Retention::class.java)?.let {
+-        if (it.value != RetentionPolicy.RUNTIME) {
+-          messager.printMessage(ERROR, "JsonQualifier @${MoreTypes.asTypeElement(annotationType).simpleName} must have RUNTIME retention")
+-        }
+-      }
+-      annotationElement.getAnnotation(java.lang.annotation.Target::class.java)?.let {
+-        if (ElementType.FIELD !in it.value) {
+-          messager.printMessage(ERROR, "JsonQualifier @${MoreTypes.asTypeElement(annotationType).simpleName} must support FIELD target")
+-        }
+-      }
+-      return this
+-    }
+-    jsonQualifiers.forEach { it.validate() }
++    moshiParameter: ParameterSpec): PropertySpec {
+     val qualifierNames = jsonQualifiers.joinToString("") {
+       "At${it.annotationType.asElement().simpleName}"
+     }
+@@ -83,10 +59,21 @@ internal data class DelegateKey(
+     val standardArgsSize = standardArgs.size + 1
+     val (initializerString, args) = when {
+       qualifiers.isEmpty() -> "" to emptyArray()
++      qualifiers.size == 1 -> {
++        ", %${standardArgsSize}T::class.java" to arrayOf(
++            qualifiers.first().annotationType.asTypeName())
++      }
+       else -> {
+-        ", %${standardArgsSize}T.getFieldJsonQualifierAnnotations(javaClass, %${standardArgsSize + 1}S)" to arrayOf(
+-            Types::class.asTypeName(),
+-            adapterName)
++        val initString = qualifiers
++            .mapIndexed { index, _ ->
++              val annoClassIndex = standardArgsSize + index
++              return@mapIndexed "%${annoClassIndex}T::class.java"
++            }
++            .joinToString()
++        val initArgs = qualifiers
++            .map { it.annotationType.asTypeName() }
++            .toTypedArray()
++        ", $initString" to initArgs
+       }
+     }
+     val finalArgs = arrayOf(*standardArgs, *args)
+@@ -94,7 +81,6 @@ internal data class DelegateKey(
+     val nullModifier = if (nullable) ".nullSafe()" else ".nonNull()"
+ 
+     return PropertySpec.builder(adapterName, adapterTypeName, KModifier.PRIVATE)
+-        .addAnnotations(qualifiers.map { AnnotationSpec.get(it).toBuilder().useSiteTarget(FIELD).build() })
+         .initializer("%1N.adapter%2L(%3L$initializerString)$nullModifier", *finalArgs)
+         .build()
+   }
+diff --git a/kotlin-codegen/compiler/src/main/java/com/squareup/moshi/JsonClassCodeGenProcessor.kt b/kotlin-codegen/compiler/src/main/java/com/squareup/moshi/JsonClassCodeGenProcessor.kt
+index 09810965..99a63573 100644
+--- a/kotlin-codegen/compiler/src/main/java/com/squareup/moshi/JsonClassCodeGenProcessor.kt
++++ b/kotlin-codegen/compiler/src/main/java/com/squareup/moshi/JsonClassCodeGenProcessor.kt
+@@ -124,7 +124,7 @@ class JsonClassCodeGenProcessor : KotlinAbstractProcessor(), KotlinMetadataUtils
+   }
+ 
+   private fun AdapterGenerator.generateAndWrite(generatedOption: TypeElement?) {
+-    val fileSpec = generateFile(messager, generatedOption)
++    val fileSpec = generateFile(generatedOption)
+     val adapterName = fileSpec.members.filterIsInstance<TypeSpec>().first().name!!
+     val outputDir = generatedDir ?: mavenGeneratedDir(adapterName)
+     fileSpec.writeTo(outputDir)
+diff --git a/kotlin-codegen/compiler/src/test/java/com/squareup/moshi/CompilerTest.kt b/kotlin-codegen/compiler/src/test/java/com/squareup/moshi/CompilerTest.kt
+index a31e97e4..7b1212c1 100644
+--- a/kotlin-codegen/compiler/src/test/java/com/squareup/moshi/CompilerTest.kt
++++ b/kotlin-codegen/compiler/src/test/java/com/squareup/moshi/CompilerTest.kt
+@@ -244,60 +244,4 @@ class CompilerTest {
+     assertThat(result.exitCode).isEqualTo(ExitCode.COMPILATION_ERROR)
+     assertThat(result.systemErr).contains("supertype java.util.Date is not a Kotlin type")
+   }
+-
+-  @Test
+-  fun nonFieldApplicableQualifier() {
+-    val call = KotlinCompilerCall(temporaryFolder.root)
+-    call.inheritClasspath = true
+-    call.addService(Processor::class, JsonClassCodeGenProcessor::class)
+-    call.addKt("source.kt", """
+-        |import com.squareup.moshi.JsonClass
+-        |import com.squareup.moshi.JsonQualifier
+-        |import kotlin.annotation.AnnotationRetention.RUNTIME
+-        |import kotlin.annotation.AnnotationTarget.PROPERTY
+-        |import kotlin.annotation.Retention
+-        |import kotlin.annotation.Target
+-        |
+-        |@Retention(RUNTIME)
+-        |@Target(PROPERTY)
+-        |@JsonQualifier
+-        |annotation class UpperCase
+-        |
+-        |@JsonClass(generateAdapter = true)
+-        |class ClassWithQualifier(@UpperCase val a: Int)
+-        |""".trimMargin())
+-
+-    val result = call.execute()
+-    println(result.systemErr)
+-    assertThat(result.exitCode).isEqualTo(ExitCode.COMPILATION_ERROR)
+-    assertThat(result.systemErr).contains("JsonQualifier @UpperCase must support FIELD target")
+-  }
+-
+-  @Test
+-  fun nonRuntimeQualifier() {
+-    val call = KotlinCompilerCall(temporaryFolder.root)
+-    call.inheritClasspath = true
+-    call.addService(Processor::class, JsonClassCodeGenProcessor::class)
+-    call.addKt("source.kt", """
+-        |import com.squareup.moshi.JsonClass
+-        |import com.squareup.moshi.JsonQualifier
+-        |import kotlin.annotation.AnnotationRetention.BINARY
+-        |import kotlin.annotation.AnnotationTarget.FIELD
+-        |import kotlin.annotation.AnnotationTarget.PROPERTY
+-        |import kotlin.annotation.Retention
+-        |import kotlin.annotation.Target
+-        |
+-        |@Retention(BINARY)
+-        |@Target(PROPERTY, FIELD)
+-        |@JsonQualifier
+-        |annotation class UpperCase
+-        |
+-        |@JsonClass(generateAdapter = true)
+-        |class ClassWithQualifier(@UpperCase val a: Int)
+-        |""".trimMargin())
+-
+-    val result = call.execute()
+-    assertThat(result.exitCode).isEqualTo(ExitCode.COMPILATION_ERROR)
+-    assertThat(result.systemErr).contains("JsonQualifier @UpperCase must have RUNTIME retention")
+-  }
+ }
+diff --git a/kotlin-codegen/integration-test/src/test/kotlin/com/squareup/moshi/GeneratedAdaptersTest.kt b/kotlin-codegen/integration-test/src/test/kotlin/com/squareup/moshi/GeneratedAdaptersTest.kt
+index 6cc69daf..60bc77c5 100644
+--- a/kotlin-codegen/integration-test/src/test/kotlin/com/squareup/moshi/GeneratedAdaptersTest.kt
++++ b/kotlin-codegen/integration-test/src/test/kotlin/com/squareup/moshi/GeneratedAdaptersTest.kt
+@@ -447,7 +447,7 @@ class GeneratedAdaptersTest {
+   }
+ 
+   @JsonClass(generateAdapter = true)
+-  class ConstructorParameterWithQualifier(@Uppercase(inFrench = true) var a: String, var b: String)
++  class ConstructorParameterWithQualifier(@Uppercase var a: String, var b: String)
+ 
+   @Test fun propertyWithQualifier() {
+     val moshi = Moshi.Builder()
+@@ -467,7 +467,7 @@ class GeneratedAdaptersTest {
+ 
+   @JsonClass(generateAdapter = true)
+   class PropertyWithQualifier {
+-    @Uppercase(inFrench = true) var a: String = ""
++    @Uppercase var a: String = ""
+     var b: String = ""
+   }
+ 
+@@ -762,14 +762,15 @@ class GeneratedAdaptersTest {
+     var b: Int = -1
+   }
+ 
++  @Retention(AnnotationRetention.RUNTIME)
+   @JsonQualifier
+-  annotation class Uppercase(val inFrench: Boolean, val onSundays: Boolean = false)
++  annotation class Uppercase
+ 
+   class UppercaseJsonAdapter {
+-    @ToJson fun toJson(@Uppercase(inFrench = true) s: String) : String {
++    @ToJson fun toJson(@Uppercase s: String) : String {
+       return s.toUpperCase(Locale.US)
+     }
+-    @FromJson @Uppercase(inFrench = true) fun fromJson(s: String) : String {
++    @FromJson @Uppercase fun fromJson(s: String) : String {
+       return s.toLowerCase(Locale.US)
+     }
+   }
+diff --git a/moshi/src/main/java/com/squareup/moshi/Types.java b/moshi/src/main/java/com/squareup/moshi/Types.java
+index 87eb62e1..2ebb1809 100644
+--- a/moshi/src/main/java/com/squareup/moshi/Types.java
++++ b/moshi/src/main/java/com/squareup/moshi/Types.java
+@@ -20,7 +20,6 @@ import com.squareup.moshi.internal.Util.ParameterizedTypeImpl;
+ import com.squareup.moshi.internal.Util.WildcardTypeImpl;
+ import java.lang.annotation.Annotation;
+ import java.lang.reflect.Array;
+-import java.lang.reflect.Field;
+ import java.lang.reflect.GenericArrayType;
+ import java.lang.reflect.InvocationHandler;
+ import java.lang.reflect.Method;
+@@ -217,36 +216,6 @@ public final class Types {
+     }
+   }
+ 
+-  /**
+-   * @param clazz the target class to read the {@code fieldName} field annotations from.
+-   * @param fieldName the target field name on {@code clazz}.
+-   * @return a set of {@link JsonQualifier}-annotated {@link Annotation} instances retrieved from
+-   *         the targeted field. Can be empty if none are found.
+-   */
+-  public static Set<? extends Annotation> getFieldJsonQualifierAnnotations(Class<?> clazz,
+-      String fieldName) {
+-    try {
+-      Field field = clazz.getDeclaredField(fieldName);
+-      if (!field.isAccessible()) {
+-        field.setAccessible(true);
+-      }
+-      Annotation[] fieldAnnotations = field.getDeclaredAnnotations();
+-      Set<Annotation> annotations = new LinkedHashSet<>(fieldAnnotations.length);
+-      for (Annotation annotation : fieldAnnotations) {
+-        if (annotation.annotationType().isAnnotationPresent(JsonQualifier.class)) {
+-          annotations.add(annotation);
+-        }
+-      }
+-      return Collections.unmodifiableSet(annotations);
+-    } catch (NoSuchFieldException e) {
+-      throw new IllegalArgumentException("Could not access field "
+-          + fieldName
+-          + " on class "
+-          + clazz.getCanonicalName(),
+-          e);
+-    }
+-  }
+-
+   @SuppressWarnings("unchecked")
+   static <T extends Annotation> T createJsonQualifierImplementation(final Class<T> annotationType) {
+     if (!annotationType.isAnnotation()) {
+diff --git a/moshi/src/test/java/com/squareup/moshi/TypesTest.java b/moshi/src/test/java/com/squareup/moshi/TypesTest.java
+index 23c1f629..85262c91 100644
+--- a/moshi/src/test/java/com/squareup/moshi/TypesTest.java
++++ b/moshi/src/test/java/com/squareup/moshi/TypesTest.java
+@@ -17,7 +17,6 @@ package com.squareup.moshi;
+ 
+ import java.lang.annotation.Annotation;
+ import java.lang.annotation.Retention;
+-import java.lang.annotation.Target;
+ import java.lang.reflect.ParameterizedType;
+ import java.lang.reflect.Type;
+ import java.util.ArrayList;
+@@ -30,7 +29,6 @@ import java.util.Set;
+ import org.junit.Test;
+ 
+ import static com.squareup.moshi.internal.Util.canonicalize;
+-import static java.lang.annotation.ElementType.FIELD;
+ import static java.lang.annotation.RetentionPolicy.RUNTIME;
+ import static org.assertj.core.api.Assertions.assertThat;
+ import static org.junit.Assert.fail;
+@@ -263,52 +261,4 @@ public final class TypesTest {
+       assertThat(expected).hasMessage("Unexpected primitive boolean. Use the boxed type.");
+     }
+   }
+-
+-  @Test public void getFieldJsonQualifierAnnotations_privateFieldTest() {
+-    Set<? extends Annotation> annotations = Types.getFieldJsonQualifierAnnotations(ClassWithAnnotatedFields.class,
+-        "privateField");
+-
+-    assertThat(annotations).hasSize(1);
+-    assertThat(annotations.iterator().next()).isInstanceOf(FieldAnnotation.class);
+-  }
+-
+-  @Test public void getFieldJsonQualifierAnnotations_publicFieldTest() {
+-    Set<? extends Annotation> annotations = Types.getFieldJsonQualifierAnnotations(ClassWithAnnotatedFields.class,
+-        "publicField");
+-
+-    assertThat(annotations).hasSize(1);
+-    assertThat(annotations.iterator().next()).isInstanceOf(FieldAnnotation.class);
+-  }
+-
+-  @Test public void getFieldJsonQualifierAnnotations_unannotatedTest() {
+-    Set<? extends Annotation> annotations = Types.getFieldJsonQualifierAnnotations(ClassWithAnnotatedFields.class,
+-        "unannotatedField");
+-
+-    assertThat(annotations).hasSize(0);
+-  }
+-
+-  @JsonQualifier
+-  @Target(FIELD)
+-  @Retention(RUNTIME)
+-  @interface FieldAnnotation {
+-
+-  }
+-
+-  @Target(FIELD)
+-  @Retention(RUNTIME)
+-  @interface NoQualifierAnnotation {
+-
+-  }
+-
+-  static class ClassWithAnnotatedFields {
+-    @FieldAnnotation
+-    @NoQualifierAnnotation
+-    private final int privateField = 0;
+-
+-    @FieldAnnotation
+-    @NoQualifierAnnotation
+-    public final int publicField = 0;
+-
+-    private final int unannotatedField = 0;
+-  }
+ }

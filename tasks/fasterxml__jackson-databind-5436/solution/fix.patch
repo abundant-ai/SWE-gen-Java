@@ -1,0 +1,539 @@
+diff --git a/release-notes/VERSION b/release-notes/VERSION
+index e038c5e98..6a99d3d7b 100644
+--- a/release-notes/VERSION
++++ b/release-notes/VERSION
+@@ -34,6 +34,8 @@ Versions: 3.x (for earlier see VERSION-2.x)
+   with Jackson 3
+  (reported by Andy W)
+  (fix contributed by Fouad A)
++#5432: Jackson 3 ignores `@JsonProperty` when Enum value is used as Map key
++ (reported by @jochenberger)
+ 
+ 3.0.2 (07-Nov-2025)
+ 
+diff --git a/src/main/java/tools/jackson/databind/AnnotationIntrospector.java b/src/main/java/tools/jackson/databind/AnnotationIntrospector.java
+index 4123839ae..5ddeb565d 100644
+--- a/src/main/java/tools/jackson/databind/AnnotationIntrospector.java
++++ b/src/main/java/tools/jackson/databind/AnnotationIntrospector.java
+@@ -939,7 +939,7 @@ public abstract class AnnotationIntrospector
+     }
+ 
+     /**
+-     * Finds the explicitly defined name of the given set of {@code Enum} values, if any.
++     * Finds the explicitly defined names, if any, of the given set of {@code Enum} values.
+      * The method overwrites entries in the incoming {@code names} array with the explicit
+      * names found, if any, leaving other entries unmodified.
+      *
+@@ -947,9 +947,9 @@ public abstract class AnnotationIntrospector
+      * @param annotatedClass the annotated class for which to find the explicit names
+      * @param enumValues the set of {@code Enum} values to find the explicit names for
+      * @param names the matching declared names of enumeration values (with indexes matching
+-     *              {@code enumValues} entries)
++     *              {@code enumValues} entries); modified as necessary
+      *
+-     * @return an array of names to use (possibly {@code names} passed as argument)
++     * @return an array of names to use (usually {@code names} passed as argument)
+      *
+      * @since 2.16
+      */
+diff --git a/src/main/java/tools/jackson/databind/EnumNamingStrategy.java b/src/main/java/tools/jackson/databind/EnumNamingStrategy.java
+index 0d2e45aea..b0497c9ba 100644
+--- a/src/main/java/tools/jackson/databind/EnumNamingStrategy.java
++++ b/src/main/java/tools/jackson/databind/EnumNamingStrategy.java
+@@ -13,9 +13,9 @@ public interface EnumNamingStrategy {
+      * Translates the given <code>enumName</code> into an external property name according to
+      * the implementation of this {@link EnumNamingStrategy}.
+      *
+-     * @param enumName the name of the enum value to translate
+      * @param config the mapper configuration
+      * @param cls the Enum class
++     * @param enumName the name of the enum value to translate
+      *
+      * @return the external property name that corresponds to the given <code>enumName</code>
+      * according to the implementation of this {@link EnumNamingStrategy}.
+diff --git a/src/main/java/tools/jackson/databind/cfg/EnumFeature.java b/src/main/java/tools/jackson/databind/cfg/EnumFeature.java
+index 7ba781f46..c7b05f433 100644
+--- a/src/main/java/tools/jackson/databind/cfg/EnumFeature.java
++++ b/src/main/java/tools/jackson/databind/cfg/EnumFeature.java
+@@ -117,7 +117,6 @@ public enum EnumFeature implements DatatypeFeature
+      */
+     WRITE_ENUMS_TO_LOWERCASE(false),
+ 
+-
+     /**
+      * Feature that determines standard serialization mechanism used for
+      * Enum values: if enabled, return value of <code>Enum.toString()</code>
+diff --git a/src/main/java/tools/jackson/databind/cfg/MapperConfig.java b/src/main/java/tools/jackson/databind/cfg/MapperConfig.java
+index 798c4b70b..040227b2a 100644
+--- a/src/main/java/tools/jackson/databind/cfg/MapperConfig.java
++++ b/src/main/java/tools/jackson/databind/cfg/MapperConfig.java
+@@ -156,11 +156,15 @@ public abstract class MapperConfig<T extends MapperConfig<T>>
+      *
+      * @param src Text to represent
+      *
+-     * @return Optimized text object constructed
++     * @return Optimized text object constructed, if {@code src} not {@code null};
++     *    {@code null} otherwise
+      */
+     public SerializableString compileString(String src) {
+         // 20-Jan-2014, tatu: For now we will just construct it directly but in distant
+         //   future might want to allow overriding somehow?
++        if (src == null) {
++            return null;
++        }
+         return new SerializedString(src);
+     }
+ 
+diff --git a/src/main/java/tools/jackson/databind/ser/jdk/JDKKeySerializers.java b/src/main/java/tools/jackson/databind/ser/jdk/JDKKeySerializers.java
+index 06b3563d2..c411d8fc1 100644
+--- a/src/main/java/tools/jackson/databind/ser/jdk/JDKKeySerializers.java
++++ b/src/main/java/tools/jackson/databind/ser/jdk/JDKKeySerializers.java
+@@ -11,7 +11,8 @@ import tools.jackson.databind.jsonFormatVisitors.JsonFormatVisitorWrapper;
+ import tools.jackson.databind.ser.impl.PropertySerializerMap;
+ import tools.jackson.databind.ser.std.StdSerializer;
+ import tools.jackson.databind.util.ClassUtil;
+-import tools.jackson.databind.util.EnumValues;
++import tools.jackson.databind.util.EnumDefinition;
++import tools.jackson.databind.util.EnumValuesToWrite;
+ 
+ public abstract class JDKKeySerializers
+ {
+@@ -78,9 +79,8 @@ public abstract class JDKKeySerializers
+ 
+     /**
+      * Method called if no specified key serializer was located; will return a
+-     * "default" key serializer initialized by {@link EnumKeySerializer#construct(Class, EnumValues, EnumValues)}
++     * "default" key serializer except with special handling for {@code Enum}s
+      */
+-    @SuppressWarnings("unchecked")
+     public static ValueSerializer<Object> getFallbackKeySerializer(SerializationConfig config,
+             Class<?> rawKeyType, AnnotatedClass annotatedClass)
+     {
+@@ -98,8 +98,7 @@ public abstract class JDKKeySerializers
+             //    for subtypes.
+             if (ClassUtil.isEnumType(rawKeyType)) {
+                 return EnumKeySerializer.construct(rawKeyType,
+-                    EnumValues.constructFromName(config, annotatedClass),
+-                    EnumSerializer.constructEnumNamingStrategyValues(config, (Class<Enum<?>>) rawKeyType, annotatedClass));
++                        EnumDefinition.construct(config, annotatedClass).valuesToWrite(config));
+             }
+         }
+         // 19-Oct-2016, tatu: Used to just return DEFAULT_KEY_SERIALIZER but why not:
+@@ -265,56 +264,36 @@ public abstract class JDKKeySerializers
+      */
+     public static class EnumKeySerializer extends StdSerializer<Object>
+     {
+-        protected final EnumValues _values;
++        protected final EnumValuesToWrite _valuesToWrite;
+ 
+-        /**
+-         * Map with key as converted property class defined implementation of {@link EnumNamingStrategy}
+-         * and with value as Enum names collected using <code>Enum.name()</code>.
+-         */
+-        protected final EnumValues _valuesByEnumNaming;
+-
+-        @Deprecated
+-        protected EnumKeySerializer(Class<?> enumType, EnumValues values) {
+-            this(enumType, values, null);
+-        }
+-
+-        protected EnumKeySerializer(Class<?> enumType, EnumValues values, EnumValues valuesByEnumNaming) {
+-            super(enumType);
+-            _values = values;
+-            _valuesByEnumNaming = valuesByEnumNaming;
+-        }
+-
+-        public static EnumKeySerializer construct(Class<?> enumType,
+-                EnumValues enumValues)
++        protected EnumKeySerializer(Class<?> enumType, EnumValuesToWrite valuesToWrite)
+         {
+-            return new EnumKeySerializer(enumType, enumValues);
++            super(enumType);
++            _valuesToWrite = valuesToWrite;
+         }
+ 
+         public static EnumKeySerializer construct(Class<?> enumType,
+-                EnumValues enumValues, EnumValues valuesByEnumNaming)
++                EnumValuesToWrite valuesToWrite)
+         {
+-            return new EnumKeySerializer(enumType, enumValues, valuesByEnumNaming);
++            return new EnumKeySerializer(enumType, valuesToWrite);
+         }
+ 
+         @Override
+-        public void serialize(Object value, JsonGenerator g, SerializationContext serializers)
++        public void serialize(Object value, JsonGenerator g, SerializationContext ctxt)
+             throws JacksonException
+         {
+-            if (serializers.isEnabled(EnumFeature.WRITE_ENUMS_USING_TO_STRING)) {
+-                g.writeName(value.toString());
+-                return;
+-            }
+-            Enum<?> en = (Enum<?>) value;
+-            if (_valuesByEnumNaming != null) {
+-                g.writeName(_valuesByEnumNaming.serializedValueFor(en));
+-                return;
+-            }
+-            // 14-Sep-2019, tatu: [databind#2129] Use this specific feature
+-            if (serializers.isEnabled(EnumFeature.WRITE_ENUM_KEYS_USING_INDEX)) {
++            final Enum<?> en = (Enum<?>) value;
++
++            // 26-Nov-2025, tatu: Should probably start with "using index" setting
++            //    (may change in 3.1?)
++            if (ctxt.isEnabled(EnumFeature.WRITE_ENUMS_USING_TO_STRING)) {
++                g.writeName(_valuesToWrite.fromToString(ctxt.getConfig(), en)); 
++            } else if (ctxt.isEnabled(EnumFeature.WRITE_ENUM_KEYS_USING_INDEX)) {
++                // 14-Sep-2019, tatu: [databind#2129] Use this specific feature
+                 g.writeName(String.valueOf(en.ordinal()));
+-                return;
++            } else {
++                g.writeName(_valuesToWrite.fromName(ctxt.getConfig(), en)); 
+             }
+-            g.writeName(_values.serializedValueFor(en));
+         }
+     }
+ }
+diff --git a/src/main/java/tools/jackson/databind/util/EnumDefinition.java b/src/main/java/tools/jackson/databind/util/EnumDefinition.java
+new file mode 100644
+index 000000000..beaaa9884
+--- /dev/null
++++ b/src/main/java/tools/jackson/databind/util/EnumDefinition.java
+@@ -0,0 +1,87 @@
++package tools.jackson.databind.util;
++
++import java.util.Arrays;
++import java.util.List;
++
++import tools.jackson.databind.AnnotationIntrospector;
++import tools.jackson.databind.EnumNamingStrategy;
++import tools.jackson.databind.cfg.MapperConfig;
++import tools.jackson.databind.introspect.AnnotatedClass;
++import tools.jackson.databind.introspect.EnumNamingStrategyFactory;
++
++/**
++ * Encapsulation of a {@link java.lang.Enum} type definition with its elements
++ * and explicitly annotated names for elements.
++ *
++ * @since 3.0.3
++ */
++public class EnumDefinition
++{
++    private final AnnotatedClass _annotatedClass;
++    private final EnumNamingStrategy _enumNamingStrategy;
++    private final Enum<?>[] _enumConstants;
++    private final String[] _explicitNames;
++
++    private EnumDefinition(AnnotatedClass annotatedClass,
++            EnumNamingStrategy enumNamingStrategy,
++            Enum<?>[] enumConstants,
++            String[] explicitNames)
++    {
++        _annotatedClass = annotatedClass;
++        _enumNamingStrategy = enumNamingStrategy;
++        _enumConstants = enumConstants;
++        _explicitNames = explicitNames;
++    }
++
++    public static EnumDefinition construct(MapperConfig<?> config,
++            AnnotatedClass annotatedClass)
++    {
++        final Class<?> enumCls0 = annotatedClass.getRawType();
++        final Enum<?>[] enumConstants = _enumConstants(enumCls0);
++        String[] explicitNames = new String[enumConstants.length];
++
++        final AnnotationIntrospector ai = config.getAnnotationIntrospector();
++        if (ai != null) {
++            explicitNames = ai.findEnumValues(config, annotatedClass, 
++                    enumConstants, explicitNames);
++        }
++        Object namingDef = config.getAnnotationIntrospector().findEnumNamingStrategy(config, annotatedClass);
++        EnumNamingStrategy enumNamingStrategy = EnumNamingStrategyFactory.createEnumNamingStrategyInstance(
++            namingDef, config.canOverrideAccessModifiers(), config.getEnumNamingStrategy());
++        
++        return new EnumDefinition(annotatedClass, enumNamingStrategy,
++                enumConstants, explicitNames);
++    }
++
++    public EnumValuesToWrite valuesToWrite(MapperConfig<?> config) {
++        return EnumValuesToWrite.construct(config, _annotatedClass,
++                _enumNamingStrategy,
++                _enumConstants, _explicitNames);
++    }
++    
++    public int size() {
++        return _enumConstants.length;
++    }
++
++    @SuppressWarnings("unchecked")
++    public Class<Enum<?>> enumClass() {
++        Class<?> cls = _annotatedClass.getRawType();
++        return (Class<Enum<?>>) cls;
++    }
++
++    public Enum<?>[] enumConstants() {
++        return _enumConstants;
++    }
++
++    public List<String> explicitNames() {
++        return Arrays.asList(_explicitNames);
++    }
++
++    private static Enum<?>[] _enumConstants(Class<?> enumCls) {
++        final Enum<?>[] enumValues = ClassUtil.findEnumType(enumCls).getEnumConstants();
++        if (enumValues == null) {
++            throw new IllegalArgumentException("Internal error: no Enum constants for Class "+enumCls.getName());
++        }
++        return enumValues;
++    }
++}
+diff --git a/src/main/java/tools/jackson/databind/util/EnumValues.java b/src/main/java/tools/jackson/databind/util/EnumValues.java
+index e1b42762d..229e70cbf 100644
+--- a/src/main/java/tools/jackson/databind/util/EnumValues.java
++++ b/src/main/java/tools/jackson/databind/util/EnumValues.java
+@@ -34,7 +34,11 @@ public final class EnumValues
+     /**
+      * NOTE: do NOT call this if configuration may change, and choice between toString()
+      *   and name() might change dynamically.
++     *
++     * @deprecated Since 3.1 call {@link #constructFromName} or {@link #constructFromToString}
++     *   instead.
+      */
++    @Deprecated // since 3.1
+     public static EnumValues construct(SerializationConfig config, AnnotatedClass enumClass) {
+         if (config.isEnabled(EnumFeature.WRITE_ENUMS_USING_TO_STRING)) {
+             return constructFromToString(config, enumClass);
+@@ -42,58 +46,40 @@ public final class EnumValues
+         return constructFromName(config, enumClass);
+     }
+ 
+-    /**
+-     * @since 2.16
+-     */
+-    public static EnumValues constructFromName(MapperConfig<?> config, AnnotatedClass annotatedClass) 
++    public static EnumValues constructFromName(MapperConfig<?> config,
++            AnnotatedClass annotatedClass) 
+     {
+-        // prepare data
+-        final AnnotationIntrospector ai = config.getAnnotationIntrospector();
+-        final boolean useLowerCase = config.isEnabled(EnumFeature.WRITE_ENUMS_TO_LOWERCASE);
+-        final Class<?> enumCls0 = annotatedClass.getRawType();
+-        final Class<Enum<?>> enumCls = _enumClass(enumCls0);
+-        final Enum<?>[] enumConstants = _enumConstants(enumCls0);
++        final EnumDefinition def = EnumDefinition.construct(config, annotatedClass);
++        final Class<Enum<?>> enumCls = def.enumClass();
++        final Enum<?>[] enumConstants = def.enumConstants();
+ 
+-        // introspect
+-        String[] names = ai.findEnumValues(config, annotatedClass, 
+-                enumConstants, new String[enumConstants.length]);
+-
+-        // build
++        List<String> explicitNames = def.explicitNames();
+         SerializableString[] textual = new SerializableString[enumConstants.length];
++        final boolean useLowerCase = config.isEnabled(EnumFeature.WRITE_ENUMS_TO_LOWERCASE);
+         for (int i = 0, len = enumConstants.length; i < len; ++i) {
+             Enum<?> enumValue = enumConstants[i];
+-            String name = _findNameToUse(names[i], enumValue.name(), useLowerCase);
++            String name = _findNameToUse(explicitNames.get(i), enumValue.name(), useLowerCase);
+             textual[enumValue.ordinal()] = config.compileString(name);
+         }
+         return construct(enumCls, textual);
+     }
+ 
+-    /**
+-     * @since 2.16
+-     */
+-    public static EnumValues constructFromToString(MapperConfig<?> config, AnnotatedClass annotatedClass)
++    public static EnumValues constructFromToString(MapperConfig<?> config,
++            AnnotatedClass annotatedClass)
+     {
+-        // prepare data
+-        final AnnotationIntrospector ai = config.getAnnotationIntrospector();
+-        final boolean useLowerCase = config.isEnabled(EnumFeature.WRITE_ENUMS_TO_LOWERCASE);
+-        final Class<?> enumCls0 = annotatedClass.getRawType();
+-        final Class<Enum<?>> enumCls = _enumClass(enumCls0);
+-        final Enum<?>[] enumConstants = _enumConstants(enumCls0);
+-
+-        // introspect
+-        String[] names = new String[enumConstants.length];
+-        if (ai != null) {
+-            ai.findEnumValues(config, annotatedClass, enumConstants, names);
+-        }
++        final EnumDefinition def = EnumDefinition.construct(config, annotatedClass);
++        final Class<Enum<?>> enumCls = def.enumClass();
++        final Enum<?>[] enumConstants = def.enumConstants();
+ 
+-        // build
++        List<String> explicitNames = def.explicitNames();
+         SerializableString[] textual = new SerializableString[enumConstants.length];
++        final boolean useLowerCase = config.isEnabled(EnumFeature.WRITE_ENUMS_TO_LOWERCASE);
+         for (int i = 0; i < enumConstants.length; i++) {
+             String enumToString = enumConstants[i].toString();
+             // 01-Feb-2024, tatu: [databind#4355] Nulls not great but... let's
+             //   coerce into "" for backwards compatibility
+             enumToString = (enumToString == null) ? "" : enumToString;
+-            String name = _findNameToUse(names[i], enumToString, useLowerCase);
++            String name = _findNameToUse(explicitNames.get(i), enumToString, useLowerCase);
+             textual[i] = config.compileString(name);
+         }
+         return construct(enumCls, textual);
+@@ -104,31 +90,21 @@ public final class EnumValues
+      * <p>
+      * The output {@link EnumValues} should contain values that are symmetric to
+      * {@link EnumResolver#constructUsingEnumNamingStrategy(DeserializationConfig, AnnotatedClass, EnumNamingStrategy)}.
+-     *
+-     * @since 2.16
+      */
+     public static EnumValues constructUsingEnumNamingStrategy(MapperConfig<?> config,
+             AnnotatedClass annotatedClass,
+             EnumNamingStrategy namingStrategy)
+     {
+-        // prepare data
+-        final AnnotationIntrospector ai = config.getAnnotationIntrospector();
+-        final boolean useLowerCase = config.isEnabled(EnumFeature.WRITE_ENUMS_TO_LOWERCASE);
+-        final Class<?> enumCls0 = annotatedClass.getRawType();
+-        final Class<Enum<?>> enumCls = _enumClass(enumCls0);
+-        final Enum<?>[] enumConstants = _enumConstants(enumCls0);
+-
+-        // introspect
+-        String[] names = new String[enumConstants.length];
+-        if (ai != null) {
+-            ai.findEnumValues(config, annotatedClass, enumConstants, names);
+-        }
++        final EnumDefinition def = EnumDefinition.construct(config, annotatedClass);
++        final Class<Enum<?>> enumCls = def.enumClass();
++        final Enum<?>[] enumConstants = def.enumConstants();
+ 
+-        // build
++        List<String> explicitNames = def.explicitNames();
+         SerializableString[] textual = new SerializableString[enumConstants.length];
++        final boolean useLowerCase = config.isEnabled(EnumFeature.WRITE_ENUMS_TO_LOWERCASE);
+         for (int i = 0, len = enumConstants.length; i < len; i++) {
+             Enum<?> enumValue = enumConstants[i];
+-            String name = _findNameToUse(names[i], namingStrategy.convertEnumToExternalName(config,
++            String name = _findNameToUse(explicitNames.get(i), namingStrategy.convertEnumToExternalName(config,
+                     annotatedClass, enumValue.name()), useLowerCase);
+             textual[i] = config.compileString(name);
+         }
+@@ -215,7 +191,7 @@ public final class EnumValues
+         EnumMap<?,SerializableString> result = _asMap;
+         if (result == null) {
+             // Alas, need to create it in a round-about way, due to typing constraints...
+-            Map<Enum<?>,SerializableString> map = new LinkedHashMap<Enum<?>,SerializableString>();
++            Map<Enum<?>,SerializableString> map = new LinkedHashMap<>();
+             for (Enum<?> en : _values) {
+                 map.put(en, _textual[en.ordinal()]);
+             }
+diff --git a/src/main/java/tools/jackson/databind/util/EnumValuesToWrite.java b/src/main/java/tools/jackson/databind/util/EnumValuesToWrite.java
+new file mode 100644
+index 000000000..d6e2aafdd
+--- /dev/null
++++ b/src/main/java/tools/jackson/databind/util/EnumValuesToWrite.java
+@@ -0,0 +1,107 @@
++package tools.jackson.databind.util;
++
++import java.util.function.Function;
++
++import tools.jackson.core.SerializableString;
++import tools.jackson.databind.EnumNamingStrategy;
++import tools.jackson.databind.cfg.EnumFeature;
++import tools.jackson.databind.cfg.MapperConfig;
++import tools.jackson.databind.introspect.AnnotatedClass;
++
++/**
++ * @since 3.0.3
++ */
++public class EnumValuesToWrite
++{
++    private final AnnotatedClass _annotatedClass;
++    private final EnumNamingStrategy _enumNamingStrategy;
++    private final Enum<?>[] _enumConstants;
++    private final SerializableString[] _explicitNames;
++
++    private volatile SerializableString[] _enumNames;
++    private volatile SerializableString[] _enumNamesLC;
++    private volatile SerializableString[] _enumToStrings;
++    private volatile SerializableString[] _enumToStringsLC;
++
++    private EnumValuesToWrite(AnnotatedClass annotatedClass,
++            EnumNamingStrategy enumNamingStrategy,
++            Enum<?>[] enumConstants, SerializableString[] explicitNames)
++    {
++        _annotatedClass = annotatedClass;
++        _enumNamingStrategy = enumNamingStrategy;
++        _enumConstants = enumConstants;
++        _explicitNames = explicitNames;
++    }
++
++    public static EnumValuesToWrite construct(MapperConfig<?> config,
++            AnnotatedClass annotatedClass,
++            EnumNamingStrategy enumNamingStrategy,
++            Enum<?>[] enumConstants, String[] explicitNames0)
++    {
++        final int len = explicitNames0.length;
++        SerializableString[] explicitNames = new SerializableString[len];
++        for (int i = 0; i < len; ++i) {
++            explicitNames[i] = config.compileString(explicitNames0[i]);
++        }
++        return new EnumValuesToWrite(annotatedClass,
++                enumNamingStrategy, enumConstants, explicitNames);
++    }
++
++    public SerializableString fromName(MapperConfig<?> config, Enum<?> en) {
++        SerializableString[] strs;
++        if (config.isEnabled(EnumFeature.WRITE_ENUMS_TO_LOWERCASE)) {
++            if ((strs = _enumNamesLC) == null) {
++                _enumNamesLC = strs = _fetch(config,
++                        e -> _nameWithStrategy(config, e),
++                        true);
++            }
++        } else {
++            if ((strs = _enumNames) == null) {
++                _enumNamesLC = strs = _fetch(config,
++                        e -> _nameWithStrategy(config, e),
++                        false);
++            }
++        }
++        return strs[en.ordinal()];
++    }
++
++    public SerializableString fromToString(MapperConfig<?> config, Enum<?> en) {
++        SerializableString[] strs;
++        if (config.isEnabled(EnumFeature.WRITE_ENUMS_TO_LOWERCASE)) {
++            if ((strs = _enumToStringsLC) == null) {
++                _enumToStringsLC = strs = _fetch(config, Enum::toString, true);
++            }
++        } else {
++            if ((strs = _enumToStrings) == null) {
++                _enumToStrings = strs = _fetch(config, Enum::toString, false);
++            }
++        }
++        return strs[en.ordinal()];
++    }
++
++    private String _nameWithStrategy(MapperConfig<?> config, Enum<?> en) {
++        String str = en.name();
++        if (_enumNamingStrategy != null) {
++            str = _enumNamingStrategy.convertEnumToExternalName(config, _annotatedClass, str);
++        }
++        return str;
++    }
++
++    private SerializableString[] _fetch(MapperConfig<?> config,
++            Function<Enum<?>,String> accessor, boolean lowerCase) {
++        final int len = _enumConstants.length;
++        SerializableString[] serStrs = new SerializableString[_enumConstants.length];
++        for (int i = 0; i < len; ++i) {
++            SerializableString ser = _explicitNames[i];
++            if (ser == null) {
++                String str = accessor.apply(_enumConstants[i]);
++                if (lowerCase) {
++                    str = str.toLowerCase();
++                }
++                ser = config.compileString(str);
++            }
++            serStrs[i] = ser;
++        }
++        return serStrs;
++    }
++}

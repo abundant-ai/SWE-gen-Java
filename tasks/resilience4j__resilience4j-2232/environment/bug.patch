@@ -1,0 +1,326 @@
+diff --git a/resilience4j-bulkhead/src/main/java/io/github/resilience4j/bulkhead/internal/SemaphoreBulkhead.java b/resilience4j-bulkhead/src/main/java/io/github/resilience4j/bulkhead/internal/SemaphoreBulkhead.java
+index c5edbdf3..aeff3cc4 100644
+--- a/resilience4j-bulkhead/src/main/java/io/github/resilience4j/bulkhead/internal/SemaphoreBulkhead.java
++++ b/resilience4j-bulkhead/src/main/java/io/github/resilience4j/bulkhead/internal/SemaphoreBulkhead.java
+@@ -34,7 +34,6 @@ import io.github.resilience4j.core.lang.Nullable;
+ import java.util.Map;
+ import java.util.concurrent.Semaphore;
+ import java.util.concurrent.TimeUnit;
+-import java.util.concurrent.locks.ReentrantLock;
+ import java.util.function.Supplier;
+ 
+ import static java.util.Collections.emptyMap;
+@@ -53,7 +52,7 @@ public class SemaphoreBulkhead implements Bulkhead {
+     private final BulkheadMetrics metrics;
+     private final BulkheadEventProcessor eventProcessor;
+ 
+-    private final ReentrantLock lock = new ReentrantLock();
++    private final Object configChangesLock = new Object();
+     private final Map<String, String> tags;
+     @SuppressWarnings("squid:S3077")
+     // this object is immutable and we replace ref entirely during config change.
+@@ -124,9 +123,7 @@ public class SemaphoreBulkhead implements Bulkhead {
+      */
+     @Override
+     public void changeConfig(final BulkheadConfig newConfig) {
+-        lock.lock();
+-
+-        try {
++        synchronized (configChangesLock) {
+             int delta = newConfig.getMaxConcurrentCalls() - config.getMaxConcurrentCalls();
+             if (delta < 0) {
+                 semaphore.acquireUninterruptibly(-delta);
+@@ -134,8 +131,6 @@ public class SemaphoreBulkhead implements Bulkhead {
+                 semaphore.release(delta);
+             }
+             config = newConfig;
+-        } finally {
+-            lock.unlock();
+         }
+     }
+ 
+diff --git a/resilience4j-bulkhead/src/test/java/io/github/resilience4j/bulkhead/internal/SemaphoreBulkheadTest.java b/resilience4j-bulkhead/src/test/java/io/github/resilience4j/bulkhead/internal/SemaphoreBulkheadTest.java
+index 44c8b0c4..cc87ece8 100644
+--- a/resilience4j-bulkhead/src/test/java/io/github/resilience4j/bulkhead/internal/SemaphoreBulkheadTest.java
++++ b/resilience4j-bulkhead/src/test/java/io/github/resilience4j/bulkhead/internal/SemaphoreBulkheadTest.java
+@@ -29,14 +29,12 @@ import org.assertj.core.api.AssertionsForClassTypes;
+ import org.junit.Before;
+ import org.junit.Test;
+ 
+-import java.lang.reflect.Field;
+ import java.time.Duration;
+ import java.util.ArrayList;
+ import java.util.HashMap;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.concurrent.atomic.AtomicBoolean;
+-import java.util.concurrent.locks.ReentrantLock;
+ import java.util.function.Supplier;
+ 
+ import static com.jayway.awaitility.Awaitility.await;
+@@ -460,17 +458,12 @@ public class SemaphoreBulkheadTest {
+ 
+     @SuppressWarnings("Duplicates")
+     @Test
+-    public void changePermissionsConcurrently() throws NoSuchFieldException, IllegalAccessException {
++    public void changePermissionsConcurrently() {
+         BulkheadConfig originalConfig = BulkheadConfig.custom()
+             .maxConcurrentCalls(3)
+             .maxWaitDuration(Duration.ofMillis(0))
+             .build();
+         SemaphoreBulkhead bulkhead = new SemaphoreBulkhead("test", originalConfig);
+-        // Access to reflection to check the lock state of ReentrantLock
+-        Field field = SemaphoreBulkhead.class.getDeclaredField("lock");
+-        field.setAccessible(true);
+-
+-        ReentrantLock lock = (ReentrantLock) field.get(bulkhead);
+ 
+         assertThat(bulkhead.getMetrics().getAvailableConcurrentCalls()).isEqualTo(3);
+ 
+@@ -515,9 +508,7 @@ public class SemaphoreBulkheadTest {
+         secondChangerThread.start();
+ 
+         await().atMost(1, SECONDS)
+-                .until(lock::isLocked);
+-        await().atMost(1, SECONDS)
+-                .until(() -> lock.hasQueuedThread(secondChangerThread));
++            .until(() -> secondChangerThread.getState().equals(BLOCKED));
+ 
+         bulkheadThreadTrigger.set(false);
+         await().atMost(1, SECONDS)
+@@ -527,9 +518,6 @@ public class SemaphoreBulkheadTest {
+         await().atMost(1, SECONDS)
+             .until(() -> secondChangerThread.getState().equals(TERMINATED));
+ 
+-        await().atMost(1, SECONDS)
+-                .until(() -> !lock.isLocked());
+-
+         assertThat(bulkhead.getBulkheadConfig().getMaxConcurrentCalls()).isEqualTo(4);
+         assertThat(bulkhead.getMetrics().getAvailableConcurrentCalls())
+             .isEqualTo(3); // main thread is still holding
+diff --git a/resilience4j-circuitbreaker/src/main/java/io/github/resilience4j/circuitbreaker/internal/CircuitBreakerStateMachine.java b/resilience4j-circuitbreaker/src/main/java/io/github/resilience4j/circuitbreaker/internal/CircuitBreakerStateMachine.java
+index 6ffd8bec..3db53604 100644
+--- a/resilience4j-circuitbreaker/src/main/java/io/github/resilience4j/circuitbreaker/internal/CircuitBreakerStateMachine.java
++++ b/resilience4j-circuitbreaker/src/main/java/io/github/resilience4j/circuitbreaker/internal/CircuitBreakerStateMachine.java
+@@ -39,7 +39,6 @@ import java.util.concurrent.*;
+ import java.util.concurrent.atomic.AtomicBoolean;
+ import java.util.concurrent.atomic.AtomicInteger;
+ import java.util.concurrent.atomic.AtomicReference;
+-import java.util.concurrent.locks.ReentrantLock;
+ import java.util.function.Function;
+ import java.util.function.Supplier;
+ import java.util.function.UnaryOperator;
+@@ -66,7 +65,6 @@ public final class CircuitBreakerStateMachine implements CircuitBreaker {
+     private final SchedulerFactory schedulerFactory;
+     private final Function<Clock, Long> currentTimestampFunction;
+     private final TimeUnit timestampUnit;
+-    private final ReentrantLock lock = new ReentrantLock();
+ 
+     /**
+      * Creates a circuitBreaker.
+@@ -810,15 +808,9 @@ public final class CircuitBreakerStateMachine implements CircuitBreaker {
+             cancelAutomaticTransitionToHalfOpen();
+         }
+ 
+-        private void toHalfOpenState() {
+-            lock.lock();
+-
+-            try {
+-                if (isOpen.compareAndSet(true, false)) {
+-                    transitionToHalfOpenState();
+-                }
+-            } finally {
+-                lock.unlock();
++        private synchronized void toHalfOpenState() {
++            if (isOpen.compareAndSet(true, false)) {
++                transitionToHalfOpenState();
+             }
+         }
+ 
+diff --git a/resilience4j-core/src/main/java/io/github/resilience4j/core/EventProcessor.java b/resilience4j-core/src/main/java/io/github/resilience4j/core/EventProcessor.java
+index 112e2719..325b00df 100644
+--- a/resilience4j-core/src/main/java/io/github/resilience4j/core/EventProcessor.java
++++ b/resilience4j-core/src/main/java/io/github/resilience4j/core/EventProcessor.java
+@@ -20,11 +20,11 @@ package io.github.resilience4j.core;
+ 
+ import io.github.resilience4j.core.lang.Nullable;
+ 
++import java.util.List;
+ import java.util.Set;
+ import java.util.concurrent.ConcurrentHashMap;
+ import java.util.concurrent.ConcurrentMap;
+ import java.util.concurrent.CopyOnWriteArraySet;
+-import java.util.concurrent.locks.ReentrantLock;
+ 
+ public class EventProcessor<T> implements EventPublisher<T> {
+ 
+@@ -36,27 +36,19 @@ public class EventProcessor<T> implements EventPublisher<T> {
+         return consumerRegistered;
+     }
+ 
+-    private final ReentrantLock lock = new ReentrantLock();
+-
+     @SuppressWarnings("unchecked")
+-    public void registerConsumer(String className, EventConsumer<? extends T> eventConsumer) {
+-        lock.lock();
+-
+-        try {
+-            this.eventConsumerMap.compute(className, (k, consumers) -> {
+-                if (consumers == null) {
+-                    consumers = new CopyOnWriteArraySet<>();
+-                    consumers.add((EventConsumer<T>) eventConsumer);
+-                    return consumers;
+-                } else {
+-                    consumers.add((EventConsumer<T>) eventConsumer);
+-                    return consumers;
+-                }
+-            });
+-            this.consumerRegistered = true;
+-        } finally {
+-            lock.unlock();
+-        }
++    public synchronized void registerConsumer(String className, EventConsumer<? extends T> eventConsumer) {
++        this.eventConsumerMap.compute(className, (k, consumers) -> {
++            if (consumers == null) {
++                consumers = new CopyOnWriteArraySet<>();
++                consumers.add((EventConsumer<T>) eventConsumer);
++                return consumers;
++            } else {
++                consumers.add((EventConsumer<T>) eventConsumer);
++                return consumers;
++            }
++        });
++        this.consumerRegistered = true;
+     }
+ 
+     public <E extends T> boolean processEvent(E event) {
+@@ -81,14 +73,8 @@ public class EventProcessor<T> implements EventPublisher<T> {
+     }
+ 
+     @Override
+-    public void onEvent(@Nullable EventConsumer<T> onEventConsumer) {
+-        lock.lock();
+-
+-        try {
+-            this.onEventConsumers.add(onEventConsumer);
+-            this.consumerRegistered = true;
+-        } finally {
+-            lock.unlock();
+-        }
++    public synchronized void onEvent(@Nullable EventConsumer<T> onEventConsumer) {
++        this.onEventConsumers.add(onEventConsumer);
++        this.consumerRegistered = true;
+     }
+ }
+diff --git a/resilience4j-core/src/main/java/io/github/resilience4j/core/metrics/FixedSizeSlidingWindowMetrics.java b/resilience4j-core/src/main/java/io/github/resilience4j/core/metrics/FixedSizeSlidingWindowMetrics.java
+index 17ed4a83..567d6376 100644
+--- a/resilience4j-core/src/main/java/io/github/resilience4j/core/metrics/FixedSizeSlidingWindowMetrics.java
++++ b/resilience4j-core/src/main/java/io/github/resilience4j/core/metrics/FixedSizeSlidingWindowMetrics.java
+@@ -20,7 +20,6 @@ package io.github.resilience4j.core.metrics;
+ 
+ 
+ import java.util.concurrent.TimeUnit;
+-import java.util.concurrent.locks.ReentrantLock;
+ 
+ /**
+  * A {@link Metrics} implementation is backed by a sliding window that aggregates only the last
+@@ -44,8 +43,6 @@ public class FixedSizeSlidingWindowMetrics implements Metrics {
+     private final Measurement[] measurements;
+     int headIndex;
+ 
+-    private final ReentrantLock lock = new ReentrantLock();
+-
+     /**
+      * Creates a new {@link FixedSizeSlidingWindowMetrics} with the given window size.
+      *
+@@ -62,26 +59,14 @@ public class FixedSizeSlidingWindowMetrics implements Metrics {
+     }
+ 
+     @Override
+-    public Snapshot record(long duration, TimeUnit durationUnit, Outcome outcome) {
+-        lock.lock();
+-
+-        try {
+-            totalAggregation.record(duration, durationUnit, outcome);
+-            moveWindowByOne().record(duration, durationUnit, outcome);
+-            return new SnapshotImpl(totalAggregation);
+-        } finally {
+-            lock.unlock();
+-        }
++    public synchronized Snapshot record(long duration, TimeUnit durationUnit, Outcome outcome) {
++        totalAggregation.record(duration, durationUnit, outcome);
++        moveWindowByOne().record(duration, durationUnit, outcome);
++        return new SnapshotImpl(totalAggregation);
+     }
+ 
+-    public Snapshot getSnapshot() {
+-        lock.lock();
+-
+-        try {
+-            return new SnapshotImpl(totalAggregation);
+-        } finally {
+-            lock.unlock();
+-        }
++    public synchronized Snapshot getSnapshot() {
++        return new SnapshotImpl(totalAggregation);
+     }
+ 
+     private Measurement moveWindowByOne() {
+diff --git a/resilience4j-core/src/main/java/io/github/resilience4j/core/metrics/SlidingTimeWindowMetrics.java b/resilience4j-core/src/main/java/io/github/resilience4j/core/metrics/SlidingTimeWindowMetrics.java
+index 287da74a..46d40d0d 100644
+--- a/resilience4j-core/src/main/java/io/github/resilience4j/core/metrics/SlidingTimeWindowMetrics.java
++++ b/resilience4j-core/src/main/java/io/github/resilience4j/core/metrics/SlidingTimeWindowMetrics.java
+@@ -21,7 +21,6 @@ package io.github.resilience4j.core.metrics;
+ 
+ import java.time.Clock;
+ import java.util.concurrent.TimeUnit;
+-import java.util.concurrent.locks.ReentrantLock;
+ 
+ /**
+  * A {@link Metrics} implementation is backed by a sliding time window that aggregates only the
+@@ -52,8 +51,6 @@ public class SlidingTimeWindowMetrics implements Metrics {
+     private final Clock clock;
+     int headIndex;
+ 
+-    private final ReentrantLock lock = new ReentrantLock();
+-
+     /**
+      * Creates a new {@link SlidingTimeWindowMetrics} with the given clock and window of time.
+      *
+@@ -74,28 +71,16 @@ public class SlidingTimeWindowMetrics implements Metrics {
+     }
+ 
+     @Override
+-    public Snapshot record(long duration, TimeUnit durationUnit, Outcome outcome) {
+-        lock.lock();
+-
+-        try {
+-            totalAggregation.record(duration, durationUnit, outcome);
+-            moveWindowToCurrentEpochSecond(getLatestPartialAggregation())
+-                    .record(duration, durationUnit, outcome);
+-            return new SnapshotImpl(totalAggregation);
+-        } finally {
+-            lock.unlock();
+-        }
++    public synchronized Snapshot record(long duration, TimeUnit durationUnit, Outcome outcome) {
++        totalAggregation.record(duration, durationUnit, outcome);
++        moveWindowToCurrentEpochSecond(getLatestPartialAggregation())
++            .record(duration, durationUnit, outcome);
++        return new SnapshotImpl(totalAggregation);
+     }
+ 
+-    public Snapshot getSnapshot() {
+-        lock.lock();
+-
+-        try {
+-            moveWindowToCurrentEpochSecond(getLatestPartialAggregation());
+-            return new SnapshotImpl(totalAggregation);
+-        } finally {
+-            lock.unlock();
+-        }
++    public synchronized Snapshot getSnapshot() {
++        moveWindowToCurrentEpochSecond(getLatestPartialAggregation());
++        return new SnapshotImpl(totalAggregation);
+     }
+ 
+     /**

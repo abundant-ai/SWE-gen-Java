@@ -1,0 +1,151 @@
+diff --git a/platforms/core-execution/worker-main/src/main/java/org/gradle/process/internal/worker/child/BootstrapSecurityManager.java b/platforms/core-execution/worker-main/src/main/java/org/gradle/process/internal/worker/child/BootstrapSecurityManager.java
+index b19884d98d0..29941d75288 100644
+--- a/platforms/core-execution/worker-main/src/main/java/org/gradle/process/internal/worker/child/BootstrapSecurityManager.java
++++ b/platforms/core-execution/worker-main/src/main/java/org/gradle/process/internal/worker/child/BootstrapSecurityManager.java
+@@ -28,7 +28,12 @@
+ 
+ /**
+  * Used to bootstrap the system classpath.
++ *
++ * <p>
++ * This class is only used on Java 8, so the removal of the {@link SecurityManager} in the future is not an issue.
++ * </p>
+  */
++// Moving this class affects the package in ApplicationClassesInSystemClassLoaderWorkerImplementationFactory
+ public class BootstrapSecurityManager extends SecurityManager {
+     private boolean initialised;
+     private final URLClassLoader target;
+diff --git a/platforms/software/testing-base-infrastructure/src/main/java/org/gradle/api/internal/tasks/testing/worker/SecurityManagerRef.java b/platforms/software/testing-base-infrastructure/src/main/java/org/gradle/api/internal/tasks/testing/worker/SecurityManagerRef.java
+new file mode 100644
+index 00000000000..2a2426e5c21
+--- /dev/null
++++ b/platforms/software/testing-base-infrastructure/src/main/java/org/gradle/api/internal/tasks/testing/worker/SecurityManagerRef.java
+@@ -0,0 +1,83 @@
++/*
++ * Copyright 2025 the original author or authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.gradle.api.internal.tasks.testing.worker;
++
++import org.jspecify.annotations.NullMarked;
++import org.slf4j.Logger;
++
++/**
++ * Abstraction to manage the {@link SecurityManager} in a way that works even if it is removed in future Java versions.
++ */
++@NullMarked
++abstract class SecurityManagerRef {
++    private static final boolean SECURITY_MANAGER_AVAILABLE;
++
++    static {
++        boolean isAvailable;
++        try {
++            Class.forName("java.lang.SecurityManager");
++            isAvailable = true;
++        } catch (ClassNotFoundException e) {
++            isAvailable = false;
++        }
++        SECURITY_MANAGER_AVAILABLE = isAvailable;
++    }
++
++    /**
++     * Acquire a security manager reference, or a fake one if {@link SecurityManager} has been removed.
++     *
++     * @return the reference
++     */
++    public static SecurityManagerRef getOrFake() {
++        if (SECURITY_MANAGER_AVAILABLE) {
++            return new RealSecurityManagerRef();
++        }
++        return new FakeSecurityManagerRef();
++    }
++
++    @NullMarked
++    private static final class RealSecurityManagerRef extends SecurityManagerRef {
++        private final SecurityManager reference = System.getSecurityManager();
++
++        @Override
++        public void reinstall(Logger logger) {
++            if (System.getSecurityManager() != reference) {
++                try {
++                    System.setSecurityManager(reference);
++                } catch (SecurityException e) {
++                    logger.warn("Unable to reset SecurityManager. Continuing anyway...", e);
++                }
++            }
++        }
++    }
++
++    @NullMarked
++    private static final class FakeSecurityManagerRef extends SecurityManagerRef {
++        @Override
++        public void reinstall(Logger logger) {
++            // No-op, as there is no security manager to reinstall
++        }
++    }
++
++    /**
++     * Reinstall the security manager if this is a real reference.
++     * Catches and reports any {@link SecurityException} that may occur.
++     *
++     * @param logger the logger to report to
++     */
++    public abstract void reinstall(Logger logger);
++}
+diff --git a/platforms/software/testing-base-infrastructure/src/main/java/org/gradle/api/internal/tasks/testing/worker/TestWorker.java b/platforms/software/testing-base-infrastructure/src/main/java/org/gradle/api/internal/tasks/testing/worker/TestWorker.java
+index b6cc9bfe512..7093452e050 100644
+--- a/platforms/software/testing-base-infrastructure/src/main/java/org/gradle/api/internal/tasks/testing/worker/TestWorker.java
++++ b/platforms/software/testing-base-infrastructure/src/main/java/org/gradle/api/internal/tasks/testing/worker/TestWorker.java
+@@ -90,7 +90,7 @@ public void execute(final WorkerProcessContext workerProcessContext) {
+ 
+         LOGGER.info("{} started executing tests.", workerProcessContext.getDisplayName());
+ 
+-        SecurityManager securityManager = System.getSecurityManager();
++        SecurityManagerRef securityManagerRef = SecurityManagerRef.getOrFake();
+ 
+         System.setProperty(WORKER_ID_SYS_PROPERTY, workerProcessContext.getWorkerId().toString());
+ 
+@@ -115,14 +115,8 @@ public void execute(final WorkerProcessContext workerProcessContext) {
+                 runQueue.clear();
+             }
+ 
+-            if (System.getSecurityManager() != securityManager) {
+-                try {
+-                    // Reset security manager the tests seem to have installed
+-                    System.setSecurityManager(securityManager);
+-                } catch (SecurityException e) {
+-                    LOGGER.warn("Unable to reset SecurityManager. Continuing anyway...", e);
+-                }
+-            }
++            // Reset any security manager the tests seem to have installed
++            securityManagerRef.reinstall(LOGGER);
+             testServices.close();
+         }
+     }
+diff --git a/subprojects/core/src/main/java/org/gradle/process/internal/worker/child/ApplicationClassesInSystemClassLoaderWorkerImplementationFactory.java b/subprojects/core/src/main/java/org/gradle/process/internal/worker/child/ApplicationClassesInSystemClassLoaderWorkerImplementationFactory.java
+index 0b0ac6bdb58..d0aed55b310 100644
+--- a/subprojects/core/src/main/java/org/gradle/process/internal/worker/child/ApplicationClassesInSystemClassLoaderWorkerImplementationFactory.java
++++ b/subprojects/core/src/main/java/org/gradle/process/internal/worker/child/ApplicationClassesInSystemClassLoaderWorkerImplementationFactory.java
+@@ -119,8 +119,9 @@ public void prepareJavaCommand(long workerId, String displayName, WorkerProcessB
+             execSpec.jvmArgs(jvmArgs);
+         } else {
+             // Use a dummy security manager, which hacks the application classpath into the system ClassLoader
++            // This branch is only taken on Java 8, so the removal of the SecurityManager in the future is not an issue.
+             execSpec.classpath(workerMainClassPath);
+-            execSpec.systemProperty("java.security.manager", WORKER_GRADLE_REMAPPING_PREFIX + "." + BootstrapSecurityManager.class.getName());
++            execSpec.systemProperty("java.security.manager", WORKER_GRADLE_REMAPPING_PREFIX + "." + "org.gradle.process.internal.worker.child.BootstrapSecurityManager");
+         }
+ 
+         // Serialize configuration for the worker process to it stdin

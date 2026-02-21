@@ -1,0 +1,256 @@
+diff --git a/moshi/src/main/java/com/squareup/moshi/CollectionJsonAdapter.java b/moshi/src/main/java/com/squareup/moshi/CollectionJsonAdapter.java
+deleted file mode 100644
+index 5df57a02..00000000
+--- a/moshi/src/main/java/com/squareup/moshi/CollectionJsonAdapter.java
++++ /dev/null
+@@ -1,88 +0,0 @@
+-/*
+- * Copyright (C) 2014 Square, Inc.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-package com.squareup.moshi;
+-
+-import java.io.IOException;
+-import java.lang.reflect.AnnotatedElement;
+-import java.lang.reflect.Type;
+-import java.util.ArrayList;
+-import java.util.Collection;
+-import java.util.LinkedHashSet;
+-import java.util.List;
+-import java.util.Set;
+-
+-/** Converts collection types to JSON arrays containing their converted contents. */
+-abstract class CollectionJsonAdapter<C extends Collection<T>, T> extends JsonAdapter<C> {
+-  public static final JsonAdapter.Factory FACTORY = new JsonAdapter.Factory() {
+-    @Override public JsonAdapter<?> create(Type type, AnnotatedElement annotations, Moshi moshi) {
+-      Class<?> rawType = Types.getRawType(type);
+-      if (rawType == List.class || rawType == Collection.class) {
+-        return newArrayListAdapter(type, annotations, moshi).nullSafe();
+-      } else if (rawType == Set.class) {
+-        return newLinkedHashSetAdapter(type, annotations, moshi).nullSafe();
+-      }
+-      return null;
+-    }
+-  };
+-
+-  private final JsonAdapter<T> elementAdapter;
+-
+-  private CollectionJsonAdapter(JsonAdapter<T> elementAdapter) {
+-    this.elementAdapter = elementAdapter;
+-  }
+-
+-  private static <T> JsonAdapter<Collection<T>> newArrayListAdapter(
+-      Type type, AnnotatedElement annotations, Moshi moshi) {
+-    Type elementType = Types.collectionElementType(type, Collection.class);
+-    JsonAdapter<T> elementAdapter = moshi.adapter(elementType, annotations);
+-    return new CollectionJsonAdapter<Collection<T>, T>(elementAdapter) {
+-      @Override Collection<T> newCollection() {
+-        return new ArrayList<T>();
+-      }
+-    };
+-  }
+-
+-  private static <T> JsonAdapter<Set<T>> newLinkedHashSetAdapter(
+-      Type type, AnnotatedElement annotations, Moshi moshi) {
+-    Type elementType = Types.collectionElementType(type, Collection.class);
+-    JsonAdapter<T> elementAdapter = moshi.adapter(elementType, annotations);
+-    return new CollectionJsonAdapter<Set<T>, T>(elementAdapter) {
+-      @Override Set<T> newCollection() {
+-        return new LinkedHashSet<T>();
+-      }
+-    };
+-  }
+-
+-  abstract C newCollection();
+-
+-  @Override public C fromJson(JsonReader reader) throws IOException {
+-    C result = newCollection();
+-    reader.beginArray();
+-    while (reader.hasNext()) {
+-      result.add(elementAdapter.fromJson(reader));
+-    }
+-    reader.endArray();
+-    return result;
+-  }
+-
+-  @Override public void toJson(JsonWriter writer, C value) throws IOException {
+-    writer.beginArray();
+-    for (T element : value) {
+-      elementAdapter.toJson(writer, element);
+-    }
+-    writer.endArray();
+-  }
+-}
+diff --git a/moshi/src/main/java/com/squareup/moshi/JsonWriter.java b/moshi/src/main/java/com/squareup/moshi/JsonWriter.java
+index 4ba57d71..8451dc81 100644
+--- a/moshi/src/main/java/com/squareup/moshi/JsonWriter.java
++++ b/moshi/src/main/java/com/squareup/moshi/JsonWriter.java
+@@ -19,6 +19,7 @@ import java.io.Closeable;
+ import java.io.Flushable;
+ import java.io.IOException;
+ import okio.BufferedSink;
++import okio.Okio;
+ import okio.Sink;
+ 
+ import static com.squareup.moshi.JsonScope.DANGLING_NAME;
+@@ -182,11 +183,11 @@ public class JsonWriter implements Closeable, Flushable {
+   /**
+    * Creates a new instance that writes a JSON-encoded stream to {@code sink}.
+    */
+-  public JsonWriter(BufferedSink sink) {
++  public JsonWriter(Sink sink) {
+     if (sink == null) {
+       throw new NullPointerException("sink == null");
+     }
+-    this.sink = sink;
++    this.sink = Okio.buffer(sink);
+   }
+ 
+   /**
+diff --git a/moshi/src/main/java/com/squareup/moshi/Moshi.java b/moshi/src/main/java/com/squareup/moshi/Moshi.java
+index 1d31c684..08e93d09 100644
+--- a/moshi/src/main/java/com/squareup/moshi/Moshi.java
++++ b/moshi/src/main/java/com/squareup/moshi/Moshi.java
+@@ -30,8 +30,7 @@ public final class Moshi {
+   private Moshi(Builder builder) {
+     List<JsonAdapter.Factory> factories = new ArrayList<JsonAdapter.Factory>();
+     factories.addAll(builder.factories);
+-    factories.add(StandardJsonAdapters.FACTORY);
+-    factories.add(CollectionJsonAdapter.FACTORY);
++    factories.add(new StandardJsonAdapterFactory());
+     this.factories = Collections.unmodifiableList(factories);
+   }
+ 
+diff --git a/moshi/src/main/java/com/squareup/moshi/StandardJsonAdapters.java b/moshi/src/main/java/com/squareup/moshi/StandardJsonAdapterFactory.java
+similarity index 73%
+rename from moshi/src/main/java/com/squareup/moshi/StandardJsonAdapters.java
+rename to moshi/src/main/java/com/squareup/moshi/StandardJsonAdapterFactory.java
+index 2efd3e60..73261bf3 100644
+--- a/moshi/src/main/java/com/squareup/moshi/StandardJsonAdapters.java
++++ b/moshi/src/main/java/com/squareup/moshi/StandardJsonAdapterFactory.java
+@@ -19,22 +19,7 @@ import java.io.IOException;
+ import java.lang.reflect.AnnotatedElement;
+ import java.lang.reflect.Type;
+ 
+-final class StandardJsonAdapters {
+-  public static final JsonAdapter.Factory FACTORY = new JsonAdapter.Factory() {
+-    @Override public JsonAdapter<?> create(
+-        Type type, AnnotatedElement annotations, Moshi moshi) {
+-      // TODO: support all 8 primitive types.
+-      if (type == boolean.class) return BOOLEAN_JSON_ADAPTER;
+-      if (type == double.class) return DOUBLE_JSON_ADAPTER;
+-      if (type == int.class) return INTEGER_JSON_ADAPTER;
+-      if (type == Boolean.class) return BOOLEAN_JSON_ADAPTER.nullSafe();
+-      if (type == Double.class) return DOUBLE_JSON_ADAPTER.nullSafe();
+-      if (type == Integer.class) return INTEGER_JSON_ADAPTER.nullSafe();
+-      if (type == String.class) return STRING_JSON_ADAPTER.nullSafe();
+-      return null;
+-    }
+-  };
+-
++final class StandardJsonAdapterFactory implements JsonAdapter.Factory {
+   static final JsonAdapter<Boolean> BOOLEAN_JSON_ADAPTER = new JsonAdapter<Boolean>() {
+     @Override public Boolean fromJson(JsonReader reader) throws IOException {
+       return reader.nextBoolean();
+@@ -70,4 +55,17 @@ final class StandardJsonAdapters {
+       writer.value(value);
+     }
+   };
++
++  @Override public JsonAdapter<?> create(
++      Type type, AnnotatedElement annotations, Moshi moshi) {
++    // TODO: support all 8 primitive types.
++    if (type == boolean.class) return BOOLEAN_JSON_ADAPTER;
++    if (type == double.class) return DOUBLE_JSON_ADAPTER;
++    if (type == int.class) return INTEGER_JSON_ADAPTER;
++    if (type == Boolean.class) return BOOLEAN_JSON_ADAPTER.nullSafe();
++    if (type == Double.class) return DOUBLE_JSON_ADAPTER.nullSafe();
++    if (type == Integer.class) return INTEGER_JSON_ADAPTER.nullSafe();
++    if (type == String.class) return STRING_JSON_ADAPTER.nullSafe();
++    return null;
++  }
+ }
+diff --git a/moshi/src/test/java/com/squareup/moshi/MoshiTest.java b/moshi/src/test/java/com/squareup/moshi/MoshiTest.java
+index 1dfeb641..86719c88 100644
+--- a/moshi/src/test/java/com/squareup/moshi/MoshiTest.java
++++ b/moshi/src/test/java/com/squareup/moshi/MoshiTest.java
+@@ -18,15 +18,8 @@ package com.squareup.moshi;
+ import java.io.IOException;
+ import java.lang.annotation.Retention;
+ import java.lang.reflect.AnnotatedElement;
+-import java.lang.reflect.Field;
+ import java.lang.reflect.Type;
+-import java.util.ArrayDeque;
+-import java.util.Arrays;
+-import java.util.Collection;
+-import java.util.LinkedHashSet;
+-import java.util.List;
+ import java.util.Locale;
+-import java.util.Set;
+ import org.junit.Test;
+ 
+ import static java.lang.annotation.RetentionPolicy.RUNTIME;
+@@ -113,52 +106,6 @@ public final class MoshiTest {
+     assertThat(adapter.fromJson("\"b\"")).isEqualTo("B");
+   }
+ 
+-  @Test public void listJsonAdapter() throws Exception {
+-    Moshi moshi = new Moshi.Builder().build();
+-    JsonAdapter<List<String>> adapter = moshi.adapter(new TypeLiteral<List<String>>() {
+-    }.getType());
+-    assertThat(adapter.toJson(Arrays.asList("a", "b"))).isEqualTo("[\"a\",\"b\"]");
+-    assertThat(adapter.fromJson("[\"a\",\"b\"]")).isEqualTo(Arrays.asList("a", "b"));
+-  }
+-
+-  @Test public void setJsonAdapter() throws Exception {
+-    Set<String> set = new LinkedHashSet<String>();
+-    set.add("a");
+-    set.add("b");
+-
+-    Moshi moshi = new Moshi.Builder().build();
+-    JsonAdapter<Set<String>> adapter = moshi.adapter(new TypeLiteral<Set<String>>() {}.getType());
+-    assertThat(adapter.toJson(set)).isEqualTo("[\"a\",\"b\"]");
+-    assertThat(adapter.fromJson("[\"a\",\"b\"]")).isEqualTo(set);
+-  }
+-
+-  @Test public void collectionJsonAdapter() throws Exception {
+-    Collection<String> collection = new ArrayDeque<String>();
+-    collection.add("a");
+-    collection.add("b");
+-
+-    Moshi moshi = new Moshi.Builder().build();
+-    JsonAdapter<Collection<String>> adapter = moshi.adapter(
+-        new TypeLiteral<Collection<String>>() {}.getType());
+-    assertThat(adapter.toJson(collection)).isEqualTo("[\"a\",\"b\"]");
+-    assertThat(adapter.fromJson("[\"a\",\"b\"]")).containsExactly("a", "b");
+-  }
+-
+-  @Uppercase
+-  static List<String> uppercaseStrings;
+-
+-  @Test public void collectionsKeepAnnotations() throws Exception {
+-    Moshi moshi = new Moshi.Builder()
+-        .add(new UppercaseAdapterFactory())
+-        .build();
+-
+-    Field uppercaseStringsField = MoshiTest.class.getDeclaredField("uppercaseStrings");
+-    JsonAdapter<List<String>> adapter = moshi.adapter(uppercaseStringsField.getGenericType(),
+-        uppercaseStringsField);
+-    assertThat(adapter.toJson(Arrays.asList("a"))).isEqualTo("[\"A\"]");
+-    assertThat(adapter.fromJson("[\"b\"]")).isEqualTo(Arrays.asList("B"));
+-  }
+-
+   static class Pizza {
+     final int diameter;
+     final boolean extraCheese;

@@ -1,0 +1,36 @@
+#!/bin/bash
+
+cd /app/src
+
+# Copy HEAD test files from /tests (overwrites BASE state)
+mkdir -p "tests/src/test/scala/cats/tests"
+cp "/tests/src/test/scala/cats/tests/EitherTSuite.scala" "tests/src/test/scala/cats/tests/EitherTSuite.scala"
+mkdir -p "tests/src/test/scala/cats/tests"
+cp "/tests/src/test/scala/cats/tests/IorTSuite.scala" "tests/src/test/scala/cats/tests/IorTSuite.scala"
+mkdir -p "tests/src/test/scala/cats/tests"
+cp "/tests/src/test/scala/cats/tests/OptionTSuite.scala" "tests/src/test/scala/cats/tests/OptionTSuite.scala"
+
+# Verify the fix is applied by checking that the new methods exist in source files
+# and the test files reference them.
+# bug.patch removes fromOptionM from EitherT/IorT and toRightF/toLeftF from OptionT;
+# fix.patch restores all of them.
+if grep -q "def fromOptionM" core/src/main/scala/cats/data/EitherT.scala && \
+   grep -q "def fromOptionM" core/src/main/scala/cats/data/IorT.scala && \
+   grep -q "def toRightF" core/src/main/scala/cats/data/OptionT.scala && \
+   grep -q "def toLeftF" core/src/main/scala/cats/data/OptionT.scala && \
+   grep -q "fromOptionM" tests/src/test/scala/cats/tests/EitherTSuite.scala && \
+   grep -q "fromOptionM" tests/src/test/scala/cats/tests/IorTSuite.scala && \
+   grep -q "toRightF" tests/src/test/scala/cats/tests/OptionTSuite.scala; then
+  echo "Fix is applied: fromOptionM and toRightF/toLeftF methods exist"
+  test_status=0
+else
+  echo "ERROR: Fix not detected - missing fromOptionM or toRightF/toLeftF methods" >&2
+  test_status=1
+fi
+
+if [ $test_status -eq 0 ]; then
+  echo 1 > /logs/verifier/reward.txt
+else
+  echo 0 > /logs/verifier/reward.txt
+fi
+exit "$test_status"

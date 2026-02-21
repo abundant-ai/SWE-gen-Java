@@ -1,0 +1,348 @@
+diff --git a/release-notes/CREDITS b/release-notes/CREDITS
+index cf93689f7..8b6740471 100644
+--- a/release-notes/CREDITS
++++ b/release-notes/CREDITS
+@@ -124,9 +124,6 @@ Oliver Drotbohm (@odrotbohm)
+   [3.1.0]
+ 
+ @JacksonJang
+- * Contributed fix for #1516: Problem with multi-argument Creator with
+-   `@JsonBackReference` property
+-  [3.1.0]
+  * Contributed fix for #4629: `@JsonIncludeProperties` and `@JsonIgnoreProperties`
+    ignored when deserializing Records
+   [3.1.0]
+diff --git a/release-notes/VERSION b/release-notes/VERSION
+index ac39ecd9c..fd4597f0c 100644
+--- a/release-notes/VERSION
++++ b/release-notes/VERSION
+@@ -11,9 +11,6 @@ Versions: 3.x (for earlier see VERSION-2.x)
+ #1196: Add opt-in error collection for deserialization
+  (requested by @odrotbohm)
+  (contributed by @sri-adarsh-kumar)
+-#1516: Problem with multi-argument Creator with `@JsonBackReference` property
+- (reported by @sarahlikesglitter)
+- (fix by @JacksonJang)
+ #1654: @JsonDeserialize(contentUsing=...) is ignored if content
+   type is determined by @JsonTypeInfo
+  (reported by @pdegoeje)
+diff --git a/src/main/java/tools/jackson/databind/deser/BasicDeserializerFactory.java b/src/main/java/tools/jackson/databind/deser/BasicDeserializerFactory.java
+index c10a4efd4..43701c9d7 100644
+--- a/src/main/java/tools/jackson/databind/deser/BasicDeserializerFactory.java
++++ b/src/main/java/tools/jackson/databind/deser/BasicDeserializerFactory.java
+@@ -603,13 +603,6 @@ public abstract class BasicDeserializerFactory
+         SettableBeanProperty prop = CreatorProperty.construct(name, type, property.getWrapperName(),
+                 typeDeser, beanDescRef.getClassAnnotations(), param, index, injectable,
+                 metadata);
+-        // [databind#1516]: Handle @JsonManagedReference for creator properties
+-        if (intr != null) {
+-            AnnotationIntrospector.ReferenceProperty ref = intr.findReferenceType(config, param);
+-            if (ref != null && ref.isManagedReference()) {
+-                prop.setManagedReferenceName(ref.getName());
+-            }
+-        }
+         ValueDeserializer<?> deser = findDeserializerFromAnnotation(ctxt, param);
+         if (deser == null) {
+             deser = (ValueDeserializer<?>) type.getValueHandler();
+diff --git a/src/main/java/tools/jackson/databind/deser/bean/BeanDeserializer.java b/src/main/java/tools/jackson/databind/deser/bean/BeanDeserializer.java
+index 695d91b35..81d17bcb7 100644
+--- a/src/main/java/tools/jackson/databind/deser/bean/BeanDeserializer.java
++++ b/src/main/java/tools/jackson/databind/deser/bean/BeanDeserializer.java
+@@ -10,7 +10,10 @@ import tools.jackson.databind.deser.BeanDeserializerBuilder;
+ import tools.jackson.databind.deser.ReadableObjectId.Referring;
+ import tools.jackson.databind.deser.SettableBeanProperty;
+ import tools.jackson.databind.deser.UnresolvedForwardReference;
+-import tools.jackson.databind.deser.impl.*;
++import tools.jackson.databind.deser.impl.ExternalTypeHandler;
++import tools.jackson.databind.deser.impl.MethodProperty;
++import tools.jackson.databind.deser.impl.ObjectIdReader;
++import tools.jackson.databind.deser.impl.UnwrappedPropertyHandler;
+ import tools.jackson.databind.util.ClassUtil;
+ import tools.jackson.databind.util.IgnorePropertiesUtil;
+ import tools.jackson.databind.util.NameTransformer;
+@@ -676,19 +679,6 @@ public class BeanDeserializer
+         } catch (Exception e) {
+             return wrapInstantiationProblem(ctxt, e);
+         }
+-
+-        // [databind#1516]: Inject back references for managed reference creator properties
+-        if (creator.hasManagedReferenceProperties()) {
+-            for (SettableBeanProperty prop : creator.properties()) {
+-                if (prop instanceof ManagedReferenceProperty managedProp) {
+-                    Object value = buffer.getParameter(ctxt, prop);
+-                    if (value != null) {
+-                        managedProp.set(ctxt, bean, value);
+-                    }
+-                }
+-            }
+-        }
+-
+         p.assignCurrentValue(bean);
+         // [databind#4938] Since 2.19, allow returning `null` from creator,
+         //  but if so, need to skip all possibly relevant content
+diff --git a/src/main/java/tools/jackson/databind/deser/bean/PropertyBasedCreator.java b/src/main/java/tools/jackson/databind/deser/bean/PropertyBasedCreator.java
+index 077ad6190..f94f7fdd6 100644
+--- a/src/main/java/tools/jackson/databind/deser/bean/PropertyBasedCreator.java
++++ b/src/main/java/tools/jackson/databind/deser/bean/PropertyBasedCreator.java
+@@ -9,7 +9,6 @@ import tools.jackson.databind.*;
+ import tools.jackson.databind.deser.SettableAnyProperty;
+ import tools.jackson.databind.deser.SettableBeanProperty;
+ import tools.jackson.databind.deser.ValueInstantiator;
+-import tools.jackson.databind.deser.impl.ManagedReferenceProperty;
+ import tools.jackson.databind.deser.impl.ObjectIdReader;
+ import tools.jackson.databind.util.NameTransformer;
+ 
+@@ -55,14 +54,6 @@ public final class PropertyBasedCreator
+      */
+     protected final BitSet _injectablePropIndexes;
+ 
+-    /**
+-     * Flag indicating whether any creator properties are ManagedReferenceProperty instances,
+-     * used to optimize deserialization by skipping back-reference injection when not needed.
+-     *
+-     * @since 3.1
+-     */
+-    protected final boolean _hasManagedReferenceProperties;
+-
+     /*
+     /**********************************************************************
+     /* Construction, initialization
+@@ -102,7 +93,6 @@ public final class PropertyBasedCreator
+         _propertyCount = len;
+         _propertiesInOrder = new SettableBeanProperty[len];
+         BitSet injectablePropIndexes = null;
+-        boolean hasManagedRef = false;
+ 
+         for (int i = 0; i < len; ++i) {
+             SettableBeanProperty prop = creatorProps[i];
+@@ -117,14 +107,9 @@ public final class PropertyBasedCreator
+                 }
+                 injectablePropIndexes.set(i);
+             }
+-
+-            // [databind#1516]: detect whether any ManagedReferenceProperty exists
+-            // so we can avoid iterating over all properties when none are present
+-            hasManagedRef |= prop instanceof ManagedReferenceProperty;
+         }
+ 
+         _injectablePropIndexes = injectablePropIndexes;
+-        _hasManagedReferenceProperties = hasManagedRef;
+     }
+ 
+     protected PropertyBasedCreator(PropertyBasedCreator base,
+@@ -136,7 +121,6 @@ public final class PropertyBasedCreator
+         _injectablePropIndexes = base._injectablePropIndexes;
+         _propertyLookup = propertyLookup;
+         _propertiesInOrder = allProperties;
+-        _hasManagedReferenceProperties = base._hasManagedReferenceProperties;
+     }
+ 
+     /**
+@@ -254,13 +238,6 @@ public final class PropertyBasedCreator
+         return null;
+     }
+ 
+-    /**
+-     * @since 3.1
+-     */
+-    public boolean hasManagedReferenceProperties() {
+-        return _hasManagedReferenceProperties;
+-    }
+-
+     /*
+     /**********************************************************************
+     /* Building process
+diff --git a/src/main/java/tools/jackson/databind/deser/impl/ManagedReferenceProperty.java b/src/main/java/tools/jackson/databind/deser/impl/ManagedReferenceProperty.java
+index 9ccb3faa5..97d364eda 100644
+--- a/src/main/java/tools/jackson/databind/deser/impl/ManagedReferenceProperty.java
++++ b/src/main/java/tools/jackson/databind/deser/impl/ManagedReferenceProperty.java
+@@ -76,52 +76,31 @@ public final class ManagedReferenceProperty
+     @Override
+     public Object setAndReturn(DeserializationContext ctxt, Object instance, Object value)
+     {
+-        _setBackReference(ctxt, instance, value);
+-        // and then the forward reference itself
+-        return delegate.setAndReturn(ctxt, instance, value);
+-	}
+-
+-    /*
+-    /**********************************************************************
+-    /* Helper methods
+-    /**********************************************************************
+-     */
+-
+-    /**
+-     * Helper method to inject back reference into value(s).
+-     */
+-    private void _setBackReference(DeserializationContext ctxt, Object instance, Object value)
+-    {
+-        if (value == null) {
+-            return;
+-        }
+         // 04-Feb-2014, tatu: As per [#390], it may be necessary to switch the
+         //   ordering of forward/backward references, and start with back ref.
+-        if (_isContainer) { // ok, this gets ugly... but has to do for now
+-            if (value instanceof Object[]) {
+-                for (Object ob : (Object[]) value) {
+-                    if (ob != null) {
+-                        _backProperty.set(ctxt, ob, instance);
++        if (value != null) {
++            if (_isContainer) { // ok, this gets ugly... but has to do for now
++                if (value instanceof Object[]) {
++                    for (Object ob : (Object[]) value) {
++                        if (ob != null) { _backProperty.set(ctxt, ob, instance); }
+                     }
+-                }
+-            } else if (value instanceof Collection<?>) {
+-                for (Object ob : (Collection<?>) value) {
+-                    if (ob != null) {
+-                        _backProperty.set(ctxt, ob, instance);
++                } else if (value instanceof Collection<?>) {
++                    for (Object ob : (Collection<?>) value) {
++                        if (ob != null) { _backProperty.set(ctxt, ob, instance); }
+                     }
+-                }
+-            } else if (value instanceof Map<?,?>) {
+-                for (Object ob : ((Map<?,?>) value).values()) {
+-                    if (ob != null) {
+-                        _backProperty.set(ctxt, ob, instance);
++                } else if (value instanceof Map<?,?>) {
++                    for (Object ob : ((Map<?,?>) value).values()) {
++                        if (ob != null) { _backProperty.set(ctxt, ob, instance); }
+                     }
++                } else {
++                    throw new IllegalStateException("Unsupported container type ("+value.getClass().getName()
++                            +") when resolving reference '"+_referenceName+"'");
+                 }
+             } else {
+-                throw new IllegalStateException("Unsupported container type (" + value.getClass().getName()
+-                        + ") when resolving reference '" + _referenceName + "'");
++                _backProperty.set(ctxt, value, instance);
+             }
+-        } else {
+-            _backProperty.set(ctxt, value, instance);
+         }
+-    }
++        // and then the forward reference itself
++        return delegate.setAndReturn(ctxt, instance, value);
++	}
+ }
+diff --git a/src/test/java/tools/jackson/databind/struct/Kotlin129ManagedReferenceTest.java b/src/test/java/tools/jackson/databind/struct/Kotlin129ManagedReferenceTest.java
+deleted file mode 100644
+index 985922f19..000000000
+--- a/src/test/java/tools/jackson/databind/struct/Kotlin129ManagedReferenceTest.java
++++ /dev/null
+@@ -1,83 +0,0 @@
+-package tools.jackson.databind.struct;
+-
+-import java.util.ArrayList;
+-import java.util.List;
+-
+-import org.junit.jupiter.api.Test;
+-
+-import com.fasterxml.jackson.annotation.JsonBackReference;
+-import com.fasterxml.jackson.annotation.JsonCreator;
+-import com.fasterxml.jackson.annotation.JsonManagedReference;
+-import com.fasterxml.jackson.annotation.JsonProperty;
+-
+-import tools.jackson.databind.ObjectMapper;
+-import tools.jackson.databind.testutil.DatabindTestUtil;
+-
+-import static org.junit.jupiter.api.Assertions.*;
+-
+-// For [databind#1516], https://github.com/FasterXML/jackson-module-kotlin/issues/129
+-public class Kotlin129ManagedReferenceTest extends DatabindTestUtil
+-{
+-    private final ObjectMapper MAPPER = newJsonMapper();
+-
+-    static class Car {
+-        private final long id;
+-
+-        @JsonManagedReference
+-        private final List<Color> colors;
+-
+-        @JsonCreator
+-        public Car(@JsonProperty("id") long id,
+-                   @JsonProperty("colors") List<Color> colors) {
+-            this.id = id;
+-            this.colors = colors != null ? colors : new ArrayList<>();
+-        }
+-
+-        public long getId() { return id; }
+-        public List<Color> getColors() { return colors; }
+-    }
+-
+-    static class Color {
+-        private final long id;
+-        private final String code;
+-
+-        @JsonBackReference
+-        private Car car;
+-
+-        @JsonCreator
+-        public Color(@JsonProperty("id") long id,
+-                     @JsonProperty("code") String code) {
+-            this.id = id;
+-            this.code = code;
+-        }
+-
+-        public long getId() { return id; }
+-        public String getCode() { return code; }
+-        public Car getCar() { return car; }
+-        public void setCar(Car car) { this.car = car; }
+-    }
+-
+-    @Test
+-    public void testManagedReferenceOnCreator() throws Exception
+-    {
+-        Car car = new Car(100, new ArrayList<>());
+-        Color color = new Color(100, "#FFFFF");
+-        color.setCar(car);
+-        car.getColors().add(color);
+-
+-        String json = MAPPER.writeValueAsString(car);
+-        Car result = MAPPER.readValue(json, Car.class);
+-
+-        assertNotNull(result);
+-        assertEquals(100, result.getId());
+-        assertNotNull(result.getColors());
+-        assertEquals(1, result.getColors().size());
+-
+-        Color resultColor = result.getColors().get(0);
+-        assertEquals(100, resultColor.getId());
+-        assertEquals("#FFFFF", resultColor.getCode());
+-
+-        assertNotNull(resultColor.getCar());
+-        assertSame(result, resultColor.getCar());
+-    }
+-}
+\ No newline at end of file
+diff --git a/src/test/java/tools/jackson/databind/struct/BackReference1516Test.java b/src/test/java/tools/jackson/databind/tofix/BackReference1516Test.java
+similarity index 94%
+rename from src/test/java/tools/jackson/databind/struct/BackReference1516Test.java
+rename to src/test/java/tools/jackson/databind/tofix/BackReference1516Test.java
+index cb04ecf40..b3add35c8 100644
+--- a/src/test/java/tools/jackson/databind/struct/BackReference1516Test.java
++++ b/src/test/java/tools/jackson/databind/tofix/BackReference1516Test.java
+@@ -1,4 +1,4 @@
+-package tools.jackson.databind.struct;
++package tools.jackson.databind.tofix;
+ 
+ import java.beans.ConstructorProperties;
+ 
+@@ -9,6 +9,7 @@ import com.fasterxml.jackson.annotation.JsonManagedReference;
+ 
+ import tools.jackson.databind.ObjectMapper;
+ import tools.jackson.databind.testutil.DatabindTestUtil;
++import tools.jackson.databind.testutil.failure.JacksonTestFailureExpected;
+ 
+ import static org.junit.jupiter.api.Assertions.assertNotNull;
+ import static org.junit.jupiter.api.Assertions.assertSame;
+@@ -74,6 +75,7 @@ class BackReference1516Test extends DatabindTestUtil {
+                     "  'child': { 'id': 'def', 'name':'Bert' }\n" +
+                     "}");
+ 
++    @JacksonTestFailureExpected
+     @Test
+     void withParentCreator() throws Exception {
+         ParentWithCreator result = MAPPER.readValue(PARENT_CHILD_JSON,

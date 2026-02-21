@@ -1,0 +1,551 @@
+diff --git a/moshi/src/main/java/com/squareup/moshi/BufferedSinkJsonWriter.java b/moshi/src/main/java/com/squareup/moshi/BufferedSinkJsonWriter.java
+index 9464dc56..cd5a8345 100644
+--- a/moshi/src/main/java/com/squareup/moshi/BufferedSinkJsonWriter.java
++++ b/moshi/src/main/java/com/squareup/moshi/BufferedSinkJsonWriter.java
+@@ -62,6 +62,8 @@ final class BufferedSinkJsonWriter extends JsonWriter {
+ 
+   private String deferredName;
+ 
++  private boolean promoteNameToValue;
++
+   BufferedSinkJsonWriter(BufferedSink sink) {
+     if (sink == null) {
+       throw new NullPointerException("sink == null");
+@@ -90,7 +92,7 @@ final class BufferedSinkJsonWriter extends JsonWriter {
+   }
+ 
+   @Override public JsonWriter endObject() throws IOException {
+-    promoteValueToName = false;
++    promoteNameToValue = false;
+     return close(EMPTY_OBJECT, NONEMPTY_OBJECT, "}");
+   }
+ 
+@@ -141,7 +143,7 @@ final class BufferedSinkJsonWriter extends JsonWriter {
+     }
+     deferredName = name;
+     pathNames[stackSize - 1] = name;
+-    promoteValueToName = false;
++    promoteNameToValue = false;
+     return this;
+   }
+ 
+@@ -157,7 +159,7 @@ final class BufferedSinkJsonWriter extends JsonWriter {
+     if (value == null) {
+       return nullValue();
+     }
+-    if (promoteValueToName) {
++    if (promoteNameToValue) {
+       return name(value);
+     }
+     writeDeferredName();
+@@ -201,7 +203,7 @@ final class BufferedSinkJsonWriter extends JsonWriter {
+     if (!lenient && (Double.isNaN(value) || Double.isInfinite(value))) {
+       throw new IllegalArgumentException("Numeric values must be finite, but was " + value);
+     }
+-    if (promoteValueToName) {
++    if (promoteNameToValue) {
+       return name(Double.toString(value));
+     }
+     writeDeferredName();
+@@ -212,7 +214,7 @@ final class BufferedSinkJsonWriter extends JsonWriter {
+   }
+ 
+   @Override public JsonWriter value(long value) throws IOException {
+-    if (promoteValueToName) {
++    if (promoteNameToValue) {
+       return name(Long.toString(value));
+     }
+     writeDeferredName();
+@@ -232,7 +234,7 @@ final class BufferedSinkJsonWriter extends JsonWriter {
+         && (string.equals("-Infinity") || string.equals("Infinity") || string.equals("NaN"))) {
+       throw new IllegalArgumentException("Numeric values must be finite, but was " + value);
+     }
+-    if (promoteValueToName) {
++    if (promoteNameToValue) {
+       return name(string);
+     }
+     writeDeferredName();
+@@ -367,4 +369,12 @@ final class BufferedSinkJsonWriter extends JsonWriter {
+         throw new IllegalStateException("Nesting problem.");
+     }
+   }
++
++  @Override void promoteNameToValue() throws IOException {
++    int context = peekScope();
++    if (context != NONEMPTY_OBJECT && context != EMPTY_OBJECT) {
++      throw new IllegalStateException("Nesting problem.");
++    }
++    promoteNameToValue = true;
++  }
+ }
+diff --git a/moshi/src/main/java/com/squareup/moshi/JsonWriter.java b/moshi/src/main/java/com/squareup/moshi/JsonWriter.java
+index c0179951..e1787607 100644
+--- a/moshi/src/main/java/com/squareup/moshi/JsonWriter.java
++++ b/moshi/src/main/java/com/squareup/moshi/JsonWriter.java
+@@ -20,9 +20,6 @@ import java.io.Flushable;
+ import java.io.IOException;
+ import okio.BufferedSink;
+ 
+-import static com.squareup.moshi.JsonScope.EMPTY_OBJECT;
+-import static com.squareup.moshi.JsonScope.NONEMPTY_OBJECT;
+-
+ /**
+  * Writes a JSON (<a href="http://www.ietf.org/rfc/rfc7159.txt">RFC 7159</a>)
+  * encoded value to a stream, one token at a time. The stream includes both
+@@ -134,7 +131,6 @@ public abstract class JsonWriter implements Closeable, Flushable {
+   String indent;
+   boolean lenient;
+   boolean serializeNulls;
+-  boolean promoteValueToName;
+ 
+   /** Returns a new instance that writes a JSON-encoded stream to {@code sink}. */
+   public static JsonWriter of(BufferedSink sink) {
+@@ -317,16 +313,10 @@ public abstract class JsonWriter implements Closeable, Flushable {
+   public abstract JsonWriter value(Number value) throws IOException;
+ 
+   /**
+-   * Changes the writer to treat the next value as a string name. This is useful for map adapters so
+-   * that arbitrary type adapters can use {@link #value} to write a name value.
++   * Changes the reader to treat the next string value as a name. This is useful for map adapters so
++   * that arbitrary type adapters can use {@link #value(String)} to write a name value.
+    */
+-  final void promoteValueToName() throws IOException {
+-    int context = peekScope();
+-    if (context != NONEMPTY_OBJECT && context != EMPTY_OBJECT) {
+-      throw new IllegalStateException("Nesting problem.");
+-    }
+-    promoteValueToName = true;
+-  }
++  abstract void promoteNameToValue() throws IOException;
+ 
+   /**
+    * Returns a <a href="http://goessner.net/articles/JsonPath/">JsonPath</a> to
+diff --git a/moshi/src/main/java/com/squareup/moshi/MapJsonAdapter.java b/moshi/src/main/java/com/squareup/moshi/MapJsonAdapter.java
+index 8cf784d9..3158108b 100644
+--- a/moshi/src/main/java/com/squareup/moshi/MapJsonAdapter.java
++++ b/moshi/src/main/java/com/squareup/moshi/MapJsonAdapter.java
+@@ -52,7 +52,7 @@ final class MapJsonAdapter<K, V> extends JsonAdapter<Map<K, V>> {
+       if (entry.getKey() == null) {
+         throw new JsonDataException("Map key is null at " + writer.getPath());
+       }
+-      writer.promoteValueToName();
++      writer.promoteNameToValue();
+       keyAdapter.toJson(writer, entry.getKey());
+       valueAdapter.toJson(writer, entry.getValue());
+     }
+diff --git a/moshi/src/main/java/com/squareup/moshi/ObjectJsonReader.java b/moshi/src/main/java/com/squareup/moshi/ObjectJsonReader.java
+index 0f30d888..8f16fec4 100644
+--- a/moshi/src/main/java/com/squareup/moshi/ObjectJsonReader.java
++++ b/moshi/src/main/java/com/squareup/moshi/ObjectJsonReader.java
+@@ -273,10 +273,10 @@ final class ObjectJsonReader extends JsonReader {
+   }
+ 
+   @Override void promoteNameToValue() throws IOException {
+-    if (hasNext()) {
+-      String name = nextName();
+-      push(name);
+-    }
++    Map.Entry<?, ?> peeked = require(Map.Entry.class, Token.NAME);
++
++    push(peeked.getKey());
++    stack[stackSize - 2] = peeked.getValue();
+   }
+ 
+   @Override public void close() throws IOException {
+diff --git a/moshi/src/main/java/com/squareup/moshi/ObjectJsonWriter.java b/moshi/src/main/java/com/squareup/moshi/ObjectJsonWriter.java
+index 237d4624..a4b7c533 100644
+--- a/moshi/src/main/java/com/squareup/moshi/ObjectJsonWriter.java
++++ b/moshi/src/main/java/com/squareup/moshi/ObjectJsonWriter.java
+@@ -79,7 +79,6 @@ final class ObjectJsonWriter extends JsonWriter {
+     if (peekScope() != EMPTY_OBJECT || deferredName != null) {
+       throw new IllegalStateException("Nesting problem.");
+     }
+-    promoteValueToName = false;
+     stackSize--;
+     stack[stackSize] = null;
+     pathNames[stackSize] = null; // Free the last path name so that it can be garbage collected!
+@@ -97,16 +96,12 @@ final class ObjectJsonWriter extends JsonWriter {
+     if (peekScope() != EMPTY_OBJECT || deferredName != null) {
+       throw new IllegalStateException("Nesting problem.");
+     }
+-    deferredName = name;
+     pathNames[stackSize - 1] = name;
+-    promoteValueToName = false;
++    deferredName = name;
+     return this;
+   }
+ 
+   @Override public JsonWriter value(String value) throws IOException {
+-    if (promoteValueToName) {
+-      return name(value);
+-    }
+     add(value);
+     pathIndices[stackSize - 1]++;
+     return this;
+@@ -135,9 +130,6 @@ final class ObjectJsonWriter extends JsonWriter {
+   }
+ 
+   @Override public JsonWriter value(long value) throws IOException {
+-    if (promoteValueToName) {
+-      return name(Long.toString(value));
+-    }
+     add(value);
+     pathIndices[stackSize - 1]++;
+     return this;
+@@ -150,14 +142,15 @@ final class ObjectJsonWriter extends JsonWriter {
+         throw new IllegalArgumentException("Numeric values must be finite, but was " + value);
+       }
+     }
+-    if (promoteValueToName) {
+-      return name(value.toString());
+-    }
+     add(value);
+     pathIndices[stackSize - 1]++;
+     return this;
+   }
+ 
++  @Override void promoteNameToValue() throws IOException {
++    throw new UnsupportedOperationException();
++  }
++
+   @Override public void close() throws IOException {
+     int size = stackSize;
+     if (size > 1 || size == 1 && scopes[size - 1] != NONEMPTY_DOCUMENT) {
+diff --git a/moshi/src/test/java/com/squareup/moshi/MapJsonAdapterTest.java b/moshi/src/test/java/com/squareup/moshi/MapJsonAdapterTest.java
+index bb07498f..0fb19554 100644
+--- a/moshi/src/test/java/com/squareup/moshi/MapJsonAdapterTest.java
++++ b/moshi/src/test/java/com/squareup/moshi/MapJsonAdapterTest.java
+@@ -125,22 +125,6 @@ public final class MapJsonAdapterTest {
+         MapEntry.entry(5, true), MapEntry.entry(6, false), MapEntry.entry(7, null));
+   }
+ 
+-  @Test public void mapWithNonStringKeysToJsonObject() throws Exception {
+-    Map<Integer, Boolean> map = new LinkedHashMap<>();
+-    map.put(5, true);
+-    map.put(6, false);
+-    map.put(7, null);
+-
+-    Map<String, Boolean> jsonObject = new LinkedHashMap<>();
+-    jsonObject.put("5", true);
+-    jsonObject.put("6", false);
+-    jsonObject.put("7", null);
+-
+-    JsonAdapter<Map<Integer, Boolean>> jsonAdapter = mapAdapter(Integer.class, Boolean.class);
+-    assertThat(jsonAdapter.serializeNulls().toJsonObject(map)).isEqualTo(jsonObject);
+-    assertThat(jsonAdapter.fromJsonObject(jsonObject)).isEqualTo(map);
+-  }
+-
+   private <K, V> String toJson(Type keyType, Type valueType, Map<K, V> value) throws IOException {
+     JsonAdapter<Map<K, V>> jsonAdapter = mapAdapter(keyType, valueType);
+     Buffer buffer = new Buffer();
+diff --git a/moshi/src/test/java/com/squareup/moshi/PromoteNameToValueTest.java b/moshi/src/test/java/com/squareup/moshi/PromoteNameToValueTest.java
+index c50005dc..284b095d 100644
+--- a/moshi/src/test/java/com/squareup/moshi/PromoteNameToValueTest.java
++++ b/moshi/src/test/java/com/squareup/moshi/PromoteNameToValueTest.java
+@@ -15,27 +15,15 @@
+  */
+ package com.squareup.moshi;
+ 
+-import java.util.List;
++import okio.Buffer;
+ import org.junit.Test;
+-import org.junit.runner.RunWith;
+-import org.junit.runners.Parameterized;
+-import org.junit.runners.Parameterized.Parameter;
+-import org.junit.runners.Parameterized.Parameters;
+ 
+ import static org.assertj.core.api.Assertions.assertThat;
+ import static org.junit.Assert.fail;
+ 
+-@RunWith(Parameterized.class)
+ public final class PromoteNameToValueTest {
+-  @Parameter public JsonCodecFactory factory;
+-
+-  @Parameters(name = "{0}")
+-  public static List<Object[]> parameters() {
+-    return JsonCodecFactory.factories();
+-  }
+-
+   @Test public void readerStringValue() throws Exception {
+-    JsonReader reader = factory.newReader("{\"a\":1}");
++    JsonReader reader = newReader("{\"a\":1}");
+     reader.beginObject();
+     reader.promoteNameToValue();
+     assertThat(reader.getPath()).isEqualTo("$.a");
+@@ -49,7 +37,7 @@ public final class PromoteNameToValueTest {
+   }
+ 
+   @Test public void readerIntegerValue() throws Exception {
+-    JsonReader reader = factory.newReader("{\"5\":1}");
++    JsonReader reader = newReader("{\"5\":1}");
+     reader.beginObject();
+     reader.promoteNameToValue();
+     assertThat(reader.getPath()).isEqualTo("$.5");
+@@ -63,7 +51,7 @@ public final class PromoteNameToValueTest {
+   }
+ 
+   @Test public void readerDoubleValue() throws Exception {
+-    JsonReader reader = factory.newReader("{\"5.5\":1}");
++    JsonReader reader = newReader("{\"5.5\":1}");
+     reader.beginObject();
+     reader.promoteNameToValue();
+     assertThat(reader.getPath()).isEqualTo("$.5.5");
+@@ -77,7 +65,7 @@ public final class PromoteNameToValueTest {
+   }
+ 
+   @Test public void readerBooleanValue() throws Exception {
+-    JsonReader reader = factory.newReader("{\"true\":1}");
++    JsonReader reader = newReader("{\"true\":1}");
+     reader.beginObject();
+     reader.promoteNameToValue();
+     assertThat(reader.getPath()).isEqualTo("$.true");
+@@ -86,9 +74,7 @@ public final class PromoteNameToValueTest {
+       reader.nextBoolean();
+       fail();
+     } catch (JsonDataException e) {
+-      assertThat(e.getMessage()).isIn(
+-          "Expected BOOLEAN but was true, a java.lang.String, at path $.true",
+-          "Expected a boolean but was STRING at path $.true");
++      assertThat(e).hasMessage("Expected a boolean but was STRING at path $.true");
+     }
+     assertThat(reader.getPath()).isEqualTo("$.true");
+     assertThat(reader.nextString()).isEqualTo("true");
+@@ -99,7 +85,7 @@ public final class PromoteNameToValueTest {
+   }
+ 
+   @Test public void readerLongValue() throws Exception {
+-    JsonReader reader = factory.newReader("{\"5\":1}");
++    JsonReader reader = newReader("{\"5\":1}");
+     reader.beginObject();
+     reader.promoteNameToValue();
+     assertThat(reader.getPath()).isEqualTo("$.5");
+@@ -113,7 +99,7 @@ public final class PromoteNameToValueTest {
+   }
+ 
+   @Test public void readerNullValue() throws Exception {
+-    JsonReader reader = factory.newReader("{\"null\":1}");
++    JsonReader reader = newReader("{\"null\":1}");
+     reader.beginObject();
+     reader.promoteNameToValue();
+     assertThat(reader.getPath()).isEqualTo("$.null");
+@@ -122,9 +108,7 @@ public final class PromoteNameToValueTest {
+       reader.nextNull();
+       fail();
+     } catch (JsonDataException e) {
+-      assertThat(e.getMessage()).isIn(
+-          "Expected NULL but was null, a java.lang.String, at path $.null",
+-          "Expected null but was STRING at path $.null");
++      assertThat(e).hasMessage("Expected null but was STRING at path $.null");
+     }
+     assertThat(reader.nextString()).isEqualTo("null");
+     assertThat(reader.getPath()).isEqualTo("$.null");
+@@ -135,7 +119,7 @@ public final class PromoteNameToValueTest {
+   }
+ 
+   @Test public void readerMultipleValueObject() throws Exception {
+-    JsonReader reader = factory.newReader("{\"a\":1,\"b\":2}");
++    JsonReader reader = newReader("{\"a\":1,\"b\":2}");
+     reader.beginObject();
+     assertThat(reader.nextName()).isEqualTo("a");
+     assertThat(reader.nextInt()).isEqualTo(1);
+@@ -151,7 +135,7 @@ public final class PromoteNameToValueTest {
+   }
+ 
+   @Test public void readerEmptyValueObject() throws Exception {
+-    JsonReader reader = factory.newReader("{}");
++    JsonReader reader = newReader("{}");
+     reader.beginObject();
+     assertThat(reader.peek()).isEqualTo(JsonReader.Token.END_OBJECT);
+     reader.promoteNameToValue();
+@@ -161,7 +145,7 @@ public final class PromoteNameToValueTest {
+   }
+ 
+   @Test public void readerUnusedPromotionDoesntPersist() throws Exception {
+-    JsonReader reader = factory.newReader("[{},{\"a\":5}]");
++    JsonReader reader = newReader("[{},{\"a\":5}]");
+     reader.beginArray();
+     reader.beginObject();
+     reader.promoteNameToValue();
+@@ -176,7 +160,7 @@ public final class PromoteNameToValueTest {
+   }
+ 
+   @Test public void readerUnquotedIntegerValue() throws Exception {
+-    JsonReader reader = factory.newReader("{5:1}");
++    JsonReader reader = newReader("{5:1}");
+     reader.setLenient(true);
+     reader.beginObject();
+     reader.promoteNameToValue();
+@@ -186,7 +170,7 @@ public final class PromoteNameToValueTest {
+   }
+ 
+   @Test public void readerUnquotedLongValue() throws Exception {
+-    JsonReader reader = factory.newReader("{5:1}");
++    JsonReader reader = newReader("{5:1}");
+     reader.setLenient(true);
+     reader.beginObject();
+     reader.promoteNameToValue();
+@@ -196,7 +180,7 @@ public final class PromoteNameToValueTest {
+   }
+ 
+   @Test public void readerUnquotedDoubleValue() throws Exception {
+-    JsonReader reader = factory.newReader("{5:1}");
++    JsonReader reader = newReader("{5:1}");
+     reader.setLenient(true);
+     reader.beginObject();
+     reader.promoteNameToValue();
+@@ -205,49 +189,57 @@ public final class PromoteNameToValueTest {
+     reader.endObject();
+   }
+ 
++  private JsonReader newReader(String s) {
++    return JsonReader.of(new Buffer().writeUtf8(s));
++  }
++
+   @Test public void writerStringValue() throws Exception {
+-    JsonWriter writer = factory.newWriter();
++    Buffer buffer = new Buffer();
++    JsonWriter writer = JsonWriter.of(buffer);
+     writer.beginObject();
+-    writer.promoteValueToName();
++    writer.promoteNameToValue();
+     writer.value("a");
+     assertThat(writer.getPath()).isEqualTo("$.a");
+     writer.value(1);
+     assertThat(writer.getPath()).isEqualTo("$.a");
+     writer.endObject();
+     assertThat(writer.getPath()).isEqualTo("$");
+-    assertThat(factory.json()).isEqualTo("{\"a\":1}");
++    assertThat(buffer.readUtf8()).isEqualTo("{\"a\":1}");
+   }
+ 
+   @Test public void writerIntegerValue() throws Exception {
+-    JsonWriter writer = factory.newWriter();
++    Buffer buffer = new Buffer();
++    JsonWriter writer = JsonWriter.of(buffer);
+     writer.beginObject();
+-    writer.promoteValueToName();
++    writer.promoteNameToValue();
+     writer.value(5);
+     assertThat(writer.getPath()).isEqualTo("$.5");
+     writer.value(1);
+     assertThat(writer.getPath()).isEqualTo("$.5");
+     writer.endObject();
+     assertThat(writer.getPath()).isEqualTo("$");
+-    assertThat(factory.json()).isEqualTo("{\"5\":1}");
++    assertThat(buffer.readUtf8()).isEqualTo("{\"5\":1}");
+   }
+ 
+   @Test public void writerDoubleValue() throws Exception {
+-    JsonWriter writer = factory.newWriter();
++    Buffer buffer = new Buffer();
++    JsonWriter writer = JsonWriter.of(buffer);
+     writer.beginObject();
+-    writer.promoteValueToName();
++    writer.promoteNameToValue();
+     writer.value(5.5d);
+     assertThat(writer.getPath()).isEqualTo("$.5.5");
+     writer.value(1);
+     assertThat(writer.getPath()).isEqualTo("$.5.5");
+     writer.endObject();
+     assertThat(writer.getPath()).isEqualTo("$");
+-    assertThat(factory.json()).isEqualTo("{\"5.5\":1}");
++    assertThat(buffer.readUtf8()).isEqualTo("{\"5.5\":1}");
+   }
+ 
+   @Test public void writerBooleanValue() throws Exception {
+-    JsonWriter writer = factory.newWriter();
++    Buffer buffer = new Buffer();
++    JsonWriter writer = JsonWriter.of(buffer);
+     writer.beginObject();
+-    writer.promoteValueToName();
++    writer.promoteNameToValue();
+     try {
+       writer.value(true);
+       fail();
+@@ -259,26 +251,28 @@ public final class PromoteNameToValueTest {
+     writer.value(1);
+     writer.endObject();
+     assertThat(writer.getPath()).isEqualTo("$");
+-    assertThat(factory.json()).isEqualTo("{\"true\":1}");
++    assertThat(buffer.readUtf8()).isEqualTo("{\"true\":1}");
+   }
+ 
+   @Test public void writerLongValue() throws Exception {
+-    JsonWriter writer = factory.newWriter();
++    Buffer buffer = new Buffer();
++    JsonWriter writer = JsonWriter.of(buffer);
+     writer.beginObject();
+-    writer.promoteValueToName();
++    writer.promoteNameToValue();
+     writer.value(5L);
+     assertThat(writer.getPath()).isEqualTo("$.5");
+     writer.value(1);
+     assertThat(writer.getPath()).isEqualTo("$.5");
+     writer.endObject();
+     assertThat(writer.getPath()).isEqualTo("$");
+-    assertThat(factory.json()).isEqualTo("{\"5\":1}");
++    assertThat(buffer.readUtf8()).isEqualTo("{\"5\":1}");
+   }
+ 
+   @Test public void writerNullValue() throws Exception {
+-    JsonWriter writer = factory.newWriter();
++    Buffer buffer = new Buffer();
++    JsonWriter writer = JsonWriter.of(buffer);
+     writer.beginObject();
+-    writer.promoteValueToName();
++    writer.promoteNameToValue();
+     try {
+       writer.nullValue();
+       fail();
+@@ -291,39 +285,42 @@ public final class PromoteNameToValueTest {
+     assertThat(writer.getPath()).isEqualTo("$.null");
+     writer.endObject();
+     assertThat(writer.getPath()).isEqualTo("$");
+-    assertThat(factory.json()).isEqualTo("{\"null\":1}");
++    assertThat(buffer.readUtf8()).isEqualTo("{\"null\":1}");
+   }
+ 
+   @Test public void writerMultipleValueObject() throws Exception {
+-    JsonWriter writer = factory.newWriter();
++    Buffer buffer = new Buffer();
++    JsonWriter writer = JsonWriter.of(buffer);
+     writer.beginObject();
+     writer.name("a");
+     writer.value(1);
+-    writer.promoteValueToName();
++    writer.promoteNameToValue();
+     writer.value("b");
+     assertThat(writer.getPath()).isEqualTo("$.b");
+     writer.value(2);
+     assertThat(writer.getPath()).isEqualTo("$.b");
+     writer.endObject();
+     assertThat(writer.getPath()).isEqualTo("$");
+-    assertThat(factory.json()).isEqualTo("{\"a\":1,\"b\":2}");
++    assertThat(buffer.readUtf8()).isEqualTo("{\"a\":1,\"b\":2}");
+   }
+ 
+   @Test public void writerEmptyValueObject() throws Exception {
+-    JsonWriter writer = factory.newWriter();
++    Buffer buffer = new Buffer();
++    JsonWriter writer = JsonWriter.of(buffer);
+     writer.beginObject();
+-    writer.promoteValueToName();
++    writer.promoteNameToValue();
+     assertThat(writer.getPath()).isEqualTo("$.");
+     writer.endObject();
+     assertThat(writer.getPath()).isEqualTo("$");
+-    assertThat(factory.json()).isEqualTo("{}");
++    assertThat(buffer.readUtf8()).isEqualTo("{}");
+   }
+ 
+   @Test public void writerUnusedPromotionDoesntPersist() throws Exception {
+-    JsonWriter writer = factory.newWriter();
++    Buffer buffer = new Buffer();
++    JsonWriter writer = JsonWriter.of(buffer);
+     writer.beginArray();
+     writer.beginObject();
+-    writer.promoteValueToName();
++    writer.promoteNameToValue();
+     writer.endObject();
+     writer.beginObject();
+     try {

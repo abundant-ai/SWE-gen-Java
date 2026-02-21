@@ -1,0 +1,240 @@
+diff --git a/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/AdapterGenerator.kt b/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/AdapterGenerator.kt
+index 5156e3d9..385f8756 100644
+--- a/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/AdapterGenerator.kt
++++ b/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/AdapterGenerator.kt
+@@ -135,7 +135,7 @@ internal class AdapterGenerator(
+     result.addProperty(optionsProperty)
+     for (uniqueAdapter in propertyList.distinctBy { it.delegateKey }) {
+       result.addProperty(uniqueAdapter.delegateKey.generateProperty(
+-          nameAllocator, typeRenderer, moshiParam))
++          nameAllocator, typeRenderer, moshiParam, messager))
+     }
+ 
+     result.addFunction(generateToStringFun())
+diff --git a/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/DelegateKey.kt b/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/DelegateKey.kt
+index 3165feda..c28353bb 100644
+--- a/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/DelegateKey.kt
++++ b/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/DelegateKey.kt
+@@ -15,7 +15,9 @@
+  */
+ package com.squareup.moshi.kotlin.codegen
+ 
++import com.google.auto.common.MoreTypes
+ import com.squareup.kotlinpoet.AnnotationSpec
++import com.squareup.kotlinpoet.AnnotationSpec.UseSiteTarget.FIELD
+ import com.squareup.kotlinpoet.ClassName
+ import com.squareup.kotlinpoet.CodeBlock
+ import com.squareup.kotlinpoet.KModifier
+@@ -31,11 +33,16 @@ import com.squareup.kotlinpoet.asClassName
+ import com.squareup.kotlinpoet.asTypeName
+ import com.squareup.moshi.JsonAdapter
+ import com.squareup.moshi.Types
++import java.lang.annotation.ElementType
++import java.lang.annotation.RetentionPolicy
++import javax.annotation.processing.Messager
++import javax.lang.model.element.AnnotationMirror
++import javax.tools.Diagnostic.Kind.ERROR
+ 
+ /** A JsonAdapter that can be used to encode and decode a particular field. */
+ internal data class DelegateKey(
+   private val type: TypeName,
+-  private val jsonQualifiers: List<AnnotationSpec>
++  private val jsonQualifiers: Set<AnnotationMirror>
+ ) {
+   val nullable get() = type.nullable
+ 
+@@ -43,17 +50,36 @@ internal data class DelegateKey(
+   fun generateProperty(
+     nameAllocator: NameAllocator,
+     typeRenderer: TypeRenderer,
+-    moshiParameter: ParameterSpec
+-  ): PropertySpec {
++    moshiParameter: ParameterSpec,
++    messager: Messager): PropertySpec {
++    fun AnnotationMirror.validate(): AnnotationMirror {
++      // Check java types since that covers both java and kotlin annotations
++      val annotationElement = MoreTypes.asTypeElement(annotationType)
++      annotationElement.getAnnotation(java.lang.annotation.Retention::class.java)?.let {
++        if (it.value != RetentionPolicy.RUNTIME) {
++          messager.printMessage(ERROR, "JsonQualifier " +
++              "@${MoreTypes.asTypeElement(annotationType).simpleName} must have RUNTIME retention")
++        }
++      }
++      annotationElement.getAnnotation(java.lang.annotation.Target::class.java)?.let {
++        if (ElementType.FIELD !in it.value) {
++          messager.printMessage(ERROR, "JsonQualifier " +
++              "@${MoreTypes.asTypeElement(annotationType).simpleName} must support FIELD target")
++        }
++      }
++      return this
++    }
++    jsonQualifiers.forEach { it.validate() }
+     val qualifierNames = jsonQualifiers.joinToString("") {
+-      "At${(it.type as ClassName).simpleName}"
++      "At${it.annotationType.asElement().simpleName}"
+     }
+     val adapterName = nameAllocator.newName(
+         "${type.toVariableName().decapitalize()}${qualifierNames}Adapter", this)
+ 
+     val adapterTypeName = JsonAdapter::class.asClassName().parameterizedBy(type)
++    val qualifiers = jsonQualifiers
+     val standardArgs = arrayOf(moshiParameter,
+-        if (type is ClassName && jsonQualifiers.isEmpty()) {
++        if (type is ClassName && qualifiers.isEmpty()) {
+           ""
+         } else {
+           CodeBlock.of("<%T>", type)
+@@ -61,7 +87,7 @@ internal data class DelegateKey(
+         typeRenderer.render(type))
+     val standardArgsSize = standardArgs.size + 1
+     val (initializerString, args) = when {
+-      jsonQualifiers.isEmpty() -> "" to emptyArray()
++      qualifiers.isEmpty() -> "" to emptyArray()
+       else -> {
+         ", %${standardArgsSize}T.getFieldJsonQualifierAnnotations(javaClass, " +
+             "%${standardArgsSize + 1}S)" to arrayOf(Types::class.asTypeName(), adapterName)
+@@ -72,7 +98,9 @@ internal data class DelegateKey(
+     val nullModifier = if (nullable) ".nullSafe()" else ".nonNull()"
+ 
+     return PropertySpec.builder(adapterName, adapterTypeName, KModifier.PRIVATE)
+-        .addAnnotations(jsonQualifiers)
++        .addAnnotations(qualifiers.map {
++          AnnotationSpec.get(it).toBuilder().useSiteTarget(FIELD).build()
++        })
+         .initializer("%1N.adapter%2L(%3L$initializerString)$nullModifier", *finalArgs)
+         .build()
+   }
+diff --git a/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/PropertyGenerator.kt b/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/PropertyGenerator.kt
+index db33a5ad..37c4c0cf 100644
+--- a/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/PropertyGenerator.kt
++++ b/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/PropertyGenerator.kt
+@@ -20,10 +20,8 @@ import com.squareup.kotlinpoet.NameAllocator
+ import com.squareup.kotlinpoet.PropertySpec
+ 
+ /** Generates functions to encode and decode a property as JSON. */
+-internal class PropertyGenerator(
+-  val target: TargetProperty,
+-  val delegateKey: DelegateKey
+-) {
++internal class PropertyGenerator(val target: TargetProperty) {
++  val delegateKey = target.delegateKey()
+   val name = target.name
+   val jsonName = target.jsonName()
+   val hasDefault = target.hasDefault
+diff --git a/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/TargetProperty.kt b/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/TargetProperty.kt
+index 8f8d3450..e1b14e52 100644
+--- a/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/TargetProperty.kt
++++ b/kotlin/codegen/src/main/java/com/squareup/moshi/kotlin/codegen/TargetProperty.kt
+@@ -16,8 +16,6 @@
+ package com.squareup.moshi.kotlin.codegen
+ 
+ import com.google.auto.common.AnnotationMirrors
+-import com.google.auto.common.MoreTypes
+-import com.squareup.kotlinpoet.AnnotationSpec
+ import com.squareup.kotlinpoet.TypeName
+ import com.squareup.moshi.Json
+ import com.squareup.moshi.JsonQualifier
+@@ -28,16 +26,11 @@ import me.eugeniomarletti.kotlin.metadata.shadow.metadata.ProtoBuf.Visibility.IN
+ import me.eugeniomarletti.kotlin.metadata.shadow.metadata.ProtoBuf.Visibility.PROTECTED
+ import me.eugeniomarletti.kotlin.metadata.shadow.metadata.ProtoBuf.Visibility.PUBLIC
+ import me.eugeniomarletti.kotlin.metadata.visibility
+-import java.lang.annotation.ElementType
+-import java.lang.annotation.Retention
+-import java.lang.annotation.RetentionPolicy
+-import java.lang.annotation.Target
+ import javax.annotation.processing.Messager
+ import javax.lang.model.element.AnnotationMirror
+ import javax.lang.model.element.Element
+ import javax.lang.model.element.ExecutableElement
+ import javax.lang.model.element.Modifier
+-import javax.lang.model.element.Name
+ import javax.lang.model.element.VariableElement
+ import javax.tools.Diagnostic
+ 
+@@ -92,33 +85,11 @@ internal data class TargetProperty(
+       return null // This property is not settable. Ignore it.
+     }
+ 
+-    val jsonQualifierMirrors = jsonQualifiers()
+-    for (jsonQualifier in jsonQualifierMirrors) {
+-      // Check Java types since that covers both Java and Kotlin annotations.
+-      val annotationElement = MoreTypes.asTypeElement(jsonQualifier.annotationType)
+-      annotationElement.getAnnotation(Retention::class.java)?.let {
+-        if (it.value != RetentionPolicy.RUNTIME) {
+-          messager.printMessage(Diagnostic.Kind.ERROR,
+-              "JsonQualifier @${jsonQualifier.simpleName} must have RUNTIME retention")
+-        }
+-      }
+-      annotationElement.getAnnotation(Target::class.java)?.let {
+-        if (ElementType.FIELD !in it.value) {
+-          messager.printMessage(Diagnostic.Kind.ERROR,
+-              "JsonQualifier @${jsonQualifier.simpleName} must support FIELD target")
+-        }
+-      }
+-    }
+-
+-    val jsonQualifierSpecs = jsonQualifierMirrors.map {
+-      AnnotationSpec.get(it).toBuilder()
+-          .useSiteTarget(AnnotationSpec.UseSiteTarget.FIELD)
+-          .build()
+-    }
+-
+-    return PropertyGenerator(this, DelegateKey(type, jsonQualifierSpecs))
++    return PropertyGenerator(this)
+   }
+ 
++  fun delegateKey() = DelegateKey(type, jsonQualifiers())
++
+   /** Returns the JsonQualifiers on the field and parameter of this property. */
+   private fun jsonQualifiers(): Set<AnnotationMirror> {
+     val elementQualifiers = element.qualifiers
+@@ -160,8 +131,5 @@ internal data class TargetProperty(
+       return getAnnotation(Json::class.java)?.name?.replace("$", "\\$")
+     }
+ 
+-  private val AnnotationMirror.simpleName: Name
+-    get() = MoreTypes.asTypeElement(annotationType).simpleName!!
+-
+   override fun toString() = name
+ }
+diff --git a/kotlin/tests/src/test/kotlin/com/squareup/moshi/kotlin/codgen/GeneratedAdaptersTest.kt b/kotlin/tests/src/test/kotlin/com/squareup/moshi/kotlin/codgen/GeneratedAdaptersTest.kt
+index 87886213..ab9a92d9 100644
+--- a/kotlin/tests/src/test/kotlin/com/squareup/moshi/kotlin/codgen/GeneratedAdaptersTest.kt
++++ b/kotlin/tests/src/test/kotlin/com/squareup/moshi/kotlin/codgen/GeneratedAdaptersTest.kt
+@@ -32,7 +32,6 @@ import org.junit.Assert.fail
+ import org.junit.Ignore
+ import org.junit.Test
+ import java.util.Locale
+-import kotlin.reflect.full.memberProperties
+ 
+ class GeneratedAdaptersTest {
+ 
+@@ -858,28 +857,6 @@ class GeneratedAdaptersTest {
+       throw AssertionError()
+     }
+ 
+-  /** https://github.com/square/moshi/issues/563 */
+-  @Test fun qualifiedAdaptersAreShared() {
+-    val moshi = Moshi.Builder()
+-        .add(UppercaseJsonAdapter())
+-        .build()
+-    val jsonAdapter = moshi.adapter(MultiplePropertiesShareAdapter::class.java)
+-
+-    val encoded = MultiplePropertiesShareAdapter("Android", "Banana")
+-    assertThat(jsonAdapter.toJson(encoded)).isEqualTo("""{"a":"ANDROID","b":"BANANA"}""")
+-
+-    val delegateAdapters = jsonAdapter::class.memberProperties.filter {
+-      it.returnType.classifier == JsonAdapter::class
+-    }
+-    assertThat(delegateAdapters).hasSize(1)
+-  }
+-
+-  @JsonClass(generateAdapter = true)
+-  class MultiplePropertiesShareAdapter(
+-    @Uppercase(true) var a: String,
+-    @Uppercase(true) var b: String
+-  )
+-
+   @Test fun toJsonOnly() {
+     val moshi = Moshi.Builder()
+         .add(CustomToJsonOnlyAdapter())

@@ -1,0 +1,159 @@
+diff --git a/ktor-server/ktor-server-core/api/ktor-server-core.api b/ktor-server/ktor-server-core/api/ktor-server-core.api
+index e3c682dd8..8e714eee5 100644
+--- a/ktor-server/ktor-server-core/api/ktor-server-core.api
++++ b/ktor-server/ktor-server-core/api/ktor-server-core.api
+@@ -590,9 +590,13 @@ public final class io/ktor/server/engine/EmbeddedServer {
+ 	public final fun reload ()V
+ 	public final fun start (Z)Lio/ktor/server/engine/EmbeddedServer;
+ 	public static synthetic fun start$default (Lio/ktor/server/engine/EmbeddedServer;ZILjava/lang/Object;)Lio/ktor/server/engine/EmbeddedServer;
++	public final fun startSuspend (ZLkotlin/coroutines/Continuation;)Ljava/lang/Object;
++	public static synthetic fun startSuspend$default (Lio/ktor/server/engine/EmbeddedServer;ZLkotlin/coroutines/Continuation;ILjava/lang/Object;)Ljava/lang/Object;
+ 	public final fun stop (JJ)V
+ 	public final fun stop (JJLjava/util/concurrent/TimeUnit;)V
+ 	public static synthetic fun stop$default (Lio/ktor/server/engine/EmbeddedServer;JJILjava/lang/Object;)V
++	public final fun stopSuspend (JJLkotlin/coroutines/Continuation;)Ljava/lang/Object;
++	public static synthetic fun stopSuspend$default (Lio/ktor/server/engine/EmbeddedServer;JJLkotlin/coroutines/Continuation;ILjava/lang/Object;)Ljava/lang/Object;
+ }
+ 
+ public final class io/ktor/server/engine/EmbeddedServerKt {
+diff --git a/ktor-server/ktor-server-core/api/ktor-server-core.klib.api b/ktor-server/ktor-server-core/api/ktor-server-core.klib.api
+index 53959feab..5099f1d68 100644
+--- a/ktor-server/ktor-server-core/api/ktor-server-core.klib.api
++++ b/ktor-server/ktor-server-core/api/ktor-server-core.klib.api
+@@ -416,6 +416,8 @@ final class <#A: io.ktor.server.engine/ApplicationEngine, #B: io.ktor.server.eng
+ 
+     final fun start(kotlin/Boolean = ...): io.ktor.server.engine/EmbeddedServer<#A, #B> // io.ktor.server.engine/EmbeddedServer.start|start(kotlin.Boolean){}[0]
+     final fun stop(kotlin/Long = ..., kotlin/Long = ...) // io.ktor.server.engine/EmbeddedServer.stop|stop(kotlin.Long;kotlin.Long){}[0]
++    final suspend fun startSuspend(kotlin/Boolean = ...): io.ktor.server.engine/EmbeddedServer<#A, #B> // io.ktor.server.engine/EmbeddedServer.startSuspend|startSuspend(kotlin.Boolean){}[0]
++    final suspend fun stopSuspend(kotlin/Long = ..., kotlin/Long = ...) // io.ktor.server.engine/EmbeddedServer.stopSuspend|stopSuspend(kotlin.Long;kotlin.Long){}[0]
+ }
+ 
+ final class <#A: kotlin/Any, #B: io.ktor.events/EventDefinition<#A>> io.ktor.server.application.hooks/MonitoringEvent : io.ktor.server.application/Hook<kotlin/Function1<#A, kotlin/Unit>> { // io.ktor.server.application.hooks/MonitoringEvent|null[0]
+diff --git a/ktor-server/ktor-server-core/common/src/io/ktor/server/engine/EmbeddedServer.kt b/ktor-server/ktor-server-core/common/src/io/ktor/server/engine/EmbeddedServer.kt
+index 36138c1f7..ff05ff5dd 100644
+--- a/ktor-server/ktor-server-core/common/src/io/ktor/server/engine/EmbeddedServer.kt
++++ b/ktor-server/ktor-server-core/common/src/io/ktor/server/engine/EmbeddedServer.kt
+@@ -6,6 +6,7 @@ package io.ktor.server.engine
+ 
+ import io.ktor.events.*
+ import io.ktor.server.application.*
++import io.ktor.server.engine.internal.*
+ import io.ktor.util.logging.*
+ import kotlinx.coroutines.*
+ import kotlin.coroutines.*
+@@ -34,10 +35,17 @@ public expect class EmbeddedServer<TEngine : ApplicationEngine, TConfiguration :
+ 
+     public fun start(wait: Boolean = false): EmbeddedServer<TEngine, TConfiguration>
+ 
++    public suspend fun startSuspend(wait: Boolean = false): EmbeddedServer<TEngine, TConfiguration>
++
+     public fun stop(
+         gracePeriodMillis: Long = engineConfig.shutdownGracePeriod,
+         timeoutMillis: Long = engineConfig.shutdownGracePeriod
+     )
++
++    public suspend fun stopSuspend(
++        gracePeriodMillis: Long = engineConfig.shutdownGracePeriod,
++        timeoutMillis: Long = engineConfig.shutdownGracePeriod
++    )
+ }
+ 
+ /**
+diff --git a/ktor-server/ktor-server-core/jsAndWasmShared/src/io/ktor/server/engine/EmbeddedServer.jsAndWasmShared.kt b/ktor-server/ktor-server-core/jsAndWasmShared/src/io/ktor/server/engine/EmbeddedServer.jsAndWasmShared.kt
+index b24fc4389..b7a8466fb 100644
+--- a/ktor-server/ktor-server-core/jsAndWasmShared/src/io/ktor/server/engine/EmbeddedServer.jsAndWasmShared.kt
++++ b/ktor-server/ktor-server-core/jsAndWasmShared/src/io/ktor/server/engine/EmbeddedServer.jsAndWasmShared.kt
+@@ -44,9 +44,7 @@ actual constructor(
+ 
+     private val modules = rootConfig.modules
+ 
+-    public actual fun start(wait: Boolean): EmbeddedServer<TEngine, TConfiguration> {
+-        addShutdownHook { stop() }
+-
++    private fun prepareToStart() {
+         safeRaiseEvent(ApplicationStarting, application)
+         try {
+             modules.forEach { application.it() }
+@@ -65,9 +63,20 @@ actual constructor(
+                 )
+             }
+         }
++    }
+ 
++    public actual fun start(wait: Boolean): EmbeddedServer<TEngine, TConfiguration> {
++        addShutdownHook { stop() }
++        prepareToStart()
+         engine.start(wait)
++        return this
++    }
+ 
++    @OptIn(DelicateCoroutinesApi::class)
++    public actual suspend fun startSuspend(wait: Boolean): EmbeddedServer<TEngine, TConfiguration> {
++        addShutdownHook { GlobalScope.launch { stopSuspend() } }
++        prepareToStart()
++        engine.startSuspend(wait)
+         return this
+     }
+ 
+@@ -76,6 +85,11 @@ actual constructor(
+         destroy(application)
+     }
+ 
++    public actual suspend fun stopSuspend(gracePeriodMillis: Long, timeoutMillis: Long) {
++        engine.stopSuspend(gracePeriodMillis, timeoutMillis)
++        destroy(application)
++    }
++
+     private fun destroy(application: Application) {
+         safeRaiseEvent(ApplicationStopping, application)
+         try {
+diff --git a/ktor-server/ktor-server-core/jvm/src/io/ktor/server/engine/EmbeddedServerJvm.kt b/ktor-server/ktor-server-core/jvm/src/io/ktor/server/engine/EmbeddedServerJvm.kt
+index 0e8b31c04..cad896656 100644
+--- a/ktor-server/ktor-server-core/jvm/src/io/ktor/server/engine/EmbeddedServerJvm.kt
++++ b/ktor-server/ktor-server-core/jvm/src/io/ktor/server/engine/EmbeddedServerJvm.kt
+@@ -294,6 +294,10 @@ actual constructor(
+         return this
+     }
+ 
++    public actual suspend fun startSuspend(wait: Boolean): EmbeddedServer<TEngine, TConfiguration> {
++        return withContext(Dispatchers.IOBridge) { start(wait) }
++    }
++
+     public fun stop(shutdownGracePeriod: Long, shutdownTimeout: Long, timeUnit: TimeUnit) {
+         try {
+             engine.stop(timeUnit.toMillis(shutdownGracePeriod), timeUnit.toMillis(shutdownTimeout))
+@@ -312,6 +316,10 @@ actual constructor(
+         stop(gracePeriodMillis, timeoutMillis, TimeUnit.MILLISECONDS)
+     }
+ 
++    public actual suspend fun stopSuspend(gracePeriodMillis: Long, timeoutMillis: Long) {
++        withContext(Dispatchers.IOBridge) { stop(gracePeriodMillis, timeoutMillis) }
++    }
++
+     private fun instantiateAndConfigureApplication(currentClassLoader: ClassLoader): Application {
+         val newInstance = if (recreateInstance || _applicationInstance == null) {
+             Application(
+diff --git a/ktor-server/ktor-server-core/posix/src/io/ktor/server/engine/EmbeddedServerNix.kt b/ktor-server/ktor-server-core/posix/src/io/ktor/server/engine/EmbeddedServerNix.kt
+index 9720830df..f9c1bdede 100644
+--- a/ktor-server/ktor-server-core/posix/src/io/ktor/server/engine/EmbeddedServerNix.kt
++++ b/ktor-server/ktor-server-core/posix/src/io/ktor/server/engine/EmbeddedServerNix.kt
+@@ -71,11 +71,19 @@ actual constructor(
+         return this
+     }
+ 
++    public actual suspend fun startSuspend(wait: Boolean): EmbeddedServer<TEngine, TConfiguration> {
++        return withContext(Dispatchers.IOBridge) { start(wait) }
++    }
++
+     public actual fun stop(gracePeriodMillis: Long, timeoutMillis: Long) {
+         engine.stop(gracePeriodMillis, timeoutMillis)
+         destroy(application)
+     }
+ 
++    public actual suspend fun stopSuspend(gracePeriodMillis: Long, timeoutMillis: Long) {
++        withContext(Dispatchers.IOBridge) { stop(gracePeriodMillis, timeoutMillis) }
++    }
++
+     private fun destroy(application: Application) {
+         safeRaiseEvent(ApplicationStopping, application)
+         try {

@@ -1,0 +1,145 @@
+diff --git a/release-notes/CREDITS b/release-notes/CREDITS
+index 9aca26c11..cc7b58e43 100644
+--- a/release-notes/CREDITS
++++ b/release-notes/CREDITS
+@@ -116,13 +116,16 @@ Fouad Almalki (@Eng-Fouad)
+   [3.1.0]
+ 
+ Christopher Currie (@christophercurrie)
+-
+-* Requested #221: Support alternate radixes when writing numeric values as strings
++ * Requested #221: Support alternate radixes when writing numeric values as strings
+   [3.1.0]
+ 
+ Davyd Fridman (@tiger9800)
++ * Implemented #221: Support alternate radixes when writing numeric values as strings
++  [3.1.0]
+ 
+-* Implemented #221: Support alternate radixes when writing numeric values as strings
++Gary Gregory (@garydgregory)
++ * Reported #429: Cannot use property annotations on `StackTraceElement` to configure
++   deserialization
+   [3.1.0]
+ 
+ Konstantin Labun (@kulabun)
+diff --git a/release-notes/VERSION b/release-notes/VERSION
+index 5e1044b90..36bae998a 100644
+--- a/release-notes/VERSION
++++ b/release-notes/VERSION
+@@ -10,6 +10,9 @@ Versions: 3.x (for earlier see VERSION-2.x)
+ #221: Support alternate radixes when writing numeric values as strings
+  (requested by Christopher C)
+  (implementation by Davyd F)
++#429: Cannot use property annotations on `StackTraceElement` to configure
++  deserialization
++ (reported by Gary G)
+ #650: `@JsonUnwrapped` prevents checks for
+   `DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES`
+  (reported by Konstantin L)
+diff --git a/src/main/java/tools/jackson/databind/deser/jdk/StackTraceElementDeserializer.java b/src/main/java/tools/jackson/databind/deser/jdk/StackTraceElementDeserializer.java
+index 36758ca6e..d5eaa8db3 100644
+--- a/src/main/java/tools/jackson/databind/deser/jdk/StackTraceElementDeserializer.java
++++ b/src/main/java/tools/jackson/databind/deser/jdk/StackTraceElementDeserializer.java
+@@ -1,12 +1,17 @@
+ package tools.jackson.databind.deser.jdk;
+ 
++import java.util.ArrayList;
++import java.util.List;
++
+ import tools.jackson.core.JacksonException;
+ import tools.jackson.core.JsonParser;
+ import tools.jackson.core.JsonToken;
+-import tools.jackson.databind.DeserializationContext;
+-import tools.jackson.databind.DeserializationFeature;
+-import tools.jackson.databind.ValueDeserializer;
++import tools.jackson.databind.*;
++import tools.jackson.databind.deser.SettableBeanProperty;
++import tools.jackson.databind.deser.bean.BeanDeserializerBase;
++import tools.jackson.databind.deser.bean.BeanPropertyMap;
+ import tools.jackson.databind.deser.std.StdScalarDeserializer;
++import tools.jackson.databind.introspect.BeanPropertyDefinition;
+ 
+ public class StackTraceElementDeserializer
+     extends StdScalarDeserializer<StackTraceElement>
+@@ -23,9 +28,62 @@ public class StackTraceElementDeserializer
+         // 27-May-2022, tatu: MUST contextualize, alas, for optimized bean property
+         //    matching to work
+         ValueDeserializer<?> adapterDeser = ctxt.findRootValueDeserializer(ctxt.constructType(Adapter.class));
++
++        // [databind#429]: Check for mix-in @JsonProperty name overrides on
++        //   StackTraceElement and propagate as aliases to the Adapter deserializer
++        if (adapterDeser instanceof BeanDeserializerBase beanDeser) {
++            Class<?> mixin = ctxt.getConfig().findMixInClassFor(StackTraceElement.class);
++            if (mixin != null) {
++                adapterDeser = _applyPropertyAliases(ctxt, beanDeser);
++            }
++        }
+         return new StackTraceElementDeserializer(adapterDeser);
+     }
+ 
++    /**
++     * Introspects {@code StackTraceElement} properties (including mix-ins) for
++     * any {@code @JsonProperty} name overrides; if found, injects them as aliases
++     * into the Adapter's {@link BeanPropertyMap} so that renamed properties are
++     * recognized without any token-stream rewriting.
++     */
++    private static ValueDeserializer<?> _applyPropertyAliases(DeserializationContext ctxt,
++            BeanDeserializerBase adapterDeser)
++    {
++        JavaType steType = ctxt.constructType(StackTraceElement.class);
++        List<BeanPropertyDefinition> steDefs = ctxt.introspectBeanDescription(steType).findProperties();
++
++        List<SettableBeanProperty> adapterProps = new ArrayList<>();
++        adapterDeser.properties().forEachRemaining(adapterProps::add);
++
++        // For each STE property where mix-in renamed it (external != internal),
++        // find the matching Adapter property and register the external name as alias
++        PropertyName[][] aliasDefs = null;
++        for (BeanPropertyDefinition steProp : steDefs) {
++            String externalName = steProp.getName();
++            String internalName = steProp.getInternalName();
++            if (externalName.equals(internalName)) {
++                continue;
++            }
++            for (int i = 0, end = adapterProps.size(); i < end; ++i) {
++                if (internalName.equals(adapterProps.get(i).getName())) {
++                    if (aliasDefs == null) {
++                        aliasDefs = new PropertyName[end][];
++                    }
++                    aliasDefs[i] = new PropertyName[] { PropertyName.construct(externalName) };
++                    break;
++                }
++            }
++        }
++        if (aliasDefs == null) {
++            return adapterDeser;
++        }
++        boolean caseInsensitive = ctxt.isEnabled(MapperFeature.ACCEPT_CASE_INSENSITIVE_PROPERTIES);
++        BeanPropertyMap newMap = BeanPropertyMap.construct(
++                ctxt.getConfig(), adapterProps, aliasDefs, caseInsensitive)
++                .initMatcher(ctxt.tokenStreamFactory());
++        return adapterDeser.withBeanProperties(newMap);
++    }
++
+     @Override
+     public StackTraceElement deserialize(JsonParser p, DeserializationContext ctxt)
+         throws JacksonException
+@@ -34,15 +92,9 @@ public class StackTraceElementDeserializer
+ 
+         // Must get an Object
+         if (t == JsonToken.START_OBJECT || t == JsonToken.PROPERTY_NAME) {
+-            Adapter adapted;
+-            // 26-May-2022, tatu: for legacy use, need to do this:
+-            if (_adapterDeserializer == null) {
+-                adapted = ctxt.readValue(p, Adapter.class);
+-            } else {
+-                adapted = (Adapter) _adapterDeserializer.deserialize(p, ctxt);
+-            }
+-            return constructValue(ctxt, adapted);
+-        } else if (t == JsonToken.START_ARRAY && ctxt.isEnabled(DeserializationFeature.UNWRAP_SINGLE_VALUE_ARRAYS)) {
++            return constructValue(ctxt, (Adapter) _adapterDeserializer.deserialize(p, ctxt));
++        }
++        if (t == JsonToken.START_ARRAY && ctxt.isEnabled(DeserializationFeature.UNWRAP_SINGLE_VALUE_ARRAYS)) {
+             p.nextToken();
+             final StackTraceElement value = deserialize(p, ctxt);
+             if (p.nextToken() != JsonToken.END_ARRAY) {

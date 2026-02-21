@@ -1,0 +1,226 @@
+diff --git a/release-notes/VERSION b/release-notes/VERSION
+index ad4f249e6..471497212 100644
+--- a/release-notes/VERSION
++++ b/release-notes/VERSION
+@@ -67,9 +67,6 @@ Versions: 3.x (for earlier see VERSION-2.x)
+   serialization
+  (requested by @arungitan)
+  (implemented by Lee Jiwon)
+-#3349: `DeserializationProblemHandler.handleUnexpectedToken()` no longer
+-  invoked for array-like types
+- (reported by @andpal)
+ #3786: Deserialization of generic container (of Record type) using `EXTERNAL_PROPERTY`
+   fails for "natural" types (`boolean`/`long`/`String`/`double`) because
+   type information is missing
+diff --git a/src/main/java/tools/jackson/databind/deser/jdk/StringCollectionDeserializer.java b/src/main/java/tools/jackson/databind/deser/jdk/StringCollectionDeserializer.java
+index f0c92da83..7e4fd0014 100644
+--- a/src/main/java/tools/jackson/databind/deser/jdk/StringCollectionDeserializer.java
++++ b/src/main/java/tools/jackson/databind/deser/jdk/StringCollectionDeserializer.java
+@@ -342,33 +342,8 @@ public final class StringCollectionDeserializer
+                 ((_unwrapSingle == null) &&
+                         ctxt.isEnabled(DeserializationFeature.ACCEPT_SINGLE_VALUE_AS_ARRAY));
+         if (!canWrap) {
+-            // [databind#3349]: For String tokens, first check if ValueInstantiator
+-            //   can create from String; then handle empty/blank coercion;
+-            //   for non-empty strings, delegate to handleUnexpectedToken
+-            //   (NOT handleMissingInstantiator)
+             if (p.hasToken(JsonToken.VALUE_STRING)) {
+-                final ValueInstantiator inst = getValueInstantiator();
+-                if ((inst != null) && inst.canCreateFromString()) {
+-                    return castToCollection(inst.createFromString(ctxt, p.getValueAsString()));
+-                }
+-                String textValue = p.getString();
+-                if (textValue.isEmpty()) {
+-                    final CoercionAction act = ctxt.findCoercionAction(logicalType(), handledType(),
+-                            CoercionInputShape.EmptyString);
+-                    if (act != null) {
+-                        // Note: for Fail, _deserializeFromEmptyString will throw;
+-                        //  for others returns coerced value
+-                        return castToCollection(_deserializeFromEmptyString(p, ctxt, act, handledType(),
+-                                "empty String (\"\")"));
+-                    }
+-                } else if (_isBlank(textValue)) {
+-                    final CoercionAction act = ctxt.findCoercionFromBlankString(logicalType(), handledType(),
+-                            CoercionAction.Fail);
+-                    // Note: for Fail, _deserializeFromEmptyString will throw;
+-                    //  for others returns coerced value
+-                    return castToCollection(_deserializeFromEmptyString(p, ctxt, act, handledType(),
+-                            "blank String (all whitespace)"));
+-                }
++                return _deserializeFromString(p, ctxt);
+             }
+             return castToCollection(ctxt.handleUnexpectedToken(_containerType, p));
+         }
+diff --git a/src/test/java/tools/jackson/databind/deser/filter/ProblemHandler3349Test.java b/src/test/java/tools/jackson/databind/deser/filter/ProblemHandler3349Test.java
+deleted file mode 100644
+index 5f6a45671..000000000
+--- a/src/test/java/tools/jackson/databind/deser/filter/ProblemHandler3349Test.java
++++ /dev/null
+@@ -1,167 +0,0 @@
+-package tools.jackson.databind.deser.filter;
+-
+-import java.util.ArrayList;
+-import java.util.Collection;
+-import java.util.Collections;
+-
+-import org.junit.jupiter.api.Test;
+-
+-import com.fasterxml.jackson.annotation.JsonCreator;
+-import com.fasterxml.jackson.annotation.JsonProperty;
+-
+-import tools.jackson.core.JsonParser;
+-import tools.jackson.core.JsonToken;
+-import tools.jackson.databind.*;
+-import tools.jackson.databind.deser.DeserializationProblemHandler;
+-import tools.jackson.databind.node.ObjectNode;
+-
+-import static org.junit.jupiter.api.Assertions.*;
+-
+-import static tools.jackson.databind.testutil.DatabindTestUtil.*;
+-
+-/**
+- * Test for [databind#3349]: DeserializationProblemHandler::handleUnexpectedToken
+- * should be invoked for array-like types when given an incompatible token.
+- */
+-public class ProblemHandler3349Test
+-{
+-    // Problem handler that tracks which handler method was called
+-    static class TrackingProblemHandler extends DeserializationProblemHandler {
+-        boolean handleUnexpectedTokenCalled = false;
+-        boolean handleInstantiationProblemCalled = false;
+-        boolean handleMissingInstantiatorCalled = false;
+-
+-        @Override
+-        public Object handleUnexpectedToken(DeserializationContext ctxt,
+-                JavaType targetType, JsonToken t, JsonParser p,
+-                String failureMsg)
+-        {
+-            handleUnexpectedTokenCalled = true;
+-            // Return empty collection to allow deserialization to proceed
+-            return new ArrayList<>();
+-        }
+-
+-        @Override
+-        public Object handleInstantiationProblem(DeserializationContext ctxt,
+-                Class<?> instClass, Object argument, Throwable t)
+-        {
+-            handleInstantiationProblemCalled = true;
+-            return NOT_HANDLED;
+-        }
+-
+-        @Override
+-        public Object handleMissingInstantiator(DeserializationContext ctxt,
+-                Class<?> instClass, tools.jackson.databind.deser.ValueInstantiator inst,
+-                JsonParser p, String msg)
+-        {
+-            handleMissingInstantiatorCalled = true;
+-            return NOT_HANDLED;
+-        }
+-    }
+-
+-    static class ArrayHolder {
+-        private final Collection<String> prop;
+-
+-        private ArrayHolder(Collection<String> prop) {
+-            this.prop = prop;
+-        }
+-
+-        @JsonCreator
+-        static ArrayHolder create(@JsonProperty("prop") Iterable<String> prop) {
+-            ArrayList<String> list = new ArrayList<>();
+-            prop.forEach(list::add);
+-            return new ArrayHolder(list);
+-        }
+-
+-        @JsonProperty("prop")
+-        public Iterable<String> getProp() {
+-            return prop;
+-        }
+-    }
+-
+-    static class StringHolder {
+-        private final String prop;
+-
+-        @JsonCreator
+-        StringHolder(@JsonProperty("prop") String prop) {
+-            this.prop = prop;
+-        }
+-
+-        @JsonProperty("prop")
+-        public String getProp() {
+-            return prop;
+-        }
+-    }
+-
+-    private final ObjectMapper MAPPER = newJsonMapper();
+-
+-    // Baseline: verify that handleUnexpectedToken is called for String type
+-    // when given an array token (this should work fine)
+-    @Test
+-    public void testHandleUnexpectedTokenForStringProp() throws Exception
+-    {
+-        TrackingProblemHandler handler = new TrackingProblemHandler();
+-        ObjectMapper mapper = jsonMapperBuilder()
+-            .addHandler(handler)
+-            .build();
+-
+-        ObjectNode input = mapper.createObjectNode();
+-        input.set("prop", mapper.createArrayNode());
+-
+-        try {
+-            mapper.treeToValue(input, StringHolder.class);
+-        } catch (Exception e) {
+-            // May fail, but we just want to check which handler was called
+-        }
+-
+-        assertTrue(handler.handleUnexpectedTokenCalled,
+-            "handleUnexpectedToken should be called when deserializing String from START_ARRAY");
+-        assertFalse(handler.handleInstantiationProblemCalled,
+-            "handleInstantiationProblem should NOT be called");
+-        assertFalse(handler.handleMissingInstantiatorCalled,
+-            "handleMissingInstantiator should NOT be called");
+-    }
+-
+-    // [databind#3349]: handleUnexpectedToken should be called for Collection/Iterable types
+-    // when given a string token instead of START_ARRAY
+-    @Test
+-    public void testHandleUnexpectedTokenForCollectionProp() throws Exception
+-    {
+-        TrackingProblemHandler handler = new TrackingProblemHandler();
+-        ObjectMapper mapper = jsonMapperBuilder()
+-            .addHandler(handler)
+-            .build();
+-
+-        ObjectNode input = mapper.createObjectNode();
+-        input.put("prop", "someString");
+-
+-        mapper.treeToValue(input, ArrayHolder.class);
+-
+-        assertTrue(handler.handleUnexpectedTokenCalled,
+-            "handleUnexpectedToken should be called when deserializing Collection from STRING token");
+-        assertFalse(handler.handleInstantiationProblemCalled,
+-            "handleInstantiationProblem should NOT be called");
+-        assertFalse(handler.handleMissingInstantiatorCalled,
+-            "handleMissingInstantiator should NOT be called");
+-    }
+-
+-    // Also test direct deserialization of Collection from string
+-    @Test
+-    public void testHandleUnexpectedTokenForDirectCollection() throws Exception
+-    {
+-        TrackingProblemHandler handler = new TrackingProblemHandler();
+-        ObjectMapper mapper = jsonMapperBuilder()
+-            .addHandler(handler)
+-            .build();
+-
+-        mapper.readValue("\"someString\"",
+-            mapper.getTypeFactory().constructCollectionType(ArrayList.class, String.class));
+-
+-        assertTrue(handler.handleUnexpectedTokenCalled,
+-            "handleUnexpectedToken should be called when deserializing Collection from STRING");
+-        assertFalse(handler.handleInstantiationProblemCalled,
+-            "handleInstantiationProblem should NOT be called");
+-        assertFalse(handler.handleMissingInstantiatorCalled,
+-            "handleMissingInstantiator should NOT be called");
+-    }
+-}

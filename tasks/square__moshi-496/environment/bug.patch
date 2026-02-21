@@ -1,0 +1,630 @@
+diff --git a/kotlin-codegen/compiler/src/main/java/com/squareup/moshi/JsonClassCodeGenProcessor.kt b/kotlin-codegen/compiler/src/main/java/com/squareup/moshi/JsonClassCodeGenProcessor.kt
+index 0d39ab1b..3ded3ede 100644
+--- a/kotlin-codegen/compiler/src/main/java/com/squareup/moshi/JsonClassCodeGenProcessor.kt
++++ b/kotlin-codegen/compiler/src/main/java/com/squareup/moshi/JsonClassCodeGenProcessor.kt
+@@ -28,7 +28,6 @@ import me.eugeniomarletti.kotlin.metadata.KotlinMetadataUtils
+ import me.eugeniomarletti.kotlin.metadata.classKind
+ import me.eugeniomarletti.kotlin.metadata.declaresDefaultValue
+ import me.eugeniomarletti.kotlin.metadata.getPropertyOrNull
+-import me.eugeniomarletti.kotlin.metadata.hasSetter
+ import me.eugeniomarletti.kotlin.metadata.isDataClass
+ import me.eugeniomarletti.kotlin.metadata.isInnerClass
+ import me.eugeniomarletti.kotlin.metadata.isPrimary
+@@ -42,7 +41,6 @@ import org.jetbrains.kotlin.serialization.ProtoBuf.Modality
+ import org.jetbrains.kotlin.serialization.ProtoBuf.Property
+ import org.jetbrains.kotlin.serialization.ProtoBuf.ValueParameter
+ import org.jetbrains.kotlin.serialization.ProtoBuf.Visibility
+-import org.jetbrains.kotlin.util.capitalizeDecapitalize.decapitalizeAsciiOnly
+ import java.io.File
+ import javax.annotation.processing.ProcessingEnvironment
+ import javax.annotation.processing.Processor
+@@ -120,12 +118,12 @@ class JsonClassCodeGenProcessor : KotlinAbstractProcessor(), KotlinMetadataUtils
+     return true
+   }
+ 
+-  private fun processElement(model: Element): AdapterGenerator? {
+-    val metadata = model.kotlinMetadata
++  private fun processElement(element: Element): AdapterGenerator? {
++    val metadata = element.kotlinMetadata
+ 
+     if (metadata !is KotlinClassMetadata) {
+       messager.printMessage(
+-          ERROR, "@JsonClass can't be applied to $model: must be a Kotlin class", model)
++          ERROR, "@JsonClass can't be applied to $element: must be a Kotlin class", element)
+       return null
+     }
+ 
+@@ -135,28 +133,27 @@ class JsonClassCodeGenProcessor : KotlinAbstractProcessor(), KotlinMetadataUtils
+     when {
+       classProto.classKind != Class.Kind.CLASS -> {
+         messager.printMessage(
+-            ERROR, "@JsonClass can't be applied to $model: must be a Kotlin class", model)
++            ERROR, "@JsonClass can't be applied to $element: must be a Kotlin class", element)
+         return null
+       }
+       classProto.isInnerClass -> {
+         messager.printMessage(
+-            ERROR, "@JsonClass can't be applied to $model: must not be an inner class",
+-            model)
++            ERROR, "@JsonClass can't be applied to $element: must not be an inner class", element)
+         return null
+       }
+       classProto.modality == Modality.ABSTRACT -> {
+         messager.printMessage(
+-            ERROR, "@JsonClass can't be applied to $model: must not be abstract", model)
++            ERROR, "@JsonClass can't be applied to $element: must not be abstract", element)
+         return null
+       }
+       classProto.visibility == Visibility.LOCAL -> {
+         messager.printMessage(
+-            ERROR, "@JsonClass can't be applied to $model: must not be local", model)
++            ERROR, "@JsonClass can't be applied to $element: must not be local", element)
+         return null
+       }
+     }
+ 
+-    val typeName = model.asType().asTypeName()
++    val typeName = element.asType().asTypeName()
+     val className = when (typeName) {
+       is ClassName -> typeName
+       is ParameterizedTypeName -> typeName.rawType
+@@ -188,106 +185,62 @@ class JsonClassCodeGenProcessor : KotlinAbstractProcessor(), KotlinMetadataUtils
+       nameResolver.getString(it.name)
+     }
+ 
+-    val annotationHolders = mutableMapOf<Property, ExecutableElement>()
+-    val fields = mutableMapOf<String, VariableElement>()
+-    val setters = mutableMapOf<String, ExecutableElement>()
+-    val getters = mutableMapOf<String, ExecutableElement>()
+-    for (element in model.enclosedElements) {
+-      if (element is VariableElement) {
+-        fields[element.name] = element
+-      } else if (element is ExecutableElement) {
+-        when {
+-          element.name.startsWith("get") -> {
+-            getters[element.name.substring("get".length).decapitalizeAsciiOnly()] = element
+-          }
+-          element.name.startsWith("is") -> {
+-            getters[element.name.substring("is".length).decapitalizeAsciiOnly()] = element
+-          }
+-          element.name.startsWith("set") -> {
+-            setters[element.name.substring("set".length).decapitalizeAsciiOnly()] = element
+-          }
+-        }
+-
+-        val property = classData.getPropertyOrNull(element)
+-        if (property != null) {
+-          annotationHolders[property] = element
+-        }
+-      }
++    // The compiler might emit methods just so it has a place to put annotations. Find these.
++    val annotatedElements = mutableMapOf<Property, ExecutableElement>()
++    for (enclosedElement in element.enclosedElements) {
++      if (enclosedElement !is ExecutableElement) continue
++      val property = classData.getPropertyOrNull(enclosedElement) ?: continue
++      annotatedElements[property] = enclosedElement
+     }
+ 
+-    val propertiesByName = mutableMapOf<String, PropertyGenerator>()
+-    for (property in properties.values) {
+-      val name = nameResolver.getString(property.name)
+-
+-      val fieldElement = fields[name]
+-      val setterElement = setters[name]
+-      val getterElement = getters[name]
+-      val element = fieldElement ?: setterElement ?: getterElement!!
++    val propertyGenerators = mutableListOf<PropertyGenerator>()
++    for (enclosedElement in element.enclosedElements) {
++      if (enclosedElement !is VariableElement) continue
+ 
++      val name = enclosedElement.simpleName.toString()
++      val property = properties[name] ?: continue
+       val parameter = parameters[name]
+-      var parameterIndex: Int = -1
+-      var parameterElement: VariableElement? = null
+-      if (parameter != null) {
+-        parameterIndex = protoConstructor.valueParameterList.indexOf(parameter)
+-        parameterElement = constructor.parameters[parameterIndex]
++
++      val parameterElement = if (parameter != null) {
++        val parameterIndex = protoConstructor.valueParameterList.indexOf(parameter)
++        constructor.parameters[parameterIndex]
++      } else {
++        null
+       }
+ 
+-      val annotationHolder = annotationHolders[property]
++      val annotatedElement = annotatedElements[property]
+ 
+       if (property.visibility != Visibility.INTERNAL
+           && property.visibility != Visibility.PROTECTED
+           && property.visibility != Visibility.PUBLIC) {
+-        messager.printMessage(ERROR, "property $name is not visible", element)
++        messager.printMessage(ERROR, "property $name is not visible", enclosedElement)
+         return null
+       }
+ 
+       val hasDefault = parameter?.declaresDefaultValue ?: true
+ 
+-      if (Modifier.TRANSIENT in element.modifiers) {
++      if (Modifier.TRANSIENT in enclosedElement.modifiers) {
+         if (!hasDefault) {
+-          messager.printMessage(
+-              ERROR, "No default value for transient property $name", element)
+-          return null
++          throw IllegalArgumentException("No default value for transient property $name")
+         }
+-        continue // This property is transient and has a default value. Ignore it.
+-      }
+-
+-      if (!property.hasSetter && parameter == null) {
+-        continue // This property is not settable. Ignore it.
++        continue
+       }
+ 
+       val delegateKey = DelegateKey(
+           property.returnType.asTypeName(nameResolver, classProto::getTypeParameter, true),
+-          jsonQualifiers(element, annotationHolder, parameterElement))
++          jsonQualifiers(enclosedElement, annotatedElement, parameterElement))
+ 
+-      propertiesByName[name] = PropertyGenerator(
++      propertyGenerators += PropertyGenerator(
+           delegateKey,
+           name,
+-          jsonName(name, element, annotationHolder, parameterElement),
+-          parameterIndex,
++          jsonName(name, enclosedElement, annotatedElement, parameterElement),
++          parameter != null,
+           hasDefault,
+           property.returnType.asTypeName(nameResolver, classProto::getTypeParameter))
+     }
+ 
+-    for (parameterElement in constructor.parameters) {
+-      val name = parameterElement.name
+-      val valueParameter = parameters[name]!!
+-      if (properties[name] == null && !valueParameter.declaresDefaultValue) {
+-        messager.printMessage(
+-            ERROR, "No property for required constructor parameter $name", parameterElement)
+-        return null
+-      }
+-    }
+-
+     // Sort properties so that those with constructor parameters come first.
+-    val propertyGenerators = propertiesByName.values.toMutableList()
+-    propertyGenerators.sortBy {
+-      if (it.hasConstructorParameter) {
+-        it.parameterIndex
+-      } else {
+-        Integer.MAX_VALUE
+-      }
+-    }
++    propertyGenerators.sortBy { if (it.hasConstructorParameter) -1 else 1 }
+ 
+     val genericTypeNames = classProto.typeParameterList
+         .map {
+@@ -315,9 +268,9 @@ class JsonClassCodeGenProcessor : KotlinAbstractProcessor(), KotlinMetadataUtils
+         }
+ 
+     return AdapterGenerator(
+-        className = className,
++        className,
+         propertyList = propertyGenerators,
+-        originalElement = model,
++        originalElement = element,
+         hasCompanionObject = hasCompanionObject,
+         visibility = classProto.visibility!!,
+         genericTypeNames = genericTypeNames,
+@@ -327,18 +280,18 @@ class JsonClassCodeGenProcessor : KotlinAbstractProcessor(), KotlinMetadataUtils
+ 
+   /** Returns the JsonQualifiers on the field and parameter of a property. */
+   private fun jsonQualifiers(
+-    element: Element,
+-    annotationHolder: ExecutableElement?,
++    field: VariableElement,
++    method: ExecutableElement?,
+     parameter: VariableElement?
+   ): Set<AnnotationMirror> {
+-    val elementQualifiers = element.qualifiers
+-    val annotationHolderQualifiers = annotationHolder.qualifiers
++    val fieldQualifiers = field.qualifiers
++    val methodQualifiers = method.qualifiers
+     val parameterQualifiers = parameter.qualifiers
+ 
+     // TODO(jwilson): union the qualifiers somehow?
+     return when {
+-      elementQualifiers.isNotEmpty() -> elementQualifiers
+-      annotationHolderQualifiers.isNotEmpty() -> annotationHolderQualifiers
++      fieldQualifiers.isNotEmpty() -> fieldQualifiers
++      methodQualifiers.isNotEmpty() -> methodQualifiers
+       parameterQualifiers.isNotEmpty() -> parameterQualifiers
+       else -> setOf()
+     }
+@@ -347,22 +300,28 @@ class JsonClassCodeGenProcessor : KotlinAbstractProcessor(), KotlinMetadataUtils
+   /** Returns the @Json name of a property, or `propertyName` if none is provided. */
+   private fun jsonName(
+     propertyName: String,
+-    element: Element,
+-    annotationHolder: ExecutableElement?,
++    field: VariableElement,
++    method: ExecutableElement?,
+     parameter: VariableElement?
+   ): String {
+-    val fieldJsonName = element.jsonName
+-    val annotationHolderJsonName = annotationHolder.jsonName
++    val fieldJsonName = field.jsonName
++    val methodJsonName = method.jsonName
+     val parameterJsonName = parameter.jsonName
+ 
+     return when {
+       fieldJsonName != null -> fieldJsonName
+-      annotationHolderJsonName != null -> annotationHolderJsonName
++      methodJsonName != null -> methodJsonName
+       parameterJsonName != null -> parameterJsonName
+       else -> propertyName
+     }
+   }
+ 
++  private fun errorMustBeKotlinClass(element: Element) {
++    messager.printMessage(ERROR,
++        "@${JsonClass::class.java.simpleName} can't be applied to $element: must be a Kotlin class",
++        element)
++  }
++
+   private fun AdapterGenerator.generateAndWrite(generatedOption: TypeElement?) {
+     val fileSpec = generateFile(generatedOption)
+     val adapterName = fileSpec.members.filterIsInstance<TypeSpec>().first().name!!
+@@ -389,8 +348,3 @@ class JsonClassCodeGenProcessor : KotlinAbstractProcessor(), KotlinMetadataUtils
+       return getAnnotation(Json::class.java)?.name
+     }
+ }
+-
+-private val Element.name: String
+-  get() {
+-    return simpleName.toString()
+-  }
+\ No newline at end of file
+diff --git a/kotlin-codegen/compiler/src/main/java/com/squareup/moshi/PropertyGenerator.kt b/kotlin-codegen/compiler/src/main/java/com/squareup/moshi/PropertyGenerator.kt
+index 6ef0d21e..83ee5c81 100644
+--- a/kotlin-codegen/compiler/src/main/java/com/squareup/moshi/PropertyGenerator.kt
++++ b/kotlin-codegen/compiler/src/main/java/com/squareup/moshi/PropertyGenerator.kt
+@@ -25,7 +25,7 @@ internal class PropertyGenerator(
+   val delegateKey: DelegateKey,
+   val name: String,
+   val serializedName: String,
+-  val parameterIndex: Int,
++  val hasConstructorParameter: Boolean,
+   val hasDefault: Boolean,
+   val typeName: TypeName
+ ) {
+@@ -35,9 +35,6 @@ internal class PropertyGenerator(
+   val isRequired
+     get() = !delegateKey.nullable && !hasDefault
+ 
+-  val hasConstructorParameter
+-    get() = parameterIndex != -1
+-
+   /** We prefer to use 'null' to mean absent, but for some properties those are distinct. */
+   val differentiateAbsentFromNull
+     get() = delegateKey.nullable && hasDefault
+diff --git a/kotlin-codegen/compiler/src/test/java/com/squareup/moshi/CompilerTest.kt b/kotlin-codegen/compiler/src/test/java/com/squareup/moshi/CompilerTest.kt
+index eed5e853..1da5a4ad 100644
+--- a/kotlin-codegen/compiler/src/test/java/com/squareup/moshi/CompilerTest.kt
++++ b/kotlin-codegen/compiler/src/test/java/com/squareup/moshi/CompilerTest.kt
+@@ -154,38 +154,4 @@ class CompilerTest {
+     assertThat(result.systemErr).contains(
+         "error: @JsonClass can't be applied to expression\$annotations(): must be a Kotlin class")
+   }
+-
+-  @Test fun requiredTransientConstructorParameterFails() {
+-    val call = KotlinCompilerCall(temporaryFolder.root)
+-    call.inheritClasspath = true
+-    call.addService(Processor::class, JsonClassCodeGenProcessor::class)
+-    call.addKt("source.kt", """
+-        |import com.squareup.moshi.JsonClass
+-        |
+-        |@JsonClass(generateAdapter = true)
+-        |class RequiredTransientConstructorParameter(@Transient var a: Int)
+-        |""".trimMargin())
+-
+-    val result = call.execute()
+-    assertThat(result.exitCode).isEqualTo(ExitCode.COMPILATION_ERROR)
+-    assertThat(result.systemErr).contains(
+-        "error: No default value for transient property a")
+-  }
+-
+-  @Test fun nonPropertyConstructorParameter() {
+-    val call = KotlinCompilerCall(temporaryFolder.root)
+-    call.inheritClasspath = true
+-    call.addService(Processor::class, JsonClassCodeGenProcessor::class)
+-    call.addKt("source.kt", """
+-        |import com.squareup.moshi.JsonClass
+-        |
+-        |@JsonClass(generateAdapter = true)
+-        |class NonPropertyConstructorParameter(a: Int, val b: Int)
+-        |""".trimMargin())
+-
+-    val result = call.execute()
+-    assertThat(result.exitCode).isEqualTo(ExitCode.COMPILATION_ERROR)
+-    assertThat(result.systemErr).contains(
+-        "error: No property for required constructor parameter a")
+-  }
+ }
+\ No newline at end of file
+diff --git a/kotlin-codegen/integration-test/src/test/kotlin/com/squareup/moshi/GeneratedAdaptersTest.kt b/kotlin-codegen/integration-test/src/test/kotlin/com/squareup/moshi/GeneratedAdaptersTest.kt
+index 46c63e57..6ed8165b 100644
+--- a/kotlin-codegen/integration-test/src/test/kotlin/com/squareup/moshi/GeneratedAdaptersTest.kt
++++ b/kotlin-codegen/integration-test/src/test/kotlin/com/squareup/moshi/GeneratedAdaptersTest.kt
+@@ -20,7 +20,6 @@ import org.intellij.lang.annotations.Language
+ import org.junit.Assert.fail
+ import org.junit.Test
+ import java.util.Locale
+-import java.util.SimpleTimeZone
+ 
+ class GeneratedAdaptersTest {
+ 
+@@ -82,11 +81,10 @@ class GeneratedAdaptersTest {
+   }
+ 
+   @JsonClass(generateAdapter = true)
+-  data class DefaultValues(
+-    val foo: String,
+-    val bar: String = "",
+-    val nullableBar: String? = null,
+-    val bazList: List<String> = emptyList())
++  data class DefaultValues(val foo: String,
++      val bar: String = "",
++      val nullableBar: String? = null,
++      val bazList: List<String> = emptyList())
+ 
+   @Test
+   fun nullableArray() {
+@@ -628,88 +626,6 @@ class GeneratedAdaptersTest {
+     var v26: Int, var v27: Int, var v28: Int, var v29: Int, var v30: Int,
+     var v31: Int, var v32: Int, var v33: Int)
+ 
+-  @Test fun extendsPlatformClassWithPrivateField() {
+-    val moshi = Moshi.Builder().build()
+-    val jsonAdapter = moshi.adapter(ExtendsPlatformClassWithPrivateField::class.java)
+-
+-    val encoded = ExtendsPlatformClassWithPrivateField(3)
+-    assertThat(jsonAdapter.toJson(encoded)).isEqualTo("""{"a":3}""")
+-
+-    val decoded = jsonAdapter.fromJson("""{"a":4,"id":"B"}""")!!
+-    assertThat(decoded.a).isEqualTo(4)
+-    assertThat(decoded.id).isEqualTo("C")
+-  }
+-
+-  @JsonClass(generateAdapter = true)
+-  internal class ExtendsPlatformClassWithPrivateField(var a: Int) : SimpleTimeZone(0, "C")
+-
+-  @Test fun unsettablePropertyIgnored() {
+-    val moshi = Moshi.Builder().build()
+-    val jsonAdapter = moshi.adapter(UnsettableProperty::class.java)
+-
+-    val encoded = UnsettableProperty()
+-    encoded.b = 5
+-    assertThat(jsonAdapter.toJson(encoded)).isEqualTo("""{"b":5}""")
+-
+-    val decoded = jsonAdapter.fromJson("""{"a":4,"b":6}""")!!
+-    assertThat(decoded.a).isEqualTo(-1)
+-    assertThat(decoded.b).isEqualTo(6)
+-  }
+-
+-  @JsonClass(generateAdapter = true)
+-  class UnsettableProperty {
+-    val a: Int = -1
+-    var b: Int = -1
+-  }
+-
+-  @Test fun getterOnlyNoBackingField() {
+-    val moshi = Moshi.Builder().build()
+-    val jsonAdapter = moshi.adapter(GetterOnly::class.java)
+-
+-    val encoded = GetterOnly(3, 5)
+-    assertThat(jsonAdapter.toJson(encoded)).isEqualTo("""{"a":3,"b":5}""")
+-
+-    val decoded = jsonAdapter.fromJson("""{"a":4,"b":6}""")!!
+-    assertThat(decoded.a).isEqualTo(4)
+-    assertThat(decoded.b).isEqualTo(6)
+-    assertThat(decoded.total).isEqualTo(10)
+-  }
+-
+-  @JsonClass(generateAdapter = true)
+-  class GetterOnly(var a: Int, var b: Int) {
+-    val total : Int
+-      get() = a + b
+-  }
+-
+-  @Test fun getterAndSetterNoBackingField() {
+-    val moshi = Moshi.Builder().build()
+-    val jsonAdapter = moshi.adapter(GetterAndSetter::class.java)
+-
+-    val encoded = GetterAndSetter(3, 5)
+-    assertThat(jsonAdapter.toJson(encoded)).isEqualTo("""{"a":3,"b":5,"total":8}""")
+-
+-    // Whether b is 6 or 7 is an implementation detail. Currently we call constructors then setters.
+-    val decoded1 = jsonAdapter.fromJson("""{"a":4,"b":6,"total":11}""")!!
+-    assertThat(decoded1.a).isEqualTo(4)
+-    assertThat(decoded1.b).isEqualTo(7)
+-    assertThat(decoded1.total).isEqualTo(11)
+-
+-    // Whether b is 6 or 7 is an implementation detail. Currently we call constructors then setters.
+-    val decoded2 = jsonAdapter.fromJson("""{"a":4,"total":11,"b":6}""")!!
+-    assertThat(decoded2.a).isEqualTo(4)
+-    assertThat(decoded2.b).isEqualTo(7)
+-    assertThat(decoded2.total).isEqualTo(11)
+-  }
+-
+-  @JsonClass(generateAdapter = true)
+-  class GetterAndSetter(var a: Int, var b: Int) {
+-    var total : Int
+-      get() = a + b
+-      set(value) {
+-        b = value - a
+-      }
+-  }
+-
+   @Retention(AnnotationRetention.RUNTIME)
+   @JsonQualifier
+   annotation class Uppercase
+diff --git a/kotlin-codegen/integration-test/src/test/kotlin/com/squareup/moshi/KotlinCodeGenTest.kt b/kotlin-codegen/integration-test/src/test/kotlin/com/squareup/moshi/KotlinCodeGenTest.kt
+index 38b00029..141afb24 100644
+--- a/kotlin-codegen/integration-test/src/test/kotlin/com/squareup/moshi/KotlinCodeGenTest.kt
++++ b/kotlin-codegen/integration-test/src/test/kotlin/com/squareup/moshi/KotlinCodeGenTest.kt
+@@ -20,6 +20,9 @@ import org.junit.Assert.fail
+ import org.junit.Ignore
+ import org.junit.Test
+ import java.io.ByteArrayOutputStream
++import java.util.Locale
++import java.util.SimpleTimeZone
++import kotlin.annotation.AnnotationRetention.RUNTIME
+ 
+ class KotlinCodeGenTest {
+   @Ignore @Test fun duplicatedValue() {
+@@ -50,6 +53,20 @@ class KotlinCodeGenTest {
+ 
+   class RepeatedValue(var a: Int, var b: Int?)
+ 
++  @Ignore @Test fun requiredTransientConstructorParameterFails() {
++    val moshi = Moshi.Builder().build()
++    try {
++      moshi.adapter(RequiredTransientConstructorParameter::class.java)
++      fail()
++    } catch (expected: IllegalArgumentException) {
++      assertThat(expected).hasMessage("No default value for transient constructor parameter #0 " +
++          "a of fun <init>(kotlin.Int): " +
++          "com.squareup.moshi.KotlinJsonAdapterTest.RequiredTransientConstructorParameter")
++    }
++  }
++
++  class RequiredTransientConstructorParameter(@Transient var a: Int)
++
+   @Ignore @Test fun supertypeConstructorParameters() {
+     val moshi = Moshi.Builder().build()
+     val jsonAdapter = moshi.adapter(SubtypeConstructorParameters::class.java)
+@@ -88,6 +105,20 @@ class KotlinCodeGenTest {
+     var b: Int = -1
+   }
+ 
++  @Ignore @Test fun extendsPlatformClassWithPrivateField() {
++    val moshi = Moshi.Builder().build()
++    val jsonAdapter = moshi.adapter(ExtendsPlatformClassWithPrivateField::class.java)
++
++    val encoded = ExtendsPlatformClassWithPrivateField(3)
++    assertThat(jsonAdapter.toJson(encoded)).isEqualTo("""{"a":3}""")
++
++    val decoded = jsonAdapter.fromJson("""{"a":4,"id":"B"}""")!!
++    assertThat(decoded.a).isEqualTo(4)
++    assertThat(decoded.id).isEqualTo("C")
++  }
++
++  internal class ExtendsPlatformClassWithPrivateField(var a: Int) : SimpleTimeZone(0, "C")
++
+   @Ignore @Test fun extendsPlatformClassWithProtectedField() {
+     val moshi = Moshi.Builder().build()
+     val jsonAdapter = moshi.adapter(ExtendsPlatformClassWithProtectedField::class.java)
+@@ -185,6 +216,84 @@ class KotlinCodeGenTest {
+     }
+   }
+ 
++  @Ignore @Test fun unsettablePropertyIgnored() {
++    val moshi = Moshi.Builder().build()
++    val jsonAdapter = moshi.adapter(UnsettableProperty::class.java)
++
++    val encoded = UnsettableProperty()
++    encoded.b = 5
++    assertThat(jsonAdapter.toJson(encoded)).isEqualTo("""{"b":5}""")
++
++    val decoded = jsonAdapter.fromJson("""{"a":4,"b":6}""")!!
++    assertThat(decoded.a).isEqualTo(-1)
++    assertThat(decoded.b).isEqualTo(6)
++  }
++
++  class UnsettableProperty {
++    val a: Int = -1
++    var b: Int = -1
++  }
++
++  @Ignore @Test fun getterOnlyNoBackingField() {
++    val moshi = Moshi.Builder().build()
++    val jsonAdapter = moshi.adapter(GetterOnly::class.java)
++
++    val encoded = GetterOnly(3, 5)
++    assertThat(jsonAdapter.toJson(encoded)).isEqualTo("""{"a":3,"b":5}""")
++
++    val decoded = jsonAdapter.fromJson("""{"a":4,"b":6}""")!!
++    assertThat(decoded.a).isEqualTo(4)
++    assertThat(decoded.b).isEqualTo(6)
++    assertThat(decoded.total).isEqualTo(10)
++  }
++
++  class GetterOnly(var a: Int, var b: Int) {
++    val total : Int
++      get() = a + b
++  }
++
++  @Ignore @Test fun getterAndSetterNoBackingField() {
++    val moshi = Moshi.Builder().build()
++    val jsonAdapter = moshi.adapter(GetterAndSetter::class.java)
++
++    val encoded = GetterAndSetter(3, 5)
++    assertThat(jsonAdapter.toJson(encoded)).isEqualTo("""{"a":3,"b":5,"total":8}""")
++
++    // Whether b is 6 or 7 is an implementation detail. Currently we call constructors then setters.
++    val decoded1 = jsonAdapter.fromJson("""{"a":4,"b":6,"total":11}""")!!
++    assertThat(decoded1.a).isEqualTo(4)
++    assertThat(decoded1.b).isEqualTo(7)
++    assertThat(decoded1.total).isEqualTo(11)
++
++    // Whether b is 6 or 7 is an implementation detail. Currently we call constructors then setters.
++    val decoded2 = jsonAdapter.fromJson("""{"a":4,"total":11,"b":6}""")!!
++    assertThat(decoded2.a).isEqualTo(4)
++    assertThat(decoded2.b).isEqualTo(7)
++    assertThat(decoded2.total).isEqualTo(11)
++  }
++
++  class GetterAndSetter(var a: Int, var b: Int) {
++    var total : Int
++      get() = a + b
++      set(value) {
++        b = value - a
++      }
++  }
++
++  @Ignore @Test fun nonPropertyConstructorParameter() {
++    val moshi = Moshi.Builder().build()
++    try {
++      moshi.adapter(NonPropertyConstructorParameter::class.java)
++      fail()
++    } catch(expected: IllegalArgumentException) {
++      assertThat(expected).hasMessage(
++          "No property for required constructor parameter #0 a of fun <init>(" +
++              "kotlin.Int, kotlin.Int): ${NonPropertyConstructorParameter::class.qualifiedName}")
++    }
++  }
++
++  class NonPropertyConstructorParameter(a: Int, val b: Int)
++
+   @Ignore @Test fun kotlinEnumsAreNotCovered() {
+     val moshi = Moshi.Builder().build()
+     val adapter = moshi.adapter(UsingEnum::class.java)
+@@ -197,4 +306,19 @@ class KotlinCodeGenTest {
+   enum class KotlinEnum {
+     A, B
+   }
++
++  // TODO(jwilson): resolve generic types?
++
++  @Retention(RUNTIME)
++  @JsonQualifier
++  annotation class Uppercase
++
++  class UppercaseJsonAdapter {
++    @ToJson fun toJson(@Uppercase s: String) : String {
++      return s.toUpperCase(Locale.US)
++    }
++    @FromJson @Uppercase fun fromJson(s: String) : String {
++      return s.toLowerCase(Locale.US)
++    }
++  }
+ }

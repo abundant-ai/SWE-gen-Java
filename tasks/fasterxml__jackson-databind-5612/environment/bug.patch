@@ -1,0 +1,725 @@
+diff --git a/src/main/java/tools/jackson/databind/ext/javatime/deser/InstantDeserializer.java b/src/main/java/tools/jackson/databind/ext/javatime/deser/InstantDeserializer.java
+index 297d50acf..1ad051823 100644
+--- a/src/main/java/tools/jackson/databind/ext/javatime/deser/InstantDeserializer.java
++++ b/src/main/java/tools/jackson/databind/ext/javatime/deser/InstantDeserializer.java
+@@ -164,7 +164,6 @@ public class InstantDeserializer<T extends Temporal>
+         _readTimestampsAsNanosOverride = base._readTimestampsAsNanosOverride;
+     }
+ 
+-    /*
+     @SuppressWarnings("unchecked")
+     protected InstantDeserializer(InstantDeserializer<T> base, Boolean adjustToContextTimezoneOverride)
+     {
+@@ -177,7 +176,6 @@ public class InstantDeserializer<T extends Temporal>
+         _adjustToContextTZOverride = adjustToContextTimezoneOverride;
+         _readTimestampsAsNanosOverride = base._readTimestampsAsNanosOverride;
+     }
+-    */
+ 
+     @SuppressWarnings("unchecked")
+     protected InstantDeserializer(InstantDeserializer<T> base, DateTimeFormatter f, Boolean leniency)
+diff --git a/src/main/java/tools/jackson/databind/ext/javatime/deser/JSR310DateTimeDeserializerBase.java b/src/main/java/tools/jackson/databind/ext/javatime/deser/JSR310DateTimeDeserializerBase.java
+index be53b5ae1..8bddb76e3 100644
+--- a/src/main/java/tools/jackson/databind/ext/javatime/deser/JSR310DateTimeDeserializerBase.java
++++ b/src/main/java/tools/jackson/databind/ext/javatime/deser/JSR310DateTimeDeserializerBase.java
+@@ -20,7 +20,7 @@ public abstract class JSR310DateTimeDeserializerBase<T>
+     protected final DateTimeFormatter _formatter;
+ 
+     /**
+-     * Setting that indicates the {@link Shape} specified for this deserializer
++     * Setting that indicates the {@link JsonFormat.Shape} specified for this deserializer
+      * as a {@link com.fasterxml.jackson.annotation.JsonFormat.Shape} annotation on
+      * property or class, or due to per-type "config override", or from global settings:
+      * If Shape is NUMBER_INT, the input value is considered to be epoch days. If not a
+diff --git a/src/main/java/tools/jackson/databind/ext/javatime/deser/MonthDeserializer.java b/src/main/java/tools/jackson/databind/ext/javatime/deser/MonthDeserializer.java
+index 087db4fd6..03f319fb6 100644
+--- a/src/main/java/tools/jackson/databind/ext/javatime/deser/MonthDeserializer.java
++++ b/src/main/java/tools/jackson/databind/ext/javatime/deser/MonthDeserializer.java
+@@ -3,13 +3,13 @@ package tools.jackson.databind.ext.javatime.deser;
+ import java.time.*;
+ import java.time.format.DateTimeFormatter;
+ import java.util.*;
+-import java.util.function.Function;
+ import java.util.stream.Collectors;
+ 
+ import tools.jackson.core.*;
+ import tools.jackson.databind.DeserializationContext;
+ import tools.jackson.databind.DeserializationFeature;
+ import tools.jackson.databind.cfg.DateTimeFeature;
++import tools.jackson.databind.exc.InvalidFormatException;
+ 
+ import com.fasterxml.jackson.annotation.JsonFormat;
+ 
+@@ -20,9 +20,7 @@ public class MonthDeserializer extends JSR310DateTimeDeserializerBase<Month>
+ {
+     public static final MonthDeserializer INSTANCE = new MonthDeserializer();
+ 
+-    // @since 3.1
+-    private final Map<String, Month> _byNameLookup = Arrays.stream(Month.values())
+-            .collect(Collectors.toUnmodifiableMap(Month::name, Function.identity()));
++    private final Set<String> possibleMonthStringValues = Arrays.stream(Month.values()).map(Month::name).collect(Collectors.toSet());
+ 
+     /**
+      * NOTE: only {@code public} so that use via annotations (see [modules-java8#202])
+@@ -41,7 +39,9 @@ public class MonthDeserializer extends JSR310DateTimeDeserializerBase<Month>
+     }
+ 
+     protected MonthDeserializer(MonthDeserializer base,
+-            Boolean leniency, DateTimeFormatter formatter, JsonFormat.Shape shape) {
++                                   Boolean leniency,
++                                   DateTimeFormatter formatter,
++                                   JsonFormat.Shape shape) {
+         super(base, leniency, formatter, shape);
+     }
+ 
+@@ -57,18 +57,23 @@ public class MonthDeserializer extends JSR310DateTimeDeserializerBase<Month>
+ 
+     @Override
+     public Month deserialize(JsonParser p, DeserializationContext ctxt)
+-        throws JacksonException
++            throws JacksonException
+     {
+         if (p.hasToken(JsonToken.VALUE_STRING)) {
+             return _fromString(p, ctxt, p.getString());
+         }
+         // Support numeric scalar input
+         if (p.hasToken(JsonToken.VALUE_NUMBER_INT)) {
+-            final int monthIndex = p.getIntValue();
++            final int raw = p.getIntValue();
+             if (ctxt.isEnabled(DateTimeFeature.ONE_BASED_MONTHS)) {
+-                return _decode1BasedMonth(monthIndex, ctxt);
++                return _decodeMonth(raw, ctxt);
+             }
+-            return _decode0BasedMonth(monthIndex, ctxt);
++            // default: 0‑based index (0 == JANUARY)
++            if (raw < 0 || raw >= 12) {
++                return (Month) ctxt.handleWeirdNumberValue(handledType(),
++                        raw, "Month index (%s) outside 0-11 range", raw);
++            }
++            return Month.values()[raw];
+         }
+         // 30-Sep-2020, tatu: New! "Scalar from Object" (mostly for XML)
+         if (p.isExpectedStartObjectToken()) {
+@@ -108,8 +113,8 @@ public class MonthDeserializer extends JSR310DateTimeDeserializerBase<Month>
+     }
+ 
+     protected Month _fromString(JsonParser p, DeserializationContext ctxt,
+-            String string0)
+-        throws JacksonException
++                                   String string0)
++            throws JacksonException
+     {
+         String string = string0.trim();
+         if (string.length() == 0) {
+@@ -122,56 +127,44 @@ public class MonthDeserializer extends JSR310DateTimeDeserializerBase<Month>
+             if (_formatter == null) {
+                 // First: try purely numeric input
+                 try {
+-                    int monthIndex = Integer.parseInt(string);
++                    int oneBasedMonthNumber = Integer.parseInt(string);
+                     if (ctxt.isEnabled(DateTimeFeature.ONE_BASED_MONTHS)) {
+-                        return _decode1BasedMonth(monthIndex, ctxt);
++                        return _decodeMonth(oneBasedMonthNumber, ctxt);
++                    }
++                    if (oneBasedMonthNumber < 0 || oneBasedMonthNumber >= 12) { // invalid for 0‑based
++                        throw new InvalidFormatException(p, "Month number " + oneBasedMonthNumber + " not allowed for 1-based Month.", oneBasedMonthNumber, Integer.class);
+                     }
+-                    return _decode0BasedMonth(monthIndex, ctxt);
++                    return Month.values()[oneBasedMonthNumber]; // 0‑based mapping
+                 } catch (NumberFormatException nfe) {
+                     // fall through – treat as textual month name
+                 }
+                 // Second: try textual input
+                 // Handle English month names such as "JANUARY" from the actual Month Enum names
+-                Month m = _byNameLookup.get(string);
+-                if (m != null) {
+-                    return m;
++                if (possibleMonthStringValues.contains(string)) {
++                    return Month.valueOf(string);
+                 }
+-                return (Month) ctxt.handleWeirdStringValue(handledType(), string, 
+-                        "not one of known `Month` values: %s",
+-                                Arrays.toString(Month.values()));
++                throw new InvalidFormatException(p, String.format("Cannot deserialize value of type `java.time.Month` from String \"%s\": not one of the values accepted for Enum class: %s", string, Arrays.toString(Month.values())), string, Month.class);
+             }
+             return Month.from(_formatter.parse(string));
+         } catch (DateTimeException e) {
+             return _handleDateTimeFormatException(ctxt, e, _formatter, string);
+         } catch (NumberFormatException e) {
+             throw ctxt.weirdStringException(string, handledType(),
+-                    "not a valid Month value");
++                    "not a valid month value");
+         }
+     }
+ 
+     /**
+      * Validate and convert a 1‑based month number to {@link Month}.
+      */
+-    private Month _decode1BasedMonth(int monthIndex, DeserializationContext ctxt)
+-        throws JacksonException
++    private Month _decodeMonth(int oneBasedMonthNumber, DeserializationContext ctxt)
++            throws JacksonException
+     {
+-        if (Month.JANUARY.getValue() <= monthIndex && monthIndex <= Month.DECEMBER.getValue()) {
+-            return Month.of(monthIndex);
++        if (Month.JANUARY.getValue() <= oneBasedMonthNumber && oneBasedMonthNumber <= Month.DECEMBER.getValue()) {
++            return Month.of(oneBasedMonthNumber);
+         }
++        // If out of range, throw an exception
+         return (Month) ctxt.handleWeirdNumberValue(handledType(),
+-                monthIndex, "month number outside 1-12 range for 1-based `Month`s");
+-    }
+-
+-    /**
+-     * Validate and convert a 0‑based month number to {@link Month}.
+-     */
+-    private Month _decode0BasedMonth(int monthIndex, DeserializationContext ctxt)
+-        throws JacksonException
+-    {
+-        if (monthIndex < 0 || monthIndex >= 12) { // invalid for 0‑based
+-            return (Month) ctxt.handleWeirdNumberValue(handledType(),
+-                    monthIndex, "month number outside 0-11 range for 0-based `Month`s");
+-        }
+-        return Month.values()[monthIndex]; // 0‑based mapping
++                oneBasedMonthNumber, "Month number %s not allowed for 1-based Month.", oneBasedMonthNumber);
+     }
+ }
+diff --git a/src/test/java/tools/jackson/databind/ext/javatime/deser/MonthDeserializerTest.java b/src/test/java/tools/jackson/databind/ext/javatime/deser/MonthDeserializerTest.java
+index 3db218abe..22720e36b 100644
+--- a/src/test/java/tools/jackson/databind/ext/javatime/deser/MonthDeserializerTest.java
++++ b/src/test/java/tools/jackson/databind/ext/javatime/deser/MonthDeserializerTest.java
+@@ -1,7 +1,6 @@
+ package tools.jackson.databind.ext.javatime.deser;
+ 
+ import java.time.Month;
+-import java.time.format.DateTimeFormatter;
+ import java.time.temporal.TemporalAccessor;
+ 
+ import org.junit.jupiter.api.function.Executable;
+@@ -9,12 +8,7 @@ import org.junit.jupiter.api.Test;
+ import org.junit.jupiter.params.ParameterizedTest;
+ import org.junit.jupiter.params.provider.CsvSource;
+ import org.junit.jupiter.params.provider.EnumSource;
+-import org.junit.jupiter.params.provider.ValueSource;
+ 
+-import com.fasterxml.jackson.annotation.JsonFormat;
+-import com.fasterxml.jackson.annotation.OptBoolean;
+-
+-import tools.jackson.databind.DeserializationFeature;
+ import tools.jackson.databind.MapperFeature;
+ import tools.jackson.databind.ObjectMapper;
+ import tools.jackson.databind.ObjectReader;
+@@ -38,11 +32,6 @@ public class MonthDeserializerTest extends DateTimeTestBase
+         public Wrapper() { }
+     }
+ 
+-    static class WrapperWithFormat {
+-        @JsonFormat(pattern = "MMM", locale = "en")
+-        public Month value;
+-    }
+-
+     @ParameterizedTest
+     @EnumSource(Month.class)
+     public void testDeserializationAsString01_oneBased(Month expectedMonth) throws Exception
+@@ -76,11 +65,11 @@ public class MonthDeserializerTest extends DateTimeTestBase
+ 
+     @ParameterizedTest
+     @CsvSource({
+-            "notamonth , 'Cannot deserialize value of type `java.time.Month` from String \"notamonth\": not one of known `Month` values:'",
+-            "JANUAR    , 'Cannot deserialize value of type `java.time.Month` from String \"JANUAR\": not one of known `Month` values:'",
+-            "march     , 'Cannot deserialize value of type `java.time.Month` from String \"march\": not one of known `Month` values:'",
+-            "0         , 'month number outside 1-12'",
+-            "13        , 'month number outside 1-12'",
++            "notamonth , 'Cannot deserialize value of type `java.time.Month` from String \"notamonth\": not one of the values accepted for Enum class:'",
++            "JANUAR    , 'Cannot deserialize value of type `java.time.Month` from String \"JANUAR\": not one of the values accepted for Enum class:'",
++            "march     , 'Cannot deserialize value of type `java.time.Month` from String \"march\": not one of the values accepted for Enum class:'",
++            "0         , 'Month number 0 not allowed for 1-based Month.'",
++            "13        , 'Month number 13 not allowed for 1-based Month.'",
+     })
+     public void testBadDeserializationAsString01_oneBased(String monthSpec, String expectedMessage) {
+         String value = "\"" + monthSpec + '"';
+@@ -208,334 +197,6 @@ public class MonthDeserializerTest extends DateTimeTestBase
+         assertNull(m);
+     }
+ 
+-    /*
+-    /**********************************************************************
+-    /* Tests for numeric int input (VALUE_NUMBER_INT)
+-    /**********************************************************************
+-     */
+-
+-    @ParameterizedTest
+-    @EnumSource(Month.class)
+-    public void testDeserializationAsInt_zeroBased(Month expectedMonth) throws Exception
+-    {
+-        int monthIndex = expectedMonth.ordinal();
+-        assertEquals(expectedMonth, readerForZeroBased().readValue(String.valueOf(monthIndex)));
+-    }
+-
+-    @ParameterizedTest
+-    @EnumSource(Month.class)
+-    public void testDeserializationAsInt_oneBased(Month expectedMonth) throws Exception
+-    {
+-        int monthNum = expectedMonth.getValue();
+-        assertEquals(expectedMonth, readerForOneBased().readValue(String.valueOf(monthNum)));
+-    }
+-
+-    @ParameterizedTest
+-    @ValueSource(ints = {-1, 12, 13, 100})
+-    public void testDeserializationAsIntOutOfRange_zeroBased(int invalidValue) throws Exception
+-    {
+-        assertError(
+-            () -> readerForZeroBased().readValue(String.valueOf(invalidValue)),
+-            MismatchedInputException.class,
+-            "month number outside 0-11 range"
+-        );
+-    }
+-
+-    @ParameterizedTest
+-    @ValueSource(ints = {0, -1, 13, 100})
+-    public void testDeserializationAsIntOutOfRange_oneBased(int invalidValue) throws Exception
+-    {
+-        assertError(
+-            () -> readerForOneBased().readValue(String.valueOf(invalidValue)),
+-            MismatchedInputException.class,
+-            "month number outside 1-12 range"
+-        );
+-    }
+-
+-    /*
+-    /**********************************************************************
+-    /* Tests for array handling
+-    /**********************************************************************
+-     */
+-
+-    @Test
+-    public void testDeserializationAsEmptyArray() throws Exception
+-    {
+-        // Empty array returns null
+-        Month result = readerForOneBased().readValue("[]");
+-        assertNull(result);
+-    }
+-
+-    @Test
+-    public void testDeserializationAsArrayWithIntValue() throws Exception
+-    {
+-        // Array with single int value (interpreted as 1-based month)
+-        Month result = readerForOneBased().readValue("[3]");
+-        assertEquals(Month.MARCH, result);
+-    }
+-
+-    @Test
+-    public void testDeserializationAsArrayWithIntValue_zeroBased() throws Exception
+-    {
+-        // Array with single int value (0-based mode still uses Month.of for array)
+-        Month result = readerForZeroBased().readValue("[3]");
+-        assertEquals(Month.MARCH, result);
+-    }
+-
+-    @Test
+-    public void testDeserializationAsArrayWithMoreThanOneElement() throws Exception
+-    {
+-        assertError(
+-            () -> readerForOneBased().readValue("[1, 2]"),
+-            MismatchedInputException.class,
+-            "Expected array to end"
+-        );
+-    }
+-
+-    @Test
+-    public void testDeserializationAsArrayWithWrongToken() throws Exception
+-    {
+-        // Boolean in array without UNWRAP should fail with specific error
+-        assertError(
+-            () -> readerForOneBased().readValue("[true]"),
+-            MismatchedInputException.class,
+-            "Expected VALUE_NUMBER_INT"
+-        );
+-    }
+-
+-    @Test
+-    public void testDeserializationAsArrayWithStringUnwrapDisabled() throws Exception
+-    {
+-        // String in array without UNWRAP_SINGLE_VALUE_ARRAYS should fail
+-        assertError(
+-            () -> readerForOneBased().readValue("[\"JANUARY\"]"),
+-            MismatchedInputException.class,
+-            "Expected VALUE_NUMBER_INT"
+-        );
+-    }
+-
+-    @Test
+-    public void testDeserializationAsArrayWithFloatUnwrapDisabled() throws Exception
+-    {
+-        // Float in array without UNWRAP should fail
+-        assertError(
+-            () -> readerForOneBased().readValue("[1.5]"),
+-            MismatchedInputException.class,
+-            "Expected VALUE_NUMBER_INT"
+-        );
+-    }
+-
+-    @Test
+-    public void testDeserializationAsArrayWithObjectUnwrapDisabled() throws Exception
+-    {
+-        // Object in array without UNWRAP should fail
+-        assertError(
+-            () -> readerForOneBased().readValue("[{}]"),
+-            MismatchedInputException.class,
+-            "Expected VALUE_NUMBER_INT"
+-        );
+-    }
+-
+-    @Test
+-    public void testDeserializationAsArrayWithStringUnwrapEnabled() throws Exception
+-    {
+-        // String in array with UNWRAP_SINGLE_VALUE_ARRAYS should work
+-        Month result = MAPPER.readerFor(Month.class)
+-                .with(DeserializationFeature.UNWRAP_SINGLE_VALUE_ARRAYS)
+-                .with(DateTimeFeature.ONE_BASED_MONTHS)
+-                .readValue("[\"JANUARY\"]");
+-        assertEquals(Month.JANUARY, result);
+-    }
+-
+-    @Test
+-    public void testDeserializationAsArrayWithNumericStringUnwrapEnabled() throws Exception
+-    {
+-        // Numeric string in array with UNWRAP_SINGLE_VALUE_ARRAYS
+-        Month result = MAPPER.readerFor(Month.class)
+-                .with(DeserializationFeature.UNWRAP_SINGLE_VALUE_ARRAYS)
+-                .with(DateTimeFeature.ONE_BASED_MONTHS)
+-                .readValue("[\"5\"]");
+-        assertEquals(Month.MAY, result);
+-    }
+-
+-    @Test
+-    public void testDeserializationAsArrayWithMoreThanOneString() throws Exception
+-    {
+-        // More than one string with UNWRAP_SINGLE_VALUE_ARRAYS should fail
+-        assertError(
+-            () -> MAPPER.readerFor(Month.class)
+-                    .with(DeserializationFeature.UNWRAP_SINGLE_VALUE_ARRAYS)
+-                    .readValue("[\"JANUARY\", \"FEBRUARY\"]"),
+-            MismatchedInputException.class,
+-            "Attempted to unwrap"
+-        );
+-    }
+-
+-    /*
+-    /**********************************************************************
+-    /* Tests for zero-based string parsing edge cases
+-    /**********************************************************************
+-     */
+-
+-    @ParameterizedTest
+-    @CsvSource({
+-            "12  , 'month number outside 0-11'",
+-            "-1  , 'month number outside 0-11'",
+-            "100 , 'month number outside 0-11'",
+-    })
+-    public void testBadDeserializationAsString_zeroBasedOutOfRange(String monthSpec, String expectedMessage) {
+-        String value = q(monthSpec);
+-        assertError(
+-            () -> readerForZeroBased().readValue(value),
+-            InvalidFormatException.class,
+-            expectedMessage
+-        );
+-    }
+-
+-    /*
+-    /**********************************************************************
+-    /* Tests for whitespace handling
+-    /**********************************************************************
+-     */
+-
+-    @Test
+-    public void testDeserializationWithWhitespace() throws Exception
+-    {
+-        // Whitespace around month name should be trimmed
+-        Month result = readerForOneBased().readValue("\" JANUARY \"");
+-        assertEquals(Month.JANUARY, result);
+-    }
+-
+-    @Test
+-    public void testDeserializationWithWhitespaceNumeric() throws Exception
+-    {
+-        // Whitespace around numeric value should be trimmed
+-        Month result = readerForOneBased().readValue("\" 6 \"");
+-        assertEquals(Month.JUNE, result);
+-    }
+-
+-    /*
+-    /**********************************************************************
+-    /* Tests for unexpected tokens
+-    /**********************************************************************
+-     */
+-
+-    @Test
+-    public void testDeserializationFromBoolean() throws Exception
+-    {
+-        // Bare boolean should be handled as unexpected token
+-        assertError(
+-            () -> readerForOneBased().readValue("true"),
+-            MismatchedInputException.class,
+-            "Unexpected token (VALUE_TRUE)"
+-        );
+-    }
+-
+-    @Test
+-    public void testDeserializationFromFloat() throws Exception
+-    {
+-        // Bare float should be handled as unexpected token
+-        assertError(
+-            () -> readerForOneBased().readValue("1.5"),
+-            MismatchedInputException.class,
+-            "Unexpected token (VALUE_NUMBER_FLOAT)"
+-        );
+-    }
+-
+-    @Test
+-    public void testDeserializationFromObject() throws Exception
+-    {
+-        // Object without scalar extraction should fail
+-        assertError(
+-            () -> readerForOneBased().readValue("{}"),
+-            MismatchedInputException.class,
+-            "Unexpected token (START_OBJECT)"
+-        );
+-    }
+-
+-    /*
+-    /**********************************************************************
+-    /* Tests for custom DateTimeFormatter
+-    /**********************************************************************
+-     */
+-
+-    @Test
+-    public void testDeserializationWithCustomFormat() throws Exception
+-    {
+-        WrapperWithFormat result = MAPPER.readValue("{\"value\":\"Jan\"}", WrapperWithFormat.class);
+-        assertEquals(Month.JANUARY, result.value);
+-    }
+-
+-    @Test
+-    public void testDeserializationWithCustomFormatMarch() throws Exception
+-    {
+-        WrapperWithFormat result = MAPPER.readValue("{\"value\":\"Mar\"}", WrapperWithFormat.class);
+-        assertEquals(Month.MARCH, result.value);
+-    }
+-
+-    @Test
+-    public void testDeserializationWithCustomFormatInvalid() throws Exception
+-    {
+-        assertError(
+-            () -> MAPPER.readValue("{\"value\":\"NotAMonth\"}", WrapperWithFormat.class),
+-            InvalidFormatException.class,
+-            "could not be parsed"
+-        );
+-    }
+-
+-    static class WrapperWithFullMonthFormat {
+-        @JsonFormat(pattern = "MMMM", locale = "en")
+-        public Month value;
+-    }
+-
+-    @Test
+-    public void testDeserializationWithFullMonthFormat() throws Exception
+-    {
+-        WrapperWithFullMonthFormat result = MAPPER.readValue(
+-                "{\"value\":\"January\"}", WrapperWithFullMonthFormat.class);
+-        assertEquals(Month.JANUARY, result.value);
+-    }
+-
+-    /*
+-    /**********************************************************************
+-    /* Tests for leniency settings
+-    /**********************************************************************
+-     */
+-
+-    static class WrapperStrict {
+-        @JsonFormat(lenient = OptBoolean.FALSE)
+-        public Month value;
+-    }
+-
+-    static class WrapperLenient {
+-        @JsonFormat(lenient = OptBoolean.TRUE)
+-        public Month value;
+-    }
+-
+-    @Test
+-    public void testWithLeniencyCreatesNewInstance() throws Exception
+-    {
+-        MonthDeserializer original = MonthDeserializer.INSTANCE;
+-        MonthDeserializer strict = original.withLeniency(false);
+-        assertNotSame(original, strict);
+-        assertFalse(strict.isLenient());
+-    }
+-
+-    @Test
+-    public void testWithDateFormatCreatesNewInstance() throws Exception
+-    {
+-        MonthDeserializer original = MonthDeserializer.INSTANCE;
+-        DateTimeFormatter formatter = DateTimeFormatter.ofPattern("MMM");
+-        MonthDeserializer withFormatter = original.withDateFormat(formatter);
+-        assertNotSame(original, withFormatter);
+-    }
+-
+-    /*
+-    /**********************************************************************
+-    /* Helper methods
+-    /**********************************************************************
+-     */
+-
+     private ObjectReader readerForZeroBased() {
+         return MAPPER
+                 .readerFor(Month.class)
+diff --git a/src/test/java/tools/jackson/databind/ext/javatime/deser/OffsetTimeDeserTest.java b/src/test/java/tools/jackson/databind/ext/javatime/deser/OffsetTimeDeserTest.java
+index 7819da5c6..9dd79631b 100644
+--- a/src/test/java/tools/jackson/databind/ext/javatime/deser/OffsetTimeDeserTest.java
++++ b/src/test/java/tools/jackson/databind/ext/javatime/deser/OffsetTimeDeserTest.java
+@@ -10,7 +10,6 @@ import org.junit.jupiter.api.Test;
+ 
+ import com.fasterxml.jackson.annotation.JsonFormat;
+ import com.fasterxml.jackson.annotation.JsonFormat.Feature;
+-import com.fasterxml.jackson.annotation.OptBoolean;
+ 
+ import tools.jackson.core.type.TypeReference;
+ 
+@@ -62,24 +61,6 @@ public class OffsetTimeDeserTest extends DateTimeTestBase
+         public WrapperWithReadTimestampsAsNanosEnabled(OffsetTime v) { value = v; }
+     }
+ 
+-    // For testing custom format (covers withDateFormat)
+-    static class WrapperWithCustomPattern {
+-        @JsonFormat(pattern = "HH:mm:ssXXX")
+-        public OffsetTime value;
+-
+-        public WrapperWithCustomPattern() { }
+-        public WrapperWithCustomPattern(OffsetTime v) { value = v; }
+-    }
+-
+-    // For testing strict mode with custom format
+-    static class StrictWrapper {
+-        @JsonFormat(pattern = "HH:mmXXX", lenient = OptBoolean.FALSE)
+-        public OffsetTime value;
+-
+-        public StrictWrapper() { }
+-        public StrictWrapper(OffsetTime v) { value = v; }
+-    }
+-
+     private final ObjectMapper MAPPER = newMapper();
+     private final ObjectReader READER = MAPPER.readerFor(OffsetTime.class);
+ 
+@@ -366,112 +347,4 @@ public class OffsetTimeDeserTest extends DateTimeTestBase
+         String valueFromEmptyStr = mapper.writeValueAsString(asMap(key, ""));
+         assertThrows(MismatchedInputException.class, () -> objectReader.readValue(valueFromEmptyStr));
+     }
+-
+-    /*
+-    /**********************************************************
+-    /* Tests for custom pattern/format (covers withDateFormat)
+-    /**********************************************************
+-     */
+-
+-    @Test
+-    public void testDeserializationWithCustomPattern() throws Exception
+-    {
+-        ObjectReader reader = MAPPER.readerFor(WrapperWithCustomPattern.class);
+-
+-        OffsetTime expected = OffsetTime.of(15, 30, 45, 0, ZoneOffset.ofHours(2));
+-        WrapperWithCustomPattern result = reader.readValue(a2q("{'value':'15:30:45+02:00'}"));
+-        assertEquals(expected, result.value);
+-
+-        // Also test with UTC offset
+-        expected = OffsetTime.of(10, 15, 30, 0, ZoneOffset.UTC);
+-        result = reader.readValue(a2q("{'value':'10:15:30Z'}"));
+-        assertEquals(expected, result.value);
+-    }
+-
+-    @Test
+-    public void testStrictCustomPatternInvalidFormat() throws Exception
+-    {
+-        // The strict wrapper expects HH:mmXXX format, so full timestamp should fail
+-        assertThrows(MismatchedInputException.class,
+-                () -> MAPPER.readValue("{\"value\":\"15:30:45+02:00\"}", StrictWrapper.class));
+-    }
+-
+-    /*
+-    /**********************************************************
+-    /* Tests for TRUNCATE_TO_MSECS_ON_READ feature
+-    /**********************************************************
+-     */
+-
+-    @Test
+-    public void testDeserializationTruncateToMillis() throws Exception
+-    {
+-        ObjectReader reader = MAPPER.readerFor(OffsetTime.class)
+-                .with(DateTimeFeature.TRUNCATE_TO_MSECS_ON_READ);
+-
+-        // From string with nanoseconds
+-        OffsetTime result = reader.readValue("\"10:30:45.123456789+02:00\"");
+-        assertEquals(123000000, result.getNano(), "Nanoseconds should be truncated to milliseconds");
+-        assertEquals(10, result.getHour());
+-        assertEquals(30, result.getMinute());
+-        assertEquals(45, result.getSecond());
+-
+-        // From array with nanoseconds
+-        result = reader.with(DateTimeFeature.READ_DATE_TIMESTAMPS_AS_NANOSECONDS)
+-                .readValue("[10,30,45,123456789,\"+02:00\"]");
+-        assertEquals(123000000, result.getNano(), "Nanoseconds from array should be truncated to milliseconds");
+-    }
+-
+-    @Test
+-    public void testDeserializationTruncateToMillisAlreadyTruncated() throws Exception
+-    {
+-        ObjectReader reader = MAPPER.readerFor(OffsetTime.class)
+-                .with(DateTimeFeature.TRUNCATE_TO_MSECS_ON_READ);
+-
+-        // Value already at millisecond precision should remain unchanged
+-        OffsetTime result = reader.readValue("\"10:30:45.123+02:00\"");
+-        assertEquals(123000000, result.getNano());
+-    }
+-
+-    /*
+-    /**********************************************************
+-    /* Tests for error cases
+-    /**********************************************************
+-     */
+-
+-    @Test
+-    public void testDeserializationFromIntegerFails() throws Exception
+-    {
+-        // OffsetTime cannot be deserialized from a standalone integer
+-        // (needs timezone info)
+-        try {
+-            READER.readValue("12345");
+-            fail("Should not accept integer for OffsetTime");
+-        } catch (MismatchedInputException e) {
+-            verifyException(e, "raw timestamp");
+-        }
+-    }
+-
+-    @Test
+-    public void testDeserializationFromArrayMissingTimeZone() throws Exception
+-    {
+-        // Array with numeric values but missing timezone string at the end
+-        try {
+-            READER.readValue("[10,30,45,123]");
+-            fail("Should fail when timezone string is missing");
+-        } catch (MismatchedInputException e) {
+-            verifyException(e, "Expected string for TimeZone");
+-        }
+-    }
+-
+-    @Test
+-    public void testDeserializationFromArrayMissingTimeZoneMinimal() throws Exception
+-    {
+-        // Array with just hour and minute but no timezone
+-        try {
+-            READER.readValue("[10,30]");
+-            fail("Should fail when timezone string is missing");
+-        } catch (MismatchedInputException e) {
+-            verifyException(e, "Expected string for TimeZone");
+-        }
+-    }
+ }

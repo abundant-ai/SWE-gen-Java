@@ -1,0 +1,926 @@
+diff --git a/kotlin-codegen/compiler/src/main/java/com/squareup/moshi/AdapterGenerator.kt b/kotlin-codegen/compiler/src/main/java/com/squareup/moshi/AdapterGenerator.kt
+index b5061c3f..8da9f594 100644
+--- a/kotlin-codegen/compiler/src/main/java/com/squareup/moshi/AdapterGenerator.kt
++++ b/kotlin-codegen/compiler/src/main/java/com/squareup/moshi/AdapterGenerator.kt
+@@ -34,6 +34,7 @@ import me.eugeniomarletti.kotlin.metadata.isDataClass
+ import me.eugeniomarletti.kotlin.metadata.shadow.metadata.ProtoBuf.Visibility
+ import me.eugeniomarletti.kotlin.metadata.visibility
+ import java.lang.reflect.Type
++import javax.annotation.processing.Messager
+ import javax.lang.model.element.TypeElement
+ 
+ /** Generates a JSON adapter for a target type. */
+@@ -81,7 +82,7 @@ internal class AdapterGenerator(
+           .joinToString(", ") { "\"$it\"" }})", JsonReader.Options::class.asTypeName())
+       .build()
+ 
+-  fun generateFile(generatedOption: TypeElement?): FileSpec {
++  fun generateFile(messager: Messager, generatedOption: TypeElement?): FileSpec {
+     for (property in propertyList) {
+       property.allocateNames(nameAllocator)
+     }
+@@ -91,11 +92,11 @@ internal class AdapterGenerator(
+     if (hasCompanionObject) {
+       result.addFunction(generateJsonAdapterFun())
+     }
+-    result.addType(generateType(generatedOption))
++    result.addType(generateType(messager, generatedOption))
+     return result.build()
+   }
+ 
+-  private fun generateType(generatedOption: TypeElement?): TypeSpec {
++  private fun generateType(messager: Messager, generatedOption: TypeElement?): TypeSpec {
+     val result = TypeSpec.classBuilder(adapterName)
+ 
+     generatedOption?.let {
+@@ -129,7 +130,7 @@ internal class AdapterGenerator(
+     result.addProperty(optionsProperty)
+     for (uniqueAdapter in propertyList.distinctBy { it.delegateKey }) {
+       result.addProperty(uniqueAdapter.delegateKey.generateProperty(
+-          nameAllocator, typeRenderer, moshiParam))
++          nameAllocator, typeRenderer, moshiParam, messager))
+     }
+ 
+     result.addFunction(generateToStringFun())
+@@ -181,13 +182,27 @@ internal class AdapterGenerator(
+     propertyList.forEachIndexed { index, property ->
+       if (property.differentiateAbsentFromNull) {
+         result.beginControlFlow("%L -> ", index)
+-        result.addStatement("%N = %N.fromJson(%N)",
+-            property.localName, nameAllocator.get(property.delegateKey), readerParam)
++        if (property.delegateKey.nullable) {
++          result.addStatement("%N = %N.fromJson(%N)",
++              property.localName, nameAllocator.get(property.delegateKey), readerParam)
++        } else {
++          result.addStatement("%N = %N.fromJson(%N)" +
++              " ?: throw %T(\"Non-null value '%N' was null at \${%N.path}\")",
++              property.localName, nameAllocator.get(property.delegateKey), readerParam,
++              JsonDataException::class, property.localName, readerParam)
++        }
+         result.addStatement("%N = true", property.localIsPresentName)
+         result.endControlFlow()
+       } else {
+-        result.addStatement("%L -> %N = %N.fromJson(%N)",
+-            index, property.localName, nameAllocator.get(property.delegateKey), readerParam)
++        if (property.delegateKey.nullable) {
++          result.addStatement("%L -> %N = %N.fromJson(%N)",
++              index, property.localName, nameAllocator.get(property.delegateKey), readerParam)
++        } else {
++          result.addStatement("%L -> %N = %N.fromJson(%N)" +
++              " ?: throw %T(\"Non-null value '%N' was null at \${%N.path}\")",
++              index, property.localName, nameAllocator.get(property.delegateKey), readerParam,
++              JsonDataException::class, property.localName, readerParam)
++        }
+       }
+     }
+ 
+diff --git a/kotlin-codegen/compiler/src/main/java/com/squareup/moshi/DelegateKey.kt b/kotlin-codegen/compiler/src/main/java/com/squareup/moshi/DelegateKey.kt
+index c39e3c1b..23024712 100644
+--- a/kotlin-codegen/compiler/src/main/java/com/squareup/moshi/DelegateKey.kt
++++ b/kotlin-codegen/compiler/src/main/java/com/squareup/moshi/DelegateKey.kt
+@@ -15,6 +15,9 @@
+  */
+ package com.squareup.moshi
+ 
++import com.google.auto.common.MoreTypes
++import com.squareup.kotlinpoet.AnnotationSpec
++import com.squareup.kotlinpoet.AnnotationSpec.UseSiteTarget.FIELD
+ import com.squareup.kotlinpoet.ClassName
+ import com.squareup.kotlinpoet.CodeBlock
+ import com.squareup.kotlinpoet.KModifier
+@@ -26,7 +29,11 @@ import com.squareup.kotlinpoet.TypeName
+ import com.squareup.kotlinpoet.TypeVariableName
+ import com.squareup.kotlinpoet.WildcardTypeName
+ import com.squareup.kotlinpoet.asTypeName
++import java.lang.annotation.ElementType
++import java.lang.annotation.RetentionPolicy
++import javax.annotation.processing.Messager
+ import javax.lang.model.element.AnnotationMirror
++import javax.tools.Diagnostic.Kind.ERROR
+ 
+ /** A JsonAdapter that can be used to encode and decode a particular field. */
+ internal data class DelegateKey(
+@@ -39,7 +46,24 @@ internal data class DelegateKey(
+   fun generateProperty(
+     nameAllocator: NameAllocator,
+     typeRenderer: TypeRenderer,
+-    moshiParameter: ParameterSpec): PropertySpec {
++    moshiParameter: ParameterSpec,
++    messager: Messager): PropertySpec {
++    fun AnnotationMirror.validate(): AnnotationMirror {
++      // Check java types since that covers both java and kotlin annotations
++      val annotationElement = MoreTypes.asTypeElement(annotationType)
++      annotationElement.getAnnotation(java.lang.annotation.Retention::class.java)?.let {
++        if (it.value != RetentionPolicy.RUNTIME) {
++          messager.printMessage(ERROR, "JsonQualifier @${MoreTypes.asTypeElement(annotationType).simpleName} must have RUNTIME retention")
++        }
++      }
++      annotationElement.getAnnotation(java.lang.annotation.Target::class.java)?.let {
++        if (ElementType.FIELD !in it.value) {
++          messager.printMessage(ERROR, "JsonQualifier @${MoreTypes.asTypeElement(annotationType).simpleName} must support FIELD target")
++        }
++      }
++      return this
++    }
++    jsonQualifiers.forEach { it.validate() }
+     val qualifierNames = jsonQualifiers.joinToString("") {
+       "At${it.annotationType.asElement().simpleName}"
+     }
+@@ -59,21 +83,10 @@ internal data class DelegateKey(
+     val standardArgsSize = standardArgs.size + 1
+     val (initializerString, args) = when {
+       qualifiers.isEmpty() -> "" to emptyArray()
+-      qualifiers.size == 1 -> {
+-        ", %${standardArgsSize}T::class.java" to arrayOf(
+-            qualifiers.first().annotationType.asTypeName())
+-      }
+       else -> {
+-        val initString = qualifiers
+-            .mapIndexed { index, _ ->
+-              val annoClassIndex = standardArgsSize + index
+-              return@mapIndexed "%${annoClassIndex}T::class.java"
+-            }
+-            .joinToString()
+-        val initArgs = qualifiers
+-            .map { it.annotationType.asTypeName() }
+-            .toTypedArray()
+-        ", $initString" to initArgs
++        ", %${standardArgsSize}T.getFieldJsonQualifierAnnotations(javaClass, %${standardArgsSize + 1}S)" to arrayOf(
++            Types::class.asTypeName(),
++            adapterName)
+       }
+     }
+     val finalArgs = arrayOf(*standardArgs, *args)
+@@ -81,6 +94,7 @@ internal data class DelegateKey(
+     val nullModifier = if (nullable) ".nullSafe()" else ".nonNull()"
+ 
+     return PropertySpec.builder(adapterName, adapterTypeName, KModifier.PRIVATE)
++        .addAnnotations(qualifiers.map { AnnotationSpec.get(it).toBuilder().useSiteTarget(FIELD).build() })
+         .initializer("%1N.adapter%2L(%3L$initializerString)$nullModifier", *finalArgs)
+         .build()
+   }
+diff --git a/kotlin-codegen/compiler/src/main/java/com/squareup/moshi/JsonClassCodeGenProcessor.kt b/kotlin-codegen/compiler/src/main/java/com/squareup/moshi/JsonClassCodeGenProcessor.kt
+index 99a63573..09810965 100644
+--- a/kotlin-codegen/compiler/src/main/java/com/squareup/moshi/JsonClassCodeGenProcessor.kt
++++ b/kotlin-codegen/compiler/src/main/java/com/squareup/moshi/JsonClassCodeGenProcessor.kt
+@@ -124,7 +124,7 @@ class JsonClassCodeGenProcessor : KotlinAbstractProcessor(), KotlinMetadataUtils
+   }
+ 
+   private fun AdapterGenerator.generateAndWrite(generatedOption: TypeElement?) {
+-    val fileSpec = generateFile(generatedOption)
++    val fileSpec = generateFile(messager, generatedOption)
+     val adapterName = fileSpec.members.filterIsInstance<TypeSpec>().first().name!!
+     val outputDir = generatedDir ?: mavenGeneratedDir(adapterName)
+     fileSpec.writeTo(outputDir)
+diff --git a/kotlin-codegen/compiler/src/test/java/com/squareup/moshi/CompilerTest.kt b/kotlin-codegen/compiler/src/test/java/com/squareup/moshi/CompilerTest.kt
+index 7b1212c1..a31e97e4 100644
+--- a/kotlin-codegen/compiler/src/test/java/com/squareup/moshi/CompilerTest.kt
++++ b/kotlin-codegen/compiler/src/test/java/com/squareup/moshi/CompilerTest.kt
+@@ -244,4 +244,60 @@ class CompilerTest {
+     assertThat(result.exitCode).isEqualTo(ExitCode.COMPILATION_ERROR)
+     assertThat(result.systemErr).contains("supertype java.util.Date is not a Kotlin type")
+   }
++
++  @Test
++  fun nonFieldApplicableQualifier() {
++    val call = KotlinCompilerCall(temporaryFolder.root)
++    call.inheritClasspath = true
++    call.addService(Processor::class, JsonClassCodeGenProcessor::class)
++    call.addKt("source.kt", """
++        |import com.squareup.moshi.JsonClass
++        |import com.squareup.moshi.JsonQualifier
++        |import kotlin.annotation.AnnotationRetention.RUNTIME
++        |import kotlin.annotation.AnnotationTarget.PROPERTY
++        |import kotlin.annotation.Retention
++        |import kotlin.annotation.Target
++        |
++        |@Retention(RUNTIME)
++        |@Target(PROPERTY)
++        |@JsonQualifier
++        |annotation class UpperCase
++        |
++        |@JsonClass(generateAdapter = true)
++        |class ClassWithQualifier(@UpperCase val a: Int)
++        |""".trimMargin())
++
++    val result = call.execute()
++    println(result.systemErr)
++    assertThat(result.exitCode).isEqualTo(ExitCode.COMPILATION_ERROR)
++    assertThat(result.systemErr).contains("JsonQualifier @UpperCase must support FIELD target")
++  }
++
++  @Test
++  fun nonRuntimeQualifier() {
++    val call = KotlinCompilerCall(temporaryFolder.root)
++    call.inheritClasspath = true
++    call.addService(Processor::class, JsonClassCodeGenProcessor::class)
++    call.addKt("source.kt", """
++        |import com.squareup.moshi.JsonClass
++        |import com.squareup.moshi.JsonQualifier
++        |import kotlin.annotation.AnnotationRetention.BINARY
++        |import kotlin.annotation.AnnotationTarget.FIELD
++        |import kotlin.annotation.AnnotationTarget.PROPERTY
++        |import kotlin.annotation.Retention
++        |import kotlin.annotation.Target
++        |
++        |@Retention(BINARY)
++        |@Target(PROPERTY, FIELD)
++        |@JsonQualifier
++        |annotation class UpperCase
++        |
++        |@JsonClass(generateAdapter = true)
++        |class ClassWithQualifier(@UpperCase val a: Int)
++        |""".trimMargin())
++
++    val result = call.execute()
++    assertThat(result.exitCode).isEqualTo(ExitCode.COMPILATION_ERROR)
++    assertThat(result.systemErr).contains("JsonQualifier @UpperCase must have RUNTIME retention")
++  }
+ }
+diff --git a/kotlin-codegen/integration-test/src/test/kotlin/com/squareup/moshi/GeneratedAdaptersTest.kt b/kotlin-codegen/integration-test/src/test/kotlin/com/squareup/moshi/GeneratedAdaptersTest.kt
+index cc879e9e..6cc69daf 100644
+--- a/kotlin-codegen/integration-test/src/test/kotlin/com/squareup/moshi/GeneratedAdaptersTest.kt
++++ b/kotlin-codegen/integration-test/src/test/kotlin/com/squareup/moshi/GeneratedAdaptersTest.kt
+@@ -383,6 +383,20 @@ class GeneratedAdaptersTest {
+     }
+   }
+ 
++  @Test fun nonNullConstructorParameterCalledWithNullFromAdapterFailsWithJsonDataException() {
++    val moshi = Moshi.Builder().add(object {
++      @FromJson fun fromJson(string: String): String? = null
++    }).build()
++    val jsonAdapter = moshi.adapter(HasNonNullConstructorParameter::class.java)
++
++    try {
++      jsonAdapter.fromJson("{\"a\":\"hello\"}")
++      fail()
++    } catch (expected: JsonDataException) {
++      assertThat(expected).hasMessage("Non-null value 'a' was null at \$.a")
++    }
++  }
++
+   @JsonClass(generateAdapter = true)
+   class HasNonNullConstructorParameter(val a: String)
+ 
+@@ -433,7 +447,7 @@ class GeneratedAdaptersTest {
+   }
+ 
+   @JsonClass(generateAdapter = true)
+-  class ConstructorParameterWithQualifier(@Uppercase var a: String, var b: String)
++  class ConstructorParameterWithQualifier(@Uppercase(inFrench = true) var a: String, var b: String)
+ 
+   @Test fun propertyWithQualifier() {
+     val moshi = Moshi.Builder()
+@@ -453,7 +467,7 @@ class GeneratedAdaptersTest {
+ 
+   @JsonClass(generateAdapter = true)
+   class PropertyWithQualifier {
+-    @Uppercase var a: String = ""
++    @Uppercase(inFrench = true) var a: String = ""
+     var b: String = ""
+   }
+ 
+@@ -539,6 +553,20 @@ class GeneratedAdaptersTest {
+     }
+   }
+ 
++  @Test fun nonNullPropertySetToNullFromAdapterFailsWithJsonDataException() {
++    val moshi = Moshi.Builder().add(object {
++      @FromJson fun fromJson(string: String): String? = null
++    }).build()
++    val jsonAdapter = moshi.adapter(HasNonNullProperty::class.java)
++
++    try {
++      jsonAdapter.fromJson("{\"a\":\"hello\"}")
++      fail()
++    } catch (expected: JsonDataException) {
++      assertThat(expected).hasMessage("Non-null value 'a' was null at \$.a")
++    }
++  }
++
+   @JsonClass(generateAdapter = true)
+   class HasNonNullProperty {
+     var a: String = ""
+@@ -734,15 +762,14 @@ class GeneratedAdaptersTest {
+     var b: Int = -1
+   }
+ 
+-  @Retention(AnnotationRetention.RUNTIME)
+   @JsonQualifier
+-  annotation class Uppercase
++  annotation class Uppercase(val inFrench: Boolean, val onSundays: Boolean = false)
+ 
+   class UppercaseJsonAdapter {
+-    @ToJson fun toJson(@Uppercase s: String) : String {
++    @ToJson fun toJson(@Uppercase(inFrench = true) s: String) : String {
+       return s.toUpperCase(Locale.US)
+     }
+-    @FromJson @Uppercase fun fromJson(s: String) : String {
++    @FromJson @Uppercase(inFrench = true) fun fromJson(s: String) : String {
+       return s.toLowerCase(Locale.US)
+     }
+   }
+diff --git a/kotlin/src/main/java/com/squareup/moshi/kotlin/KotlinJsonAdapter.kt b/kotlin/src/main/java/com/squareup/moshi/kotlin/KotlinJsonAdapter.kt
+index 922cc11c..82762f0c 100644
+--- a/kotlin/src/main/java/com/squareup/moshi/kotlin/KotlinJsonAdapter.kt
++++ b/kotlin/src/main/java/com/squareup/moshi/kotlin/KotlinJsonAdapter.kt
+@@ -46,7 +46,7 @@ private val KOTLIN_METADATA = Class.forName("kotlin.Metadata") as Class<out Anno
+  * Placeholder value used when a field is absent from the JSON. Note that this code
+  * distinguishes between absent values and present-but-null values.
+  */
+-private object ABSENT_VALUE
++private val ABSENT_VALUE = Any()
+ 
+ /**
+  * This class encodes Kotlin classes using their properties. It decodes them by first invoking the
+@@ -68,7 +68,7 @@ internal class KotlinJsonAdapter<T>(
+       val binding = if (index != -1) bindings[index] else null
+ 
+       if (binding == null) {
+-        reader.nextName()
++        reader.skipName()
+         reader.skipValue()
+         continue
+       }
+@@ -79,6 +79,11 @@ internal class KotlinJsonAdapter<T>(
+       }
+ 
+       values[index] = binding.adapter.fromJson(reader)
++
++      if (values[index] == null && !binding.property.returnType.isMarkedNullable) {
++        throw JsonDataException(
++            "Non-null value '${binding.property.name}' was null at ${reader.path}")
++      }
+     }
+     reader.endObject()
+ 
+@@ -90,9 +95,6 @@ internal class KotlinJsonAdapter<T>(
+               "Required value '${constructor.parameters[i].name}' missing at ${reader.path}")
+         }
+         values[i] = null // Replace absent with null.
+-      } else if (values[i] == null && !constructor.parameters[i].type.isMarkedNullable) {
+-        throw JsonDataException("Non-null value '${constructor.parameters[i].name}' " +
+-            "was null at ${reader.path}")
+       }
+     }
+ 
+@@ -103,10 +105,6 @@ internal class KotlinJsonAdapter<T>(
+     for (i in constructorSize until bindings.size) {
+       val binding = bindings[i]!!
+       val value = values[i]
+-      if (value == null && !binding.property.returnType.isMarkedNullable) {
+-        throw JsonDataException("Non-null value '${binding.property.name}' " +
+-            "was null at ${reader.path}")
+-      }
+       binding.set(result, value)
+     }
+ 
+diff --git a/kotlin/src/test/java/com/squareup/moshi/kotlin/KotlinJsonAdapterTest.kt b/kotlin/src/test/java/com/squareup/moshi/kotlin/KotlinJsonAdapterTest.kt
+index e1111ae8..2f1ec153 100644
+--- a/kotlin/src/test/java/com/squareup/moshi/kotlin/KotlinJsonAdapterTest.kt
++++ b/kotlin/src/test/java/com/squareup/moshi/kotlin/KotlinJsonAdapterTest.kt
+@@ -148,7 +148,21 @@ class KotlinJsonAdapterTest {
+       jsonAdapter.fromJson("{\"a\":null}")
+       fail()
+     } catch (expected: JsonDataException) {
+-      assertThat(expected).hasMessage("Non-null value 'a' was null at \$")
++      assertThat(expected).hasMessage("Non-null value 'a' was null at \$.a")
++    }
++  }
++
++  @Test fun nonNullConstructorParameterCalledWithNullFromAdapterFailsWithJsonDataException() {
++    val moshi = Moshi.Builder().add(object {
++      @FromJson fun fromJson(string: String): String? = null
++    }).add(KotlinJsonAdapterFactory()).build()
++    val jsonAdapter = moshi.adapter(HasNonNullConstructorParameter::class.java)
++
++    try {
++      jsonAdapter.fromJson("{\"a\":\"hello\"}")
++      fail()
++    } catch (expected: JsonDataException) {
++      assertThat(expected).hasMessage("Non-null value 'a' was null at \$.a")
+     }
+   }
+ 
+@@ -162,7 +176,21 @@ class KotlinJsonAdapterTest {
+       jsonAdapter.fromJson("{\"a\":null}")
+       fail()
+     } catch (expected: JsonDataException) {
+-      assertThat(expected).hasMessage("Non-null value 'a' was null at \$")
++      assertThat(expected).hasMessage("Non-null value 'a' was null at \$.a")
++    }
++  }
++
++  @Test fun nonNullPropertySetToNullFromAdapterFailsWithJsonDataException() {
++    val moshi = Moshi.Builder().add(object {
++      @FromJson fun fromJson(string: String): String? = null
++    }).add(KotlinJsonAdapterFactory()).build()
++    val jsonAdapter = moshi.adapter(HasNonNullProperty::class.java)
++
++    try {
++      jsonAdapter.fromJson("{\"a\":\"hello\"}")
++      fail()
++    } catch (expected: JsonDataException) {
++      assertThat(expected).hasMessage("Non-null value 'a' was null at \$.a")
+     }
+   }
+ 
+diff --git a/moshi/src/main/java/com/squareup/moshi/ClassJsonAdapter.java b/moshi/src/main/java/com/squareup/moshi/ClassJsonAdapter.java
+index 31663494..5517de5c 100644
+--- a/moshi/src/main/java/com/squareup/moshi/ClassJsonAdapter.java
++++ b/moshi/src/main/java/com/squareup/moshi/ClassJsonAdapter.java
+@@ -151,7 +151,7 @@ final class ClassJsonAdapter<T> extends JsonAdapter<T> {
+       while (reader.hasNext()) {
+         int index = reader.selectName(options);
+         if (index == -1) {
+-          reader.nextName();
++          reader.skipName();
+           reader.skipValue();
+           continue;
+         }
+diff --git a/moshi/src/main/java/com/squareup/moshi/JsonAdapter.java b/moshi/src/main/java/com/squareup/moshi/JsonAdapter.java
+index 345c0272..7c46133d 100644
+--- a/moshi/src/main/java/com/squareup/moshi/JsonAdapter.java
++++ b/moshi/src/main/java/com/squareup/moshi/JsonAdapter.java
+@@ -219,9 +219,9 @@ public abstract class JsonAdapter<T> {
+ 
+   /**
+    * Returns a JSON adapter equal to this, but that throws a {@link JsonDataException} when
+-   * {@linkplain JsonReader#setFailOnUnknown(boolean) unknown values} are encountered. This
+-   * constraint applies to both the top-level message handled by this type adapter as well as to
+-   * nested messages.
++   * {@linkplain JsonReader#setFailOnUnknown(boolean) unknown names and values} are encountered.
++   * This constraint applies to both the top-level message handled by this type adapter as well as
++   * to nested messages.
+    */
+   @CheckReturnValue public final JsonAdapter<T> failOnUnknown() {
+     final JsonAdapter<T> delegate = this;
+diff --git a/moshi/src/main/java/com/squareup/moshi/JsonReader.java b/moshi/src/main/java/com/squareup/moshi/JsonReader.java
+index 1ecd8781..29863bb5 100644
+--- a/moshi/src/main/java/com/squareup/moshi/JsonReader.java
++++ b/moshi/src/main/java/com/squareup/moshi/JsonReader.java
+@@ -279,7 +279,7 @@ public abstract class JsonReader implements Closeable {
+   }
+ 
+   /**
+-   * Returns true if this parser forbids skipping values.
++   * Returns true if this parser forbids skipping names and values.
+    */
+   @CheckReturnValue public final boolean failOnUnknown() {
+     return failOnUnknown;
+@@ -332,6 +332,15 @@ public abstract class JsonReader implements Closeable {
+    */
+   public abstract int selectName(Options options) throws IOException;
+ 
++  /**
++   * Skips the next token, consuming it. This method is intended for use when the JSON token stream
++   * contains unrecognized or unhandled names.
++   *
++   * <p>This throws a {@link JsonDataException} if this parser has been configured to {@linkplain
++   * #failOnUnknown fail on unknown} names.
++   */
++  public abstract void skipName() throws IOException;
++
+   /**
+    * Returns the {@linkplain Token#STRING string} value of the next token, consuming it. If the next
+    * token is a number, this method will return its string form.
+diff --git a/moshi/src/main/java/com/squareup/moshi/JsonUtf8Reader.java b/moshi/src/main/java/com/squareup/moshi/JsonUtf8Reader.java
+index 6ea058b4..200ab078 100644
+--- a/moshi/src/main/java/com/squareup/moshi/JsonUtf8Reader.java
++++ b/moshi/src/main/java/com/squareup/moshi/JsonUtf8Reader.java
+@@ -562,6 +562,27 @@ final class JsonUtf8Reader extends JsonReader {
+     return result;
+   }
+ 
++  @Override public void skipName() throws IOException {
++    if (failOnUnknown) {
++      throw new JsonDataException("Cannot skip unexpected " + peek() + " at " + getPath());
++    }
++    int p = peeked;
++    if (p == PEEKED_NONE) {
++      p = doPeek();
++    }
++    if (p == PEEKED_UNQUOTED_NAME) {
++      skipUnquotedValue();
++    } else if (p == PEEKED_DOUBLE_QUOTED_NAME) {
++      skipQuotedValue(DOUBLE_QUOTE_OR_SLASH);
++    } else if (p == PEEKED_SINGLE_QUOTED_NAME) {
++      skipQuotedValue(SINGLE_QUOTE_OR_SLASH);
++    } else if (p != PEEKED_BUFFERED_NAME) {
++      throw new JsonDataException("Expected a name but was " + peek() + " at path " + getPath());
++    }
++    peeked = PEEKED_NONE;
++    pathNames[stackSize - 1] = "null";
++  }
++
+   /**
+    * If {@code name} is in {@code options} this consumes it and returns its index.
+    * Otherwise this returns -1 and no name is consumed.
+diff --git a/moshi/src/main/java/com/squareup/moshi/JsonUtf8Writer.java b/moshi/src/main/java/com/squareup/moshi/JsonUtf8Writer.java
+index 7a7a727a..5cedfe18 100644
+--- a/moshi/src/main/java/com/squareup/moshi/JsonUtf8Writer.java
++++ b/moshi/src/main/java/com/squareup/moshi/JsonUtf8Writer.java
+@@ -18,7 +18,6 @@ package com.squareup.moshi;
+ import java.io.IOException;
+ import javax.annotation.Nullable;
+ import okio.BufferedSink;
+-import okio.BufferedSource;
+ import okio.Sink;
+ 
+ import static com.squareup.moshi.JsonScope.DANGLING_NAME;
+@@ -262,18 +261,6 @@ final class JsonUtf8Writer extends JsonWriter {
+     return this;
+   }
+ 
+-  @Override public JsonWriter value(BufferedSource source) throws IOException {
+-    if (promoteValueToName) {
+-      throw new IllegalStateException(
+-          "BufferedSource cannot be used as a map key in JSON at path " + getPath());
+-    }
+-    writeDeferredName();
+-    beforeValue();
+-    sink.writeAll(source);
+-    pathIndices[stackSize - 1]++;
+-    return this;
+-  }
+-
+   /**
+    * Ensures all buffered data is written to the underlying {@link Sink}
+    * and flushes that writer.
+diff --git a/moshi/src/main/java/com/squareup/moshi/JsonValueReader.java b/moshi/src/main/java/com/squareup/moshi/JsonValueReader.java
+index 063c35c9..5babf478 100644
+--- a/moshi/src/main/java/com/squareup/moshi/JsonValueReader.java
++++ b/moshi/src/main/java/com/squareup/moshi/JsonValueReader.java
+@@ -151,6 +151,18 @@ final class JsonValueReader extends JsonReader {
+     return -1;
+   }
+ 
++  @Override public void skipName() throws IOException {
++    if (failOnUnknown) {
++      throw new JsonDataException("Cannot skip unexpected " + peek() + " at " + getPath());
++    }
++
++    Map.Entry<?, ?> peeked = require(Map.Entry.class, Token.NAME);
++
++    // Swap the Map.Entry for its value on the stack.
++    stack[stackSize - 1] = peeked.getValue();
++    pathNames[stackSize - 2] = "null";
++  }
++
+   @Override public String nextString() throws IOException {
+     Object peeked = (stackSize != 0 ? stack[stackSize - 1] : null);
+     if (peeked instanceof String) {
+diff --git a/moshi/src/main/java/com/squareup/moshi/JsonValueWriter.java b/moshi/src/main/java/com/squareup/moshi/JsonValueWriter.java
+index 64878efd..9bc06b37 100644
+--- a/moshi/src/main/java/com/squareup/moshi/JsonValueWriter.java
++++ b/moshi/src/main/java/com/squareup/moshi/JsonValueWriter.java
+@@ -21,7 +21,6 @@ import java.util.ArrayList;
+ import java.util.List;
+ import java.util.Map;
+ import javax.annotation.Nullable;
+-import okio.BufferedSource;
+ 
+ import static com.squareup.moshi.JsonScope.EMPTY_ARRAY;
+ import static com.squareup.moshi.JsonScope.EMPTY_DOCUMENT;
+@@ -206,23 +205,6 @@ final class JsonValueWriter extends JsonWriter {
+     return this;
+   }
+ 
+-  @Override public JsonWriter value(BufferedSource source) throws IOException {
+-    if (promoteValueToName) {
+-      throw new IllegalStateException(
+-          "BufferedSource cannot be used as a map key in JSON at path " + getPath());
+-    }
+-    Object value = JsonReader.of(source).readJsonValue();
+-    boolean serializeNulls = this.serializeNulls;
+-    this.serializeNulls = true;
+-    try {
+-      add(value);
+-    } finally {
+-      this.serializeNulls = serializeNulls;
+-    }
+-    pathIndices[stackSize - 1]++;
+-    return this;
+-  }
+-
+   @Override public void close() throws IOException {
+     int size = stackSize;
+     if (size > 1 || size == 1 && scopes[size - 1] != NONEMPTY_DOCUMENT) {
+diff --git a/moshi/src/main/java/com/squareup/moshi/JsonWriter.java b/moshi/src/main/java/com/squareup/moshi/JsonWriter.java
+index 678171ce..70e9513c 100644
+--- a/moshi/src/main/java/com/squareup/moshi/JsonWriter.java
++++ b/moshi/src/main/java/com/squareup/moshi/JsonWriter.java
+@@ -22,7 +22,6 @@ import java.util.Arrays;
+ import javax.annotation.CheckReturnValue;
+ import javax.annotation.Nullable;
+ import okio.BufferedSink;
+-import okio.BufferedSource;
+ 
+ import static com.squareup.moshi.JsonScope.EMPTY_OBJECT;
+ import static com.squareup.moshi.JsonScope.NONEMPTY_OBJECT;
+@@ -336,15 +335,6 @@ public abstract class JsonWriter implements Closeable, Flushable {
+    */
+   public abstract JsonWriter value(@Nullable Number value) throws IOException;
+ 
+-  /**
+-   * Writes {@code source} directly without encoding its contents.
+-   * Since no validation is performed, {@link #setSerializeNulls} and other writer configurations
+-   * are not respected.
+-   *
+-   * @return this writer.
+-   */
+-  public abstract JsonWriter value(BufferedSource source) throws IOException;
+-
+   /**
+    * Changes the writer to treat the next value as a string name. This is useful for map adapters so
+    * that arbitrary type adapters can use {@link #value} to write a name value.
+diff --git a/moshi/src/main/java/com/squareup/moshi/Types.java b/moshi/src/main/java/com/squareup/moshi/Types.java
+index 2ebb1809..87eb62e1 100644
+--- a/moshi/src/main/java/com/squareup/moshi/Types.java
++++ b/moshi/src/main/java/com/squareup/moshi/Types.java
+@@ -20,6 +20,7 @@ import com.squareup.moshi.internal.Util.ParameterizedTypeImpl;
+ import com.squareup.moshi.internal.Util.WildcardTypeImpl;
+ import java.lang.annotation.Annotation;
+ import java.lang.reflect.Array;
++import java.lang.reflect.Field;
+ import java.lang.reflect.GenericArrayType;
+ import java.lang.reflect.InvocationHandler;
+ import java.lang.reflect.Method;
+@@ -216,6 +217,36 @@ public final class Types {
+     }
+   }
+ 
++  /**
++   * @param clazz the target class to read the {@code fieldName} field annotations from.
++   * @param fieldName the target field name on {@code clazz}.
++   * @return a set of {@link JsonQualifier}-annotated {@link Annotation} instances retrieved from
++   *         the targeted field. Can be empty if none are found.
++   */
++  public static Set<? extends Annotation> getFieldJsonQualifierAnnotations(Class<?> clazz,
++      String fieldName) {
++    try {
++      Field field = clazz.getDeclaredField(fieldName);
++      if (!field.isAccessible()) {
++        field.setAccessible(true);
++      }
++      Annotation[] fieldAnnotations = field.getDeclaredAnnotations();
++      Set<Annotation> annotations = new LinkedHashSet<>(fieldAnnotations.length);
++      for (Annotation annotation : fieldAnnotations) {
++        if (annotation.annotationType().isAnnotationPresent(JsonQualifier.class)) {
++          annotations.add(annotation);
++        }
++      }
++      return Collections.unmodifiableSet(annotations);
++    } catch (NoSuchFieldException e) {
++      throw new IllegalArgumentException("Could not access field "
++          + fieldName
++          + " on class "
++          + clazz.getCanonicalName(),
++          e);
++    }
++  }
++
+   @SuppressWarnings("unchecked")
+   static <T extends Annotation> T createJsonQualifierImplementation(final Class<T> annotationType) {
+     if (!annotationType.isAnnotation()) {
+diff --git a/moshi/src/test/java/com/squareup/moshi/JsonReaderTest.java b/moshi/src/test/java/com/squareup/moshi/JsonReaderTest.java
+index d656998b..86d71063 100644
+--- a/moshi/src/test/java/com/squareup/moshi/JsonReaderTest.java
++++ b/moshi/src/test/java/com/squareup/moshi/JsonReaderTest.java
+@@ -960,4 +960,23 @@ public final class JsonReaderTest {
+     assertThat(value).isEqualTo(
+         Collections.singletonMap("pizzas", Arrays.asList("cheese", "pepperoni")));
+   }
++
++  @Test public void skipName() throws IOException {
++    JsonReader reader = newReader("{\"a\":1}");
++    reader.beginObject();
++    reader.skipName();
++    assertThat(reader.peek()).isEqualTo(JsonReader.Token.NUMBER);
++    reader.skipValue();
++    reader.endObject();
++  }
++
++  @Test public void skipNameOnValueFails() throws IOException {
++    JsonReader reader = newReader("1");
++    try {
++      reader.skipName();
++      fail();
++    } catch (JsonDataException expected) {
++    }
++    assertThat(reader.nextInt()).isEqualTo(1);
++  }
+ }
+diff --git a/moshi/src/test/java/com/squareup/moshi/JsonUtf8ReaderTest.java b/moshi/src/test/java/com/squareup/moshi/JsonUtf8ReaderTest.java
+index 89f28a03..7f1a5044 100644
+--- a/moshi/src/test/java/com/squareup/moshi/JsonUtf8ReaderTest.java
++++ b/moshi/src/test/java/com/squareup/moshi/JsonUtf8ReaderTest.java
+@@ -994,6 +994,20 @@ public final class JsonUtf8ReaderTest {
+     }
+   }
+ 
++  @Test public void failureMessagePathFromSkipName() throws IOException {
++    JsonReader reader = newReader("{\"a\":[42,}");
++    reader.beginObject();
++    reader.skipName();
++    reader.beginArray();
++    reader.nextInt();
++    try {
++      reader.peek();
++      fail();
++    } catch (JsonEncodingException expected) {
++      assertThat(expected).hasMessage("Expected value at path $.null[1]");
++    }
++  }
++
+   @Test @Ignore public void strictVeryLongNumber() throws IOException {
+     JsonReader reader = newReader("[0." + repeat('9', 8192) + "]");
+     reader.beginArray();
+diff --git a/moshi/src/test/java/com/squareup/moshi/JsonUtf8WriterTest.java b/moshi/src/test/java/com/squareup/moshi/JsonUtf8WriterTest.java
+index 08679213..b5b424a7 100644
+--- a/moshi/src/test/java/com/squareup/moshi/JsonUtf8WriterTest.java
++++ b/moshi/src/test/java/com/squareup/moshi/JsonUtf8WriterTest.java
+@@ -107,20 +107,4 @@ public final class JsonUtf8WriterTest {
+     // JsonWriter doesn't attempt to detect duplicate names
+     assertThat(buffer.readUtf8()).isEqualTo("{\"a\":1,\"a\":2}");
+   }
+-
+-  @Test public void valueFromSource() throws IOException {
+-    Buffer buffer = new Buffer();
+-    JsonWriter writer = JsonUtf8Writer.of(buffer);
+-    writer.beginObject();
+-    writer.name("a");
+-    writer.value(new Buffer().writeUtf8("[\"value\"]"));
+-    writer.name("b");
+-    writer.value(new Buffer().writeUtf8("2"));
+-    writer.name("c");
+-    writer.value(3);
+-    writer.name("d");
+-    writer.value(new Buffer().writeUtf8("null"));
+-    writer.endObject();
+-    assertThat(buffer.readUtf8()).isEqualTo("{\"a\":[\"value\"],\"b\":2,\"c\":3,\"d\":null}");
+-  }
+ }
+diff --git a/moshi/src/test/java/com/squareup/moshi/JsonValueWriterTest.java b/moshi/src/test/java/com/squareup/moshi/JsonValueWriterTest.java
+index a3211047..2087cace 100644
+--- a/moshi/src/test/java/com/squareup/moshi/JsonValueWriterTest.java
++++ b/moshi/src/test/java/com/squareup/moshi/JsonValueWriterTest.java
+@@ -23,10 +23,8 @@ import java.util.List;
+ import java.util.Map;
+ import java.util.concurrent.atomic.AtomicInteger;
+ import java.util.concurrent.atomic.AtomicLong;
+-import okio.Buffer;
+ import org.junit.Test;
+ 
+-import static java.util.Collections.singletonList;
+ import static org.assertj.core.api.Assertions.assertThat;
+ import static org.assertj.core.api.Assertions.entry;
+ import static org.junit.Assert.fail;
+@@ -241,22 +239,6 @@ public final class JsonValueWriterTest {
+     assertThat((List<?>) writer.root()).isEqualTo(numbers);
+   }
+ 
+-  @Test public void valueFromSource() throws IOException {
+-    JsonValueWriter writer = new JsonValueWriter();
+-    writer.beginObject();
+-    writer.name("a");
+-    writer.value(new Buffer().writeUtf8("[\"value\"]"));
+-    writer.name("b");
+-    writer.value(new Buffer().writeUtf8("2"));
+-    writer.name("c");
+-    writer.value(3);
+-    writer.name("d");
+-    writer.value(new Buffer().writeUtf8("null"));
+-    writer.endObject();
+-    assertThat((Map<?, ?>) writer.root()).containsExactly(
+-      entry("a", singletonList("value")), entry("b", 2.0d), entry("c", 3L), entry("d", null));
+-  }
+-
+   /**
+    * Returns an instance of number whose {@link #toString} is {@code s}. Using the standard number
+    * methods like {@link Number#doubleValue} are awkward because they may truncate or discard
+@@ -286,3 +268,4 @@ public final class JsonValueWriterTest {
+     };
+   }
+ }
++
+diff --git a/moshi/src/test/java/com/squareup/moshi/MoshiTest.java b/moshi/src/test/java/com/squareup/moshi/MoshiTest.java
+index f81d2725..c284ec0a 100644
+--- a/moshi/src/test/java/com/squareup/moshi/MoshiTest.java
++++ b/moshi/src/test/java/com/squareup/moshi/MoshiTest.java
+@@ -910,7 +910,7 @@ public final class MoshiTest {
+       adapter.fromJson("{\"diameter\":5,\"crust\":\"thick\",\"extraCheese\":true}");
+       fail();
+     } catch (JsonDataException expected) {
+-      assertThat(expected).hasMessage("Cannot skip unexpected STRING at $.crust");
++      assertThat(expected).hasMessage("Cannot skip unexpected NAME at $.diameter");
+     }
+   }
+ 
+diff --git a/moshi/src/test/java/com/squareup/moshi/PromoteNameToValueTest.java b/moshi/src/test/java/com/squareup/moshi/PromoteNameToValueTest.java
+index 02064c47..335e9d04 100644
+--- a/moshi/src/test/java/com/squareup/moshi/PromoteNameToValueTest.java
++++ b/moshi/src/test/java/com/squareup/moshi/PromoteNameToValueTest.java
+@@ -16,7 +16,6 @@
+ package com.squareup.moshi;
+ 
+ import java.util.List;
+-import okio.Buffer;
+ import org.junit.Test;
+ import org.junit.runner.RunWith;
+ import org.junit.runners.Parameterized;
+@@ -334,21 +333,4 @@ public final class PromoteNameToValueTest {
+     }
+     writer.name("a");
+   }
+-
+-  @Test public void writerSourceValueFails() throws Exception {
+-    JsonWriter writer = factory.newWriter();
+-    writer.beginObject();
+-    writer.promoteValueToName();
+-    try {
+-      writer.value(new Buffer().writeUtf8("\"a\""));
+-      fail();
+-    } catch (IllegalStateException expected) {
+-      assertThat(expected).hasMessage(
+-          "BufferedSource cannot be used as a map key in JSON at path $.");
+-    }
+-    writer.value("a");
+-    writer.value("a value");
+-    writer.endObject();
+-    assertThat(factory.json()).isEqualTo("{\"a\":\"a value\"}");
+-  }
+ }
+diff --git a/moshi/src/test/java/com/squareup/moshi/TypesTest.java b/moshi/src/test/java/com/squareup/moshi/TypesTest.java
+index 85262c91..23c1f629 100644
+--- a/moshi/src/test/java/com/squareup/moshi/TypesTest.java
++++ b/moshi/src/test/java/com/squareup/moshi/TypesTest.java
+@@ -17,6 +17,7 @@ package com.squareup.moshi;
+ 
+ import java.lang.annotation.Annotation;
+ import java.lang.annotation.Retention;
++import java.lang.annotation.Target;
+ import java.lang.reflect.ParameterizedType;
+ import java.lang.reflect.Type;
+ import java.util.ArrayList;
+@@ -29,6 +30,7 @@ import java.util.Set;
+ import org.junit.Test;
+ 
+ import static com.squareup.moshi.internal.Util.canonicalize;
++import static java.lang.annotation.ElementType.FIELD;
+ import static java.lang.annotation.RetentionPolicy.RUNTIME;
+ import static org.assertj.core.api.Assertions.assertThat;
+ import static org.junit.Assert.fail;
+@@ -261,4 +263,52 @@ public final class TypesTest {
+       assertThat(expected).hasMessage("Unexpected primitive boolean. Use the boxed type.");
+     }
+   }
++
++  @Test public void getFieldJsonQualifierAnnotations_privateFieldTest() {
++    Set<? extends Annotation> annotations = Types.getFieldJsonQualifierAnnotations(ClassWithAnnotatedFields.class,
++        "privateField");
++
++    assertThat(annotations).hasSize(1);
++    assertThat(annotations.iterator().next()).isInstanceOf(FieldAnnotation.class);
++  }
++
++  @Test public void getFieldJsonQualifierAnnotations_publicFieldTest() {
++    Set<? extends Annotation> annotations = Types.getFieldJsonQualifierAnnotations(ClassWithAnnotatedFields.class,
++        "publicField");
++
++    assertThat(annotations).hasSize(1);
++    assertThat(annotations.iterator().next()).isInstanceOf(FieldAnnotation.class);
++  }
++
++  @Test public void getFieldJsonQualifierAnnotations_unannotatedTest() {
++    Set<? extends Annotation> annotations = Types.getFieldJsonQualifierAnnotations(ClassWithAnnotatedFields.class,
++        "unannotatedField");
++
++    assertThat(annotations).hasSize(0);
++  }
++
++  @JsonQualifier
++  @Target(FIELD)
++  @Retention(RUNTIME)
++  @interface FieldAnnotation {
++
++  }
++
++  @Target(FIELD)
++  @Retention(RUNTIME)
++  @interface NoQualifierAnnotation {
++
++  }
++
++  static class ClassWithAnnotatedFields {
++    @FieldAnnotation
++    @NoQualifierAnnotation
++    private final int privateField = 0;
++
++    @FieldAnnotation
++    @NoQualifierAnnotation
++    public final int publicField = 0;
++
++    private final int unannotatedField = 0;
++  }
+ }

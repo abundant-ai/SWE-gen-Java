@@ -1,0 +1,246 @@
+diff --git a/moshi/src/main/java/com/squareup/moshi/ClassJsonAdapter.java b/moshi/src/main/java/com/squareup/moshi/ClassJsonAdapter.java
+index 71d45349..aee6d55b 100644
+--- a/moshi/src/main/java/com/squareup/moshi/ClassJsonAdapter.java
++++ b/moshi/src/main/java/com/squareup/moshi/ClassJsonAdapter.java
+@@ -95,15 +95,14 @@ final class ClassJsonAdapter<T> extends JsonAdapter<T> {
+         // Look up a type adapter for this type.
+         Type fieldType = resolve(type, rawType, field.getGenericType());
+         Set<? extends Annotation> annotations = Util.jsonAnnotations(field);
+-        String fieldName = field.getName();
+-        JsonAdapter<Object> adapter = moshi.adapter(fieldType, annotations, fieldName);
++        JsonAdapter<Object> adapter = moshi.adapter(fieldType, annotations);
+ 
+         // Create the binding between field and JSON.
+         field.setAccessible(true);
+ 
+         // Store it using the field's name. If there was already a field with this name, fail!
+         Json jsonAnnotation = field.getAnnotation(Json.class);
+-        String name = jsonAnnotation != null ? jsonAnnotation.name() : fieldName;
++        String name = jsonAnnotation != null ? jsonAnnotation.name() : field.getName();
+         FieldBinding<Object> fieldBinding = new FieldBinding<>(name, field, adapter);
+         FieldBinding<?> replaced = fieldBindings.put(name, fieldBinding);
+         if (replaced != null) {
+diff --git a/moshi/src/main/java/com/squareup/moshi/Moshi.java b/moshi/src/main/java/com/squareup/moshi/Moshi.java
+index 26db3162..8d39c474 100644
+--- a/moshi/src/main/java/com/squareup/moshi/Moshi.java
++++ b/moshi/src/main/java/com/squareup/moshi/Moshi.java
+@@ -89,19 +89,9 @@ public final class Moshi {
+     return adapter(type, Collections.unmodifiableSet(annotations));
+   }
+ 
+-  @CheckReturnValue
+-  public <T> JsonAdapter<T> adapter(Type type, Set<? extends Annotation> annotations) {
+-    return adapter(type, annotations, null);
+-  }
+-
+-  /**
+-   * @param fieldName An optional field name associated with this type. The field name is used as a
+-   * hint for better adapter lookup error messages for nested structures.
+-   */
+   @CheckReturnValue
+   @SuppressWarnings("unchecked") // Factories are required to return only matching JsonAdapters.
+-  public <T> JsonAdapter<T> adapter(Type type, Set<? extends Annotation> annotations,
+-      @Nullable String fieldName) {
++  public <T> JsonAdapter<T> adapter(Type type, Set<? extends Annotation> annotations) {
+     if (type == null) {
+       throw new NullPointerException("type == null");
+     }
+@@ -133,10 +123,8 @@ public final class Moshi {
+     }
+ 
+     // Prepare for re-entrant calls, then ask each factory to create a type adapter.
+-    DeferredAdapter<T> deferredAdapter = new DeferredAdapter<>(type, fieldName, cacheKey);
+-
++    DeferredAdapter<T> deferredAdapter = new DeferredAdapter<>(cacheKey);
+     deferredAdapters.add(deferredAdapter);
+-    int lastIndex = deferredAdapters.size() - 1;
+     try {
+       for (int i = 0, size = factories.size(); i < size; i++) {
+         JsonAdapter<T> result = (JsonAdapter<T>) factories.get(i).create(type, annotations, this);
+@@ -145,19 +133,12 @@ public final class Moshi {
+           synchronized (adapterCache) {
+             adapterCache.put(cacheKey, result);
+           }
+-          // Remove the type or field name only when we succeed in creating the adapter,
+-          // so we have the full stack  at the top level.
+-          deferredAdapters.remove(lastIndex);
+           return result;
+         }
+       }
+-    } catch (IllegalArgumentException e) {
+-      if (lastIndex == 0) { // Rewrite the exception at the top level.
+-        e = errorWithFields(deferredAdapters, e);
+-      }
+-      throw e;
+     } finally {
+-      if (lastIndex == 0) {
++      deferredAdapters.remove(deferredAdapters.size() - 1);
++      if (deferredAdapters.isEmpty()) {
+         reentrantCalls.remove();
+       }
+     }
+@@ -200,27 +181,6 @@ public final class Moshi {
+     return Arrays.asList(type, annotations);
+   }
+ 
+-  static IllegalArgumentException errorWithFields(List<DeferredAdapter<?>> typesAndFieldNames,
+-      IllegalArgumentException e) {
+-    int size = typesAndFieldNames.size();
+-    if (size == 1 && typesAndFieldNames.get(0).fieldName == null) {
+-      return e;
+-    }
+-    StringBuilder errorMessageBuilder = new StringBuilder(e.getMessage());
+-    for (int i = size - 1; i >= 0; i--) {
+-      DeferredAdapter<?> deferredAdapter = typesAndFieldNames.get(i);
+-      errorMessageBuilder
+-          .append("\nfor ")
+-          .append(deferredAdapter.type);
+-      if (deferredAdapter.fieldName != null) {
+-        errorMessageBuilder
+-            .append(' ')
+-            .append(deferredAdapter.fieldName);
+-      }
+-    }
+-    return new IllegalArgumentException(errorMessageBuilder.toString(), e);
+-  }
+-
+   public static final class Builder {
+     final List<JsonAdapter.Factory> factories = new ArrayList<>();
+ 
+@@ -290,15 +250,11 @@ public final class Moshi {
+    * <p>Typically this is necessary in self-referential object models, such as an {@code Employee}
+    * class that has a {@code List<Employee>} field for an organization's management hierarchy.
+    */
+-  private static final class DeferredAdapter<T> extends JsonAdapter<T> {
+-    final Type type;
+-    final @Nullable String fieldName;
++  private static class DeferredAdapter<T> extends JsonAdapter<T> {
+     @Nullable Object cacheKey;
+     private @Nullable JsonAdapter<T> delegate;
+ 
+-    DeferredAdapter(Type type, @Nullable String fieldName, Object cacheKey) {
+-      this.type = type;
+-      this.fieldName = fieldName;
++    DeferredAdapter(Object cacheKey) {
+       this.cacheKey = cacheKey;
+     }
+ 
+diff --git a/moshi/src/test/java/com/squareup/moshi/JsonQualifiersTest.java b/moshi/src/test/java/com/squareup/moshi/JsonQualifiersTest.java
+index 7deb2c6f..0dfe77ef 100644
+--- a/moshi/src/test/java/com/squareup/moshi/JsonQualifiersTest.java
++++ b/moshi/src/test/java/com/squareup/moshi/JsonQualifiersTest.java
+@@ -332,12 +332,7 @@ public final class JsonQualifiersTest {
+       moshi.adapter(StringAndFooString.class);
+       fail();
+     } catch (IllegalArgumentException expected) {
+-      assertThat(expected).hasMessage("No @FromJson adapter for class java.lang.String annotated "
+-          + "[@com.squareup.moshi.JsonQualifiersTest$FooPrefix()]"
+-          + "\nfor class java.lang.String b"
+-          + "\nfor class com.squareup.moshi.JsonQualifiersTest$StringAndFooString");
+-      assertThat(expected).hasCauseExactlyInstanceOf(IllegalArgumentException.class);
+-      assertThat(expected.getCause()).hasMessage("No @FromJson adapter for class java.lang.String "
++      assertThat(expected).hasMessage("No @FromJson adapter for class java.lang.String "
+           + "annotated [@com.squareup.moshi.JsonQualifiersTest$FooPrefix()]");
+     }
+   }
+@@ -358,12 +353,7 @@ public final class JsonQualifiersTest {
+       moshi.adapter(StringAndFooString.class);
+       fail();
+     } catch (IllegalArgumentException expected) {
+-      assertThat(expected).hasMessage("No @ToJson adapter for class java.lang.String annotated "
+-          + "[@com.squareup.moshi.JsonQualifiersTest$FooPrefix()]"
+-          + "\nfor class java.lang.String b"
+-          + "\nfor class com.squareup.moshi.JsonQualifiersTest$StringAndFooString");
+-      assertThat(expected).hasCauseExactlyInstanceOf(IllegalArgumentException.class);
+-      assertThat(expected.getCause()).hasMessage("No @ToJson adapter for class java.lang.String "
++      assertThat(expected).hasMessage("No @ToJson adapter for class java.lang.String "
+           + "annotated [@com.squareup.moshi.JsonQualifiersTest$FooPrefix()]");
+     }
+   }
+diff --git a/moshi/src/test/java/com/squareup/moshi/MoshiTest.java b/moshi/src/test/java/com/squareup/moshi/MoshiTest.java
+index 1303b630..cefd67af 100644
+--- a/moshi/src/test/java/com/squareup/moshi/MoshiTest.java
++++ b/moshi/src/test/java/com/squareup/moshi/MoshiTest.java
+@@ -45,7 +45,6 @@ import static java.lang.annotation.RetentionPolicy.RUNTIME;
+ import static org.assertj.core.api.Assertions.assertThat;
+ import static org.junit.Assert.fail;
+ 
+-@SuppressWarnings("CheckReturnValue")
+ public final class MoshiTest {
+   @Test public void booleanAdapter() throws Exception {
+     Moshi moshi = new Moshi.Builder().build();
+@@ -956,74 +955,6 @@ public final class MoshiTest {
+     }
+   }
+ 
+-  static final class HasPlatformType {
+-    ArrayList<String> strings;
+-
+-    static final class Wrapper {
+-      HasPlatformType hasPlatformType;
+-    }
+-
+-    static final class ListWrapper {
+-      List<HasPlatformType> platformTypes;
+-    }
+-  }
+-
+-  @Test public void reentrantFieldErrorMessagesTopLevelMap() {
+-    Moshi moshi = new Moshi.Builder().build();
+-    try {
+-      moshi.adapter(Types.newParameterizedType(Map.class, String.class, HasPlatformType.class));
+-      fail();
+-    } catch (IllegalArgumentException e) {
+-      assertThat(e).hasMessage(
+-          "Platform java.util.ArrayList<java.lang.String> (with no annotations) requires explicit "
+-              + "JsonAdapter to be registered"
+-              + "\nfor java.util.ArrayList<java.lang.String> strings"
+-              + "\nfor class com.squareup.moshi.MoshiTest$HasPlatformType"
+-              + "\nfor java.util.Map<java.lang.String, "
+-              + "com.squareup.moshi.MoshiTest$HasPlatformType>");
+-      assertThat(e).hasCauseExactlyInstanceOf(IllegalArgumentException.class);
+-      assertThat(e.getCause()).hasMessage("Platform java.util.ArrayList<java.lang.String> "
+-          + "(with no annotations) requires explicit JsonAdapter to be registered");
+-    }
+-  }
+-
+-  @Test public void reentrantFieldErrorMessagesWrapper() {
+-    Moshi moshi = new Moshi.Builder().build();
+-    try {
+-      moshi.adapter(HasPlatformType.Wrapper.class);
+-      fail();
+-    } catch (IllegalArgumentException e) {
+-      assertThat(e).hasMessage(
+-          "Platform java.util.ArrayList<java.lang.String> (with no annotations) requires explicit "
+-              + "JsonAdapter to be registered"
+-              + "\nfor java.util.ArrayList<java.lang.String> strings"
+-              + "\nfor class com.squareup.moshi.MoshiTest$HasPlatformType hasPlatformType"
+-              + "\nfor class com.squareup.moshi.MoshiTest$HasPlatformType$Wrapper");
+-      assertThat(e).hasCauseExactlyInstanceOf(IllegalArgumentException.class);
+-      assertThat(e.getCause()).hasMessage("Platform java.util.ArrayList<java.lang.String> "
+-          + "(with no annotations) requires explicit JsonAdapter to be registered");
+-    }
+-  }
+-
+-  @Test public void reentrantFieldErrorMessagesListWrapper() {
+-    Moshi moshi = new Moshi.Builder().build();
+-    try {
+-      moshi.adapter(HasPlatformType.ListWrapper.class);
+-      fail();
+-    } catch (IllegalArgumentException e) {
+-      assertThat(e).hasMessage(
+-          "Platform java.util.ArrayList<java.lang.String> (with no annotations) requires explicit "
+-              + "JsonAdapter to be registered"
+-              + "\nfor java.util.ArrayList<java.lang.String> strings"
+-              + "\nfor class com.squareup.moshi.MoshiTest$HasPlatformType"
+-              + "\nfor java.util.List<com.squareup.moshi.MoshiTest$HasPlatformType> platformTypes"
+-              + "\nfor class com.squareup.moshi.MoshiTest$HasPlatformType$ListWrapper");
+-      assertThat(e).hasCauseExactlyInstanceOf(IllegalArgumentException.class);
+-      assertThat(e.getCause()).hasMessage("Platform java.util.ArrayList<java.lang.String> "
+-          + "(with no annotations) requires explicit JsonAdapter to be registered");
+-    }
+-  }
+-
+   @Test public void qualifierWithElementsMayNotBeDirectlyRegistered() throws IOException {
+     try {
+       new Moshi.Builder()

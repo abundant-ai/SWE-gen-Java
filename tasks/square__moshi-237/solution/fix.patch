@@ -1,0 +1,328 @@
+diff --git a/moshi/src/main/java/com/squareup/moshi/BufferedSinkJsonWriter.java b/moshi/src/main/java/com/squareup/moshi/BufferedSinkJsonWriter.java
+index 9464dc56..1260b81d 100644
+--- a/moshi/src/main/java/com/squareup/moshi/BufferedSinkJsonWriter.java
++++ b/moshi/src/main/java/com/squareup/moshi/BufferedSinkJsonWriter.java
+@@ -62,6 +62,8 @@ final class BufferedSinkJsonWriter extends JsonWriter {
+ 
+   private String deferredName;
+ 
++  private boolean promoteNameToValue;
++
+   BufferedSinkJsonWriter(BufferedSink sink) {
+     if (sink == null) {
+       throw new NullPointerException("sink == null");
+@@ -90,7 +92,7 @@ final class BufferedSinkJsonWriter extends JsonWriter {
+   }
+ 
+   @Override public JsonWriter endObject() throws IOException {
+-    promoteValueToName = false;
++    promoteNameToValue = false;
+     return close(EMPTY_OBJECT, NONEMPTY_OBJECT, "}");
+   }
+ 
+@@ -141,7 +143,7 @@ final class BufferedSinkJsonWriter extends JsonWriter {
+     }
+     deferredName = name;
+     pathNames[stackSize - 1] = name;
+-    promoteValueToName = false;
++    promoteNameToValue = false;
+     return this;
+   }
+ 
+@@ -157,7 +159,7 @@ final class BufferedSinkJsonWriter extends JsonWriter {
+     if (value == null) {
+       return nullValue();
+     }
+-    if (promoteValueToName) {
++    if (promoteNameToValue) {
+       return name(value);
+     }
+     writeDeferredName();
+@@ -198,10 +200,10 @@ final class BufferedSinkJsonWriter extends JsonWriter {
+   }
+ 
+   @Override public JsonWriter value(double value) throws IOException {
+-    if (!lenient && (Double.isNaN(value) || Double.isInfinite(value))) {
++    if (Double.isNaN(value) || Double.isInfinite(value)) {
+       throw new IllegalArgumentException("Numeric values must be finite, but was " + value);
+     }
+-    if (promoteValueToName) {
++    if (promoteNameToValue) {
+       return name(Double.toString(value));
+     }
+     writeDeferredName();
+@@ -212,7 +214,7 @@ final class BufferedSinkJsonWriter extends JsonWriter {
+   }
+ 
+   @Override public JsonWriter value(long value) throws IOException {
+-    if (promoteValueToName) {
++    if (promoteNameToValue) {
+       return name(Long.toString(value));
+     }
+     writeDeferredName();
+@@ -232,7 +234,7 @@ final class BufferedSinkJsonWriter extends JsonWriter {
+         && (string.equals("-Infinity") || string.equals("Infinity") || string.equals("NaN"))) {
+       throw new IllegalArgumentException("Numeric values must be finite, but was " + value);
+     }
+-    if (promoteValueToName) {
++    if (promoteNameToValue) {
+       return name(string);
+     }
+     writeDeferredName();
+@@ -367,4 +369,12 @@ final class BufferedSinkJsonWriter extends JsonWriter {
+         throw new IllegalStateException("Nesting problem.");
+     }
+   }
++
++  @Override void promoteNameToValue() throws IOException {
++    int context = peekScope();
++    if (context != NONEMPTY_OBJECT && context != EMPTY_OBJECT) {
++      throw new IllegalStateException("Nesting problem.");
++    }
++    promoteNameToValue = true;
++  }
+ }
+diff --git a/moshi/src/main/java/com/squareup/moshi/JsonAdapter.java b/moshi/src/main/java/com/squareup/moshi/JsonAdapter.java
+index 50d48135..0f403039 100644
+--- a/moshi/src/main/java/com/squareup/moshi/JsonAdapter.java
++++ b/moshi/src/main/java/com/squareup/moshi/JsonAdapter.java
+@@ -83,31 +83,6 @@ public abstract class JsonAdapter<T> {
+     }
+   }
+ 
+-  /**
+-   * Returns a JSON adapter equal to this JSON adapter, but that serializes nulls when encoding
+-   * JSON.
+-   */
+-  public final JsonAdapter<T> serializeNulls() {
+-    final JsonAdapter<T> delegate = this;
+-    return new JsonAdapter<T>() {
+-      @Override public T fromJson(JsonReader reader) throws IOException {
+-        return delegate.fromJson(reader);
+-      }
+-      @Override public void toJson(JsonWriter writer, T value) throws IOException {
+-        boolean serializeNulls = writer.getSerializeNulls();
+-        writer.setSerializeNulls(true);
+-        try {
+-          delegate.toJson(writer, value);
+-        } finally {
+-          writer.setSerializeNulls(serializeNulls);
+-        }
+-      }
+-      @Override public String toString() {
+-        return delegate + ".serializeNulls()";
+-      }
+-    };
+-  }
+-
+   /**
+    * Returns a JSON adapter equal to this JSON adapter, but with support for reading and writing
+    * nulls.
+diff --git a/moshi/src/main/java/com/squareup/moshi/JsonWriter.java b/moshi/src/main/java/com/squareup/moshi/JsonWriter.java
+index c0179951..e1787607 100644
+--- a/moshi/src/main/java/com/squareup/moshi/JsonWriter.java
++++ b/moshi/src/main/java/com/squareup/moshi/JsonWriter.java
+@@ -20,9 +20,6 @@ import java.io.Flushable;
+ import java.io.IOException;
+ import okio.BufferedSink;
+ 
+-import static com.squareup.moshi.JsonScope.EMPTY_OBJECT;
+-import static com.squareup.moshi.JsonScope.NONEMPTY_OBJECT;
+-
+ /**
+  * Writes a JSON (<a href="http://www.ietf.org/rfc/rfc7159.txt">RFC 7159</a>)
+  * encoded value to a stream, one token at a time. The stream includes both
+@@ -134,7 +131,6 @@ public abstract class JsonWriter implements Closeable, Flushable {
+   String indent;
+   boolean lenient;
+   boolean serializeNulls;
+-  boolean promoteValueToName;
+ 
+   /** Returns a new instance that writes a JSON-encoded stream to {@code sink}. */
+   public static JsonWriter of(BufferedSink sink) {
+@@ -317,16 +313,10 @@ public abstract class JsonWriter implements Closeable, Flushable {
+   public abstract JsonWriter value(Number value) throws IOException;
+ 
+   /**
+-   * Changes the writer to treat the next value as a string name. This is useful for map adapters so
+-   * that arbitrary type adapters can use {@link #value} to write a name value.
++   * Changes the reader to treat the next string value as a name. This is useful for map adapters so
++   * that arbitrary type adapters can use {@link #value(String)} to write a name value.
+    */
+-  final void promoteValueToName() throws IOException {
+-    int context = peekScope();
+-    if (context != NONEMPTY_OBJECT && context != EMPTY_OBJECT) {
+-      throw new IllegalStateException("Nesting problem.");
+-    }
+-    promoteValueToName = true;
+-  }
++  abstract void promoteNameToValue() throws IOException;
+ 
+   /**
+    * Returns a <a href="http://goessner.net/articles/JsonPath/">JsonPath</a> to
+diff --git a/moshi/src/main/java/com/squareup/moshi/MapJsonAdapter.java b/moshi/src/main/java/com/squareup/moshi/MapJsonAdapter.java
+index 8cf784d9..3158108b 100644
+--- a/moshi/src/main/java/com/squareup/moshi/MapJsonAdapter.java
++++ b/moshi/src/main/java/com/squareup/moshi/MapJsonAdapter.java
+@@ -52,7 +52,7 @@ final class MapJsonAdapter<K, V> extends JsonAdapter<Map<K, V>> {
+       if (entry.getKey() == null) {
+         throw new JsonDataException("Map key is null at " + writer.getPath());
+       }
+-      writer.promoteValueToName();
++      writer.promoteNameToValue();
+       keyAdapter.toJson(writer, entry.getKey());
+       valueAdapter.toJson(writer, entry.getValue());
+     }
+diff --git a/moshi/src/main/java/com/squareup/moshi/Moshi.java b/moshi/src/main/java/com/squareup/moshi/Moshi.java
+index 39e83f39..16cedada 100644
+--- a/moshi/src/main/java/com/squareup/moshi/Moshi.java
++++ b/moshi/src/main/java/com/squareup/moshi/Moshi.java
+@@ -61,6 +61,11 @@ public final class Moshi {
+     return adapter(type, Util.NO_ANNOTATIONS);
+   }
+ 
++  public <T> JsonAdapter<T> adapter(Type type, Class<? extends Annotation> annotationType) {
++    return adapter(type,
++        Collections.singleton(Types.createJsonQualifierImplementation(annotationType)));
++  }
++
+   @SuppressWarnings("unchecked") // Factories are required to return only matching JsonAdapters.
+   public <T> JsonAdapter<T> adapter(Type type, Set<? extends Annotation> annotations) {
+     type = Types.canonicalize(type);
+diff --git a/moshi/src/main/java/com/squareup/moshi/ObjectJsonReader.java b/moshi/src/main/java/com/squareup/moshi/ObjectJsonReader.java
+index 0f30d888..8f16fec4 100644
+--- a/moshi/src/main/java/com/squareup/moshi/ObjectJsonReader.java
++++ b/moshi/src/main/java/com/squareup/moshi/ObjectJsonReader.java
+@@ -273,10 +273,10 @@ final class ObjectJsonReader extends JsonReader {
+   }
+ 
+   @Override void promoteNameToValue() throws IOException {
+-    if (hasNext()) {
+-      String name = nextName();
+-      push(name);
+-    }
++    Map.Entry<?, ?> peeked = require(Map.Entry.class, Token.NAME);
++
++    push(peeked.getKey());
++    stack[stackSize - 2] = peeked.getValue();
+   }
+ 
+   @Override public void close() throws IOException {
+diff --git a/moshi/src/main/java/com/squareup/moshi/ObjectJsonWriter.java b/moshi/src/main/java/com/squareup/moshi/ObjectJsonWriter.java
+index 237d4624..a4b7c533 100644
+--- a/moshi/src/main/java/com/squareup/moshi/ObjectJsonWriter.java
++++ b/moshi/src/main/java/com/squareup/moshi/ObjectJsonWriter.java
+@@ -79,7 +79,6 @@ final class ObjectJsonWriter extends JsonWriter {
+     if (peekScope() != EMPTY_OBJECT || deferredName != null) {
+       throw new IllegalStateException("Nesting problem.");
+     }
+-    promoteValueToName = false;
+     stackSize--;
+     stack[stackSize] = null;
+     pathNames[stackSize] = null; // Free the last path name so that it can be garbage collected!
+@@ -97,16 +96,12 @@ final class ObjectJsonWriter extends JsonWriter {
+     if (peekScope() != EMPTY_OBJECT || deferredName != null) {
+       throw new IllegalStateException("Nesting problem.");
+     }
+-    deferredName = name;
+     pathNames[stackSize - 1] = name;
+-    promoteValueToName = false;
++    deferredName = name;
+     return this;
+   }
+ 
+   @Override public JsonWriter value(String value) throws IOException {
+-    if (promoteValueToName) {
+-      return name(value);
+-    }
+     add(value);
+     pathIndices[stackSize - 1]++;
+     return this;
+@@ -135,9 +130,6 @@ final class ObjectJsonWriter extends JsonWriter {
+   }
+ 
+   @Override public JsonWriter value(long value) throws IOException {
+-    if (promoteValueToName) {
+-      return name(Long.toString(value));
+-    }
+     add(value);
+     pathIndices[stackSize - 1]++;
+     return this;
+@@ -150,14 +142,15 @@ final class ObjectJsonWriter extends JsonWriter {
+         throw new IllegalArgumentException("Numeric values must be finite, but was " + value);
+       }
+     }
+-    if (promoteValueToName) {
+-      return name(value.toString());
+-    }
+     add(value);
+     pathIndices[stackSize - 1]++;
+     return this;
+   }
+ 
++  @Override void promoteNameToValue() throws IOException {
++    throw new UnsupportedOperationException();
++  }
++
+   @Override public void close() throws IOException {
+     int size = stackSize;
+     if (size > 1 || size == 1 && scopes[size - 1] != NONEMPTY_DOCUMENT) {
+diff --git a/moshi/src/main/java/com/squareup/moshi/Types.java b/moshi/src/main/java/com/squareup/moshi/Types.java
+index 67cac084..02a841f7 100644
+--- a/moshi/src/main/java/com/squareup/moshi/Types.java
++++ b/moshi/src/main/java/com/squareup/moshi/Types.java
+@@ -15,10 +15,14 @@
+  */
+ package com.squareup.moshi;
+ 
++import java.lang.annotation.Annotation;
+ import java.lang.reflect.Array;
+ import java.lang.reflect.GenericArrayType;
+ import java.lang.reflect.GenericDeclaration;
++import java.lang.reflect.InvocationHandler;
++import java.lang.reflect.Method;
+ import java.lang.reflect.ParameterizedType;
++import java.lang.reflect.Proxy;
+ import java.lang.reflect.Type;
+ import java.lang.reflect.TypeVariable;
+ import java.lang.reflect.WildcardType;
+@@ -137,6 +141,39 @@ public final class Types {
+     }
+   }
+ 
++  @SuppressWarnings("unchecked")
++  static <T extends Annotation> T createJsonQualifierImplementation(final Class<T> annotationType) {
++    if (!annotationType.isAnnotation()) {
++      throw new IllegalArgumentException(annotationType + " must be an annotation.");
++    }
++    if (!annotationType.isAnnotationPresent(JsonQualifier.class)) {
++      throw new IllegalArgumentException(annotationType + " must have @JsonQualifier.");
++    }
++    if (annotationType.getDeclaredMethods().length != 0) {
++      throw new IllegalArgumentException(annotationType + " must not declare methods.");
++    }
++    return (T) Proxy.newProxyInstance(annotationType.getClassLoader(),
++        new Class<?>[] { annotationType }, new InvocationHandler() {
++          @Override public Object invoke(Object proxy, Method method, Object[] args)
++              throws Throwable {
++            String methodName = method.getName();
++            switch (methodName) {
++              case "annotationType":
++                return annotationType;
++              case "equals":
++                Object o = args[0];
++                return annotationType.isInstance(o);
++              case "hashCode":
++                return 0;
++              case "toString":
++                return "@" + annotationType.getName() + "()";
++              default:
++                return method.invoke(proxy, args);
++            }
++          }
++        });
++  }
++
+   static boolean equal(Object a, Object b) {
+     return a == b || (a != null && a.equals(b));
+   }

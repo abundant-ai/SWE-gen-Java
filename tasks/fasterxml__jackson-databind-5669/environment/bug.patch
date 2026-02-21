@@ -1,0 +1,436 @@
+diff --git a/src/main/java/tools/jackson/databind/deser/jdk/EnumMapDeserializer.java b/src/main/java/tools/jackson/databind/deser/jdk/EnumMapDeserializer.java
+index e64c6ba7f..336d14c6b 100644
+--- a/src/main/java/tools/jackson/databind/deser/jdk/EnumMapDeserializer.java
++++ b/src/main/java/tools/jackson/databind/deser/jdk/EnumMapDeserializer.java
+@@ -229,7 +229,7 @@ public class EnumMapDeserializer
+             return deserialize(p, ctxt, constructMap(ctxt));
+         case JsonTokenId.ID_STRING:
+             // (empty) String may be ok however; or single-String-arg ctor
+-            return _deserializeFromStringForContainer(p, ctxt);
++            return _deserializeFromString(p, ctxt);
+         case JsonTokenId.ID_START_ARRAY:
+             // Empty array, or single-value wrapped in array?
+             return _deserializeFromArray(p, ctxt);
+diff --git a/src/main/java/tools/jackson/databind/deser/jdk/MapDeserializer.java b/src/main/java/tools/jackson/databind/deser/jdk/MapDeserializer.java
+index d969075cd..13d846f17 100644
+--- a/src/main/java/tools/jackson/databind/deser/jdk/MapDeserializer.java
++++ b/src/main/java/tools/jackson/databind/deser/jdk/MapDeserializer.java
+@@ -430,7 +430,7 @@ public class MapDeserializer
+             return _readAndBind(p, ctxt, result);
+         case JsonTokenId.ID_STRING:
+             // (empty) String may be ok however; or single-String-arg ctor
+-            return _deserializeFromStringForContainer(p, ctxt);
++            return _deserializeFromString(p, ctxt);
+         case JsonTokenId.ID_START_ARRAY:
+             // Empty array, or single-value wrapped in array?
+             return _deserializeFromArray(p, ctxt);
+diff --git a/src/main/java/tools/jackson/databind/deser/jdk/ObjectArrayDeserializer.java b/src/main/java/tools/jackson/databind/deser/jdk/ObjectArrayDeserializer.java
+index 102caefab..0df6ce809 100644
+--- a/src/main/java/tools/jackson/databind/deser/jdk/ObjectArrayDeserializer.java
++++ b/src/main/java/tools/jackson/databind/deser/jdk/ObjectArrayDeserializer.java
+@@ -359,14 +359,15 @@ public class ObjectArrayDeserializer
+                 ((_unwrapSingle == null) &&
+                         ctxt.isEnabled(DeserializationFeature.ACCEPT_SINGLE_VALUE_AS_ARRAY));
+         if (!canWrap) {
++            // 2 exceptions with Strings:
+             if (p.hasToken(JsonToken.VALUE_STRING)) {
+                 // One exception; byte arrays are generally serialized as base64, so that should be handled
+                 // note: not `byte[]`, but `Byte[]` -- former is primitive array
+                 if (_elementClass == Byte.class) {
+                     return deserializeFromBase64(p, ctxt);
+                 }
+-                // [databind#3349]: for non-empty strings, delegate to handleUnexpectedToken
+-                return _deserializeFromStringForContainer(p, ctxt);
++                // Second: empty (and maybe blank) String
++                return _deserializeFromString(p, ctxt);
+             }
+             return ctxt.handleUnexpectedToken(_containerType, p);
+         }
+diff --git a/src/main/java/tools/jackson/databind/deser/jdk/PrimitiveArrayDeserializers.java b/src/main/java/tools/jackson/databind/deser/jdk/PrimitiveArrayDeserializers.java
+index 21c23dfeb..4aeeed10f 100644
+--- a/src/main/java/tools/jackson/databind/deser/jdk/PrimitiveArrayDeserializers.java
++++ b/src/main/java/tools/jackson/databind/deser/jdk/PrimitiveArrayDeserializers.java
+@@ -213,10 +213,9 @@ public abstract class PrimitiveArrayDeserializers<T>
+         //   single-element wrapping of a String value
+         // Let's still call _deserializeFromString() for empty strings no matter what,
+         // and for all values if wrapping not enabled
+-        // [databind#3349]: for non-empty strings, delegate to handleUnexpectedToken
+         if (p.hasToken(JsonToken.VALUE_STRING)) {
+             if (!canWrap || _isBlank(p.getString())) {
+-                return _deserializeFromStringForContainer(p, ctxt);
++                return _deserializeFromString(p, ctxt);
+             }
+         }
+         if (canWrap) {
+diff --git a/src/main/java/tools/jackson/databind/deser/jdk/StringArrayDeserializer.java b/src/main/java/tools/jackson/databind/deser/jdk/StringArrayDeserializer.java
+index 0dbc8b460..2ede63696 100644
+--- a/src/main/java/tools/jackson/databind/deser/jdk/StringArrayDeserializer.java
++++ b/src/main/java/tools/jackson/databind/deser/jdk/StringArrayDeserializer.java
+@@ -352,8 +352,7 @@ public final class StringArrayDeserializer
+             return new String[] { value };
+         }
+         if (p.hasToken(JsonToken.VALUE_STRING)) {
+-            // [databind#3349]: for non-empty strings, delegate to handleUnexpectedToken
+-            return _deserializeFromStringForContainer(p, ctxt);
++            return _deserializeFromString(p, ctxt);
+         }
+         return (String[]) ctxt.handleUnexpectedToken(getValueType(ctxt), p);
+     }
+diff --git a/src/main/java/tools/jackson/databind/deser/jdk/StringCollectionDeserializer.java b/src/main/java/tools/jackson/databind/deser/jdk/StringCollectionDeserializer.java
+index 405dab1b6..f0c92da83 100644
+--- a/src/main/java/tools/jackson/databind/deser/jdk/StringCollectionDeserializer.java
++++ b/src/main/java/tools/jackson/databind/deser/jdk/StringCollectionDeserializer.java
+@@ -342,9 +342,33 @@ public final class StringCollectionDeserializer
+                 ((_unwrapSingle == null) &&
+                         ctxt.isEnabled(DeserializationFeature.ACCEPT_SINGLE_VALUE_AS_ARRAY));
+         if (!canWrap) {
+-            // [databind#3349]: special check for possible coercions etc
++            // [databind#3349]: For String tokens, first check if ValueInstantiator
++            //   can create from String; then handle empty/blank coercion;
++            //   for non-empty strings, delegate to handleUnexpectedToken
++            //   (NOT handleMissingInstantiator)
+             if (p.hasToken(JsonToken.VALUE_STRING)) {
+-                return _deserializeFromStringForContainer(p, ctxt);
++                final ValueInstantiator inst = getValueInstantiator();
++                if ((inst != null) && inst.canCreateFromString()) {
++                    return castToCollection(inst.createFromString(ctxt, p.getValueAsString()));
++                }
++                String textValue = p.getString();
++                if (textValue.isEmpty()) {
++                    final CoercionAction act = ctxt.findCoercionAction(logicalType(), handledType(),
++                            CoercionInputShape.EmptyString);
++                    if (act != null) {
++                        // Note: for Fail, _deserializeFromEmptyString will throw;
++                        //  for others returns coerced value
++                        return castToCollection(_deserializeFromEmptyString(p, ctxt, act, handledType(),
++                                "empty String (\"\")"));
++                    }
++                } else if (_isBlank(textValue)) {
++                    final CoercionAction act = ctxt.findCoercionFromBlankString(logicalType(), handledType(),
++                            CoercionAction.Fail);
++                    // Note: for Fail, _deserializeFromEmptyString will throw;
++                    //  for others returns coerced value
++                    return castToCollection(_deserializeFromEmptyString(p, ctxt, act, handledType(),
++                            "blank String (all whitespace)"));
++                }
+             }
+             return castToCollection(ctxt.handleUnexpectedToken(_containerType, p));
+         }
+diff --git a/src/main/java/tools/jackson/databind/deser/std/StdDeserializer.java b/src/main/java/tools/jackson/databind/deser/std/StdDeserializer.java
+index f6f9bd143..633c87cea 100644
+--- a/src/main/java/tools/jackson/databind/deser/std/StdDeserializer.java
++++ b/src/main/java/tools/jackson/databind/deser/std/StdDeserializer.java
+@@ -265,52 +265,6 @@ public abstract class StdDeserializer<T>
+                 value);
+     }
+ 
+-    /**
+-     * Helper method for handling a String token during deserialization of
+-     * a container type (Collection, Map, array etc).
+-     * Checks for String-argument creator first, then empty/blank String coercion,
+-     * and finally delegates to
+-     * {@link DeserializationContext#handleUnexpectedToken(JavaType, JsonParser)}.
+-     *<p>
+-     * NOTE: compared to {@link #_deserializeFromString}, this method does NOT try
+-     * coercions from String to numeric/boolean types, and does NOT call
+-     * {@link DeserializationContext#handleMissingInstantiator} as a fallback: instead,
+-     * calls {@link DeserializationContext#handleUnexpectedToken}.
+-     *<p>
+-     * [databind#3349]: Previously, some container deserializers called
+-     * {@link #_deserializeFromString} which incorrectly routed
+-     * non-empty Strings through {@code handleMissingInstantiator} instead of
+-     * {@code handleUnexpectedToken}.
+-     *
+-     * @since 3.1
+-     */
+-    @SuppressWarnings("unchecked")
+-    protected T _deserializeFromStringForContainer(JsonParser p, DeserializationContext ctxt)
+-        throws JacksonException
+-    {
+-        final ValueInstantiator inst = getValueInstantiator();
+-        final Class<?> rawTargetType = handledType();
+-
+-        if ((inst != null) && inst.canCreateFromString()) {
+-            return (T) inst.createFromString(ctxt, p.getValueAsString());
+-        }
+-        String value = p.getValueAsString();
+-        if (value.isEmpty()) {
+-            final CoercionAction act = ctxt.findCoercionAction(logicalType(), rawTargetType,
+-                    CoercionInputShape.EmptyString);
+-            if (act != null) {
+-                return (T) _deserializeFromEmptyString(p, ctxt, act,
+-                        rawTargetType, "empty String (\"\")");
+-            }
+-        } else if (_isBlank(value)) {
+-            final CoercionAction act = ctxt.findCoercionFromBlankString(logicalType(), rawTargetType,
+-                    CoercionAction.Fail);
+-            return (T) _deserializeFromEmptyString(p, ctxt, act,
+-                    rawTargetType, "blank String (all whitespace)");
+-        }
+-        return (T) ctxt.handleUnexpectedToken(getValueType(ctxt), p);
+-    }
+-
+     protected Object _deserializeFromEmptyString(JsonParser p, DeserializationContext ctxt,
+             CoercionAction act, Class<?> rawTargetType, String desc) throws JacksonException
+     {
+diff --git a/src/test/java/tools/jackson/databind/deser/filter/ProblemHandler3349Test.java b/src/test/java/tools/jackson/databind/deser/filter/ProblemHandler3349Test.java
+index f006dde66..5f6a45671 100644
+--- a/src/test/java/tools/jackson/databind/deser/filter/ProblemHandler3349Test.java
++++ b/src/test/java/tools/jackson/databind/deser/filter/ProblemHandler3349Test.java
+@@ -2,8 +2,7 @@ package tools.jackson.databind.deser.filter;
+ 
+ import java.util.ArrayList;
+ import java.util.Collection;
+-import java.util.HashMap;
+-import java.util.Map;
++import java.util.Collections;
+ 
+ import org.junit.jupiter.api.Test;
+ 
+@@ -22,8 +21,7 @@ import static tools.jackson.databind.testutil.DatabindTestUtil.*;
+ 
+ /**
+  * Test for [databind#3349]: DeserializationProblemHandler::handleUnexpectedToken
+- * should be invoked for container types (Collections, Maps, arrays) when given
+- * an incompatible String token.
++ * should be invoked for array-like types when given an incompatible token.
+  */
+ public class ProblemHandler3349Test
+ {
+@@ -39,18 +37,8 @@ public class ProblemHandler3349Test
+                 String failureMsg)
+         {
+             handleUnexpectedTokenCalled = true;
+-            if (targetType.isMapLikeType()) {
+-                return new HashMap<>();
+-            }
+-            if (targetType.isCollectionLikeType()) {
+-                return new ArrayList<>();
+-            }
+-            if (targetType.isArrayType()) {
+-                // Return zero-length array of correct type
+-                return java.lang.reflect.Array.newInstance(
+-                        targetType.getContentType().getRawClass(), 0);
+-            }
+-            return NOT_HANDLED;
++            // Return empty collection to allow deserialization to proceed
++            return new ArrayList<>();
+         }
+ 
+         @Override
+@@ -69,12 +57,6 @@ public class ProblemHandler3349Test
+             handleMissingInstantiatorCalled = true;
+             return NOT_HANDLED;
+         }
+-
+-        void reset() {
+-            handleUnexpectedTokenCalled = false;
+-            handleInstantiationProblemCalled = false;
+-            handleMissingInstantiatorCalled = false;
+-        }
+     }
+ 
+     static class ArrayHolder {
+@@ -111,14 +93,10 @@ public class ProblemHandler3349Test
+         }
+     }
+ 
+-    /*
+-    /**********************************************************************
+-    /* Test methods: baseline
+-    /**********************************************************************
+-     */
++    private final ObjectMapper MAPPER = newJsonMapper();
+ 
+     // Baseline: verify that handleUnexpectedToken is called for String type
+-    // when given an array token (this should work fine, not affected by #3349)
++    // when given an array token (this should work fine)
+     @Test
+     public void testHandleUnexpectedTokenForStringProp() throws Exception
+     {
+@@ -136,15 +114,14 @@ public class ProblemHandler3349Test
+             // May fail, but we just want to check which handler was called
+         }
+ 
+-        _verifyHandleUnexpectedTokenCalled(handler);
++        assertTrue(handler.handleUnexpectedTokenCalled,
++            "handleUnexpectedToken should be called when deserializing String from START_ARRAY");
++        assertFalse(handler.handleInstantiationProblemCalled,
++            "handleInstantiationProblem should NOT be called");
++        assertFalse(handler.handleMissingInstantiatorCalled,
++            "handleMissingInstantiator should NOT be called");
+     }
+ 
+-    /*
+-    /**********************************************************************
+-    /* Test methods: Collection types
+-    /**********************************************************************
+-     */
+-
+     // [databind#3349]: handleUnexpectedToken should be called for Collection/Iterable types
+     // when given a string token instead of START_ARRAY
+     @Test
+@@ -160,151 +137,31 @@ public class ProblemHandler3349Test
+ 
+         mapper.treeToValue(input, ArrayHolder.class);
+ 
+-        _verifyHandleUnexpectedTokenCalled(handler);
++        assertTrue(handler.handleUnexpectedTokenCalled,
++            "handleUnexpectedToken should be called when deserializing Collection from STRING token");
++        assertFalse(handler.handleInstantiationProblemCalled,
++            "handleInstantiationProblem should NOT be called");
++        assertFalse(handler.handleMissingInstantiatorCalled,
++            "handleMissingInstantiator should NOT be called");
+     }
+ 
+-    // [databind#3349]: direct Collection<String> (StringCollectionDeserializer)
++    // Also test direct deserialization of Collection from string
+     @Test
+-    public void testHandleUnexpectedTokenForStringCollection() throws Exception
++    public void testHandleUnexpectedTokenForDirectCollection() throws Exception
+     {
+         TrackingProblemHandler handler = new TrackingProblemHandler();
+         ObjectMapper mapper = jsonMapperBuilder()
+             .addHandler(handler)
+             .build();
+ 
+-        mapper.readValue(q("someString"),
++        mapper.readValue("\"someString\"",
+             mapper.getTypeFactory().constructCollectionType(ArrayList.class, String.class));
+ 
+-        _verifyHandleUnexpectedTokenCalled(handler);
+-    }
+-
+-    // [databind#3349]: Collection<Integer> (CollectionDeserializer)
+-    @Test
+-    public void testHandleUnexpectedTokenForObjectCollection() throws Exception
+-    {
+-        TrackingProblemHandler handler = new TrackingProblemHandler();
+-        ObjectMapper mapper = jsonMapperBuilder()
+-            .addHandler(handler)
+-            .build();
+-
+-        mapper.readValue(q("someString"),
+-            mapper.getTypeFactory().constructCollectionType(ArrayList.class, Integer.class));
+-
+-        _verifyHandleUnexpectedTokenCalled(handler);
+-    }
+-
+-    /*
+-    /**********************************************************************
+-    /* Test methods: Map types
+-    /**********************************************************************
+-     */
+-
+-    // [databind#3349]: Map<String,String> (MapDeserializer)
+-    @Test
+-    public void testHandleUnexpectedTokenForMap() throws Exception
+-    {
+-        TrackingProblemHandler handler = new TrackingProblemHandler();
+-        ObjectMapper mapper = jsonMapperBuilder()
+-            .addHandler(handler)
+-            .build();
+-
+-        mapper.readValue(q("someString"),
+-            mapper.getTypeFactory().constructMapType(HashMap.class, String.class, String.class));
+-
+-        _verifyHandleUnexpectedTokenCalled(handler);
+-    }
+-
+-    /*
+-    /**********************************************************************
+-    /* Test methods: Array types
+-    /**********************************************************************
+-     */
+-
+-    // [databind#3349]: Object[] (ObjectArrayDeserializer)
+-    @Test
+-    public void testHandleUnexpectedTokenForObjectArray() throws Exception
+-    {
+-        TrackingProblemHandler handler = new TrackingProblemHandler();
+-        ObjectMapper mapper = jsonMapperBuilder()
+-            .addHandler(handler)
+-            .build();
+-
+-        mapper.readValue(q("someString"), Object[].class);
+-
+-        _verifyHandleUnexpectedTokenCalled(handler);
+-    }
+-
+-    // [databind#3349]: String[] (StringArrayDeserializer)
+-    @Test
+-    public void testHandleUnexpectedTokenForStringArray() throws Exception
+-    {
+-        TrackingProblemHandler handler = new TrackingProblemHandler();
+-        ObjectMapper mapper = jsonMapperBuilder()
+-            .addHandler(handler)
+-            .build();
+-
+-        mapper.readValue(q("someString"), String[].class);
+-
+-        _verifyHandleUnexpectedTokenCalled(handler);
+-    }
+-
+-    // [databind#3349]: int[] (PrimitiveArrayDeserializers)
+-    @Test
+-    public void testHandleUnexpectedTokenForIntArray() throws Exception
+-    {
+-        TrackingProblemHandler handler = new TrackingProblemHandler();
+-        ObjectMapper mapper = jsonMapperBuilder()
+-            .addHandler(handler)
+-            .build();
+-
+-        mapper.readValue(q("someString"), int[].class);
+-
+-        _verifyHandleUnexpectedTokenCalled(handler);
+-    }
+-
+-    // [databind#3349]: long[] (PrimitiveArrayDeserializers)
+-    @Test
+-    public void testHandleUnexpectedTokenForLongArray() throws Exception
+-    {
+-        TrackingProblemHandler handler = new TrackingProblemHandler();
+-        ObjectMapper mapper = jsonMapperBuilder()
+-            .addHandler(handler)
+-            .build();
+-
+-        mapper.readValue(q("someString"), long[].class);
+-
+-        _verifyHandleUnexpectedTokenCalled(handler);
+-    }
+-
+-    // NOTE: double[] and float[] not tested here: they have special "packed binary
+-    // vector" handling that intercepts STRING tokens (base64) before handleNonArray
+-
+-    // [databind#3349]: boolean[] (PrimitiveArrayDeserializers)
+-    @Test
+-    public void testHandleUnexpectedTokenForBooleanArray() throws Exception
+-    {
+-        TrackingProblemHandler handler = new TrackingProblemHandler();
+-        ObjectMapper mapper = jsonMapperBuilder()
+-            .addHandler(handler)
+-            .build();
+-
+-        mapper.readValue(q("someString"), boolean[].class);
+-
+-        _verifyHandleUnexpectedTokenCalled(handler);
+-    }
+-
+-    /*
+-    /**********************************************************************
+-    /* Helper methods
+-    /**********************************************************************
+-     */
+-
+-    private void _verifyHandleUnexpectedTokenCalled(TrackingProblemHandler handler) {
+         assertTrue(handler.handleUnexpectedTokenCalled,
+-            "handleUnexpectedToken should have been called");
++            "handleUnexpectedToken should be called when deserializing Collection from STRING");
+         assertFalse(handler.handleInstantiationProblemCalled,
+-            "handleInstantiationProblem should NOT have been called");
++            "handleInstantiationProblem should NOT be called");
+         assertFalse(handler.handleMissingInstantiatorCalled,
+-            "handleMissingInstantiator should NOT have been called");
++            "handleMissingInstantiator should NOT be called");
+     }
+ }

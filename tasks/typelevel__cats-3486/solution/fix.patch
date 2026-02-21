@@ -1,0 +1,341 @@
+diff --git a/.travis.yml b/.travis.yml
+index 0af6325cb..1542878e8 100644
+--- a/.travis.yml
++++ b/.travis.yml
+@@ -13,6 +13,7 @@ jdk:
+ 
+ scala_version_212: &scala_version_212 2.12.11
+ scala_version_213: &scala_version_213 2.13.2
++dotty_version: &dotty_version 0.24.0
+ 
+ before_install:
+  - export PATH=${PATH}:./vendor/bundle
+@@ -76,6 +77,14 @@ jobs:
+       name: Binary compatibility 2.13
+       scala: *scala_version_213
+ 
++    # Note that we're currently only building some modules on Dotty, not running tests.
++    - &dotty_tests
++      stage: test
++      name: Dotty tests
++      env: TEST="Dotty tests"
++      script: sbt ++$TRAVIS_SCALA_VERSION! alleycatsLawsJVM/compile
++      scala: *dotty_version
++
+     - stage: styling
+       name: Linting
+       env: TEST="linting"
+diff --git a/core/src/main/scala-2.x/src/main/scala/cats/arrow/FunctionKMacros.scala b/core/src/main/scala-2.x/src/main/scala/cats/arrow/FunctionKMacros.scala
+new file mode 100644
+index 000000000..6e79d704e
+--- /dev/null
++++ b/core/src/main/scala-2.x/src/main/scala/cats/arrow/FunctionKMacros.scala
+@@ -0,0 +1,102 @@
++package cats
++package arrow
++
++import scala.language.experimental.macros
++import scala.reflect.macros.blackbox.Context
++
++private[arrow] class FunctionKMacroMethods {
++
++  /**
++   * Lifts function `f` of `F[A] => G[A]` into a `FunctionK[F, G]`.
++   *
++   * {{{
++   *   def headOption[A](list: List[A]): Option[A] = list.headOption
++   *   val lifted: FunctionK[List, Option] = FunctionK.lift(headOption)
++   * }}}
++   *
++   * Note: This method has a macro implementation that returns a new
++   * `FunctionK` instance as follows:
++   *
++   * {{{
++   *   new FunctionK[F, G] {
++   *     def apply[A](fa: F[A]): G[A] = f(fa)
++   *   }
++   * }}}
++   *
++   * Additionally, the type parameters on `f` must not be specified.
++   */
++  def lift[F[_], G[_]](f: (F[α] => G[α]) forSome { type α }): FunctionK[F, G] =
++    macro FunctionKMacros.lift[F, G]
++}
++
++private[arrow] object FunctionKMacros {
++
++  def lift[F[_], G[_]](c: Context)(
++    f: c.Expr[(F[α] => G[α]) forSome { type α }]
++  )(implicit
++    evF: c.WeakTypeTag[F[_]],
++    evG: c.WeakTypeTag[G[_]]
++  ): c.Expr[FunctionK[F, G]] =
++    c.Expr[FunctionK[F, G]](new Lifter[c.type](c).lift[F, G](f.tree))
++  // ^^note: extra space after c.type to appease scalastyle
++
++  private[this] class Lifter[C <: Context](val c: C) {
++    import c.universe._
++
++    def lift[F[_], G[_]](tree: Tree)(implicit
++      evF: c.WeakTypeTag[F[_]],
++      evG: c.WeakTypeTag[G[_]]
++    ): Tree =
++      unblock(tree) match {
++        case q"($param) => $trans[..$typeArgs](${arg: Ident})" if param.name == arg.name =>
++          typeArgs
++            .collect { case tt: TypeTree => tt }
++            .find(tt => Option(tt.original).isDefined)
++            .foreach { param =>
++              c.abort(param.pos,
++                      s"type parameter $param must not be supplied when lifting function $trans to FunctionK"
++              )
++            }
++
++          val F = punchHole(evF.tpe)
++          val G = punchHole(evG.tpe)
++
++          q"""
++        new _root_.cats.arrow.FunctionK[$F, $G] {
++          def apply[A](fa: $F[A]): $G[A] = $trans(fa)
++        }
++       """
++        case other =>
++          c.abort(other.pos, s"Unexpected tree $other when lifting to FunctionK")
++      }
++
++    private[this] def unblock(tree: Tree): Tree =
++      tree match {
++        case Block(Nil, expr) => expr
++        case _                => tree
++      }
++
++    private[this] def punchHole(tpe: Type): Tree =
++      tpe match {
++        case PolyType(undet :: Nil, underlying: TypeRef) =>
++          val α = TypeName("α")
++          def rebind(typeRef: TypeRef): Tree =
++            if (typeRef.sym == undet) tq"$α"
++            else {
++              val args = typeRef.args.map {
++                case ref: TypeRef => rebind(ref)
++                case arg          => tq"$arg"
++              }
++              tq"${typeRef.sym}[..$args]"
++            }
++          val rebound = rebind(underlying)
++          tq"""({type λ[$α] = $rebound})#λ"""
++        case TypeRef(pre, sym, Nil) =>
++          tq"$sym"
++        case _ =>
++          c.abort(c.enclosingPosition, s"Unexpected type $tpe when lifting to FunctionK")
++      }
++
++  }
++
++}
+diff --git a/core/src/main/scala-3.x/src/main/scala/cats/arrow/FunctionKMacros.scala b/core/src/main/scala-3.x/src/main/scala/cats/arrow/FunctionKMacros.scala
+new file mode 100644
+index 000000000..639b6ccf7
+--- /dev/null
++++ b/core/src/main/scala-3.x/src/main/scala/cats/arrow/FunctionKMacros.scala
+@@ -0,0 +1,4 @@
++package cats
++package arrow
++
++private[arrow] class FunctionKMacroMethods
+diff --git a/core/src/main/scala/cats/arrow/FunctionK.scala b/core/src/main/scala/cats/arrow/FunctionK.scala
+index 295605936..f2f6457ae 100644
+--- a/core/src/main/scala/cats/arrow/FunctionK.scala
++++ b/core/src/main/scala/cats/arrow/FunctionK.scala
+@@ -1,9 +1,6 @@
+ package cats
+ package arrow
+ 
+-import scala.language.experimental.macros
+-import scala.reflect.macros.blackbox.Context
+-
+ import cats.data.{EitherK, Tuple2K}
+ 
+ /**
+@@ -64,105 +61,11 @@ trait FunctionK[F[_], G[_]] extends Serializable { self =>
+     new FunctionK[F, Tuple2K[G, H, *]] { def apply[A](fa: F[A]): Tuple2K[G, H, A] = Tuple2K(self(fa), h(fa)) }
+ }
+ 
+-object FunctionK {
++object FunctionK extends FunctionKMacroMethods {
+ 
+   /**
+    * The identity transformation of `F` to `F`
+    */
+   def id[F[_]]: FunctionK[F, F] = new FunctionK[F, F] { def apply[A](fa: F[A]): F[A] = fa }
+ 
+-  /**
+-   * Lifts function `f` of `F[A] => G[A]` into a `FunctionK[F, G]`.
+-   *
+-   * {{{
+-   *   def headOption[A](list: List[A]): Option[A] = list.headOption
+-   *   val lifted: FunctionK[List, Option] = FunctionK.lift(headOption)
+-   * }}}
+-   *
+-   * Note: This method has a macro implementation that returns a new
+-   * `FunctionK` instance as follows:
+-   *
+-   * {{{
+-   *   new FunctionK[F, G] {
+-   *     def apply[A](fa: F[A]): G[A] = f(fa)
+-   *   }
+-   * }}}
+-   *
+-   * Additionally, the type parameters on `f` must not be specified.
+-   */
+-  def lift[F[_], G[_]](f: (F[α] => G[α]) forSome { type α }): FunctionK[F, G] =
+-    macro FunctionKMacros.lift[F, G]
+-
+-}
+-
+-private[arrow] object FunctionKMacros {
+-
+-  def lift[F[_], G[_]](c: Context)(
+-    f: c.Expr[(F[α] => G[α]) forSome { type α }]
+-  )(implicit
+-    evF: c.WeakTypeTag[F[_]],
+-    evG: c.WeakTypeTag[G[_]]
+-  ): c.Expr[FunctionK[F, G]] =
+-    c.Expr[FunctionK[F, G]](new Lifter[c.type](c).lift[F, G](f.tree))
+-  // ^^note: extra space after c.type to appease scalastyle
+-
+-  private[this] class Lifter[C <: Context](val c: C) {
+-    import c.universe._
+-
+-    def lift[F[_], G[_]](tree: Tree)(implicit
+-      evF: c.WeakTypeTag[F[_]],
+-      evG: c.WeakTypeTag[G[_]]
+-    ): Tree =
+-      unblock(tree) match {
+-        case q"($param) => $trans[..$typeArgs](${arg: Ident})" if param.name == arg.name =>
+-          typeArgs
+-            .collect { case tt: TypeTree => tt }
+-            .find(tt => Option(tt.original).isDefined)
+-            .foreach { param =>
+-              c.abort(param.pos,
+-                      s"type parameter $param must not be supplied when lifting function $trans to FunctionK"
+-              )
+-            }
+-
+-          val F = punchHole(evF.tpe)
+-          val G = punchHole(evG.tpe)
+-
+-          q"""
+-        new _root_.cats.arrow.FunctionK[$F, $G] {
+-          def apply[A](fa: $F[A]): $G[A] = $trans(fa)
+-        }
+-       """
+-        case other =>
+-          c.abort(other.pos, s"Unexpected tree $other when lifting to FunctionK")
+-      }
+-
+-    private[this] def unblock(tree: Tree): Tree =
+-      tree match {
+-        case Block(Nil, expr) => expr
+-        case _                => tree
+-      }
+-
+-    private[this] def punchHole(tpe: Type): Tree =
+-      tpe match {
+-        case PolyType(undet :: Nil, underlying: TypeRef) =>
+-          val α = TypeName("α")
+-          def rebind(typeRef: TypeRef): Tree =
+-            if (typeRef.sym == undet) tq"$α"
+-            else {
+-              val args = typeRef.args.map {
+-                case ref: TypeRef => rebind(ref)
+-                case arg          => tq"$arg"
+-              }
+-              tq"${typeRef.sym}[..$args]"
+-            }
+-          val rebound = rebind(underlying)
+-          tq"""({type λ[$α] = $rebound})#λ"""
+-        case TypeRef(pre, sym, Nil) =>
+-          tq"$sym"
+-        case _ =>
+-          c.abort(c.enclosingPosition, s"Unexpected type $tpe when lifting to FunctionK")
+-      }
+-
+-  }
+-
+ }
+diff --git a/laws/src/main/scala/cats/laws/ApplicativeErrorLaws.scala b/laws/src/main/scala/cats/laws/ApplicativeErrorLaws.scala
+index dd061468e..438acec34 100644
+--- a/laws/src/main/scala/cats/laws/ApplicativeErrorLaws.scala
++++ b/laws/src/main/scala/cats/laws/ApplicativeErrorLaws.scala
+@@ -32,7 +32,7 @@ trait ApplicativeErrorLaws[F[_], E] extends ApplicativeLaws[F] {
+     F.handleError(fa)(f) <-> F.recover(fa) { case x => f(x) }
+ 
+   def recoverConsistentWithRecoverWith[A](fa: F[A], pf: PartialFunction[E, A]): IsEq[F[A]] =
+-    F.recover(fa)(pf) <-> F.recoverWith(fa)(pf.andThen(F.pure _))
++    F.recover(fa)(pf) <-> F.recoverWith(fa)(pf.andThen(F.pure(_)))
+ 
+   def attemptConsistentWithAttemptT[A](fa: F[A]): IsEq[EitherT[F, E, A]] =
+     EitherT(F.attempt(fa)) <-> F.attemptT(fa)
+diff --git a/laws/src/main/scala/cats/laws/NonEmptyTraverseLaws.scala b/laws/src/main/scala/cats/laws/NonEmptyTraverseLaws.scala
+index e89d7d4ac..6955e5de8 100644
+--- a/laws/src/main/scala/cats/laws/NonEmptyTraverseLaws.scala
++++ b/laws/src/main/scala/cats/laws/NonEmptyTraverseLaws.scala
+@@ -1,6 +1,8 @@
+ package cats.laws
+ 
+-import cats.{Apply, Id, NonEmptyTraverse, Semigroup}
++// The `catsInstancesForId` import is necessary to work around a Dotty
++// issue related to https://github.com/lampepfl/dotty/issues/9067.
++import cats.{catsInstancesForId, Apply, Id, NonEmptyTraverse, Semigroup}
+ import cats.data.{Const, Nested}
+ import cats.syntax.nonEmptyTraverse._
+ import cats.syntax.reducible._
+diff --git a/laws/src/main/scala/cats/laws/discipline/Eq.scala b/laws/src/main/scala/cats/laws/discipline/Eq.scala
+index 4ae4f4a44..3193131e1 100644
+--- a/laws/src/main/scala/cats/laws/discipline/Eq.scala
++++ b/laws/src/main/scala/cats/laws/discipline/Eq.scala
+@@ -154,7 +154,7 @@ object eq {
+    * and comparing the application of the two functions.
+    */
+   implicit def catsLawsEqForFn2[A, B, C](implicit A: Arbitrary[A], B: Arbitrary[B], C: Eq[C]): Eq[(A, B) => C] =
+-    Eq.by((_: (A, B) => C).tupled)(catsLawsEqForFn1)
++    Eq.by((_: (A, B) => C).tupled)(catsLawsEqForFn1[(A, B), C])
+ 
+   /**
+    * `Eq[AndThen]` instance, built by piggybacking on [[catsLawsEqForFn1]].
+diff --git a/laws/src/main/scala/cats/laws/discipline/NonEmptyParallelTests.scala b/laws/src/main/scala/cats/laws/discipline/NonEmptyParallelTests.scala
+index 05fd98b31..ef92f5e83 100644
+--- a/laws/src/main/scala/cats/laws/discipline/NonEmptyParallelTests.scala
++++ b/laws/src/main/scala/cats/laws/discipline/NonEmptyParallelTests.scala
+@@ -35,6 +35,6 @@ object NonEmptyParallelTests {
+   def apply[M[_]](implicit ev: NonEmptyParallel[M]): NonEmptyParallelTests.Aux[M, ev.F] =
+     apply[M, ev.F](ev, implicitly)
+ 
+-  def apply[M[_], F[_]](implicit ev: NonEmptyParallel.Aux[M, F], D: DummyImplicit): NonEmptyParallelTests.Aux[M, F] =
+-    new NonEmptyParallelTests[M] { val laws = NonEmptyParallelLaws[M] }
++  def apply[M[_], F0[_]](implicit ev: NonEmptyParallel.Aux[M, F0], D: DummyImplicit): NonEmptyParallelTests.Aux[M, F0] =
++    new NonEmptyParallelTests[M] { val laws: NonEmptyParallelLaws.Aux[M, F0] = NonEmptyParallelLaws[M](ev) }
+ }
+diff --git a/laws/src/main/scala/cats/laws/discipline/ParallelTests.scala b/laws/src/main/scala/cats/laws/discipline/ParallelTests.scala
+index d8827ce81..93fcb7dfa 100644
+--- a/laws/src/main/scala/cats/laws/discipline/ParallelTests.scala
++++ b/laws/src/main/scala/cats/laws/discipline/ParallelTests.scala
+@@ -31,6 +31,6 @@ object ParallelTests {
+   def apply[M[_]](implicit ev: Parallel[M]): ParallelTests.Aux[M, ev.F] =
+     apply[M, ev.F](ev, implicitly)
+ 
+-  def apply[M[_], F[_]](implicit ev: Parallel.Aux[M, F], D: DummyImplicit): ParallelTests.Aux[M, F] =
+-    new ParallelTests[M] { val laws = ParallelLaws[M] }
++  def apply[M[_], F0[_]](implicit ev: Parallel.Aux[M, F0], D: DummyImplicit): ParallelTests.Aux[M, F0] =
++    new ParallelTests[M] { val laws: ParallelLaws.Aux[M, F0] = ParallelLaws[M](ev) }
+ }
+diff --git a/project/plugins.sbt b/project/plugins.sbt
+index 6036712f2..ff3c366e5 100644
+--- a/project/plugins.sbt
++++ b/project/plugins.sbt
+@@ -1,3 +1,4 @@
++addSbtPlugin("ch.epfl.lamp" % "sbt-dotty" % "0.4.1")
+ addSbtPlugin("ch.epfl.scala" % "sbt-scalafix" % "0.9.17")
+ addSbtPlugin("com.eed3si9n" % "sbt-unidoc" % "0.4.3")
+ addSbtPlugin("com.github.gseitz" %% "sbt-release" % "1.0.13")

@@ -1,0 +1,1162 @@
+diff --git a/moshi/src/main/java/com/squareup/moshi/BufferedSinkJsonWriter.java b/moshi/src/main/java/com/squareup/moshi/BufferedSinkJsonWriter.java
+index 1260b81d..9464dc56 100644
+--- a/moshi/src/main/java/com/squareup/moshi/BufferedSinkJsonWriter.java
++++ b/moshi/src/main/java/com/squareup/moshi/BufferedSinkJsonWriter.java
+@@ -62,8 +62,6 @@ final class BufferedSinkJsonWriter extends JsonWriter {
+ 
+   private String deferredName;
+ 
+-  private boolean promoteNameToValue;
+-
+   BufferedSinkJsonWriter(BufferedSink sink) {
+     if (sink == null) {
+       throw new NullPointerException("sink == null");
+@@ -92,7 +90,7 @@ final class BufferedSinkJsonWriter extends JsonWriter {
+   }
+ 
+   @Override public JsonWriter endObject() throws IOException {
+-    promoteNameToValue = false;
++    promoteValueToName = false;
+     return close(EMPTY_OBJECT, NONEMPTY_OBJECT, "}");
+   }
+ 
+@@ -143,7 +141,7 @@ final class BufferedSinkJsonWriter extends JsonWriter {
+     }
+     deferredName = name;
+     pathNames[stackSize - 1] = name;
+-    promoteNameToValue = false;
++    promoteValueToName = false;
+     return this;
+   }
+ 
+@@ -159,7 +157,7 @@ final class BufferedSinkJsonWriter extends JsonWriter {
+     if (value == null) {
+       return nullValue();
+     }
+-    if (promoteNameToValue) {
++    if (promoteValueToName) {
+       return name(value);
+     }
+     writeDeferredName();
+@@ -200,10 +198,10 @@ final class BufferedSinkJsonWriter extends JsonWriter {
+   }
+ 
+   @Override public JsonWriter value(double value) throws IOException {
+-    if (Double.isNaN(value) || Double.isInfinite(value)) {
++    if (!lenient && (Double.isNaN(value) || Double.isInfinite(value))) {
+       throw new IllegalArgumentException("Numeric values must be finite, but was " + value);
+     }
+-    if (promoteNameToValue) {
++    if (promoteValueToName) {
+       return name(Double.toString(value));
+     }
+     writeDeferredName();
+@@ -214,7 +212,7 @@ final class BufferedSinkJsonWriter extends JsonWriter {
+   }
+ 
+   @Override public JsonWriter value(long value) throws IOException {
+-    if (promoteNameToValue) {
++    if (promoteValueToName) {
+       return name(Long.toString(value));
+     }
+     writeDeferredName();
+@@ -234,7 +232,7 @@ final class BufferedSinkJsonWriter extends JsonWriter {
+         && (string.equals("-Infinity") || string.equals("Infinity") || string.equals("NaN"))) {
+       throw new IllegalArgumentException("Numeric values must be finite, but was " + value);
+     }
+-    if (promoteNameToValue) {
++    if (promoteValueToName) {
+       return name(string);
+     }
+     writeDeferredName();
+@@ -369,12 +367,4 @@ final class BufferedSinkJsonWriter extends JsonWriter {
+         throw new IllegalStateException("Nesting problem.");
+     }
+   }
+-
+-  @Override void promoteNameToValue() throws IOException {
+-    int context = peekScope();
+-    if (context != NONEMPTY_OBJECT && context != EMPTY_OBJECT) {
+-      throw new IllegalStateException("Nesting problem.");
+-    }
+-    promoteNameToValue = true;
+-  }
+ }
+diff --git a/moshi/src/main/java/com/squareup/moshi/JsonAdapter.java b/moshi/src/main/java/com/squareup/moshi/JsonAdapter.java
+index 0f403039..50d48135 100644
+--- a/moshi/src/main/java/com/squareup/moshi/JsonAdapter.java
++++ b/moshi/src/main/java/com/squareup/moshi/JsonAdapter.java
+@@ -83,6 +83,31 @@ public abstract class JsonAdapter<T> {
+     }
+   }
+ 
++  /**
++   * Returns a JSON adapter equal to this JSON adapter, but that serializes nulls when encoding
++   * JSON.
++   */
++  public final JsonAdapter<T> serializeNulls() {
++    final JsonAdapter<T> delegate = this;
++    return new JsonAdapter<T>() {
++      @Override public T fromJson(JsonReader reader) throws IOException {
++        return delegate.fromJson(reader);
++      }
++      @Override public void toJson(JsonWriter writer, T value) throws IOException {
++        boolean serializeNulls = writer.getSerializeNulls();
++        writer.setSerializeNulls(true);
++        try {
++          delegate.toJson(writer, value);
++        } finally {
++          writer.setSerializeNulls(serializeNulls);
++        }
++      }
++      @Override public String toString() {
++        return delegate + ".serializeNulls()";
++      }
++    };
++  }
++
+   /**
+    * Returns a JSON adapter equal to this JSON adapter, but with support for reading and writing
+    * nulls.
+diff --git a/moshi/src/main/java/com/squareup/moshi/JsonWriter.java b/moshi/src/main/java/com/squareup/moshi/JsonWriter.java
+index e1787607..c0179951 100644
+--- a/moshi/src/main/java/com/squareup/moshi/JsonWriter.java
++++ b/moshi/src/main/java/com/squareup/moshi/JsonWriter.java
+@@ -20,6 +20,9 @@ import java.io.Flushable;
+ import java.io.IOException;
+ import okio.BufferedSink;
+ 
++import static com.squareup.moshi.JsonScope.EMPTY_OBJECT;
++import static com.squareup.moshi.JsonScope.NONEMPTY_OBJECT;
++
+ /**
+  * Writes a JSON (<a href="http://www.ietf.org/rfc/rfc7159.txt">RFC 7159</a>)
+  * encoded value to a stream, one token at a time. The stream includes both
+@@ -131,6 +134,7 @@ public abstract class JsonWriter implements Closeable, Flushable {
+   String indent;
+   boolean lenient;
+   boolean serializeNulls;
++  boolean promoteValueToName;
+ 
+   /** Returns a new instance that writes a JSON-encoded stream to {@code sink}. */
+   public static JsonWriter of(BufferedSink sink) {
+@@ -313,10 +317,16 @@ public abstract class JsonWriter implements Closeable, Flushable {
+   public abstract JsonWriter value(Number value) throws IOException;
+ 
+   /**
+-   * Changes the reader to treat the next string value as a name. This is useful for map adapters so
+-   * that arbitrary type adapters can use {@link #value(String)} to write a name value.
++   * Changes the writer to treat the next value as a string name. This is useful for map adapters so
++   * that arbitrary type adapters can use {@link #value} to write a name value.
+    */
+-  abstract void promoteNameToValue() throws IOException;
++  final void promoteValueToName() throws IOException {
++    int context = peekScope();
++    if (context != NONEMPTY_OBJECT && context != EMPTY_OBJECT) {
++      throw new IllegalStateException("Nesting problem.");
++    }
++    promoteValueToName = true;
++  }
+ 
+   /**
+    * Returns a <a href="http://goessner.net/articles/JsonPath/">JsonPath</a> to
+diff --git a/moshi/src/main/java/com/squareup/moshi/MapJsonAdapter.java b/moshi/src/main/java/com/squareup/moshi/MapJsonAdapter.java
+index 3158108b..8cf784d9 100644
+--- a/moshi/src/main/java/com/squareup/moshi/MapJsonAdapter.java
++++ b/moshi/src/main/java/com/squareup/moshi/MapJsonAdapter.java
+@@ -52,7 +52,7 @@ final class MapJsonAdapter<K, V> extends JsonAdapter<Map<K, V>> {
+       if (entry.getKey() == null) {
+         throw new JsonDataException("Map key is null at " + writer.getPath());
+       }
+-      writer.promoteNameToValue();
++      writer.promoteValueToName();
+       keyAdapter.toJson(writer, entry.getKey());
+       valueAdapter.toJson(writer, entry.getValue());
+     }
+diff --git a/moshi/src/main/java/com/squareup/moshi/Moshi.java b/moshi/src/main/java/com/squareup/moshi/Moshi.java
+index 16cedada..39e83f39 100644
+--- a/moshi/src/main/java/com/squareup/moshi/Moshi.java
++++ b/moshi/src/main/java/com/squareup/moshi/Moshi.java
+@@ -61,11 +61,6 @@ public final class Moshi {
+     return adapter(type, Util.NO_ANNOTATIONS);
+   }
+ 
+-  public <T> JsonAdapter<T> adapter(Type type, Class<? extends Annotation> annotationType) {
+-    return adapter(type,
+-        Collections.singleton(Types.createJsonQualifierImplementation(annotationType)));
+-  }
+-
+   @SuppressWarnings("unchecked") // Factories are required to return only matching JsonAdapters.
+   public <T> JsonAdapter<T> adapter(Type type, Set<? extends Annotation> annotations) {
+     type = Types.canonicalize(type);
+diff --git a/moshi/src/main/java/com/squareup/moshi/ObjectJsonReader.java b/moshi/src/main/java/com/squareup/moshi/ObjectJsonReader.java
+index 8f16fec4..0f30d888 100644
+--- a/moshi/src/main/java/com/squareup/moshi/ObjectJsonReader.java
++++ b/moshi/src/main/java/com/squareup/moshi/ObjectJsonReader.java
+@@ -273,10 +273,10 @@ final class ObjectJsonReader extends JsonReader {
+   }
+ 
+   @Override void promoteNameToValue() throws IOException {
+-    Map.Entry<?, ?> peeked = require(Map.Entry.class, Token.NAME);
+-
+-    push(peeked.getKey());
+-    stack[stackSize - 2] = peeked.getValue();
++    if (hasNext()) {
++      String name = nextName();
++      push(name);
++    }
+   }
+ 
+   @Override public void close() throws IOException {
+diff --git a/moshi/src/main/java/com/squareup/moshi/ObjectJsonWriter.java b/moshi/src/main/java/com/squareup/moshi/ObjectJsonWriter.java
+index a4b7c533..237d4624 100644
+--- a/moshi/src/main/java/com/squareup/moshi/ObjectJsonWriter.java
++++ b/moshi/src/main/java/com/squareup/moshi/ObjectJsonWriter.java
+@@ -79,6 +79,7 @@ final class ObjectJsonWriter extends JsonWriter {
+     if (peekScope() != EMPTY_OBJECT || deferredName != null) {
+       throw new IllegalStateException("Nesting problem.");
+     }
++    promoteValueToName = false;
+     stackSize--;
+     stack[stackSize] = null;
+     pathNames[stackSize] = null; // Free the last path name so that it can be garbage collected!
+@@ -96,12 +97,16 @@ final class ObjectJsonWriter extends JsonWriter {
+     if (peekScope() != EMPTY_OBJECT || deferredName != null) {
+       throw new IllegalStateException("Nesting problem.");
+     }
+-    pathNames[stackSize - 1] = name;
+     deferredName = name;
++    pathNames[stackSize - 1] = name;
++    promoteValueToName = false;
+     return this;
+   }
+ 
+   @Override public JsonWriter value(String value) throws IOException {
++    if (promoteValueToName) {
++      return name(value);
++    }
+     add(value);
+     pathIndices[stackSize - 1]++;
+     return this;
+@@ -130,6 +135,9 @@ final class ObjectJsonWriter extends JsonWriter {
+   }
+ 
+   @Override public JsonWriter value(long value) throws IOException {
++    if (promoteValueToName) {
++      return name(Long.toString(value));
++    }
+     add(value);
+     pathIndices[stackSize - 1]++;
+     return this;
+@@ -142,15 +150,14 @@ final class ObjectJsonWriter extends JsonWriter {
+         throw new IllegalArgumentException("Numeric values must be finite, but was " + value);
+       }
+     }
++    if (promoteValueToName) {
++      return name(value.toString());
++    }
+     add(value);
+     pathIndices[stackSize - 1]++;
+     return this;
+   }
+ 
+-  @Override void promoteNameToValue() throws IOException {
+-    throw new UnsupportedOperationException();
+-  }
+-
+   @Override public void close() throws IOException {
+     int size = stackSize;
+     if (size > 1 || size == 1 && scopes[size - 1] != NONEMPTY_DOCUMENT) {
+diff --git a/moshi/src/main/java/com/squareup/moshi/Types.java b/moshi/src/main/java/com/squareup/moshi/Types.java
+index 02a841f7..67cac084 100644
+--- a/moshi/src/main/java/com/squareup/moshi/Types.java
++++ b/moshi/src/main/java/com/squareup/moshi/Types.java
+@@ -15,14 +15,10 @@
+  */
+ package com.squareup.moshi;
+ 
+-import java.lang.annotation.Annotation;
+ import java.lang.reflect.Array;
+ import java.lang.reflect.GenericArrayType;
+ import java.lang.reflect.GenericDeclaration;
+-import java.lang.reflect.InvocationHandler;
+-import java.lang.reflect.Method;
+ import java.lang.reflect.ParameterizedType;
+-import java.lang.reflect.Proxy;
+ import java.lang.reflect.Type;
+ import java.lang.reflect.TypeVariable;
+ import java.lang.reflect.WildcardType;
+@@ -141,39 +137,6 @@ public final class Types {
+     }
+   }
+ 
+-  @SuppressWarnings("unchecked")
+-  static <T extends Annotation> T createJsonQualifierImplementation(final Class<T> annotationType) {
+-    if (!annotationType.isAnnotation()) {
+-      throw new IllegalArgumentException(annotationType + " must be an annotation.");
+-    }
+-    if (!annotationType.isAnnotationPresent(JsonQualifier.class)) {
+-      throw new IllegalArgumentException(annotationType + " must have @JsonQualifier.");
+-    }
+-    if (annotationType.getDeclaredMethods().length != 0) {
+-      throw new IllegalArgumentException(annotationType + " must not declare methods.");
+-    }
+-    return (T) Proxy.newProxyInstance(annotationType.getClassLoader(),
+-        new Class<?>[] { annotationType }, new InvocationHandler() {
+-          @Override public Object invoke(Object proxy, Method method, Object[] args)
+-              throws Throwable {
+-            String methodName = method.getName();
+-            switch (methodName) {
+-              case "annotationType":
+-                return annotationType;
+-              case "equals":
+-                Object o = args[0];
+-                return annotationType.isInstance(o);
+-              case "hashCode":
+-                return 0;
+-              case "toString":
+-                return "@" + annotationType.getName() + "()";
+-              default:
+-                return method.invoke(proxy, args);
+-            }
+-          }
+-        });
+-  }
+-
+   static boolean equal(Object a, Object b) {
+     return a == b || (a != null && a.equals(b));
+   }
+diff --git a/moshi/src/test/java/com/squareup/moshi/JsonAdapterTest.java b/moshi/src/test/java/com/squareup/moshi/JsonAdapterTest.java
+new file mode 100644
+index 00000000..fa32a6d0
+--- /dev/null
++++ b/moshi/src/test/java/com/squareup/moshi/JsonAdapterTest.java
+@@ -0,0 +1,167 @@
++/*
++ * Copyright (C) 2017 Square, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package com.squareup.moshi;
++
++import java.io.IOException;
++import java.util.Arrays;
++import java.util.Collections;
++import java.util.List;
++import java.util.Locale;
++import java.util.Map;
++import org.junit.Test;
++import org.junit.runner.RunWith;
++import org.junit.runners.Parameterized;
++import org.junit.runners.Parameterized.Parameter;
++import org.junit.runners.Parameterized.Parameters;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.junit.Assert.fail;
++import static org.junit.Assume.assumeTrue;
++
++@RunWith(Parameterized.class)
++public final class JsonAdapterTest {
++  @Parameter public JsonCodecFactory factory;
++
++  @Parameters(name = "{0}")
++  public static List<Object[]> parameters() {
++    return JsonCodecFactory.factories();
++  }
++
++  @Test public void lenient() throws Exception {
++    JsonAdapter<Double> lenient = new JsonAdapter<Double>() {
++      @Override public Double fromJson(JsonReader reader) throws IOException {
++        return reader.nextDouble();
++      }
++
++      @Override public void toJson(JsonWriter writer, Double value) throws IOException {
++        writer.value(value);
++      }
++    }.lenient();
++
++    JsonReader reader = factory.newReader("[-Infinity, NaN, Infinity]");
++    reader.beginArray();
++    assertThat(lenient.fromJson(reader)).isEqualTo(Double.NEGATIVE_INFINITY);
++    assertThat(lenient.fromJson(reader)).isNaN();
++    assertThat(lenient.fromJson(reader)).isEqualTo(Double.POSITIVE_INFINITY);
++    reader.endArray();
++
++    JsonWriter writer = factory.newWriter();
++    writer.beginArray();
++    lenient.toJson(writer, Double.NEGATIVE_INFINITY);
++    lenient.toJson(writer, Double.NaN);
++    lenient.toJson(writer, Double.POSITIVE_INFINITY);
++    writer.endArray();
++    assertThat(factory.json()).isEqualTo("[-Infinity,NaN,Infinity]");
++  }
++
++  @Test public void nullSafe() throws Exception {
++    JsonAdapter<String> toUpperCase = new JsonAdapter<String>() {
++      @Override public String fromJson(JsonReader reader) throws IOException {
++        return reader.nextString().toUpperCase(Locale.US);
++      }
++
++      @Override public void toJson(JsonWriter writer, String value) throws IOException {
++        writer.value(value.toUpperCase(Locale.US));
++      }
++    }.nullSafe();
++
++    JsonReader reader = factory.newReader("[\"a\", null, \"c\"]");
++    reader.beginArray();
++    assertThat(toUpperCase.fromJson(reader)).isEqualTo("A");
++    assertThat(toUpperCase.fromJson(reader)).isNull();
++    assertThat(toUpperCase.fromJson(reader)).isEqualTo("C");
++    reader.endArray();
++
++    JsonWriter writer = factory.newWriter();
++    writer.beginArray();
++    toUpperCase.toJson(writer, "a");
++    toUpperCase.toJson(writer, null);
++    toUpperCase.toJson(writer, "c");
++    writer.endArray();
++    assertThat(factory.json()).isEqualTo("[\"A\",null,\"C\"]");
++  }
++
++  @Test public void failOnUnknown() throws Exception {
++    JsonAdapter<String> alwaysSkip = new JsonAdapter<String>() {
++      @Override public String fromJson(JsonReader reader) throws IOException {
++        reader.skipValue();
++        throw new AssertionError();
++      }
++
++      @Override public void toJson(JsonWriter writer, String value) throws IOException {
++        throw new AssertionError();
++      }
++    }.failOnUnknown();
++
++    JsonReader reader = factory.newReader("[\"a\"]");
++    reader.beginArray();
++    try {
++      alwaysSkip.fromJson(reader);
++      fail();
++    } catch (JsonDataException expected) {
++      assertThat(expected).hasMessage("Cannot skip unexpected STRING at $[0]");
++    }
++    assertThat(reader.nextString()).isEqualTo("a");
++    reader.endArray();
++  }
++
++  @Test public void indent() throws Exception {
++    assumeTrue(factory.encodesToBytes());
++
++    JsonAdapter<List<String>> indent = new JsonAdapter<List<String>>() {
++      @Override public List<String> fromJson(JsonReader reader) throws IOException {
++        throw new AssertionError();
++      }
++
++      @Override public void toJson(JsonWriter writer, List<String> value) throws IOException {
++        writer.beginArray();
++        for (String s : value) {
++          writer.value(s);
++        }
++        writer.endArray();
++      }
++    }.indent("\t\t\t");
++
++    JsonWriter writer = factory.newWriter();
++    indent.toJson(writer, Arrays.asList("a", "b", "c"));
++    assertThat(factory.json()).isEqualTo(""
++        + "[\n"
++        + "\t\t\t\"a\",\n"
++        + "\t\t\t\"b\",\n"
++        + "\t\t\t\"c\"\n"
++        + "]");
++  }
++
++  @Test public void serializeNulls() throws Exception {
++    JsonAdapter<Map<String, String>> serializeNulls = new JsonAdapter<Map<String, String>>() {
++      @Override public Map<String, String> fromJson(JsonReader reader) throws IOException {
++        throw new AssertionError();
++      }
++
++      @Override public void toJson(JsonWriter writer, Map<String, String> map) throws IOException {
++        writer.beginObject();
++        for (Map.Entry<String, String> entry : map.entrySet()) {
++          writer.name(entry.getKey()).value(entry.getValue());
++        }
++        writer.endObject();
++      }
++    }.serializeNulls();
++
++    JsonWriter writer = factory.newWriter();
++    serializeNulls.toJson(writer, Collections.<String, String>singletonMap("a", null));
++    assertThat(factory.json()).isEqualTo("{\"a\":null}");
++  }
++}
+diff --git a/moshi/src/test/java/com/squareup/moshi/JsonWriterFactory.java b/moshi/src/test/java/com/squareup/moshi/JsonCodecFactory.java
+similarity index 69%
+rename from moshi/src/test/java/com/squareup/moshi/JsonWriterFactory.java
+rename to moshi/src/test/java/com/squareup/moshi/JsonCodecFactory.java
+index 820f8b7d..758e6b84 100644
+--- a/moshi/src/test/java/com/squareup/moshi/JsonWriterFactory.java
++++ b/moshi/src/test/java/com/squareup/moshi/JsonCodecFactory.java
+@@ -20,14 +20,19 @@ import java.util.Arrays;
+ import java.util.List;
+ import okio.Buffer;
+ 
+-abstract class JsonWriterFactory {
++abstract class JsonCodecFactory {
+   private static final Moshi MOSHI = new Moshi.Builder().build();
+   private static final JsonAdapter<Object> OBJECT_ADAPTER = MOSHI.adapter(Object.class);
+ 
+   static List<Object[]> factories() {
+-    final JsonWriterFactory bufferedSink = new JsonWriterFactory() {
++    final JsonCodecFactory bufferedSink = new JsonCodecFactory() {
+       Buffer buffer;
+ 
++      @Override public JsonReader newReader(String json) {
++        Buffer buffer = new Buffer().writeUtf8(json);
++        return JsonReader.of(buffer);
++      }
++
+       @Override JsonWriter newWriter() {
+         buffer = new Buffer();
+         return new BufferedSinkJsonWriter(buffer);
+@@ -39,18 +44,29 @@ abstract class JsonWriterFactory {
+         return result;
+       }
+ 
+-      @Override boolean supportsMultipleTopLevelValuesInOneDocument() {
++      @Override boolean encodesToBytes() {
+         return true;
+       }
+ 
+       @Override public String toString() {
+-        return "BufferedSinkJsonWriter";
++        return "Buffer";
+       }
+     };
+ 
+-    final JsonWriterFactory object = new JsonWriterFactory() {
++    final JsonCodecFactory object = new JsonCodecFactory() {
+       ObjectJsonWriter writer;
+ 
++      @Override public JsonReader newReader(String json) throws IOException {
++        Moshi moshi = new Moshi.Builder().build();
++        Object object = moshi.adapter(Object.class).lenient().fromJson(json);
++        return new ObjectJsonReader(object);
++      }
++
++      // TODO(jwilson): fix precision checks and delete his method.
++      @Override boolean implementsStrictPrecision() {
++        return false;
++      }
++
+       @Override JsonWriter newWriter() {
+         writer = new ObjectJsonWriter();
+         return writer;
+@@ -62,6 +78,7 @@ abstract class JsonWriterFactory {
+           Buffer buffer = new Buffer();
+           JsonWriter bufferedSinkWriter = JsonWriter.of(buffer);
+           bufferedSinkWriter.setSerializeNulls(true);
++          bufferedSinkWriter.setLenient(true);
+           OBJECT_ADAPTER.toJson(bufferedSinkWriter, writer.root());
+           return buffer.readUtf8();
+         } catch (IOException e) {
+@@ -75,7 +92,7 @@ abstract class JsonWriterFactory {
+       }
+ 
+       @Override public String toString() {
+-        return "ObjectJsonWriter";
++        return "Object";
+       }
+     };
+ 
+@@ -84,10 +101,17 @@ abstract class JsonWriterFactory {
+         new Object[] { object });
+   }
+ 
++  abstract JsonReader newReader(String json) throws IOException;
++
+   abstract JsonWriter newWriter();
++
++  boolean implementsStrictPrecision() {
++    return true;
++  }
++
+   abstract String json();
+ 
+-  boolean supportsMultipleTopLevelValuesInOneDocument() {
++  boolean encodesToBytes() {
+     return false;
+   }
+ 
+diff --git a/moshi/src/test/java/com/squareup/moshi/JsonReaderFactory.java b/moshi/src/test/java/com/squareup/moshi/JsonReaderFactory.java
+deleted file mode 100644
+index d8ca8560..00000000
+--- a/moshi/src/test/java/com/squareup/moshi/JsonReaderFactory.java
++++ /dev/null
+@@ -1,71 +0,0 @@
+-/*
+- * Copyright (C) 2017 Square, Inc.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-package com.squareup.moshi;
+-
+-import java.io.IOException;
+-import java.util.Arrays;
+-import java.util.List;
+-import okio.Buffer;
+-
+-abstract class JsonReaderFactory {
+-  static List<Object[]> factories() {
+-    JsonReaderFactory bufferedSource = new JsonReaderFactory() {
+-      @Override public JsonReader newReader(String json) {
+-        Buffer buffer = new Buffer().writeUtf8(json);
+-        return JsonReader.of(buffer);
+-      }
+-
+-      @Override boolean supportsMultipleTopLevelValuesInOneDocument() {
+-        return true;
+-      }
+-
+-      @Override public String toString() {
+-        return "BufferedSourceJsonReader";
+-      }
+-    };
+-
+-    JsonReaderFactory jsonObject = new JsonReaderFactory() {
+-      @Override public JsonReader newReader(String json) throws IOException {
+-        Moshi moshi = new Moshi.Builder().build();
+-        Object object = moshi.adapter(Object.class).lenient().fromJson(json);
+-        return new ObjectJsonReader(object);
+-      }
+-
+-      // TODO(jwilson): fix precision checks and delete his method.
+-      @Override boolean implementsStrictPrecision() {
+-        return false;
+-      }
+-
+-      @Override public String toString() {
+-        return "ObjectJsonReader";
+-      }
+-    };
+-
+-    return Arrays.asList(
+-        new Object[] { bufferedSource },
+-        new Object[] { jsonObject });
+-  }
+-
+-  abstract JsonReader newReader(String json) throws IOException;
+-
+-  boolean supportsMultipleTopLevelValuesInOneDocument() {
+-    return false;
+-  }
+-
+-  boolean implementsStrictPrecision() {
+-    return true;
+-  }
+-}
+diff --git a/moshi/src/test/java/com/squareup/moshi/JsonReaderPathTest.java b/moshi/src/test/java/com/squareup/moshi/JsonReaderPathTest.java
+index 7be08607..875232ec 100644
+--- a/moshi/src/test/java/com/squareup/moshi/JsonReaderPathTest.java
++++ b/moshi/src/test/java/com/squareup/moshi/JsonReaderPathTest.java
+@@ -28,11 +28,11 @@ import static org.junit.Assume.assumeTrue;
+ 
+ @RunWith(Parameterized.class)
+ public final class JsonReaderPathTest {
+-  @Parameter public JsonReaderFactory factory;
++  @Parameter public JsonCodecFactory factory;
+ 
+   @Parameters(name = "{0}")
+   public static List<Object[]> parameters() {
+-    return JsonReaderFactory.factories();
++    return JsonCodecFactory.factories();
+   }
+ 
+   @Test public void path() throws IOException {
+@@ -185,7 +185,7 @@ public final class JsonReaderPathTest {
+   }
+ 
+   @Test public void multipleTopLevelValuesInOneDocument() throws IOException {
+-    assumeTrue(factory.supportsMultipleTopLevelValuesInOneDocument());
++    assumeTrue(factory.encodesToBytes());
+ 
+     JsonReader reader = factory.newReader("[][]");
+     reader.setLenient(true);
+diff --git a/moshi/src/test/java/com/squareup/moshi/JsonReaderTest.java b/moshi/src/test/java/com/squareup/moshi/JsonReaderTest.java
+index 361635c0..bfb56649 100644
+--- a/moshi/src/test/java/com/squareup/moshi/JsonReaderTest.java
++++ b/moshi/src/test/java/com/squareup/moshi/JsonReaderTest.java
+@@ -28,7 +28,6 @@ import static com.squareup.moshi.JsonReader.Token.BEGIN_ARRAY;
+ import static com.squareup.moshi.JsonReader.Token.BEGIN_OBJECT;
+ import static com.squareup.moshi.JsonReader.Token.NAME;
+ import static com.squareup.moshi.JsonReader.Token.STRING;
+-import static com.squareup.moshi.TestUtil.newReader;
+ import static com.squareup.moshi.TestUtil.repeat;
+ import static org.assertj.core.api.Assertions.assertThat;
+ import static org.junit.Assert.assertEquals;
+@@ -37,11 +36,11 @@ import static org.junit.Assume.assumeTrue;
+ 
+ @RunWith(Parameterized.class)
+ public final class JsonReaderTest {
+-  @Parameter public JsonReaderFactory factory;
++  @Parameter public JsonCodecFactory factory;
+ 
+   @Parameters(name = "{0}")
+   public static List<Object[]> parameters() {
+-    return JsonReaderFactory.factories();
++    return JsonCodecFactory.factories();
+   }
+ 
+   JsonReader newReader(String json) throws IOException {
+diff --git a/moshi/src/test/java/com/squareup/moshi/JsonWriterPathTest.java b/moshi/src/test/java/com/squareup/moshi/JsonWriterPathTest.java
+index bce20c53..ad9ca0cd 100644
+--- a/moshi/src/test/java/com/squareup/moshi/JsonWriterPathTest.java
++++ b/moshi/src/test/java/com/squareup/moshi/JsonWriterPathTest.java
+@@ -29,11 +29,11 @@ import static org.junit.Assume.assumeTrue;
+ 
+ @RunWith(Parameterized.class)
+ public final class JsonWriterPathTest {
+-  @Parameter public JsonWriterFactory factory;
++  @Parameter public JsonCodecFactory factory;
+ 
+   @Parameters(name = "{0}")
+   public static List<Object[]> parameters() {
+-    return JsonWriterFactory.factories();
++    return JsonCodecFactory.factories();
+   }
+ 
+   @Test public void path() throws IOException {
+@@ -202,7 +202,7 @@ public final class JsonWriterPathTest {
+   }
+ 
+   @Test public void multipleTopLevelValuesInOneDocument() throws IOException {
+-    assumeTrue(factory.supportsMultipleTopLevelValuesInOneDocument());
++    assumeTrue(factory.encodesToBytes());
+ 
+     JsonWriter writer = factory.newWriter();
+     writer.setLenient(true);
+diff --git a/moshi/src/test/java/com/squareup/moshi/JsonWriterTest.java b/moshi/src/test/java/com/squareup/moshi/JsonWriterTest.java
+index 55abfa6a..571f6446 100644
+--- a/moshi/src/test/java/com/squareup/moshi/JsonWriterTest.java
++++ b/moshi/src/test/java/com/squareup/moshi/JsonWriterTest.java
+@@ -31,11 +31,11 @@ import static org.junit.Assume.assumeTrue;
+ 
+ @RunWith(Parameterized.class)
+ public final class JsonWriterTest {
+-  @Parameter public JsonWriterFactory factory;
++  @Parameter public JsonCodecFactory factory;
+ 
+   @Parameters(name = "{0}")
+   public static List<Object[]> parameters() {
+-    return JsonWriterFactory.factories();
++    return JsonCodecFactory.factories();
+   }
+ 
+   @Test public void nullsValuesNotSerializedByDefault() throws IOException {
+@@ -469,7 +469,7 @@ public final class JsonWriterTest {
+   }
+ 
+   @Test public void lenientWriterPermitsMultipleTopLevelValues() throws IOException {
+-    assumeTrue(factory.supportsMultipleTopLevelValuesInOneDocument());
++    assumeTrue(factory.encodesToBytes());
+ 
+     JsonWriter writer = factory.newWriter();
+     writer.setLenient(true);
+diff --git a/moshi/src/test/java/com/squareup/moshi/MapJsonAdapterTest.java b/moshi/src/test/java/com/squareup/moshi/MapJsonAdapterTest.java
+index 0fb19554..bb07498f 100644
+--- a/moshi/src/test/java/com/squareup/moshi/MapJsonAdapterTest.java
++++ b/moshi/src/test/java/com/squareup/moshi/MapJsonAdapterTest.java
+@@ -125,6 +125,22 @@ public final class MapJsonAdapterTest {
+         MapEntry.entry(5, true), MapEntry.entry(6, false), MapEntry.entry(7, null));
+   }
+ 
++  @Test public void mapWithNonStringKeysToJsonObject() throws Exception {
++    Map<Integer, Boolean> map = new LinkedHashMap<>();
++    map.put(5, true);
++    map.put(6, false);
++    map.put(7, null);
++
++    Map<String, Boolean> jsonObject = new LinkedHashMap<>();
++    jsonObject.put("5", true);
++    jsonObject.put("6", false);
++    jsonObject.put("7", null);
++
++    JsonAdapter<Map<Integer, Boolean>> jsonAdapter = mapAdapter(Integer.class, Boolean.class);
++    assertThat(jsonAdapter.serializeNulls().toJsonObject(map)).isEqualTo(jsonObject);
++    assertThat(jsonAdapter.fromJsonObject(jsonObject)).isEqualTo(map);
++  }
++
+   private <K, V> String toJson(Type keyType, Type valueType, Map<K, V> value) throws IOException {
+     JsonAdapter<Map<K, V>> jsonAdapter = mapAdapter(keyType, valueType);
+     Buffer buffer = new Buffer();
+diff --git a/moshi/src/test/java/com/squareup/moshi/PromoteNameToValueTest.java b/moshi/src/test/java/com/squareup/moshi/PromoteNameToValueTest.java
+index 284b095d..c50005dc 100644
+--- a/moshi/src/test/java/com/squareup/moshi/PromoteNameToValueTest.java
++++ b/moshi/src/test/java/com/squareup/moshi/PromoteNameToValueTest.java
+@@ -15,15 +15,27 @@
+  */
+ package com.squareup.moshi;
+ 
+-import okio.Buffer;
++import java.util.List;
+ import org.junit.Test;
++import org.junit.runner.RunWith;
++import org.junit.runners.Parameterized;
++import org.junit.runners.Parameterized.Parameter;
++import org.junit.runners.Parameterized.Parameters;
+ 
+ import static org.assertj.core.api.Assertions.assertThat;
+ import static org.junit.Assert.fail;
+ 
++@RunWith(Parameterized.class)
+ public final class PromoteNameToValueTest {
++  @Parameter public JsonCodecFactory factory;
++
++  @Parameters(name = "{0}")
++  public static List<Object[]> parameters() {
++    return JsonCodecFactory.factories();
++  }
++
+   @Test public void readerStringValue() throws Exception {
+-    JsonReader reader = newReader("{\"a\":1}");
++    JsonReader reader = factory.newReader("{\"a\":1}");
+     reader.beginObject();
+     reader.promoteNameToValue();
+     assertThat(reader.getPath()).isEqualTo("$.a");
+@@ -37,7 +49,7 @@ public final class PromoteNameToValueTest {
+   }
+ 
+   @Test public void readerIntegerValue() throws Exception {
+-    JsonReader reader = newReader("{\"5\":1}");
++    JsonReader reader = factory.newReader("{\"5\":1}");
+     reader.beginObject();
+     reader.promoteNameToValue();
+     assertThat(reader.getPath()).isEqualTo("$.5");
+@@ -51,7 +63,7 @@ public final class PromoteNameToValueTest {
+   }
+ 
+   @Test public void readerDoubleValue() throws Exception {
+-    JsonReader reader = newReader("{\"5.5\":1}");
++    JsonReader reader = factory.newReader("{\"5.5\":1}");
+     reader.beginObject();
+     reader.promoteNameToValue();
+     assertThat(reader.getPath()).isEqualTo("$.5.5");
+@@ -65,7 +77,7 @@ public final class PromoteNameToValueTest {
+   }
+ 
+   @Test public void readerBooleanValue() throws Exception {
+-    JsonReader reader = newReader("{\"true\":1}");
++    JsonReader reader = factory.newReader("{\"true\":1}");
+     reader.beginObject();
+     reader.promoteNameToValue();
+     assertThat(reader.getPath()).isEqualTo("$.true");
+@@ -74,7 +86,9 @@ public final class PromoteNameToValueTest {
+       reader.nextBoolean();
+       fail();
+     } catch (JsonDataException e) {
+-      assertThat(e).hasMessage("Expected a boolean but was STRING at path $.true");
++      assertThat(e.getMessage()).isIn(
++          "Expected BOOLEAN but was true, a java.lang.String, at path $.true",
++          "Expected a boolean but was STRING at path $.true");
+     }
+     assertThat(reader.getPath()).isEqualTo("$.true");
+     assertThat(reader.nextString()).isEqualTo("true");
+@@ -85,7 +99,7 @@ public final class PromoteNameToValueTest {
+   }
+ 
+   @Test public void readerLongValue() throws Exception {
+-    JsonReader reader = newReader("{\"5\":1}");
++    JsonReader reader = factory.newReader("{\"5\":1}");
+     reader.beginObject();
+     reader.promoteNameToValue();
+     assertThat(reader.getPath()).isEqualTo("$.5");
+@@ -99,7 +113,7 @@ public final class PromoteNameToValueTest {
+   }
+ 
+   @Test public void readerNullValue() throws Exception {
+-    JsonReader reader = newReader("{\"null\":1}");
++    JsonReader reader = factory.newReader("{\"null\":1}");
+     reader.beginObject();
+     reader.promoteNameToValue();
+     assertThat(reader.getPath()).isEqualTo("$.null");
+@@ -108,7 +122,9 @@ public final class PromoteNameToValueTest {
+       reader.nextNull();
+       fail();
+     } catch (JsonDataException e) {
+-      assertThat(e).hasMessage("Expected null but was STRING at path $.null");
++      assertThat(e.getMessage()).isIn(
++          "Expected NULL but was null, a java.lang.String, at path $.null",
++          "Expected null but was STRING at path $.null");
+     }
+     assertThat(reader.nextString()).isEqualTo("null");
+     assertThat(reader.getPath()).isEqualTo("$.null");
+@@ -119,7 +135,7 @@ public final class PromoteNameToValueTest {
+   }
+ 
+   @Test public void readerMultipleValueObject() throws Exception {
+-    JsonReader reader = newReader("{\"a\":1,\"b\":2}");
++    JsonReader reader = factory.newReader("{\"a\":1,\"b\":2}");
+     reader.beginObject();
+     assertThat(reader.nextName()).isEqualTo("a");
+     assertThat(reader.nextInt()).isEqualTo(1);
+@@ -135,7 +151,7 @@ public final class PromoteNameToValueTest {
+   }
+ 
+   @Test public void readerEmptyValueObject() throws Exception {
+-    JsonReader reader = newReader("{}");
++    JsonReader reader = factory.newReader("{}");
+     reader.beginObject();
+     assertThat(reader.peek()).isEqualTo(JsonReader.Token.END_OBJECT);
+     reader.promoteNameToValue();
+@@ -145,7 +161,7 @@ public final class PromoteNameToValueTest {
+   }
+ 
+   @Test public void readerUnusedPromotionDoesntPersist() throws Exception {
+-    JsonReader reader = newReader("[{},{\"a\":5}]");
++    JsonReader reader = factory.newReader("[{},{\"a\":5}]");
+     reader.beginArray();
+     reader.beginObject();
+     reader.promoteNameToValue();
+@@ -160,7 +176,7 @@ public final class PromoteNameToValueTest {
+   }
+ 
+   @Test public void readerUnquotedIntegerValue() throws Exception {
+-    JsonReader reader = newReader("{5:1}");
++    JsonReader reader = factory.newReader("{5:1}");
+     reader.setLenient(true);
+     reader.beginObject();
+     reader.promoteNameToValue();
+@@ -170,7 +186,7 @@ public final class PromoteNameToValueTest {
+   }
+ 
+   @Test public void readerUnquotedLongValue() throws Exception {
+-    JsonReader reader = newReader("{5:1}");
++    JsonReader reader = factory.newReader("{5:1}");
+     reader.setLenient(true);
+     reader.beginObject();
+     reader.promoteNameToValue();
+@@ -180,7 +196,7 @@ public final class PromoteNameToValueTest {
+   }
+ 
+   @Test public void readerUnquotedDoubleValue() throws Exception {
+-    JsonReader reader = newReader("{5:1}");
++    JsonReader reader = factory.newReader("{5:1}");
+     reader.setLenient(true);
+     reader.beginObject();
+     reader.promoteNameToValue();
+@@ -189,57 +205,49 @@ public final class PromoteNameToValueTest {
+     reader.endObject();
+   }
+ 
+-  private JsonReader newReader(String s) {
+-    return JsonReader.of(new Buffer().writeUtf8(s));
+-  }
+-
+   @Test public void writerStringValue() throws Exception {
+-    Buffer buffer = new Buffer();
+-    JsonWriter writer = JsonWriter.of(buffer);
++    JsonWriter writer = factory.newWriter();
+     writer.beginObject();
+-    writer.promoteNameToValue();
++    writer.promoteValueToName();
+     writer.value("a");
+     assertThat(writer.getPath()).isEqualTo("$.a");
+     writer.value(1);
+     assertThat(writer.getPath()).isEqualTo("$.a");
+     writer.endObject();
+     assertThat(writer.getPath()).isEqualTo("$");
+-    assertThat(buffer.readUtf8()).isEqualTo("{\"a\":1}");
++    assertThat(factory.json()).isEqualTo("{\"a\":1}");
+   }
+ 
+   @Test public void writerIntegerValue() throws Exception {
+-    Buffer buffer = new Buffer();
+-    JsonWriter writer = JsonWriter.of(buffer);
++    JsonWriter writer = factory.newWriter();
+     writer.beginObject();
+-    writer.promoteNameToValue();
++    writer.promoteValueToName();
+     writer.value(5);
+     assertThat(writer.getPath()).isEqualTo("$.5");
+     writer.value(1);
+     assertThat(writer.getPath()).isEqualTo("$.5");
+     writer.endObject();
+     assertThat(writer.getPath()).isEqualTo("$");
+-    assertThat(buffer.readUtf8()).isEqualTo("{\"5\":1}");
++    assertThat(factory.json()).isEqualTo("{\"5\":1}");
+   }
+ 
+   @Test public void writerDoubleValue() throws Exception {
+-    Buffer buffer = new Buffer();
+-    JsonWriter writer = JsonWriter.of(buffer);
++    JsonWriter writer = factory.newWriter();
+     writer.beginObject();
+-    writer.promoteNameToValue();
++    writer.promoteValueToName();
+     writer.value(5.5d);
+     assertThat(writer.getPath()).isEqualTo("$.5.5");
+     writer.value(1);
+     assertThat(writer.getPath()).isEqualTo("$.5.5");
+     writer.endObject();
+     assertThat(writer.getPath()).isEqualTo("$");
+-    assertThat(buffer.readUtf8()).isEqualTo("{\"5.5\":1}");
++    assertThat(factory.json()).isEqualTo("{\"5.5\":1}");
+   }
+ 
+   @Test public void writerBooleanValue() throws Exception {
+-    Buffer buffer = new Buffer();
+-    JsonWriter writer = JsonWriter.of(buffer);
++    JsonWriter writer = factory.newWriter();
+     writer.beginObject();
+-    writer.promoteNameToValue();
++    writer.promoteValueToName();
+     try {
+       writer.value(true);
+       fail();
+@@ -251,28 +259,26 @@ public final class PromoteNameToValueTest {
+     writer.value(1);
+     writer.endObject();
+     assertThat(writer.getPath()).isEqualTo("$");
+-    assertThat(buffer.readUtf8()).isEqualTo("{\"true\":1}");
++    assertThat(factory.json()).isEqualTo("{\"true\":1}");
+   }
+ 
+   @Test public void writerLongValue() throws Exception {
+-    Buffer buffer = new Buffer();
+-    JsonWriter writer = JsonWriter.of(buffer);
++    JsonWriter writer = factory.newWriter();
+     writer.beginObject();
+-    writer.promoteNameToValue();
++    writer.promoteValueToName();
+     writer.value(5L);
+     assertThat(writer.getPath()).isEqualTo("$.5");
+     writer.value(1);
+     assertThat(writer.getPath()).isEqualTo("$.5");
+     writer.endObject();
+     assertThat(writer.getPath()).isEqualTo("$");
+-    assertThat(buffer.readUtf8()).isEqualTo("{\"5\":1}");
++    assertThat(factory.json()).isEqualTo("{\"5\":1}");
+   }
+ 
+   @Test public void writerNullValue() throws Exception {
+-    Buffer buffer = new Buffer();
+-    JsonWriter writer = JsonWriter.of(buffer);
++    JsonWriter writer = factory.newWriter();
+     writer.beginObject();
+-    writer.promoteNameToValue();
++    writer.promoteValueToName();
+     try {
+       writer.nullValue();
+       fail();
+@@ -285,42 +291,39 @@ public final class PromoteNameToValueTest {
+     assertThat(writer.getPath()).isEqualTo("$.null");
+     writer.endObject();
+     assertThat(writer.getPath()).isEqualTo("$");
+-    assertThat(buffer.readUtf8()).isEqualTo("{\"null\":1}");
++    assertThat(factory.json()).isEqualTo("{\"null\":1}");
+   }
+ 
+   @Test public void writerMultipleValueObject() throws Exception {
+-    Buffer buffer = new Buffer();
+-    JsonWriter writer = JsonWriter.of(buffer);
++    JsonWriter writer = factory.newWriter();
+     writer.beginObject();
+     writer.name("a");
+     writer.value(1);
+-    writer.promoteNameToValue();
++    writer.promoteValueToName();
+     writer.value("b");
+     assertThat(writer.getPath()).isEqualTo("$.b");
+     writer.value(2);
+     assertThat(writer.getPath()).isEqualTo("$.b");
+     writer.endObject();
+     assertThat(writer.getPath()).isEqualTo("$");
+-    assertThat(buffer.readUtf8()).isEqualTo("{\"a\":1,\"b\":2}");
++    assertThat(factory.json()).isEqualTo("{\"a\":1,\"b\":2}");
+   }
+ 
+   @Test public void writerEmptyValueObject() throws Exception {
+-    Buffer buffer = new Buffer();
+-    JsonWriter writer = JsonWriter.of(buffer);
++    JsonWriter writer = factory.newWriter();
+     writer.beginObject();
+-    writer.promoteNameToValue();
++    writer.promoteValueToName();
+     assertThat(writer.getPath()).isEqualTo("$.");
+     writer.endObject();
+     assertThat(writer.getPath()).isEqualTo("$");
+-    assertThat(buffer.readUtf8()).isEqualTo("{}");
++    assertThat(factory.json()).isEqualTo("{}");
+   }
+ 
+   @Test public void writerUnusedPromotionDoesntPersist() throws Exception {
+-    Buffer buffer = new Buffer();
+-    JsonWriter writer = JsonWriter.of(buffer);
++    JsonWriter writer = factory.newWriter();
+     writer.beginArray();
+     writer.beginObject();
+-    writer.promoteNameToValue();
++    writer.promoteValueToName();
+     writer.endObject();
+     writer.beginObject();
+     try {
+diff --git a/moshi/src/test/java/com/squareup/moshi/TypesTest.java b/moshi/src/test/java/com/squareup/moshi/TypesTest.java
+index 5b91809a..a41070ea 100644
+--- a/moshi/src/test/java/com/squareup/moshi/TypesTest.java
++++ b/moshi/src/test/java/com/squareup/moshi/TypesTest.java
+@@ -15,7 +15,6 @@
+  */
+ package com.squareup.moshi;
+ 
+-import java.lang.annotation.Retention;
+ import java.lang.reflect.ParameterizedType;
+ import java.lang.reflect.Type;
+ import java.util.ArrayList;
+@@ -24,7 +23,6 @@ import java.util.Map;
+ import java.util.Properties;
+ import org.junit.Test;
+ 
+-import static java.lang.annotation.RetentionPolicy.RUNTIME;
+ import static org.assertj.core.api.Assertions.assertThat;
+ import static org.junit.Assert.fail;
+ 
+@@ -145,20 +143,4 @@ public final class TypesTest {
+     assertThat(Types.mapKeyAndValueTypes(StringIntegerMap.class, StringIntegerMap.class))
+         .containsExactly(String.class, Integer.class);
+   }
+-
+-  @Test public void createJsonQualifierImplementation() throws Exception {
+-    TestQualifier actual = Types.createJsonQualifierImplementation(TestQualifier.class);
+-    TestQualifier expected =
+-        (TestQualifier) TypesTest.class.getDeclaredField("unused").getAnnotations()[0];
+-    assertThat(actual.annotationType()).isEqualTo(TestQualifier.class);
+-    assertThat(actual).isEqualTo(expected);
+-    assertThat(actual).isNotEqualTo(null);
+-    assertThat(actual.hashCode()).isEqualTo(expected.hashCode());
+-    assertThat(actual.getClass()).isNotEqualTo(TestQualifier.class);
+-  }
+-
+-  @TestQualifier private static Object unused;
+-
+-  @Retention(RUNTIME) @JsonQualifier @interface TestQualifier {
+-  }
+ }

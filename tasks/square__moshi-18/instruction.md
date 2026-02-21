@@ -1,0 +1,11 @@
+Moshi needs an internal map implementation that preserves insertion-order iteration while still providing efficient key lookups and predictable behavior when keys are comparable. Currently, using the existing map behavior causes incorrect iteration order and/or unsafe behavior in edge cases around removal and key comparability.
+
+Implement a `LinkedHashTreeMap<K, V>` class that behaves like an insertion-ordered map with tree-based lookup semantics, and ensure it correctly supports the following behaviors:
+
+- Insertion order must be preserved for iteration over `keySet()`, `values()`, and `entrySet()`. For example, after calling `put("a", "android")`, `put("c", "cola")`, `put("b", "bbq")`, iterating keys must yield `a, c, b` (and corresponding values `android, cola, bbq`).
+- Removing entries through an `Iterator<Map.Entry<K,V>>` over `entrySet()` must correctly unlink the removed node exactly once. In particular, if the iterator advances to the last entry and `remove()` is called, the remaining iteration order must still be correct (e.g., after removing the last inserted entry above, keys should iterate as `a, c`).
+- Null keys are not permitted: calling `put(null, value)` must throw `NullPointerException`.
+- Keys must be comparable (unless a custom comparator is supported and provided). If a non-comparable key is used with `put(nonComparableKey, value)`, it must throw `ClassCastException`.
+- Lookup methods must be safe with invalid keys: `containsKey(null)` must always return `false` (and must not throw), and `containsKey(nonComparableObject)` must return `false` rather than throwing.
+
+The class should expose the expected `Map`-like API used by callers (`put`, `get`, `remove`, `containsKey`, `entrySet`, `keySet`, `values`, and iterators). It must also include the internal types referenced by callers of this implementation: `LinkedHashTreeMap.Node`, `LinkedHashTreeMap.AvlIterator`, and `LinkedHashTreeMap.AvlBuilder` (with behavior consistent enough to support correct iteration, balancing, and safe mutation during iteration).

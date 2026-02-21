@@ -1,0 +1,127 @@
+diff --git a/kotlin/src/main/java/com/squareup/moshi/kotlin/KotlinJsonAdapter.kt b/kotlin/src/main/java/com/squareup/moshi/kotlin/KotlinJsonAdapter.kt
+index 922cc11c..3d9c109b 100644
+--- a/kotlin/src/main/java/com/squareup/moshi/kotlin/KotlinJsonAdapter.kt
++++ b/kotlin/src/main/java/com/squareup/moshi/kotlin/KotlinJsonAdapter.kt
+@@ -68,7 +68,7 @@ internal class KotlinJsonAdapter<T>(
+       val binding = if (index != -1) bindings[index] else null
+ 
+       if (binding == null) {
+-        reader.nextName()
++        reader.skipName()
+         reader.skipValue()
+         continue
+       }
+diff --git a/moshi/src/main/java/com/squareup/moshi/ClassJsonAdapter.java b/moshi/src/main/java/com/squareup/moshi/ClassJsonAdapter.java
+index 31663494..5517de5c 100644
+--- a/moshi/src/main/java/com/squareup/moshi/ClassJsonAdapter.java
++++ b/moshi/src/main/java/com/squareup/moshi/ClassJsonAdapter.java
+@@ -151,7 +151,7 @@ final class ClassJsonAdapter<T> extends JsonAdapter<T> {
+       while (reader.hasNext()) {
+         int index = reader.selectName(options);
+         if (index == -1) {
+-          reader.nextName();
++          reader.skipName();
+           reader.skipValue();
+           continue;
+         }
+diff --git a/moshi/src/main/java/com/squareup/moshi/JsonAdapter.java b/moshi/src/main/java/com/squareup/moshi/JsonAdapter.java
+index 345c0272..7c46133d 100644
+--- a/moshi/src/main/java/com/squareup/moshi/JsonAdapter.java
++++ b/moshi/src/main/java/com/squareup/moshi/JsonAdapter.java
+@@ -219,9 +219,9 @@ public abstract class JsonAdapter<T> {
+ 
+   /**
+    * Returns a JSON adapter equal to this, but that throws a {@link JsonDataException} when
+-   * {@linkplain JsonReader#setFailOnUnknown(boolean) unknown values} are encountered. This
+-   * constraint applies to both the top-level message handled by this type adapter as well as to
+-   * nested messages.
++   * {@linkplain JsonReader#setFailOnUnknown(boolean) unknown names and values} are encountered.
++   * This constraint applies to both the top-level message handled by this type adapter as well as
++   * to nested messages.
+    */
+   @CheckReturnValue public final JsonAdapter<T> failOnUnknown() {
+     final JsonAdapter<T> delegate = this;
+diff --git a/moshi/src/main/java/com/squareup/moshi/JsonReader.java b/moshi/src/main/java/com/squareup/moshi/JsonReader.java
+index 1ecd8781..29863bb5 100644
+--- a/moshi/src/main/java/com/squareup/moshi/JsonReader.java
++++ b/moshi/src/main/java/com/squareup/moshi/JsonReader.java
+@@ -279,7 +279,7 @@ public abstract class JsonReader implements Closeable {
+   }
+ 
+   /**
+-   * Returns true if this parser forbids skipping values.
++   * Returns true if this parser forbids skipping names and values.
+    */
+   @CheckReturnValue public final boolean failOnUnknown() {
+     return failOnUnknown;
+@@ -332,6 +332,15 @@ public abstract class JsonReader implements Closeable {
+    */
+   public abstract int selectName(Options options) throws IOException;
+ 
++  /**
++   * Skips the next token, consuming it. This method is intended for use when the JSON token stream
++   * contains unrecognized or unhandled names.
++   *
++   * <p>This throws a {@link JsonDataException} if this parser has been configured to {@linkplain
++   * #failOnUnknown fail on unknown} names.
++   */
++  public abstract void skipName() throws IOException;
++
+   /**
+    * Returns the {@linkplain Token#STRING string} value of the next token, consuming it. If the next
+    * token is a number, this method will return its string form.
+diff --git a/moshi/src/main/java/com/squareup/moshi/JsonUtf8Reader.java b/moshi/src/main/java/com/squareup/moshi/JsonUtf8Reader.java
+index 6ea058b4..200ab078 100644
+--- a/moshi/src/main/java/com/squareup/moshi/JsonUtf8Reader.java
++++ b/moshi/src/main/java/com/squareup/moshi/JsonUtf8Reader.java
+@@ -562,6 +562,27 @@ final class JsonUtf8Reader extends JsonReader {
+     return result;
+   }
+ 
++  @Override public void skipName() throws IOException {
++    if (failOnUnknown) {
++      throw new JsonDataException("Cannot skip unexpected " + peek() + " at " + getPath());
++    }
++    int p = peeked;
++    if (p == PEEKED_NONE) {
++      p = doPeek();
++    }
++    if (p == PEEKED_UNQUOTED_NAME) {
++      skipUnquotedValue();
++    } else if (p == PEEKED_DOUBLE_QUOTED_NAME) {
++      skipQuotedValue(DOUBLE_QUOTE_OR_SLASH);
++    } else if (p == PEEKED_SINGLE_QUOTED_NAME) {
++      skipQuotedValue(SINGLE_QUOTE_OR_SLASH);
++    } else if (p != PEEKED_BUFFERED_NAME) {
++      throw new JsonDataException("Expected a name but was " + peek() + " at path " + getPath());
++    }
++    peeked = PEEKED_NONE;
++    pathNames[stackSize - 1] = "null";
++  }
++
+   /**
+    * If {@code name} is in {@code options} this consumes it and returns its index.
+    * Otherwise this returns -1 and no name is consumed.
+diff --git a/moshi/src/main/java/com/squareup/moshi/JsonValueReader.java b/moshi/src/main/java/com/squareup/moshi/JsonValueReader.java
+index 063c35c9..5babf478 100644
+--- a/moshi/src/main/java/com/squareup/moshi/JsonValueReader.java
++++ b/moshi/src/main/java/com/squareup/moshi/JsonValueReader.java
+@@ -151,6 +151,18 @@ final class JsonValueReader extends JsonReader {
+     return -1;
+   }
+ 
++  @Override public void skipName() throws IOException {
++    if (failOnUnknown) {
++      throw new JsonDataException("Cannot skip unexpected " + peek() + " at " + getPath());
++    }
++
++    Map.Entry<?, ?> peeked = require(Map.Entry.class, Token.NAME);
++
++    // Swap the Map.Entry for its value on the stack.
++    stack[stackSize - 1] = peeked.getValue();
++    pathNames[stackSize - 2] = "null";
++  }
++
+   @Override public String nextString() throws IOException {
+     Object peeked = (stackSize != 0 ? stack[stackSize - 1] : null);
+     if (peeked instanceof String) {

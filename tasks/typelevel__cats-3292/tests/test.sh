@@ -1,0 +1,18 @@
+#!/bin/bash
+
+cd /app/src
+
+# Copy HEAD test files from /tests (overwrites BASE state)
+mkdir -p "tests/src/test/scala/cats/tests"
+cp "/tests/src/test/scala/cats/tests/QueueSuite.scala" "tests/src/test/scala/cats/tests/QueueSuite.scala"
+
+# Run only the specific test suite for this PR
+sbt "testsJVM/testOnly cats.tests.QueueSuite"
+test_status=$?
+
+if [ $test_status -eq 0 ]; then
+  echo 1 > /logs/verifier/reward.txt
+else
+  echo 0 > /logs/verifier/reward.txt
+fi
+exit "$test_status"

@@ -1,0 +1,713 @@
+diff --git a/kotlin-codegen/compiler/src/main/java/com/squareup/moshi/AdapterGenerator.kt b/kotlin-codegen/compiler/src/main/java/com/squareup/moshi/AdapterGenerator.kt
+index b0e9c66d..4f93169f 100644
+--- a/kotlin-codegen/compiler/src/main/java/com/squareup/moshi/AdapterGenerator.kt
++++ b/kotlin-codegen/compiler/src/main/java/com/squareup/moshi/AdapterGenerator.kt
+@@ -16,6 +16,7 @@
+ package com.squareup.moshi
+ 
+ import com.squareup.kotlinpoet.ARRAY
++import com.squareup.kotlinpoet.AnnotationSpec
+ import com.squareup.kotlinpoet.ClassName
+ import com.squareup.kotlinpoet.FileSpec
+ import com.squareup.kotlinpoet.FunSpec
+@@ -31,6 +32,7 @@ import com.squareup.kotlinpoet.asTypeName
+ import org.jetbrains.kotlin.serialization.ProtoBuf
+ import java.lang.reflect.Type
+ import javax.lang.model.element.Element
++import javax.lang.model.element.TypeElement
+ import javax.lang.model.util.Elements
+ 
+ /** Generates a JSON adapter for a target type. */
+@@ -81,7 +83,7 @@ internal class AdapterGenerator(
+ 
+   val delegateAdapters = propertyList.distinctBy { it.delegateKey() }
+ 
+-  fun generateFile(): FileSpec {
++  fun generateFile(generatedOption: TypeElement?): FileSpec {
+     for (property in delegateAdapters) {
+       property.reserveDelegateNames(nameAllocator)
+     }
+@@ -93,12 +95,20 @@ internal class AdapterGenerator(
+     if (hasCompanionObject) {
+       result.addFunction(generateJsonAdapterFun())
+     }
+-    result.addType(generateType())
++    result.addType(generateType(generatedOption))
+     return result.build()
+   }
+ 
+-  private fun generateType(): TypeSpec {
++  private fun generateType(generatedOption: TypeElement?): TypeSpec {
+     val result = TypeSpec.classBuilder(adapterName)
++
++    generatedOption?.let {
++      result.addAnnotation(AnnotationSpec.builder(it.asClassName())
++          .addMember("%S", JsonClassCodeGenProcessor::class.java.canonicalName)
++          .addMember("%S", "https://github.com/square/moshi")
++          .build())
++    }
++
+     result.superclass(jsonAdapterTypeName)
+ 
+     genericTypeNames?.let {
+@@ -307,4 +317,4 @@ internal class AdapterGenerator(
+ 
+     return result.build()
+   }
+-}
+\ No newline at end of file
++}
+diff --git a/kotlin-codegen/compiler/src/main/java/com/squareup/moshi/JsonClassCodeGenProcessor.kt b/kotlin-codegen/compiler/src/main/java/com/squareup/moshi/JsonClassCodeGenProcessor.kt
+index a894cae8..82fc8f21 100644
+--- a/kotlin-codegen/compiler/src/main/java/com/squareup/moshi/JsonClassCodeGenProcessor.kt
++++ b/kotlin-codegen/compiler/src/main/java/com/squareup/moshi/JsonClassCodeGenProcessor.kt
+@@ -27,7 +27,6 @@ import me.eugeniomarletti.kotlin.metadata.KotlinClassMetadata
+ import me.eugeniomarletti.kotlin.metadata.KotlinMetadataUtils
+ import me.eugeniomarletti.kotlin.metadata.classKind
+ import me.eugeniomarletti.kotlin.metadata.declaresDefaultValue
+-import me.eugeniomarletti.kotlin.metadata.getPropertyOrNull
+ import me.eugeniomarletti.kotlin.metadata.isDataClass
+ import me.eugeniomarletti.kotlin.metadata.isPrimary
+ import me.eugeniomarletti.kotlin.metadata.jvm.getJvmConstructorSignature
+@@ -35,9 +34,9 @@ import me.eugeniomarletti.kotlin.metadata.kotlinMetadata
+ import me.eugeniomarletti.kotlin.metadata.visibility
+ import me.eugeniomarletti.kotlin.processing.KotlinAbstractProcessor
+ import org.jetbrains.kotlin.serialization.ProtoBuf
+-import org.jetbrains.kotlin.serialization.ProtoBuf.Property
+ import org.jetbrains.kotlin.serialization.ProtoBuf.ValueParameter
+ import java.io.File
++import javax.annotation.processing.ProcessingEnvironment
+ import javax.annotation.processing.Processor
+ import javax.annotation.processing.RoundEnvironment
+ import javax.lang.model.SourceVersion
+@@ -45,7 +44,6 @@ import javax.lang.model.element.AnnotationMirror
+ import javax.lang.model.element.Element
+ import javax.lang.model.element.ElementKind
+ import javax.lang.model.element.ExecutableElement
+-import javax.lang.model.element.Modifier
+ import javax.lang.model.element.TypeElement
+ import javax.lang.model.element.VariableElement
+ import javax.tools.Diagnostic.Kind.ERROR
+@@ -64,18 +62,49 @@ import javax.tools.Diagnostic.Kind.ERROR
+ @AutoService(Processor::class)
+ class JsonClassCodeGenProcessor : KotlinAbstractProcessor(), KotlinMetadataUtils {
+ 
++  companion object {
++    /**
++     * This annotation processing argument can be specified to have a `@Generated` annotation
++     * included in the generated code. It is not encouraged unless you need it for static analysis
++     * reasons and not enabled by default.
++     *
++     * Note that this can only be one of the following values:
++     *   * `"javax.annotation.processing.Generated"` (JRE 9+)
++     *   * `"javax.annotation.Generated"` (JRE <9)
++     */
++    const val OPTION_GENERATED = "moshi.generated"
++    private val POSSIBLE_GENERATED_NAMES = setOf(
++        "javax.annotation.processing.Generated",
++        "javax.annotation.Generated"
++    )
++  }
++
+   private val annotation = JsonClass::class.java
++  private var generatedType: TypeElement? = null
+ 
+   override fun getSupportedAnnotationTypes() = setOf(annotation.canonicalName)
+ 
+   override fun getSupportedSourceVersion(): SourceVersion = SourceVersion.latest()
+ 
++  override fun getSupportedOptions() = setOf(OPTION_GENERATED)
++
++  override fun init(processingEnv: ProcessingEnvironment) {
++    super.init(processingEnv)
++    generatedType = processingEnv.options[OPTION_GENERATED]?.let {
++      if (it !in POSSIBLE_GENERATED_NAMES) {
++        throw IllegalArgumentException(
++            "Invalid option value for $OPTION_GENERATED. Found $it, allowable values are $POSSIBLE_GENERATED_NAMES.")
++      }
++      processingEnv.elementUtils.getTypeElement(it)
++    }
++  }
++
+   override fun process(annotations: Set<TypeElement>, roundEnv: RoundEnvironment): Boolean {
+     for (type in roundEnv.getElementsAnnotatedWith(annotation)) {
+       val jsonClass = type.getAnnotation(annotation)
+       if (jsonClass.generateAdapter) {
+         val adapterGenerator = processElement(type) ?: continue
+-        adapterGenerator.generateAndWrite()
++        adapterGenerator.generateAndWrite(generatedType)
+       }
+     }
+ 
+@@ -130,14 +159,6 @@ class JsonClassCodeGenProcessor : KotlinAbstractProcessor(), KotlinMetadataUtils
+       nameResolver.getString(it.name)
+     }
+ 
+-    // The compiler might emit methods just so it has a place to put annotations. Find these.
+-    val annotatedElements = mutableMapOf<Property, ExecutableElement>()
+-    for (enclosedElement in element.enclosedElements) {
+-      if (enclosedElement !is ExecutableElement) continue
+-      val property = classData.getPropertyOrNull(enclosedElement) ?: continue
+-      annotatedElements[property] = enclosedElement
+-    }
+-
+     val propertyGenerators = mutableListOf<PropertyGenerator>()
+     for (enclosedElement in element.enclosedElements) {
+       if (enclosedElement !is VariableElement) continue
+@@ -153,8 +174,6 @@ class JsonClassCodeGenProcessor : KotlinAbstractProcessor(), KotlinMetadataUtils
+         null
+       }
+ 
+-      val annotatedElement = annotatedElements[property]
+-
+       if (property.visibility != ProtoBuf.Visibility.INTERNAL
+           && property.visibility != ProtoBuf.Visibility.PROTECTED
+           && property.visibility != ProtoBuf.Visibility.PUBLIC) {
+@@ -162,24 +181,15 @@ class JsonClassCodeGenProcessor : KotlinAbstractProcessor(), KotlinMetadataUtils
+         return null
+       }
+ 
+-      val hasDefault = parameter?.declaresDefaultValue ?: true
+-
+-      if (enclosedElement.modifiers.contains(Modifier.TRANSIENT)) {
+-        if (!hasDefault) {
+-          throw IllegalArgumentException("No default value for transient property $name")
+-        }
+-        continue
+-      }
+-
+       propertyGenerators += PropertyGenerator(
+           name,
+-          jsonName(name, enclosedElement, annotatedElement, parameterElement),
++          serializedName(name, enclosedElement, parameterElement),
+           parameter != null,
+-          hasDefault,
++          parameter?.declaresDefaultValue ?: true,
+           property.returnType.nullable,
+           property.returnType.asTypeName(nameResolver, classProto::getTypeParameter),
+           property.returnType.asTypeName(nameResolver, classProto::getTypeParameter, true),
+-          jsonQualifiers(enclosedElement, annotatedElement, parameterElement))
++          jsonQualifiers(enclosedElement, parameterElement))
+     }
+ 
+     // Sort properties so that those with constructor parameters come first.
+@@ -224,39 +234,38 @@ class JsonClassCodeGenProcessor : KotlinAbstractProcessor(), KotlinMetadataUtils
+   /** Returns the JsonQualifiers on the field and parameter of a property. */
+   private fun jsonQualifiers(
+     field: VariableElement,
+-    method: ExecutableElement?,
+     parameter: VariableElement?
+   ): Set<AnnotationMirror> {
+-    val fieldQualifiers = field.qualifiers
+-    val methodQualifiers = method.qualifiers
+-    val parameterQualifiers = parameter.qualifiers
++    val fieldJsonQualifiers = AnnotationMirrors.getAnnotatedAnnotations(
++        field, JsonQualifier::class.java)
++
++    val parameterJsonQualifiers: Set<AnnotationMirror> = if (parameter != null) {
++      AnnotationMirrors.getAnnotatedAnnotations(parameter, JsonQualifier::class.java)
++    } else {
++      setOf()
++    }
+ 
+     // TODO(jwilson): union the qualifiers somehow?
+-    return when {
+-      fieldQualifiers.isNotEmpty() -> fieldQualifiers
+-      methodQualifiers.isNotEmpty() -> methodQualifiers
+-      parameterQualifiers.isNotEmpty() -> parameterQualifiers
+-      else -> setOf()
++    if (fieldJsonQualifiers.isNotEmpty()) {
++      return fieldJsonQualifiers
++    } else {
++      return parameterJsonQualifiers
+     }
+   }
+ 
+   /** Returns the @Json name of a property, or `propertyName` if none is provided. */
+-  private fun jsonName(
++  private fun serializedName(
+     propertyName: String,
+     field: VariableElement,
+-    method: ExecutableElement?,
+     parameter: VariableElement?
+   ): String {
+-    val fieldJsonName = field.jsonName
+-    val methodJsonName = method.jsonName
+-    val parameterJsonName = parameter.jsonName
+-
+-    return when {
+-      fieldJsonName != null -> fieldJsonName
+-      methodJsonName != null -> methodJsonName
+-      parameterJsonName != null -> parameterJsonName
+-      else -> propertyName
+-    }
++    val fieldAnnotation = field.getAnnotation(Json::class.java)
++    if (fieldAnnotation != null) return fieldAnnotation.name
++
++    val parameterAnnotation = parameter?.getAnnotation(Json::class.java)
++    if (parameterAnnotation != null) return parameterAnnotation.name
++
++    return propertyName
+   }
+ 
+   private fun errorMustBeKotlinClass(element: Element) {
+@@ -265,8 +274,8 @@ class JsonClassCodeGenProcessor : KotlinAbstractProcessor(), KotlinMetadataUtils
+         element)
+   }
+ 
+-  private fun AdapterGenerator.generateAndWrite() {
+-    val fileSpec = generateFile()
++  private fun AdapterGenerator.generateAndWrite(generatedOption: TypeElement?) {
++    val fileSpec = generateFile(generatedOption)
+     val adapterName = fileSpec.members.filterIsInstance<TypeSpec>().first().name!!
+     val outputDir = generatedDir ?: mavenGeneratedDir(adapterName)
+     fileSpec.writeTo(outputDir)
+@@ -278,16 +287,5 @@ class JsonClassCodeGenProcessor : KotlinAbstractProcessor(), KotlinMetadataUtils
+     val file = filer.createSourceFile(adapterName).toUri().let(::File)
+     return file.parentFile.also { file.delete() }
+   }
+-
+-  private val Element?.qualifiers: Set<AnnotationMirror>
+-    get() {
+-      if (this == null) return setOf()
+-      return AnnotationMirrors.getAnnotatedAnnotations(this, JsonQualifier::class.java)
+-    }
+-
+-  private val Element?.jsonName: String?
+-    get() {
+-      if (this == null) return null
+-      return getAnnotation(Json::class.java)?.name
+-    }
+ }
++
+diff --git a/kotlin-codegen/compiler/src/main/java/com/squareup/moshi/PropertyGenerator.kt b/kotlin-codegen/compiler/src/main/java/com/squareup/moshi/PropertyGenerator.kt
+index f6301102..68b61d77 100644
+--- a/kotlin-codegen/compiler/src/main/java/com/squareup/moshi/PropertyGenerator.kt
++++ b/kotlin-codegen/compiler/src/main/java/com/squareup/moshi/PropertyGenerator.kt
+@@ -52,7 +52,7 @@ internal class PropertyGenerator(
+ 
+   fun reserveDelegateNames(nameAllocator: NameAllocator) {
+     val qualifierNames = jsonQualifiers.joinToString("") {
+-      "At${it.annotationType.asElement().simpleName.toString().capitalize()}"
++      "at${it.annotationType.asElement().simpleName.toString().capitalize()}"
+     }
+     nameAllocator.newName("${unaliasedName.toVariableName()}${qualifierNames}Adapter",
+         delegateKey())
+diff --git a/kotlin-codegen/integration-test/src/test/kotlin/com/squareup/moshi/GeneratedAdaptersTest.kt b/kotlin-codegen/integration-test/src/test/kotlin/com/squareup/moshi/GeneratedAdaptersTest.kt
+index 49e8be01..e077d805 100644
+--- a/kotlin-codegen/integration-test/src/test/kotlin/com/squareup/moshi/GeneratedAdaptersTest.kt
++++ b/kotlin-codegen/integration-test/src/test/kotlin/com/squareup/moshi/GeneratedAdaptersTest.kt
+@@ -16,10 +16,9 @@
+ package com.squareup.moshi
+ 
+ import org.assertj.core.api.Assertions.assertThat
++import org.assertj.core.api.Assertions.fail
+ import org.intellij.lang.annotations.Language
+-import org.junit.Assert.fail
+ import org.junit.Test
+-import java.util.Locale
+ 
+ class GeneratedAdaptersTest {
+ 
+@@ -354,190 +353,6 @@ class GeneratedAdaptersTest {
+ 
+   @JsonClass(generateAdapter = true)
+   class ConstructorDefaultValues(var a: Int = -1, var b: Int = -2)
+-
+-  @Test fun requiredValueAbsent() {
+-    val moshi = Moshi.Builder().build()
+-    val jsonAdapter = moshi.adapter(RequiredValueAbsent::class.java)
+-
+-    try {
+-      jsonAdapter.fromJson("""{"a":4}""")
+-      fail()
+-    } catch(expected: JsonDataException) {
+-      assertThat(expected).hasMessage("Required property 'b' missing at \$")
+-    }
+-  }
+-
+-  @JsonClass(generateAdapter = true)
+-  class RequiredValueAbsent(var a: Int = 3, var b: Int)
+-
+-  @Test fun nonNullConstructorParameterCalledWithNullFailsWithJsonDataException() {
+-    val moshi = Moshi.Builder().build()
+-    val jsonAdapter = moshi.adapter(HasNonNullConstructorParameter::class.java)
+-
+-    try {
+-      jsonAdapter.fromJson("{\"a\":null}")
+-      fail()
+-    } catch (expected: JsonDataException) {
+-      assertThat(expected).hasMessage("Required property 'a' missing at \$")
+-    }
+-  }
+-
+-  @JsonClass(generateAdapter = true)
+-  class HasNonNullConstructorParameter(val a: String)
+-
+-  @Test fun explicitNull() {
+-    val moshi = Moshi.Builder().build()
+-    val jsonAdapter = moshi.adapter(ExplicitNull::class.java)
+-
+-    val encoded = ExplicitNull(null, 5)
+-    assertThat(jsonAdapter.toJson(encoded)).isEqualTo("""{"b":5}""")
+-    assertThat(jsonAdapter.serializeNulls().toJson(encoded)).isEqualTo("""{"a":null,"b":5}""")
+-
+-    val decoded = jsonAdapter.fromJson("""{"a":null,"b":6}""")!!
+-    assertThat(decoded.a).isEqualTo(null)
+-    assertThat(decoded.b).isEqualTo(6)
+-  }
+-
+-  @JsonClass(generateAdapter = true)
+-  class ExplicitNull(var a: Int?, var b: Int?)
+-
+-  @Test fun absentNull() {
+-    val moshi = Moshi.Builder().build()
+-    val jsonAdapter = moshi.adapter(AbsentNull::class.java)
+-
+-    val encoded = AbsentNull(null, 5)
+-    assertThat(jsonAdapter.toJson(encoded)).isEqualTo("""{"b":5}""")
+-    assertThat(jsonAdapter.serializeNulls().toJson(encoded)).isEqualTo("""{"a":null,"b":5}""")
+-
+-    val decoded = jsonAdapter.fromJson("""{"b":6}""")!!
+-    assertThat(decoded.a).isNull()
+-    assertThat(decoded.b).isEqualTo(6)
+-  }
+-
+-  @JsonClass(generateAdapter = true)
+-  class AbsentNull(var a: Int?, var b: Int?)
+-
+-  @Test fun constructorParameterWithQualifier() {
+-    val moshi = Moshi.Builder()
+-        .add(UppercaseJsonAdapter())
+-        .build()
+-    val jsonAdapter = moshi.adapter(ConstructorParameterWithQualifier::class.java)
+-
+-    val encoded = ConstructorParameterWithQualifier("Android", "Banana")
+-    assertThat(jsonAdapter.toJson(encoded)).isEqualTo("""{"a":"ANDROID","b":"Banana"}""")
+-
+-    val decoded = jsonAdapter.fromJson("""{"a":"Android","b":"Banana"}""")!!
+-    assertThat(decoded.a).isEqualTo("android")
+-    assertThat(decoded.b).isEqualTo("Banana")
+-  }
+-
+-  @JsonClass(generateAdapter = true)
+-  class ConstructorParameterWithQualifier(@Uppercase var a: String, var b: String)
+-
+-  @Test fun propertyWithQualifier() {
+-    val moshi = Moshi.Builder()
+-        .add(UppercaseJsonAdapter())
+-        .build()
+-    val jsonAdapter = moshi.adapter(PropertyWithQualifier::class.java)
+-
+-    val encoded = PropertyWithQualifier()
+-    encoded.a = "Android"
+-    encoded.b = "Banana"
+-    assertThat(jsonAdapter.toJson(encoded)).isEqualTo("""{"a":"ANDROID","b":"Banana"}""")
+-
+-    val decoded = jsonAdapter.fromJson("""{"a":"Android","b":"Banana"}""")!!
+-    assertThat(decoded.a).isEqualTo("android")
+-    assertThat(decoded.b).isEqualTo("Banana")
+-  }
+-
+-  @JsonClass(generateAdapter = true)
+-  class PropertyWithQualifier {
+-    @Uppercase var a: String = ""
+-    var b: String = ""
+-  }
+-
+-  @Test fun constructorParameterWithJsonName() {
+-    val moshi = Moshi.Builder().build()
+-    val jsonAdapter = moshi.adapter(ConstructorParameterWithJsonName::class.java)
+-
+-    val encoded = ConstructorParameterWithJsonName(3, 5)
+-    assertThat(jsonAdapter.toJson(encoded)).isEqualTo("""{"key a":3,"b":5}""")
+-
+-    val decoded = jsonAdapter.fromJson("""{"key a":4,"b":6}""")!!
+-    assertThat(decoded.a).isEqualTo(4)
+-    assertThat(decoded.b).isEqualTo(6)
+-  }
+-
+-  @JsonClass(generateAdapter = true)
+-  class ConstructorParameterWithJsonName(@Json(name = "key a") var a: Int, var b: Int)
+-
+-  @Test fun propertyWithJsonName() {
+-    val moshi = Moshi.Builder().build()
+-    val jsonAdapter = moshi.adapter(PropertyWithJsonName::class.java)
+-
+-    val encoded = PropertyWithJsonName()
+-    encoded.a = 3
+-    encoded.b = 5
+-    assertThat(jsonAdapter.toJson(encoded)).isEqualTo("""{"key a":3,"b":5}""")
+-
+-    val decoded = jsonAdapter.fromJson("""{"key a":4,"b":6}""")!!
+-    assertThat(decoded.a).isEqualTo(4)
+-    assertThat(decoded.b).isEqualTo(6)
+-  }
+-
+-  @JsonClass(generateAdapter = true)
+-  class PropertyWithJsonName {
+-    @Json(name = "key a") var a: Int = -1
+-    var b: Int = -1
+-  }
+-
+-  @Test fun transientConstructorParameter() {
+-    val moshi = Moshi.Builder().build()
+-    val jsonAdapter = moshi.adapter(TransientConstructorParameter::class.java)
+-
+-    val encoded = TransientConstructorParameter(3, 5)
+-    assertThat(jsonAdapter.toJson(encoded)).isEqualTo("""{"b":5}""")
+-
+-    val decoded = jsonAdapter.fromJson("""{"a":4,"b":6}""")!!
+-    assertThat(decoded.a).isEqualTo(-1)
+-    assertThat(decoded.b).isEqualTo(6)
+-  }
+-
+-  @JsonClass(generateAdapter = true)
+-  class TransientConstructorParameter(@Transient var a: Int = -1, var b: Int = -1)
+-
+-  @Test fun transientProperty() {
+-    val moshi = Moshi.Builder().build()
+-    val jsonAdapter = moshi.adapter(TransientProperty::class.java)
+-
+-    val encoded = TransientProperty()
+-    encoded.a = 3
+-    encoded.b = 5
+-    assertThat(jsonAdapter.toJson(encoded)).isEqualTo("""{"b":5}""")
+-
+-    val decoded = jsonAdapter.fromJson("""{"a":4,"b":6}""")!!
+-    assertThat(decoded.a).isEqualTo(-1)
+-    assertThat(decoded.b).isEqualTo(6)
+-  }
+-
+-  @JsonClass(generateAdapter = true)
+-  class TransientProperty {
+-    @Transient var a: Int = -1
+-    var b: Int = -1
+-  }
+-
+-  @Retention(AnnotationRetention.RUNTIME)
+-  @JsonQualifier
+-  annotation class Uppercase
+-
+-  class UppercaseJsonAdapter {
+-    @ToJson fun toJson(@Uppercase s: String) : String {
+-      return s.toUpperCase(Locale.US)
+-    }
+-    @FromJson @Uppercase fun fromJson(s: String) : String {
+-      return s.toLowerCase(Locale.US)
+-    }
+-  }
+ }
+ 
+ // Has to be outside to avoid Types seeing an owning class
+diff --git a/kotlin-codegen/integration-test/src/test/kotlin/com/squareup/moshi/KotlinCodeGenTest.kt b/kotlin-codegen/integration-test/src/test/kotlin/com/squareup/moshi/KotlinCodeGenTest.kt
+index a8c1df30..151f124b 100644
+--- a/kotlin-codegen/integration-test/src/test/kotlin/com/squareup/moshi/KotlinCodeGenTest.kt
++++ b/kotlin-codegen/integration-test/src/test/kotlin/com/squareup/moshi/KotlinCodeGenTest.kt
+@@ -25,19 +25,33 @@ import java.util.SimpleTimeZone
+ import kotlin.annotation.AnnotationRetention.RUNTIME
+ 
+ class KotlinCodeGenTest {
+-  @Ignore @Test fun duplicatedValue() {
++  @Ignore @Test fun requiredValueAbsent() {
+     val moshi = Moshi.Builder().build()
+-    val jsonAdapter = moshi.adapter(DuplicateValue::class.java)
++    val jsonAdapter = moshi.adapter(RequiredValueAbsent::class.java)
+ 
+     try {
+-      jsonAdapter.fromJson("""{"a":4,"a":4}""")
++      jsonAdapter.fromJson("""{"a":4}""")
+       fail()
+     } catch(expected: JsonDataException) {
+-      assertThat(expected).hasMessage("Multiple values for a at $.a")
++      assertThat(expected).hasMessage("Required value b missing at $")
+     }
+   }
+ 
+-  class DuplicateValue(var a: Int = -1, var b: Int = -2)
++  class RequiredValueAbsent(var a: Int = 3, var b: Int)
++
++  @Ignore @Test fun nonNullConstructorParameterCalledWithNullFailsWithJsonDataException() {
++    val moshi = Moshi.Builder().build()
++    val jsonAdapter = moshi.adapter(HasNonNullConstructorParameter::class.java)
++
++    try {
++      jsonAdapter.fromJson("{\"a\":null}")
++      fail()
++    } catch (expected: JsonDataException) {
++      assertThat(expected).hasMessage("Non-null value a was null at \$")
++    }
++  }
++
++  class HasNonNullConstructorParameter(val a: String)
+ 
+   @Ignore @Test fun nonNullPropertySetToNullFailsWithJsonDataException() {
+     val moshi = Moshi.Builder().build()
+@@ -55,6 +69,50 @@ class KotlinCodeGenTest {
+     var a: String = ""
+   }
+ 
++  @Ignore @Test fun duplicatedValue() {
++    val moshi = Moshi.Builder().build()
++    val jsonAdapter = moshi.adapter(DuplicateValue::class.java)
++
++    try {
++      jsonAdapter.fromJson("""{"a":4,"a":4}""")
++      fail()
++    } catch(expected: JsonDataException) {
++      assertThat(expected).hasMessage("Multiple values for a at $.a")
++    }
++  }
++
++  class DuplicateValue(var a: Int = -1, var b: Int = -2)
++
++  @Ignore @Test fun explicitNull() {
++    val moshi = Moshi.Builder().build()
++    val jsonAdapter = moshi.adapter(ExplicitNull::class.java)
++
++    val encoded = ExplicitNull(null, 5)
++    assertThat(jsonAdapter.toJson(encoded)).isEqualTo("""{"b":5}""")
++    assertThat(jsonAdapter.serializeNulls().toJson(encoded)).isEqualTo("""{"a":null,"b":5}""")
++
++    val decoded = jsonAdapter.fromJson("""{"a":null,"b":6}""")!!
++    assertThat(decoded.a).isEqualTo(null)
++    assertThat(decoded.b).isEqualTo(6)
++  }
++
++  class ExplicitNull(var a: Int?, var b: Int?)
++
++  @Ignore @Test fun absentNull() {
++    val moshi = Moshi.Builder().build()
++    val jsonAdapter = moshi.adapter(AbsentNull::class.java)
++
++    val encoded = AbsentNull(null, 5)
++    assertThat(jsonAdapter.toJson(encoded)).isEqualTo("""{"b":5}""")
++    assertThat(jsonAdapter.serializeNulls().toJson(encoded)).isEqualTo("""{"a":null,"b":5}""")
++
++    val decoded = jsonAdapter.fromJson("""{"b":6}""")!!
++    assertThat(decoded.a).isNull()
++    assertThat(decoded.b).isEqualTo(6)
++  }
++
++  class AbsentNull(var a: Int?, var b: Int?)
++
+   @Ignore @Test fun repeatedValue() {
+     val moshi = Moshi.Builder().build()
+     val jsonAdapter = moshi.adapter(RepeatedValue::class.java)
+@@ -69,6 +127,90 @@ class KotlinCodeGenTest {
+ 
+   class RepeatedValue(var a: Int, var b: Int?)
+ 
++  @Ignore @Test fun constructorParameterWithQualifier() {
++    val moshi = Moshi.Builder()
++        .add(UppercaseJsonAdapter())
++        .build()
++    val jsonAdapter = moshi.adapter(ConstructorParameterWithQualifier::class.java)
++
++    val encoded = ConstructorParameterWithQualifier("Android", "Banana")
++    assertThat(jsonAdapter.toJson(encoded)).isEqualTo("""{"a":"ANDROID","b":"Banana"}""")
++
++    val decoded = jsonAdapter.fromJson("""{"a":"Android","b":"Banana"}""")!!
++    assertThat(decoded.a).isEqualTo("android")
++    assertThat(decoded.b).isEqualTo("Banana")
++  }
++
++  class ConstructorParameterWithQualifier(@Uppercase var a: String, var b: String)
++
++  @Ignore @Test fun propertyWithQualifier() {
++    val moshi = Moshi.Builder()
++        .add(UppercaseJsonAdapter())
++        .build()
++    val jsonAdapter = moshi.adapter(PropertyWithQualifier::class.java)
++
++    val encoded = PropertyWithQualifier()
++    encoded.a = "Android"
++    encoded.b = "Banana"
++    assertThat(jsonAdapter.toJson(encoded)).isEqualTo("""{"a":"ANDROID","b":"Banana"}""")
++
++    val decoded = jsonAdapter.fromJson("""{"a":"Android","b":"Banana"}""")!!
++    assertThat(decoded.a).isEqualTo("android")
++    assertThat(decoded.b).isEqualTo("Banana")
++  }
++
++  class PropertyWithQualifier {
++    @Uppercase var a: String = ""
++    var b: String = ""
++  }
++
++  @Ignore @Test fun constructorParameterWithJsonName() {
++    val moshi = Moshi.Builder().build()
++    val jsonAdapter = moshi.adapter(ConstructorParameterWithJsonName::class.java)
++
++    val encoded = ConstructorParameterWithJsonName(3, 5)
++    assertThat(jsonAdapter.toJson(encoded)).isEqualTo("""{"key a":3,"b":5}""")
++
++    val decoded = jsonAdapter.fromJson("""{"key a":4,"b":6}""")!!
++    assertThat(decoded.a).isEqualTo(4)
++    assertThat(decoded.b).isEqualTo(6)
++  }
++
++  class ConstructorParameterWithJsonName(@Json(name = "key a") var a: Int, var b: Int)
++
++  @Ignore @Test fun propertyWithJsonName() {
++    val moshi = Moshi.Builder().build()
++    val jsonAdapter = moshi.adapter(PropertyWithJsonName::class.java)
++
++    val encoded = PropertyWithJsonName()
++    encoded.a = 3
++    encoded.b = 5
++    assertThat(jsonAdapter.toJson(encoded)).isEqualTo("""{"key a":3,"b":5}""")
++
++    val decoded = jsonAdapter.fromJson("""{"key a":4,"b":6}""")!!
++    assertThat(decoded.a).isEqualTo(4)
++    assertThat(decoded.b).isEqualTo(6)
++  }
++
++  class PropertyWithJsonName {
++    @Json(name = "key a") var a: Int = -1
++    var b: Int = -1
++  }
++
++  @Ignore @Test fun transientConstructorParameter() {
++    val moshi = Moshi.Builder().build()
++    val jsonAdapter = moshi.adapter(TransientConstructorParameter::class.java)
++
++    val encoded = TransientConstructorParameter(3, 5)
++    assertThat(jsonAdapter.toJson(encoded)).isEqualTo("""{"b":5}""")
++
++    val decoded = jsonAdapter.fromJson("""{"a":4,"b":6}""")!!
++    assertThat(decoded.a).isEqualTo(-1)
++    assertThat(decoded.b).isEqualTo(6)
++  }
++
++  class TransientConstructorParameter(@Transient var a: Int = -1, var b: Int = -1)
++
+   @Ignore @Test fun requiredTransientConstructorParameterFails() {
+     val moshi = Moshi.Builder().build()
+     try {
+@@ -83,6 +225,25 @@ class KotlinCodeGenTest {
+ 
+   class RequiredTransientConstructorParameter(@Transient var a: Int)
+ 
++  @Ignore @Test fun transientProperty() {
++    val moshi = Moshi.Builder().build()
++    val jsonAdapter = moshi.adapter(TransientProperty::class.java)
++
++    val encoded = TransientProperty()
++    encoded.a = 3
++    encoded.b = 5
++    assertThat(jsonAdapter.toJson(encoded)).isEqualTo("""{"b":5}""")
++
++    val decoded = jsonAdapter.fromJson("""{"a":4,"b":6}""")!!
++    assertThat(decoded.a).isEqualTo(-1)
++    assertThat(decoded.b).isEqualTo(6)
++  }
++
++  class TransientProperty {
++    @Transient var a: Int = -1
++    var b: Int = -1
++  }
++
+   @Ignore @Test fun supertypeConstructorParameters() {
+     val moshi = Moshi.Builder().build()
+     val jsonAdapter = moshi.adapter(SubtypeConstructorParameters::class.java)

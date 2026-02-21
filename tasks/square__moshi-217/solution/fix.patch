@@ -1,0 +1,202 @@
+diff --git a/moshi/src/main/java/com/squareup/moshi/BufferedSourceJsonReader.java b/moshi/src/main/java/com/squareup/moshi/BufferedSourceJsonReader.java
+index 6362d015..dd64b8ec 100644
+--- a/moshi/src/main/java/com/squareup/moshi/BufferedSourceJsonReader.java
++++ b/moshi/src/main/java/com/squareup/moshi/BufferedSourceJsonReader.java
+@@ -47,10 +47,11 @@ final class BufferedSourceJsonReader extends JsonReader {
+   private static final int PEEKED_SINGLE_QUOTED_NAME = 12;
+   private static final int PEEKED_DOUBLE_QUOTED_NAME = 13;
+   private static final int PEEKED_UNQUOTED_NAME = 14;
++  private static final int PEEKED_BUFFERED_NAME = 15;
+   /** When this is returned, the integer value is stored in peekedLong. */
+-  private static final int PEEKED_LONG = 15;
+-  private static final int PEEKED_NUMBER = 16;
+-  private static final int PEEKED_EOF = 17;
++  private static final int PEEKED_LONG = 16;
++  private static final int PEEKED_NUMBER = 17;
++  private static final int PEEKED_EOF = 18;
+ 
+   /* State machine when parsing numbers */
+   private static final int NUMBER_CHAR_NONE = 0;
+@@ -98,6 +99,7 @@ final class BufferedSourceJsonReader extends JsonReader {
+   // StackOverflowErrors.
+   private final int[] stack = new int[32];
+   private int stackSize = 0;
++
+   {
+     stack[stackSize++] = JsonScope.EMPTY_DOCUMENT;
+   }
+@@ -215,6 +217,7 @@ final class BufferedSourceJsonReader extends JsonReader {
+       case PEEKED_SINGLE_QUOTED_NAME:
+       case PEEKED_DOUBLE_QUOTED_NAME:
+       case PEEKED_UNQUOTED_NAME:
++      case PEEKED_BUFFERED_NAME:
+         return Token.NAME;
+       case PEEKED_TRUE:
+       case PEEKED_FALSE:
+@@ -545,6 +548,8 @@ final class BufferedSourceJsonReader extends JsonReader {
+       result = nextQuotedValue(DOUBLE_QUOTE_OR_SLASH);
+     } else if (p == PEEKED_SINGLE_QUOTED_NAME) {
+       result = nextQuotedValue(SINGLE_QUOTE_OR_SLASH);
++    } else if (p == PEEKED_BUFFERED_NAME) {
++      result = peekedString;
+     } else {
+       throw new JsonDataException("Expected a name but was " + peek() + " at path " + getPath());
+     }
+@@ -553,12 +558,12 @@ final class BufferedSourceJsonReader extends JsonReader {
+     return result;
+   }
+ 
+-  @Override int selectName(Options options) throws IOException {
++  @Override public int selectName(Options options) throws IOException {
+     int p = peeked;
+     if (p == PEEKED_NONE) {
+       p = doPeek();
+     }
+-    if (p != PEEKED_DOUBLE_QUOTED_NAME) {
++    if (p  < PEEKED_SINGLE_QUOTED_NAME || p > PEEKED_BUFFERED_NAME) {
+       return -1;
+     }
+ 
+@@ -566,8 +571,30 @@ final class BufferedSourceJsonReader extends JsonReader {
+     if (result != -1) {
+       peeked = PEEKED_NONE;
+       pathNames[stackSize - 1] = options.strings[result];
++
++      return result;
+     }
+-    return result;
++
++    // The next name may be unnecessary escaped. Save the last recorded path name, so that we
++    // can restore the peek state in case we fail to find a match.
++    String lastPathName = pathNames[stackSize - 1];
++
++    String nextName = nextName();
++    for (int i = 0, size = options.strings.length; i < size; i++) {
++      if (nextName.equals(options.strings[i])) {
++        peeked = PEEKED_NONE;
++        pathNames[stackSize - 1] = nextName;
++
++        return i;
++      }
++    }
++
++    peeked = PEEKED_BUFFERED_NAME;
++    peekedString = nextName;
++    // We can't push the path further, make it seem like nothing happened.
++    pathNames[stackSize - 1] = lastPathName;
++
++    return -1;
+   }
+ 
+   @Override public String nextString() throws IOException {
+@@ -597,12 +624,12 @@ final class BufferedSourceJsonReader extends JsonReader {
+     return result;
+   }
+ 
+-  @Override int selectString(Options options) throws IOException {
++  @Override public int selectString(Options options) throws IOException {
+     int p = peeked;
+     if (p == PEEKED_NONE) {
+       p = doPeek();
+     }
+-    if (p != PEEKED_DOUBLE_QUOTED) {
++    if (p < PEEKED_SINGLE_QUOTED || p > PEEKED_BUFFERED) {
+       return -1;
+     }
+ 
+@@ -610,8 +637,25 @@ final class BufferedSourceJsonReader extends JsonReader {
+     if (result != -1) {
+       peeked = PEEKED_NONE;
+       pathIndices[stackSize - 1]++;
++
++      return result;
+     }
+-    return result;
++
++    String nextString = nextString();
++    for (int i = 0, size = options.strings.length; i < size; i++) {
++      if (nextString.equals(options.strings[i])) {
++        peeked = PEEKED_NONE;
++        pathIndices[stackSize - 1]++;
++
++        return i;
++      }
++    }
++
++    peeked = PEEKED_BUFFERED;
++    peekedString = nextString;
++    pathIndices[stackSize - 1]--;
++
++    return -1;
+   }
+ 
+   @Override public boolean nextBoolean() throws IOException {
+@@ -995,7 +1039,7 @@ final class BufferedSourceJsonReader extends JsonReader {
+    */
+   private boolean skipTo(String toFind) throws IOException {
+     outer:
+-    for (; source.request(toFind.length());) {
++    for (; source.request(toFind.length()); ) {
+       for (int c = 0; c < toFind.length(); c++) {
+         if (buffer.getByte(c) != toFind.charAt(c)) {
+           buffer.readByte();
+diff --git a/moshi/src/main/java/com/squareup/moshi/JsonReader.java b/moshi/src/main/java/com/squareup/moshi/JsonReader.java
+index 7592ad7c..b3ee721b 100644
+--- a/moshi/src/main/java/com/squareup/moshi/JsonReader.java
++++ b/moshi/src/main/java/com/squareup/moshi/JsonReader.java
+@@ -274,7 +274,7 @@ public abstract class JsonReader implements Closeable {
+    * If the next token is a {@linkplain Token#NAME property name} that's in {@code options}, this
+    * consumes it and returns its index. Otherwise this returns -1 and no name is consumed.
+    */
+-  abstract int selectName(Options options) throws IOException;
++  public abstract int selectName(Options options) throws IOException;
+ 
+   /**
+    * Returns the {@linkplain Token#STRING string} value of the next token, consuming it. If the next
+@@ -288,7 +288,7 @@ public abstract class JsonReader implements Closeable {
+    * If the next token is a {@linkplain Token#STRING string} that's in {@code options}, this
+    * consumes it and returns its index. Otherwise this returns -1 and no string is consumed.
+    */
+-  abstract int selectString(Options options) throws IOException;
++  public abstract int selectString(Options options) throws IOException;
+ 
+   /**
+    * Returns the {@linkplain Token#BOOLEAN boolean} value of the next token, consuming it.
+@@ -359,13 +359,9 @@ public abstract class JsonReader implements Closeable {
+ 
+   /**
+    * A set of strings to be chosen with {@link #selectName} or {@link #selectString}. This prepares
+-   * the encoded values of the strings so they can be read directly from the input source. It cannot
+-   * read arbitrary encodings of the strings: if any of a string's characters are unnecessarily
+-   * escaped in the source JSON, that string will not be selected. Similarly, if the string is
+-   * unquoted or uses single quotes in the source JSON, it will not be selected. Client code that
+-   * uses this class should fall back to another mechanism to accommodate this possibility.
++   * the encoded values of the strings so they can be read directly from the input source.
+    */
+-  static final class Options {
++  public static final class Options {
+     final String[] strings;
+     final okio.Options doubleQuoteSuffix;
+ 
+diff --git a/moshi/src/main/java/com/squareup/moshi/ObjectJsonReader.java b/moshi/src/main/java/com/squareup/moshi/ObjectJsonReader.java
+index 41fe0782..090b5851 100644
+--- a/moshi/src/main/java/com/squareup/moshi/ObjectJsonReader.java
++++ b/moshi/src/main/java/com/squareup/moshi/ObjectJsonReader.java
+@@ -158,7 +158,7 @@ final class ObjectJsonReader extends JsonReader {
+     return result;
+   }
+ 
+-  @Override int selectName(Options options) throws IOException {
++  @Override public int selectName(Options options) throws IOException {
+     Map.Entry<?, ?> peeked = require(Map.Entry.class, Token.NAME);
+     String name = stringKey(peeked);
+     for (int i = 0, length = options.strings.length; i < length; i++) {
+@@ -178,7 +178,7 @@ final class ObjectJsonReader extends JsonReader {
+     return peeked;
+   }
+ 
+-  @Override int selectString(Options options) throws IOException {
++  @Override public int selectString(Options options) throws IOException {
+     String peeked = require(String.class, Token.STRING);
+     for (int i = 0, length = options.strings.length; i < length; i++) {
+       if (options.strings[i].equals(peeked)) {

@@ -1,0 +1,221 @@
+diff --git a/.scalafmt.conf b/.scalafmt.conf
+index 3abbf3a70..caf916edd 100644
+--- a/.scalafmt.conf
++++ b/.scalafmt.conf
+@@ -1,4 +1,4 @@
+-version=2.5.3
++version=2.5.2
+ align.openParenCallSite = true
+ align.openParenDefnSite = true
+ maxColumn = 120
+diff --git a/core/src/main/scala/cats/SemigroupK.scala b/core/src/main/scala/cats/SemigroupK.scala
+index 3c9ed4251..c7a09db51 100644
+--- a/core/src/main/scala/cats/SemigroupK.scala
++++ b/core/src/main/scala/cats/SemigroupK.scala
+@@ -39,6 +39,31 @@ import scala.annotation.implicitNotFound
+   @simulacrum.op("<+>", alias = true)
+   def combineK[A](x: F[A], y: F[A]): F[A]
+ 
++  /**
++   * Similar to [[combineK]] but uses [[Eval]] to allow for laziness in the second
++   * argument. This can allow for "short-circuiting" of computations.
++   *
++   * NOTE: the default implementation of `combineKEval` does not short-circuit
++   * computations. For data structures that can benefit from laziness, [[SemigroupK]]
++   * instances should override this method.
++   *
++   * In the following example, `x.combineK(bomb)` would result in an error,
++   * but `combineKEval` "short-circuits" the computation. `x` is `Some` and thus the
++   * result of `bomb` doesn't even need to be evaluated in order to determine
++   * that the result of `combineKEval` should be `x`.
++   *
++   * {{{
++   * scala> import cats.{Eval, Later}
++   * scala> import cats.implicits._
++   * scala> val bomb: Eval[Option[Int]] = Later(sys.error("boom"))
++   * scala> val x: Option[Int] = Some(42)
++   * scala> x.combineKEval(bomb).value
++   * res0: Option[Int] = Some(42)
++   * }}}
++   */
++  def combineKEval[A](x: F[A], y: Eval[F[A]]): Eval[F[A]] =
++    y.map(yy => combineK(x, yy))
++
+   /**
+    * Given a type A, create a concrete Semigroup[F[A]].
+    *
+@@ -110,6 +135,7 @@ object SemigroupK extends ScalaVersionSpecificMonoidKInstances {
+   /****************************************************************************/
+   /* THE FOLLOWING CODE IS MANAGED BY SIMULACRUM; PLEASE DO NOT EDIT!!!!      */
+   /****************************************************************************/
++
+   /**
+    * Summon an instance of [[SemigroupK]] for `F`.
+    */
+@@ -121,6 +147,7 @@ object SemigroupK extends ScalaVersionSpecificMonoidKInstances {
+     val typeClassInstance: TypeClassType
+     def combineK(y: F[A]): F[A] = typeClassInstance.combineK[A](self, y)
+     def <+>(y: F[A]): F[A] = typeClassInstance.combineK[A](self, y)
++    def combineKEval(y: Eval[F[A]]): Eval[F[A]] = typeClassInstance.combineKEval[A](self, y)
+     def sum[B](fb: F[B])(implicit F: Functor[F]): F[Either[A, B]] = typeClassInstance.sum[A, B](self, fb)(F)
+   }
+   trait AllOps[F[_], A] extends Ops[F, A]
+diff --git a/core/src/main/scala/cats/instances/either.scala b/core/src/main/scala/cats/instances/either.scala
+index 994bf1fc0..a558fd503 100644
+--- a/core/src/main/scala/cats/instances/either.scala
++++ b/core/src/main/scala/cats/instances/either.scala
+@@ -186,6 +186,12 @@ trait EitherInstances extends cats.kernel.instances.EitherInstances {
+           case Left(_)  => y
+           case Right(_) => x
+         }
++
++      override def combineKEval[A](x: Either[L, A], y: Eval[Either[L, A]]): Eval[Either[L, A]] =
++        x match {
++          case Left(_)  => y
++          case Right(_) => Now(x)
++        }
+     }
+ 
+   implicit def catsStdShowForEither[A, B](implicit A: Show[A], B: Show[B]): Show[Either[A, B]] =
+diff --git a/core/src/main/scala/cats/instances/list.scala b/core/src/main/scala/cats/instances/list.scala
+index 31dbe5d5d..a0b271920 100644
+--- a/core/src/main/scala/cats/instances/list.scala
++++ b/core/src/main/scala/cats/instances/list.scala
+@@ -74,6 +74,15 @@ trait ListInstances extends cats.kernel.instances.ListInstances {
+       override def foldMap[A, B](fa: List[A])(f: A => B)(implicit B: Monoid[B]): B =
+         B.combineAll(fa.iterator.map(f))
+ 
++      override def foldMapK[G[_], A, B](fa: List[A])(f: A => G[B])(implicit G: MonoidK[G]): G[B] = {
++        def loop(fa: List[A]): Eval[G[B]] =
++          fa match {
++            case head :: tl => G.combineKEval(f(head), Eval.defer(loop(tl)))
++            case Nil        => Eval.now(G.empty)
++          }
++        loop(fa).value
++      }
++
+       def traverse[G[_], A, B](fa: List[A])(f: A => G[B])(implicit G: Applicative[G]): G[List[B]] = {
+         def loop(fa: List[A]): Eval[G[List[B]]] =
+           fa match {
+diff --git a/core/src/main/scala/cats/instances/option.scala b/core/src/main/scala/cats/instances/option.scala
+index bf5194d36..64a130093 100644
+--- a/core/src/main/scala/cats/instances/option.scala
++++ b/core/src/main/scala/cats/instances/option.scala
+@@ -23,6 +23,12 @@ trait OptionInstances extends cats.kernel.instances.OptionInstances {
+ 
+       def combineK[A](x: Option[A], y: Option[A]): Option[A] = x.orElse(y)
+ 
++      override def combineKEval[A](x: Option[A], y: Eval[Option[A]]): Eval[Option[A]] =
++        x match {
++          case None    => y
++          case Some(_) => Now(x)
++        }
++
+       def pure[A](x: A): Option[A] = Some(x)
+ 
+       override def map[A, B](fa: Option[A])(f: A => B): Option[B] =
+diff --git a/core/src/main/scala/cats/instances/vector.scala b/core/src/main/scala/cats/instances/vector.scala
+index 138433a60..e5828c9f7 100644
+--- a/core/src/main/scala/cats/instances/vector.scala
++++ b/core/src/main/scala/cats/instances/vector.scala
+@@ -84,6 +84,12 @@ trait VectorInstances extends cats.kernel.instances.VectorInstances {
+       override def get[A](fa: Vector[A])(idx: Long): Option[A] =
+         if (idx < Int.MaxValue && fa.size > idx && idx >= 0) Some(fa(idx.toInt)) else None
+ 
++      override def foldMapK[G[_], A, B](fa: Vector[A])(f: A => G[B])(implicit G: MonoidK[G]): G[B] = {
++        def loop(i: Int): Eval[G[B]] =
++          if (i < fa.length) G.combineKEval(f(fa(i)), Eval.defer(loop(i + 1))) else Eval.now(G.empty)
++        loop(0).value
++      }
++
+       final override def traverse[G[_], A, B](fa: Vector[A])(f: A => G[B])(implicit G: Applicative[G]): G[Vector[B]] = {
+         def loop(i: Int): Eval[G[List[B]]] =
+           if (i < fa.length) G.map2Eval(f(fa(i)), Eval.defer(loop(i + 1)))(_ :: _) else Eval.now(G.pure(Nil))
+diff --git a/laws/src/main/scala/cats/laws/ShortCircuitingLaws.scala b/laws/src/main/scala/cats/laws/ShortCircuitingLaws.scala
+index 0811d6917..6d4300cc5 100644
+--- a/laws/src/main/scala/cats/laws/ShortCircuitingLaws.scala
++++ b/laws/src/main/scala/cats/laws/ShortCircuitingLaws.scala
+@@ -6,10 +6,28 @@ import cats.instances.option._
+ import cats.syntax.foldable._
+ import cats.syntax.traverse._
+ import cats.syntax.traverseFilter._
+-import cats.{Applicative, Traverse, TraverseFilter}
++import cats.{Applicative, Foldable, MonoidK, Traverse, TraverseFilter}
+ 
+ trait ShortCircuitingLaws[F[_]] {
+ 
++  def foldMapKShortCircuits[A](fa: F[A], empty: A)(implicit F: Foldable[F]): IsEq[Long] = {
++    val size = fa.size
++    val maxInvocationsAllowed = size / 2
++    val f = new RestrictedFunction[A, Option[A]]((a: A) => None, maxInvocationsAllowed, Some(empty))
++
++    fa.foldMapK(f)
++    f.invocations.get <-> (maxInvocationsAllowed + 1).min(size)
++  }
++
++  def foldMapKWontShortCircuit[A](fa: F[A], empty: A)(implicit F: Foldable[F]): IsEq[Long] = {
++    val size = fa.size
++    val maxInvocationsAllowed = size / 2
++    val f = new RestrictedFunction[A, Option[A]]((a: A) => None, maxInvocationsAllowed, Some(empty))
++
++    fa.foldMapK(f)(F, nonShortCircuitingMonoidK)
++    f.invocations.get <-> size
++  }
++
+   def traverseShortCircuits[A](fa: F[A])(implicit F: Traverse[F]): IsEq[Long] = {
+     val size = fa.size
+     val maxInvocationsAllowed = size / 2
+@@ -86,6 +104,11 @@ trait ShortCircuitingLaws[F[_]] {
+     override def pure[A](a: A): Option[A] = Some(a)
+     override def ap[A, B](ff: Option[A => B])(fa: Option[A]): Option[B] = ff.flatMap(f => fa.map(f))
+   }
++
++  private[this] val nonShortCircuitingMonoidK: MonoidK[Option] = new MonoidK[Option] {
++    def empty[A]: Option[A] = None
++    def combineK[A](x: Option[A], y: Option[A]): Option[A] = x.orElse(y)
++  }
+ }
+ 
+ object ShortCircuitingLaws {
+diff --git a/laws/src/main/scala/cats/laws/discipline/ShortCircuitingTests.scala b/laws/src/main/scala/cats/laws/discipline/ShortCircuitingTests.scala
+index 649c3af0a..1f40605a1 100644
+--- a/laws/src/main/scala/cats/laws/discipline/ShortCircuitingTests.scala
++++ b/laws/src/main/scala/cats/laws/discipline/ShortCircuitingTests.scala
+@@ -1,7 +1,7 @@
+ package cats.laws.discipline
+ 
+ import cats.laws.ShortCircuitingLaws
+-import cats.{Eq, Traverse, TraverseFilter}
++import cats.{Eq, Foldable, Traverse, TraverseFilter}
+ import org.scalacheck.Arbitrary
+ import org.scalacheck.Prop.forAll
+ import org.typelevel.discipline.Laws
+@@ -9,6 +9,14 @@ import org.typelevel.discipline.Laws
+ trait ShortCircuitingTests[F[_]] extends Laws {
+   def laws: ShortCircuitingLaws[F]
+ 
++  def foldable[A: Arbitrary](implicit F: Foldable[F], ArbFA: Arbitrary[F[A]], lEq: Eq[Long]): RuleSet =
++    new DefaultRuleSet(
++      name = "foldMapKShortCircuiting",
++      parent = None,
++      "foldMapK short-circuits if MonoidK[G].combineKEval shorts" -> forAll(laws.foldMapKShortCircuits[A] _),
++      "foldMapK won't short-circuit if MonoidK[G].combineKEval won't" -> forAll(laws.foldMapKWontShortCircuit[A] _)
++    )
++
+   def traverse[A: Arbitrary](implicit F: Traverse[F], ArbFA: Arbitrary[F[A]], lEq: Eq[Long]): RuleSet =
+     new DefaultRuleSet(
+       name = "traverseShortCircuiting",
+diff --git a/project/build.properties b/project/build.properties
+index 654fe70c4..742d2e044 100644
+--- a/project/build.properties
++++ b/project/build.properties
+@@ -1 +1 @@
+-sbt.version=1.3.12
++sbt.version=1.3.11
+diff --git a/scalafix/project/build.properties b/scalafix/project/build.properties
+index 654fe70c4..742d2e044 100644
+--- a/scalafix/project/build.properties
++++ b/scalafix/project/build.properties
+@@ -1 +1 @@
+-sbt.version=1.3.12
++sbt.version=1.3.11

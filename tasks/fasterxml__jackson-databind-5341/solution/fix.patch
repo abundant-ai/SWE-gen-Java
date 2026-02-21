@@ -1,0 +1,156 @@
+diff --git a/release-notes/CREDITS b/release-notes/CREDITS
+index 2950df02c..0f593827f 100644
+--- a/release-notes/CREDITS
++++ b/release-notes/CREDITS
+@@ -72,6 +72,14 @@ David Nault (@dnault)
+  * Requested #5244: Support accessing annotations via `AnnotatedMember.annotations()`
+   [3.0.0]
+ 
++Artur (@Artur-)
++ * Reported #5319: `TreeTraversingParser` does not respect
++   `DeserializationFeature.ACCEPT_FLOAT_AS_INT`
++  [3.0.0]
++ * Reported #5340: `DeserializationFeature.ACCEPT_FLOAT_AS_INT` not respected for byte/short
++   when deserializing from JsonNode
++  [3.0.1]
++
+ Dónal Murtagh (@donalmurtagh)
+  * Reported #5323: `UUID` serialization is broken in v3.0.0-rc9
+   [3.0.0]
+diff --git a/release-notes/VERSION b/release-notes/VERSION
+index e7d6ebd78..12593a2ab 100644
+--- a/release-notes/VERSION
++++ b/release-notes/VERSION
+@@ -5,6 +5,12 @@ Versions: 3.x (for earlier see VERSION-2.x)
+ === Releases ===
+ ------------------------------------------------------------------------
+ 
++3.0.1 (not yet released)
++
++#5340: `DeserializationFeature.ACCEPT_FLOAT_AS_INT` not respected for byte/short
++  when deserializing from JsonNode
++ (reported by @Artur)
++
+ 3.0.0 (03-Oct-2025)
+ 
+ #5319: `TreeTraversingParser` does not respect `DeserializationFeature.ACCEPT_FLOAT_AS_INT`
+diff --git a/src/main/java/tools/jackson/databind/deser/jdk/NumberDeserializers.java b/src/main/java/tools/jackson/databind/deser/jdk/NumberDeserializers.java
+index eb34d5ca0..ce2303f14 100644
+--- a/src/main/java/tools/jackson/databind/deser/jdk/NumberDeserializers.java
++++ b/src/main/java/tools/jackson/databind/deser/jdk/NumberDeserializers.java
+@@ -26,7 +26,7 @@ import tools.jackson.databind.util.ClassUtil;
+  */
+ public class NumberDeserializers
+ {
+-    private final static HashSet<String> _classNames = new HashSet<String>();
++    private final static HashSet<String> _classNames = new HashSet<>();
+     static {
+         // note: can skip primitive types; other ways to check them:
+         Class<?>[] numberTypes = new Class<?>[] {
+@@ -278,7 +278,14 @@ public class NumberDeserializers
+                 if (act == CoercionAction.AsEmpty) {
+                     return (Byte) getEmptyValue(ctxt);
+                 }
+-                return p.getByteValue();
++                // 11-Oct-2025, tatu: [databind#5240] Cumbersome as there is no
++                //  `getValueAsByte()` that'd avoid checks. So need to work around.
++                int i = p.getValueAsInt();
++                if (_shortOverflow(i)) {
++                    // Let's trigger overflow handling
++                    return p.getByteValue();
++                }
++                return (byte) i;
+             case JsonTokenId.ID_NULL: // null fine for non-primitive
+                 return (Byte) getNullValue(ctxt);
+             case JsonTokenId.ID_NUMBER_INT:
+@@ -368,7 +375,14 @@ public class NumberDeserializers
+                 if (act == CoercionAction.AsEmpty) {
+                     return (Short) getEmptyValue(ctxt);
+                 }
+-                return p.getShortValue();
++                // 11-Oct-2025, tatu: [databind#5240] Cumbersome as there is no
++                //  `getValueAsShort()` that'd avoid checks. So need to work around.
++                int i = p.getValueAsInt();
++                if (_shortOverflow(i)) {
++                    // Let's trigger overflow handling
++                    return p.getShortValue();
++                }
++                return (short) i;
+             case JsonTokenId.ID_NULL: // null fine for non-primitive
+                 return (Short) getNullValue(ctxt);
+             case JsonTokenId.ID_NUMBER_INT:
+diff --git a/src/main/java/tools/jackson/databind/deser/std/StdDeserializer.java b/src/main/java/tools/jackson/databind/deser/std/StdDeserializer.java
+index 3aa05c37a..fbee204ca 100644
+--- a/src/main/java/tools/jackson/databind/deser/std/StdDeserializer.java
++++ b/src/main/java/tools/jackson/databind/deser/std/StdDeserializer.java
+@@ -524,7 +524,14 @@ public abstract class StdDeserializer<T>
+             if (act == CoercionAction.AsEmpty) {
+                 return (byte) 0;
+             }
+-            return p.getByteValue();
++            // 11-Oct-2025, tatu: [databind#5240] Cumbersome as there is no
++            //  `getValueAsByte()` that'd avoid checks. So need to work around.
++            int i = p.getValueAsInt();
++            if (_shortOverflow(i)) {
++                // Let's trigger overflow handling
++                return p.getByteValue();
++            }
++            return (byte) i;
+         case JsonTokenId.ID_NUMBER_INT:
+             return p.getByteValue();
+         case JsonTokenId.ID_NULL:
+@@ -601,7 +608,14 @@ public abstract class StdDeserializer<T>
+             if (act == CoercionAction.AsEmpty) {
+                 return (short) 0;
+             }
+-            return p.getShortValue();
++            // 11-Oct-2025, tatu: [databind#5240] Cumbersome as there is no
++            //  `getValueAsShort()` that'd avoid checks. So need to work around.
++            int i = p.getValueAsInt();
++            if (_shortOverflow(i)) {
++                // Let's trigger overflow handling
++                return p.getShortValue();
++            }
++            return (short) i;
+         case JsonTokenId.ID_NUMBER_INT:
+             return p.getShortValue();
+         case JsonTokenId.ID_NULL:
+@@ -676,8 +690,10 @@ public abstract class StdDeserializer<T>
+             if (act == CoercionAction.AsEmpty) {
+                 return 0;
+             }
++            // Important! Must use coercing conversion method here:
+             return p.getValueAsInt();
+         case JsonTokenId.ID_NUMBER_INT:
++            // Here regular (strict) accessor is fine
+             return p.getIntValue();
+         case JsonTokenId.ID_NULL:
+             _verifyNullForPrimitive(ctxt);
+diff --git a/src/main/java/tools/jackson/databind/node/TreeTraversingParser.java b/src/main/java/tools/jackson/databind/node/TreeTraversingParser.java
+index a2310e66c..2f5116c1e 100644
+--- a/src/main/java/tools/jackson/databind/node/TreeTraversingParser.java
++++ b/src/main/java/tools/jackson/databind/node/TreeTraversingParser.java
+@@ -294,6 +294,23 @@ public class TreeTraversingParser
+         return (float) currentNumericNode(NR_FLOAT).doubleValue();
+     }
+ 
++    @Override
++    public short getShortValue() throws InputCoercionException {
++        final NumericNode node = (NumericNode) currentNumericNode(NR_INT);
++        if (!node.canConvertToShort()) {
++            String desc = _longIntegerDesc(node.asString());
++            if (!node.canConvertToExactIntegral()) {
++                throw _constructInputCoercion(String.format(
++"Numeric value (%s) of `%s` has fractional part; cannot convert to `short`",
++                        desc, node.getClass().getSimpleName()),
++                    node.asToken(), Integer.TYPE);
++            }
++            // otherwise assume range overflow
++            _reportOverflowShort(desc, currentToken());
++        }
++        return node.shortValue();
++    }
++
+     @Override
+     public int getIntValue() throws InputCoercionException {
+         final NumericNode node = (NumericNode) currentNumericNode(NR_INT);

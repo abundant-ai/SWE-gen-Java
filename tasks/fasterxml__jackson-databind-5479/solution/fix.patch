@@ -1,0 +1,129 @@
+diff --git a/release-notes/VERSION b/release-notes/VERSION
+index 44c020520..e4b7bf5dd 100644
+--- a/release-notes/VERSION
++++ b/release-notes/VERSION
+@@ -14,6 +14,7 @@ Versions: 3.x (for earlier see VERSION-2.x)
+ #1654: @JsonDeserialize(contentUsing=...) is ignored if content
+   type is determined by @JsonTypeInfo
+  (reported by @pdegoeje)
++ (fix by @cowtowncoder, @JacksonJang)
+ #1980: Add method `remove(JsonPointer)` in `ContainerNode`
+  (fix by @cowtowncoder, w/ Claude code)
+ #3964: Deserialization issue: MismatchedInputException, Bean not
+diff --git a/src/main/java/tools/jackson/databind/ValueSerializer.java b/src/main/java/tools/jackson/databind/ValueSerializer.java
+index 95aaf99a5..d138228af 100644
+--- a/src/main/java/tools/jackson/databind/ValueSerializer.java
++++ b/src/main/java/tools/jackson/databind/ValueSerializer.java
+@@ -4,6 +4,7 @@ import java.util.Iterator;
+ import java.util.Set;
+ 
+ import com.fasterxml.jackson.annotation.JsonFormat;
++import com.fasterxml.jackson.annotation.JsonTypeInfo.As;
+ 
+ import tools.jackson.core.*;
+ import tools.jackson.databind.jsonFormatVisitors.JsonFormatVisitable;
+@@ -252,13 +253,20 @@ public abstract class ValueSerializer<T>
+             TypeSerializer typeSer)
+         throws JacksonException
+     {
++        // 07-Dec-2025, tatu: [databind#1654] Check for "no-op" type serializer
++        //   indirectly
++        if (typeSer.getTypeInclusion() == As.NOTHING) {
++            serialize(value, gen, ctxt);
++            return;
++        }
++
+         Class<?> clz = handledType();
+         if (clz == null) {
+             clz = value.getClass();
+         }
+         ctxt.reportBadDefinition(clz, String.format(
+-                "Type id handling not implemented for type %s (by serializer of type %s)",
+-                clz.getName(), getClass().getName()));
++"Type id handling (method `serializeWithType()`) not implemented for type %s (by serializer of type %s)",
++                ClassUtil.nameOf(clz), ClassUtil.nameOf(getClass())));
+     }
+ 
+     /*
+diff --git a/src/main/java/tools/jackson/databind/deser/BasicDeserializerFactory.java b/src/main/java/tools/jackson/databind/deser/BasicDeserializerFactory.java
+index e7585cd05..36c559b08 100644
+--- a/src/main/java/tools/jackson/databind/deser/BasicDeserializerFactory.java
++++ b/src/main/java/tools/jackson/databind/deser/BasicDeserializerFactory.java
+@@ -24,6 +24,7 @@ import tools.jackson.databind.ext.jdk8.OptionalIntDeserializer;
+ import tools.jackson.databind.ext.jdk8.OptionalLongDeserializer;
+ import tools.jackson.databind.introspect.*;
+ import tools.jackson.databind.jsontype.TypeDeserializer;
++import tools.jackson.databind.jsontype.impl.NoOpTypeDeserializer;
+ import tools.jackson.databind.type.*;
+ import tools.jackson.databind.util.*;
+ 
+@@ -767,8 +768,12 @@ public abstract class BasicDeserializerFactory
+ 
+         // Then optional type info: if type has been resolved, we may already know type deserializer:
+         TypeDeserializer contentTypeDeser = (TypeDeserializer) contentType.getTypeHandler();
+-        // but if not, may still be possible to find:
+-        if (contentTypeDeser == null) {
++        // [databind#1654]: @JsonTypeInfo(use = Id.NONE) should not apply type deserializer
++        // when custom content deserializer is specified via @JsonDeserialize(contentUsing = ...)
++        if (contentTypeDeser instanceof NoOpTypeDeserializer) {
++            contentTypeDeser = null;
++        } else if (contentTypeDeser == null) {
++            // but if not, may still be possible to find:
+             contentTypeDeser = ctxt.findTypeDeserializer(contentType);
+         }
+         // 23-Nov-2010, tatu: Custom deserializer?
+diff --git a/src/main/java/tools/jackson/databind/jsontype/TypeResolverProvider.java b/src/main/java/tools/jackson/databind/jsontype/TypeResolverProvider.java
+index 2a5d91515..7c6de1b8b 100644
+--- a/src/main/java/tools/jackson/databind/jsontype/TypeResolverProvider.java
++++ b/src/main/java/tools/jackson/databind/jsontype/TypeResolverProvider.java
+@@ -119,6 +119,7 @@ public class TypeResolverProvider
+         if (b == NO_RESOLVER) {
+             // 07-Dec-2025, tatu: Should we actually do this? (No test coverage yet)
+             //return NoOpTypeSerializer.instance();
++
+             return null;
+         }
+         Collection<NamedType> subtypes = config.getSubtypeResolver().collectAndResolveSubtypesByClass(
+diff --git a/src/main/java/tools/jackson/databind/jsontype/TypeSerializer.java b/src/main/java/tools/jackson/databind/jsontype/TypeSerializer.java
+index 7974b5596..c943133d5 100644
+--- a/src/main/java/tools/jackson/databind/jsontype/TypeSerializer.java
++++ b/src/main/java/tools/jackson/databind/jsontype/TypeSerializer.java
+@@ -92,6 +92,10 @@ public abstract class TypeSerializer
+         case WRAPPER_OBJECT:
+             typeIdDef.include = WritableTypeId.Inclusion.WRAPPER_OBJECT;
+             break;
++        case NOTHING:
++            // 07-Dec-2025, tatu: No suitable constant to use. Should add "NOTHING"?
++            typeIdDef.include = null;
++            break;
+         default:
+             VersionUtil.throwInternal();
+         }
+diff --git a/src/main/java/tools/jackson/databind/jsontype/impl/NoOpTypeDeserializer.java b/src/main/java/tools/jackson/databind/jsontype/impl/NoOpTypeDeserializer.java
+index 0c259b3c8..bed72ec4d 100644
+--- a/src/main/java/tools/jackson/databind/jsontype/impl/NoOpTypeDeserializer.java
++++ b/src/main/java/tools/jackson/databind/jsontype/impl/NoOpTypeDeserializer.java
+@@ -48,8 +48,7 @@ public class NoOpTypeDeserializer extends TypeDeserializer
+ 
+     @Override
+     public JsonTypeInfo.As getTypeInclusion() {
+-        // No proper value but need to return something
+-        return JsonTypeInfo.As.EXISTING_PROPERTY;
++        return JsonTypeInfo.As.NOTHING;
+     }
+ 
+     @Override
+diff --git a/src/main/java/tools/jackson/databind/jsontype/impl/NoOpTypeSerializer.java b/src/main/java/tools/jackson/databind/jsontype/impl/NoOpTypeSerializer.java
+index 0820ea70e..371091177 100644
+--- a/src/main/java/tools/jackson/databind/jsontype/impl/NoOpTypeSerializer.java
++++ b/src/main/java/tools/jackson/databind/jsontype/impl/NoOpTypeSerializer.java
+@@ -38,8 +38,7 @@ public class NoOpTypeSerializer extends TypeSerializer
+ 
+     @Override
+     public JsonTypeInfo.As getTypeInclusion() {
+-        // No proper one to use but must return something:
+-        return JsonTypeInfo.As.EXISTING_PROPERTY;
++        return JsonTypeInfo.As.NOTHING;
+     }
+ 
+     @Override

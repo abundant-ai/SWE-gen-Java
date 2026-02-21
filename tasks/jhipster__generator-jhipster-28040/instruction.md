@@ -1,7 +1,0 @@
-When generating a Spring Boot application configured to use Couchbase, enabling a cache provider should result in the generated sample application actually using Spring’s Cache abstraction during typical REST operations.
-
-Currently, even when a cache provider is enabled for a Couchbase-based generated app, the generated integration tests do not validate caching behavior (or the generated app behaves as if caching is effectively disabled). As a result, cache-related regressions can slip through unnoticed in Couchbase setups.
-
-Update the generated Couchbase sample so that caching is enabled and observable in the user management REST flow. In particular, the generated integration test class `UserResourceIT` should, when any cache provider is enabled, interact with `org.springframework.cache.CacheManager` and verify that relevant caches are created/populated and can be accessed via `CacheManager.getCache(...)`. The generated test should be able to retrieve a non-null `Cache` instance for the expected cache name(s) and validate that cache usage is not a no-op.
-
-This should work for Couchbase without breaking other database types. Couchbase-specific security context handling (using `SecurityContextHolder` / `TestSecurityContextHolder`) must continue to work alongside the caching verification. The end result is that a Couchbase app generated with caching turned on will have caching effectively enabled in the sample and covered by integration tests, rather than silently skipping cache behavior.

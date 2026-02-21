@@ -1,0 +1,854 @@
+diff --git a/kotlin-codegen/compiler/src/main/java/com/squareup/moshi/AdapterGenerator.kt b/kotlin-codegen/compiler/src/main/java/com/squareup/moshi/AdapterGenerator.kt
+index 707bc114..c49a1c0b 100644
+--- a/kotlin-codegen/compiler/src/main/java/com/squareup/moshi/AdapterGenerator.kt
++++ b/kotlin-codegen/compiler/src/main/java/com/squareup/moshi/AdapterGenerator.kt
+@@ -81,11 +81,11 @@ internal class AdapterGenerator(
+           .joinToString(", ") { "\"$it\"" }})", JsonReader.Options::class.asTypeName())
+       .build()
+ 
+-  val delegateAdapters = propertyList.distinctBy { it.delegateKey }
++  val delegateAdapters = propertyList.distinctBy { it.delegateKey() }
+ 
+   fun generateFile(generatedOption: TypeElement?): FileSpec {
+     for (property in delegateAdapters) {
+-      property.delegateKey.reserveName(nameAllocator)
++      property.reserveDelegateNames(nameAllocator)
+     }
+     for (property in propertyList) {
+       property.allocateNames(nameAllocator)
+@@ -125,7 +125,7 @@ internal class AdapterGenerator(
+ 
+     result.addProperty(optionsProperty)
+     for (uniqueAdapter in delegateAdapters) {
+-      result.addProperty(uniqueAdapter.delegateKey.generateProperty(nameAllocator, this))
++      result.addProperty(uniqueAdapter.generateDelegateProperty(this))
+     }
+ 
+     result.addFunction(generateToStringFun())
+@@ -178,12 +178,12 @@ internal class AdapterGenerator(
+       if (property.differentiateAbsentFromNull) {
+         result.beginControlFlow("%L -> ", index)
+         result.addStatement("%N = %N.fromJson(%N)",
+-            property.localName, nameAllocator.get(property.delegateKey), readerParam)
++            property.localName, property.delegateName, readerParam)
+         result.addStatement("%N = true", property.localIsPresentName)
+         result.endControlFlow()
+       } else {
+         result.addStatement("%L -> %N = %N.fromJson(%N)",
+-            index, property.localName, nameAllocator.get(property.delegateKey), readerParam)
++            index, property.localName, property.delegateName, readerParam)
+       }
+     }
+ 
+@@ -281,7 +281,7 @@ internal class AdapterGenerator(
+     propertyList.forEach { property ->
+       result.addStatement("%N.name(%S)", writerParam, property.serializedName)
+       result.addStatement("%N.toJson(%N, %N.%L)",
+-          nameAllocator.get(property.delegateKey), writerParam, valueParam, property.name)
++          property.delegateName, writerParam, valueParam, property.name)
+     }
+     result.addStatement("%N.endObject()", writerParam)
+ 
+diff --git a/kotlin-codegen/compiler/src/main/java/com/squareup/moshi/DelegateKey.kt b/kotlin-codegen/compiler/src/main/java/com/squareup/moshi/DelegateKey.kt
+deleted file mode 100644
+index c5ec3020..00000000
+--- a/kotlin-codegen/compiler/src/main/java/com/squareup/moshi/DelegateKey.kt
++++ /dev/null
+@@ -1,111 +0,0 @@
+-/*
+- * Copyright (C) 2018 Square, Inc.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-package com.squareup.moshi
+-
+-import com.squareup.kotlinpoet.ClassName
+-import com.squareup.kotlinpoet.CodeBlock
+-import com.squareup.kotlinpoet.KModifier
+-import com.squareup.kotlinpoet.NameAllocator
+-import com.squareup.kotlinpoet.ParameterizedTypeName
+-import com.squareup.kotlinpoet.PropertySpec
+-import com.squareup.kotlinpoet.TypeName
+-import com.squareup.kotlinpoet.TypeVariableName
+-import com.squareup.kotlinpoet.WildcardTypeName
+-import com.squareup.kotlinpoet.asTypeName
+-import javax.lang.model.element.AnnotationMirror
+-
+-/** A JsonAdapter that can be used to encode and decode a particular field. */
+-internal data class DelegateKey(
+-  val type: TypeName,
+-  val jsonQualifiers: Set<AnnotationMirror>
+-) {
+-  val nullable
+-    get() = type.nullable || type is TypeVariableName
+-
+-  fun reserveName(nameAllocator: NameAllocator) {
+-    val qualifierNames = jsonQualifiers.joinToString("") {
+-      "At${it.annotationType.asElement().simpleName}"
+-    }
+-    nameAllocator.newName("${type.toVariableName().decapitalize()}${qualifierNames}Adapter", this)
+-  }
+-
+-  /** Returns an adapter to use when encoding and decoding this property. */
+-  fun generateProperty(nameAllocator: NameAllocator, enclosing: AdapterGenerator): PropertySpec {
+-    val adapterTypeName = ParameterizedTypeName.get(
+-        JsonAdapter::class.asTypeName(), type)
+-    val qualifiers = jsonQualifiers
+-    val standardArgs = arrayOf(enclosing.moshiParam,
+-        if (type is ClassName && qualifiers.isEmpty()) {
+-          ""
+-        } else {
+-          CodeBlock.of("<%T>", type)
+-        },
+-        type.makeType(
+-            enclosing.elements, enclosing.typesParam, enclosing.genericTypeNames ?: emptyList()))
+-    val standardArgsSize = standardArgs.size + 1
+-    val (initializerString, args) = when {
+-      qualifiers.isEmpty() -> "" to emptyArray()
+-      qualifiers.size == 1 -> {
+-        ", %${standardArgsSize}T::class.java" to arrayOf(
+-            qualifiers.first().annotationType.asTypeName())
+-      }
+-      else -> {
+-        val initString = qualifiers
+-            .mapIndexed { index, _ ->
+-              val annoClassIndex = standardArgsSize + index
+-              return@mapIndexed "%${annoClassIndex}T::class.java"
+-            }
+-            .joinToString()
+-        val initArgs = qualifiers
+-            .map { it.annotationType.asTypeName() }
+-            .toTypedArray()
+-        ", $initString" to initArgs
+-      }
+-    }
+-    val finalArgs = arrayOf(*standardArgs, *args)
+-
+-    val nullModifier = if (nullable) ".nullSafe()" else ".nonNull()"
+-
+-    return PropertySpec.builder(nameAllocator.get(this), adapterTypeName, KModifier.PRIVATE)
+-        .initializer("%1N.adapter%2L(%3L$initializerString)$nullModifier", *finalArgs)
+-        .build()
+-  }
+-}
+-
+-/**
+- * Returns a suggested variable name derived from a list of type names. This just concatenates,
+- * yielding types like MapOfStringLong.
+- */
+-private fun List<TypeName>.toVariableNames(): String {
+-  return joinToString("") { it.toVariableName() }
+-}
+-
+-/** Returns a suggested variable name derived from a type name, like nullableListOfString. */
+-private fun TypeName.toVariableName(): String {
+-  val base = when (this) {
+-    is ClassName -> simpleName()
+-    is ParameterizedTypeName -> rawType.simpleName() + "Of" + typeArguments.toVariableNames()
+-    is WildcardTypeName -> (lowerBounds + upperBounds).toVariableNames()
+-    is TypeVariableName -> name + bounds.toVariableNames()
+-    else -> throw IllegalArgumentException("Unrecognized type! $this")
+-  }
+-
+-  return if (nullable) {
+-    "Nullable$base"
+-  } else {
+-    base
+-  }
+-}
+diff --git a/kotlin-codegen/compiler/src/main/java/com/squareup/moshi/JsonClassCodeGenProcessor.kt b/kotlin-codegen/compiler/src/main/java/com/squareup/moshi/JsonClassCodeGenProcessor.kt
+index 3ded3ede..6b4ebbda 100644
+--- a/kotlin-codegen/compiler/src/main/java/com/squareup/moshi/JsonClassCodeGenProcessor.kt
++++ b/kotlin-codegen/compiler/src/main/java/com/squareup/moshi/JsonClassCodeGenProcessor.kt
+@@ -29,18 +29,14 @@ import me.eugeniomarletti.kotlin.metadata.classKind
+ import me.eugeniomarletti.kotlin.metadata.declaresDefaultValue
+ import me.eugeniomarletti.kotlin.metadata.getPropertyOrNull
+ import me.eugeniomarletti.kotlin.metadata.isDataClass
+-import me.eugeniomarletti.kotlin.metadata.isInnerClass
+ import me.eugeniomarletti.kotlin.metadata.isPrimary
+ import me.eugeniomarletti.kotlin.metadata.jvm.getJvmConstructorSignature
+ import me.eugeniomarletti.kotlin.metadata.kotlinMetadata
+-import me.eugeniomarletti.kotlin.metadata.modality
+ import me.eugeniomarletti.kotlin.metadata.visibility
+ import me.eugeniomarletti.kotlin.processing.KotlinAbstractProcessor
+-import org.jetbrains.kotlin.serialization.ProtoBuf.Class
+-import org.jetbrains.kotlin.serialization.ProtoBuf.Modality
++import org.jetbrains.kotlin.serialization.ProtoBuf
+ import org.jetbrains.kotlin.serialization.ProtoBuf.Property
+ import org.jetbrains.kotlin.serialization.ProtoBuf.ValueParameter
+-import org.jetbrains.kotlin.serialization.ProtoBuf.Visibility
+ import java.io.File
+ import javax.annotation.processing.ProcessingEnvironment
+ import javax.annotation.processing.Processor
+@@ -122,35 +118,16 @@ class JsonClassCodeGenProcessor : KotlinAbstractProcessor(), KotlinMetadataUtils
+     val metadata = element.kotlinMetadata
+ 
+     if (metadata !is KotlinClassMetadata) {
+-      messager.printMessage(
+-          ERROR, "@JsonClass can't be applied to $element: must be a Kotlin class", element)
++      errorMustBeKotlinClass(element)
+       return null
+     }
+ 
+     val classData = metadata.data
+     val (nameResolver, classProto) = classData
+ 
+-    when {
+-      classProto.classKind != Class.Kind.CLASS -> {
+-        messager.printMessage(
+-            ERROR, "@JsonClass can't be applied to $element: must be a Kotlin class", element)
+-        return null
+-      }
+-      classProto.isInnerClass -> {
+-        messager.printMessage(
+-            ERROR, "@JsonClass can't be applied to $element: must not be an inner class", element)
+-        return null
+-      }
+-      classProto.modality == Modality.ABSTRACT -> {
+-        messager.printMessage(
+-            ERROR, "@JsonClass can't be applied to $element: must not be abstract", element)
+-        return null
+-      }
+-      classProto.visibility == Visibility.LOCAL -> {
+-        messager.printMessage(
+-            ERROR, "@JsonClass can't be applied to $element: must not be local", element)
+-        return null
+-      }
++    if (classProto.classKind != ProtoBuf.Class.Kind.CLASS) {
++      errorMustBeKotlinClass(element)
++      return null
+     }
+ 
+     val typeName = element.asType().asTypeName()
+@@ -210,9 +187,9 @@ class JsonClassCodeGenProcessor : KotlinAbstractProcessor(), KotlinMetadataUtils
+ 
+       val annotatedElement = annotatedElements[property]
+ 
+-      if (property.visibility != Visibility.INTERNAL
+-          && property.visibility != Visibility.PROTECTED
+-          && property.visibility != Visibility.PUBLIC) {
++      if (property.visibility != ProtoBuf.Visibility.INTERNAL
++          && property.visibility != ProtoBuf.Visibility.PROTECTED
++          && property.visibility != ProtoBuf.Visibility.PUBLIC) {
+         messager.printMessage(ERROR, "property $name is not visible", enclosedElement)
+         return null
+       }
+@@ -226,17 +203,15 @@ class JsonClassCodeGenProcessor : KotlinAbstractProcessor(), KotlinMetadataUtils
+         continue
+       }
+ 
+-      val delegateKey = DelegateKey(
+-          property.returnType.asTypeName(nameResolver, classProto::getTypeParameter, true),
+-          jsonQualifiers(enclosedElement, annotatedElement, parameterElement))
+-
+       propertyGenerators += PropertyGenerator(
+-          delegateKey,
+           name,
+           jsonName(name, enclosedElement, annotatedElement, parameterElement),
+           parameter != null,
+           hasDefault,
+-          property.returnType.asTypeName(nameResolver, classProto::getTypeParameter))
++          property.returnType.nullable,
++          property.returnType.asTypeName(nameResolver, classProto::getTypeParameter),
++          property.returnType.asTypeName(nameResolver, classProto::getTypeParameter, true),
++          jsonQualifiers(enclosedElement, annotatedElement, parameterElement))
+     }
+ 
+     // Sort properties so that those with constructor parameters come first.
+diff --git a/kotlin-codegen/compiler/src/main/java/com/squareup/moshi/PropertyGenerator.kt b/kotlin-codegen/compiler/src/main/java/com/squareup/moshi/PropertyGenerator.kt
+index 83ee5c81..f6301102 100644
+--- a/kotlin-codegen/compiler/src/main/java/com/squareup/moshi/PropertyGenerator.kt
++++ b/kotlin-codegen/compiler/src/main/java/com/squareup/moshi/PropertyGenerator.kt
+@@ -16,32 +16,97 @@
+ package com.squareup.moshi
+ 
+ import com.squareup.kotlinpoet.BOOLEAN
++import com.squareup.kotlinpoet.ClassName
++import com.squareup.kotlinpoet.CodeBlock
++import com.squareup.kotlinpoet.KModifier
+ import com.squareup.kotlinpoet.NameAllocator
++import com.squareup.kotlinpoet.ParameterizedTypeName
+ import com.squareup.kotlinpoet.PropertySpec
+ import com.squareup.kotlinpoet.TypeName
++import com.squareup.kotlinpoet.TypeVariableName
++import com.squareup.kotlinpoet.WildcardTypeName
++import com.squareup.kotlinpoet.asTypeName
++import javax.lang.model.element.AnnotationMirror
+ 
+ /** Generates functions to encode and decode a property as JSON. */
+ internal class PropertyGenerator(
+-  val delegateKey: DelegateKey,
+   val name: String,
+   val serializedName: String,
+   val hasConstructorParameter: Boolean,
+   val hasDefault: Boolean,
+-  val typeName: TypeName
++  val nullable: Boolean,
++  val typeName: TypeName,
++  val unaliasedName: TypeName,
++  val jsonQualifiers: Set<AnnotationMirror>
+ ) {
++  lateinit var delegateName: String
+   lateinit var localName: String
+   lateinit var localIsPresentName: String
+ 
+   val isRequired
+-    get() = !delegateKey.nullable && !hasDefault
++    get() = !nullable && !hasDefault
+ 
+   /** We prefer to use 'null' to mean absent, but for some properties those are distinct. */
+   val differentiateAbsentFromNull
+-    get() = delegateKey.nullable && hasDefault
++    get() = hasDefault && nullable
++
++  fun reserveDelegateNames(nameAllocator: NameAllocator) {
++    val qualifierNames = jsonQualifiers.joinToString("") {
++      "At${it.annotationType.asElement().simpleName.toString().capitalize()}"
++    }
++    nameAllocator.newName("${unaliasedName.toVariableName()}${qualifierNames}Adapter",
++        delegateKey())
++  }
+ 
+   fun allocateNames(nameAllocator: NameAllocator) {
+     localName = nameAllocator.newName(name)
+     localIsPresentName = nameAllocator.newName("${name}Set")
++    delegateName = nameAllocator.get(delegateKey())
++  }
++
++  /** Returns a key that matches keys of properties that can share an adapter. */
++  fun delegateKey() = unaliasedName to jsonQualifiers
++
++  /** Returns an adapter to use when encoding and decoding this property. */
++  fun generateDelegateProperty(enclosing: AdapterGenerator): PropertySpec {
++    val adapterTypeName = ParameterizedTypeName.get(
++        JsonAdapter::class.asTypeName(), unaliasedName)
++    val qualifiers = jsonQualifiers.toList()
++    val standardArgs = arrayOf(enclosing.moshiParam,
++        if (unaliasedName is ClassName && qualifiers.isEmpty()) {
++          ""
++        } else {
++          CodeBlock.of("<%T>", unaliasedName)
++        },
++        unaliasedName.makeType(
++            enclosing.elements, enclosing.typesParam, enclosing.genericTypeNames ?: emptyList()))
++    val standardArgsSize = standardArgs.size + 1
++    val (initializerString, args) = when {
++      qualifiers.isEmpty() -> "" to emptyArray()
++      qualifiers.size == 1 -> {
++        ", %${standardArgsSize}T::class.java" to arrayOf(
++            qualifiers.first().annotationType.asTypeName())
++      }
++      else -> {
++        val initString = qualifiers
++            .mapIndexed { index, _ ->
++              val annoClassIndex = standardArgsSize + index
++              return@mapIndexed "%${annoClassIndex}T::class.java"
++            }
++            .joinToString()
++        val initArgs = qualifiers
++            .map { it.annotationType.asTypeName() }
++            .toTypedArray()
++        ", $initString" to initArgs
++      }
++    }
++    val finalArgs = arrayOf(*standardArgs, *args)
++
++    return PropertySpec.builder(delegateName, adapterTypeName,
++        KModifier.PRIVATE)
++        .initializer("%1N.adapter%2L(%3L$initializerString)${if (nullable) ".nullSafe()" else ""}",
++            *finalArgs)
++        .build()
+   }
+ 
+   fun generateLocalProperty(): PropertySpec {
+@@ -58,3 +123,25 @@ internal class PropertyGenerator(
+         .build()
+   }
+ }
++
++/**
++ * Returns a suggested variable name derived from a list of type names.
++ */
++private fun List<TypeName>.toVariableNames(): String {
++  return joinToString("_") { it.toVariableName() }
++}
++
++/**
++ * Returns a suggested variable name derived from a type name.
++ */
++private fun TypeName.toVariableName(): String {
++  return when (this) {
++    is ClassName -> simpleName().decapitalize()
++    is ParameterizedTypeName -> {
++      rawType.simpleName().decapitalize() + if (typeArguments.isEmpty()) "" else "__" + typeArguments.toVariableNames()
++    }
++    is WildcardTypeName -> "wildcard__" + (lowerBounds + upperBounds).toVariableNames()
++    is TypeVariableName -> name.decapitalize() + if (bounds.isEmpty()) "" else "__" + bounds.toVariableNames()
++    else -> throw IllegalArgumentException("Unrecognized type! $this")
++  }.let { if (nullable) "${it}_nullable" else it }
++}
+diff --git a/kotlin-codegen/compiler/src/test/java/com/squareup/moshi/CompilerTest.kt b/kotlin-codegen/compiler/src/test/java/com/squareup/moshi/CompilerTest.kt
+index 1da5a4ad..6a0ac2c6 100644
+--- a/kotlin-codegen/compiler/src/test/java/com/squareup/moshi/CompilerTest.kt
++++ b/kotlin-codegen/compiler/src/test/java/com/squareup/moshi/CompilerTest.kt
+@@ -17,7 +17,6 @@ package com.squareup.moshi
+ 
+ import org.assertj.core.api.Assertions.assertThat
+ import org.jetbrains.kotlin.cli.common.ExitCode
+-import org.junit.Ignore
+ import org.junit.Rule
+ import org.junit.Test
+ import org.junit.rules.TemporaryFolder
+@@ -27,7 +26,8 @@ import javax.annotation.processing.Processor
+ class CompilerTest {
+   @Rule @JvmField var temporaryFolder: TemporaryFolder = TemporaryFolder()
+ 
+-  @Test fun privateProperty() {
++  @Test
++  fun test() {
+     val call = KotlinCompilerCall(temporaryFolder.root)
+     call.inheritClasspath = true
+     call.addService(Processor::class, JsonClassCodeGenProcessor::class)
+@@ -42,116 +42,4 @@ class CompilerTest {
+     assertThat(result.exitCode).isEqualTo(ExitCode.COMPILATION_ERROR)
+     assertThat(result.systemErr).contains("property a is not visible")
+   }
+-
+-  @Test fun interfacesNotSupported() {
+-    val call = KotlinCompilerCall(temporaryFolder.root)
+-    call.inheritClasspath = true
+-    call.addService(Processor::class, JsonClassCodeGenProcessor::class)
+-    call.addKt("source.kt", """
+-        |import com.squareup.moshi.JsonClass
+-        |
+-        |@JsonClass(generateAdapter = true)
+-        |interface Interface
+-        |""".trimMargin())
+-
+-    val result = call.execute()
+-    assertThat(result.exitCode).isEqualTo(ExitCode.COMPILATION_ERROR)
+-    assertThat(result.systemErr).contains(
+-        "error: @JsonClass can't be applied to Interface: must be a Kotlin class")
+-  }
+-
+-  @Test fun abstractClassesNotSupported() {
+-    val call = KotlinCompilerCall(temporaryFolder.root)
+-    call.inheritClasspath = true
+-    call.addService(Processor::class, JsonClassCodeGenProcessor::class)
+-    call.addKt("source.kt", """
+-        |import com.squareup.moshi.JsonClass
+-        |
+-        |@JsonClass(generateAdapter = true)
+-        |abstract class AbstractClass(val a: Int)
+-        |""".trimMargin())
+-
+-    val result = call.execute()
+-    assertThat(result.exitCode).isEqualTo(ExitCode.COMPILATION_ERROR)
+-    assertThat(result.systemErr).contains(
+-        "error: @JsonClass can't be applied to AbstractClass: must not be abstract")
+-  }
+-
+-  @Test fun innerClassesNotSupported() {
+-    val call = KotlinCompilerCall(temporaryFolder.root)
+-    call.inheritClasspath = true
+-    call.addService(Processor::class, JsonClassCodeGenProcessor::class)
+-    call.addKt("source.kt", """
+-        |import com.squareup.moshi.JsonClass
+-        |
+-        |class Outer {
+-        |  @JsonClass(generateAdapter = true)
+-        |  inner class InnerClass(val a: Int)
+-        |}
+-        |""".trimMargin())
+-
+-    val result = call.execute()
+-    assertThat(result.exitCode).isEqualTo(ExitCode.COMPILATION_ERROR)
+-    assertThat(result.systemErr).contains(
+-        "error: @JsonClass can't be applied to Outer.InnerClass: must not be an inner class")
+-  }
+-
+-  // Annotation processors don't get called for local classes, so we don't have the opportunity to
+-  // print an error message. Instead local classes will fail at runtime.
+-  @Ignore
+-  @Test fun localClassesNotSupported() {
+-    val call = KotlinCompilerCall(temporaryFolder.root)
+-    call.inheritClasspath = true
+-    call.addService(Processor::class, JsonClassCodeGenProcessor::class)
+-    call.addKt("source.kt", """
+-        |import com.squareup.moshi.JsonClass
+-        |
+-        |fun outer() {
+-        |  @JsonClass(generateAdapter = true)
+-        |  class LocalClass(val a: Int)
+-        |}
+-        |""".trimMargin())
+-
+-    val result = call.execute()
+-    assertThat(result.exitCode).isEqualTo(ExitCode.COMPILATION_ERROR)
+-    assertThat(result.systemErr).contains(
+-        "error: @JsonClass can't be applied to LocalClass: must not be local")
+-  }
+-
+-  @Test fun objectDeclarationsNotSupported() {
+-    val call = KotlinCompilerCall(temporaryFolder.root)
+-    call.inheritClasspath = true
+-    call.addService(Processor::class, JsonClassCodeGenProcessor::class)
+-    call.addKt("source.kt", """
+-        |import com.squareup.moshi.JsonClass
+-        |
+-        |@JsonClass(generateAdapter = true)
+-        |object ObjectDeclaration {
+-        |  var a = 5
+-        |}
+-        |""".trimMargin())
+-    val result = call.execute()
+-    assertThat(result.exitCode).isEqualTo(ExitCode.COMPILATION_ERROR)
+-    assertThat(result.systemErr).contains(
+-        "error: @JsonClass can't be applied to ObjectDeclaration: must be a Kotlin class")
+-  }
+-
+-  @Test fun objectExpressionsNotSupported() {
+-    val call = KotlinCompilerCall(temporaryFolder.root)
+-    call.inheritClasspath = true
+-    call.addService(Processor::class, JsonClassCodeGenProcessor::class)
+-    call.addKt("source.kt", """
+-        |import com.squareup.moshi.JsonClass
+-        |
+-        |@JsonClass(generateAdapter = true)
+-        |val expression = object : Any() {
+-        |  var a = 5
+-        |}
+-        |""".trimMargin())
+-
+-    val result = call.execute()
+-    assertThat(result.exitCode).isEqualTo(ExitCode.COMPILATION_ERROR)
+-    assertThat(result.systemErr).contains(
+-        "error: @JsonClass can't be applied to expression\$annotations(): must be a Kotlin class")
+-  }
+ }
+\ No newline at end of file
+diff --git a/kotlin-codegen/integration-test/src/test/kotlin/com/squareup/moshi/GeneratedAdaptersTest.kt b/kotlin-codegen/integration-test/src/test/kotlin/com/squareup/moshi/GeneratedAdaptersTest.kt
+index 6ed8165b..49e8be01 100644
+--- a/kotlin-codegen/integration-test/src/test/kotlin/com/squareup/moshi/GeneratedAdaptersTest.kt
++++ b/kotlin-codegen/integration-test/src/test/kotlin/com/squareup/moshi/GeneratedAdaptersTest.kt
+@@ -378,7 +378,7 @@ class GeneratedAdaptersTest {
+       jsonAdapter.fromJson("{\"a\":null}")
+       fail()
+     } catch (expected: JsonDataException) {
+-      assertThat(expected).hasMessage("Unexpected null at \$.a")
++      assertThat(expected).hasMessage("Required property 'a' missing at \$")
+     }
+   }
+ 
+@@ -526,106 +526,6 @@ class GeneratedAdaptersTest {
+     var b: Int = -1
+   }
+ 
+-  @Test fun nonNullPropertySetToNullFailsWithJsonDataException() {
+-    val moshi = Moshi.Builder().build()
+-    val jsonAdapter = moshi.adapter(HasNonNullProperty::class.java)
+-
+-    try {
+-      jsonAdapter.fromJson("{\"a\":null}")
+-      fail()
+-    } catch (expected: JsonDataException) {
+-      assertThat(expected).hasMessage("Unexpected null at \$.a")
+-    }
+-  }
+-
+-  @JsonClass(generateAdapter = true)
+-  class HasNonNullProperty {
+-    var a: String = ""
+-  }
+-
+-  @Test fun manyProperties32() {
+-    val moshi = Moshi.Builder().build()
+-    val jsonAdapter = moshi.adapter(ManyProperties32::class.java)
+-
+-    val encoded = ManyProperties32(
+-        101, 102, 103, 104, 105,
+-        106, 107, 108, 109, 110,
+-        111, 112, 113, 114, 115,
+-        116, 117, 118, 119, 120,
+-        121, 122, 123, 124, 125,
+-        126, 127, 128, 129, 130,
+-        131, 132)
+-    val json = ("""
+-        |{
+-        |"v01":101,"v02":102,"v03":103,"v04":104,"v05":105,
+-        |"v06":106,"v07":107,"v08":108,"v09":109,"v10":110,
+-        |"v11":111,"v12":112,"v13":113,"v14":114,"v15":115,
+-        |"v16":116,"v17":117,"v18":118,"v19":119,"v20":120,
+-        |"v21":121,"v22":122,"v23":123,"v24":124,"v25":125,
+-        |"v26":126,"v27":127,"v28":128,"v29":129,"v30":130,
+-        |"v31":131,"v32":132
+-        |}
+-        |""").trimMargin().replace("\n", "")
+-
+-    assertThat(jsonAdapter.toJson(encoded)).isEqualTo(json)
+-
+-    val decoded = jsonAdapter.fromJson(json)!!
+-    assertThat(decoded.v01).isEqualTo(101)
+-    assertThat(decoded.v32).isEqualTo(132)
+-  }
+-
+-  @JsonClass(generateAdapter = true)
+-  class ManyProperties32(
+-    var v01: Int, var v02: Int, var v03: Int, var v04: Int, var v05: Int,
+-    var v06: Int, var v07: Int, var v08: Int, var v09: Int, var v10: Int,
+-    var v11: Int, var v12: Int, var v13: Int, var v14: Int, var v15: Int,
+-    var v16: Int, var v17: Int, var v18: Int, var v19: Int, var v20: Int,
+-    var v21: Int, var v22: Int, var v23: Int, var v24: Int, var v25: Int,
+-    var v26: Int, var v27: Int, var v28: Int, var v29: Int, var v30: Int,
+-    var v31: Int, var v32: Int)
+-
+-  @Test fun manyProperties33() {
+-    val moshi = Moshi.Builder().build()
+-    val jsonAdapter = moshi.adapter(ManyProperties33::class.java)
+-
+-    val encoded = ManyProperties33(
+-        101, 102, 103, 104, 105,
+-        106, 107, 108, 109, 110,
+-        111, 112, 113, 114, 115,
+-        116, 117, 118, 119, 120,
+-        121, 122, 123, 124, 125,
+-        126, 127, 128, 129, 130,
+-        131, 132, 133)
+-    val json = ("""
+-        |{
+-        |"v01":101,"v02":102,"v03":103,"v04":104,"v05":105,
+-        |"v06":106,"v07":107,"v08":108,"v09":109,"v10":110,
+-        |"v11":111,"v12":112,"v13":113,"v14":114,"v15":115,
+-        |"v16":116,"v17":117,"v18":118,"v19":119,"v20":120,
+-        |"v21":121,"v22":122,"v23":123,"v24":124,"v25":125,
+-        |"v26":126,"v27":127,"v28":128,"v29":129,"v30":130,
+-        |"v31":131,"v32":132,"v33":133
+-        |}
+-        |""").trimMargin().replace("\n", "")
+-
+-    assertThat(jsonAdapter.toJson(encoded)).isEqualTo(json)
+-
+-    val decoded = jsonAdapter.fromJson(json)!!
+-    assertThat(decoded.v01).isEqualTo(101)
+-    assertThat(decoded.v32).isEqualTo(132)
+-    assertThat(decoded.v33).isEqualTo(133)
+-  }
+-
+-  @JsonClass(generateAdapter = true)
+-  class ManyProperties33(
+-    var v01: Int, var v02: Int, var v03: Int, var v04: Int, var v05: Int,
+-    var v06: Int, var v07: Int, var v08: Int, var v09: Int, var v10: Int,
+-    var v11: Int, var v12: Int, var v13: Int, var v14: Int, var v15: Int,
+-    var v16: Int, var v17: Int, var v18: Int, var v19: Int, var v20: Int,
+-    var v21: Int, var v22: Int, var v23: Int, var v24: Int, var v25: Int,
+-    var v26: Int, var v27: Int, var v28: Int, var v29: Int, var v30: Int,
+-    var v31: Int, var v32: Int, var v33: Int)
+-
+   @Retention(AnnotationRetention.RUNTIME)
+   @JsonQualifier
+   annotation class Uppercase
+diff --git a/kotlin-codegen/integration-test/src/test/kotlin/com/squareup/moshi/KotlinCodeGenTest.kt b/kotlin-codegen/integration-test/src/test/kotlin/com/squareup/moshi/KotlinCodeGenTest.kt
+index 141afb24..4369c249 100644
+--- a/kotlin-codegen/integration-test/src/test/kotlin/com/squareup/moshi/KotlinCodeGenTest.kt
++++ b/kotlin-codegen/integration-test/src/test/kotlin/com/squareup/moshi/KotlinCodeGenTest.kt
+@@ -39,6 +39,22 @@ class KotlinCodeGenTest {
+ 
+   class DuplicateValue(var a: Int = -1, var b: Int = -2)
+ 
++  @Ignore @Test fun nonNullPropertySetToNullFailsWithJsonDataException() {
++    val moshi = Moshi.Builder().build()
++    val jsonAdapter = moshi.adapter(HasNonNullProperty::class.java)
++
++    try {
++      jsonAdapter.fromJson("{\"a\":null}")
++      fail()
++    } catch (expected: JsonDataException) {
++      assertThat(expected).hasMessage("Non-null value a was null at \$")
++    }
++  }
++
++  class HasNonNullProperty {
++    var a: String = ""
++  }
++
+   @Ignore @Test fun repeatedValue() {
+     val moshi = Moshi.Builder().build()
+     val jsonAdapter = moshi.adapter(RepeatedValue::class.java)
+@@ -307,6 +323,167 @@ class KotlinCodeGenTest {
+     A, B
+   }
+ 
++  @Ignore @Test fun interfacesNotSupported() {
++    val moshi = Moshi.Builder().build()
++    try {
++      moshi.adapter(Interface::class.java)
++      fail()
++    } catch (e: IllegalArgumentException) {
++      assertThat(e).hasMessage("No JsonAdapter for interface " +
++          "com.squareup.moshi.KotlinJsonAdapterTest\$Interface (with no annotations)")
++    }
++  }
++
++  interface Interface
++
++  @Ignore @Test fun abstractClassesNotSupported() {
++    val moshi = Moshi.Builder().build()
++    try {
++      moshi.adapter(AbstractClass::class.java)
++      fail()
++    } catch (e: IllegalArgumentException) {
++      assertThat(e).hasMessage(
++          "Cannot serialize abstract class com.squareup.moshi.KotlinJsonAdapterTest\$AbstractClass")
++    }
++  }
++
++  abstract class AbstractClass(val a: Int)
++
++  @Ignore @Test fun innerClassesNotSupported() {
++    val moshi = Moshi.Builder().build()
++    try {
++      moshi.adapter(InnerClass::class.java)
++      fail()
++    } catch (e: IllegalArgumentException) {
++      assertThat(e).hasMessage(
++          "Cannot serialize non-static nested class com.squareup.moshi.KotlinCodeGenTest\$InnerClass")
++    }
++  }
++
++  inner class InnerClass(val a: Int)
++
++  @Ignore @Test fun localClassesNotSupported() {
++    class LocalClass(val a: Int)
++    val moshi = Moshi.Builder().build()
++    try {
++      moshi.adapter(LocalClass::class.java)
++      fail()
++    } catch (e: IllegalArgumentException) {
++      assertThat(e).hasMessage("Cannot serialize local class or object expression " +
++          "com.squareup.moshi.KotlinJsonAdapterTest\$localClassesNotSupported\$LocalClass")
++    }
++  }
++
++  @Ignore @Test fun objectDeclarationsNotSupported() {
++    val moshi = Moshi.Builder().build()
++    try {
++      moshi.adapter(ObjectDeclaration.javaClass)
++      fail()
++    } catch (e: IllegalArgumentException) {
++      assertThat(e).hasMessage("Cannot serialize object declaration " +
++          "com.squareup.moshi.KotlinJsonAdapterTest\$ObjectDeclaration")
++    }
++  }
++
++  object ObjectDeclaration {
++    var a = 5
++  }
++
++  @Ignore @Test fun objectExpressionsNotSupported() {
++    val expression = object : Any() {
++      var a = 5
++    }
++    val moshi = Moshi.Builder().build()
++    try {
++      moshi.adapter(expression.javaClass)
++      fail()
++    } catch (e: IllegalArgumentException) {
++      assertThat(e).hasMessage("Cannot serialize local class or object expression " +
++          "com.squareup.moshi.KotlinJsonAdapterTest\$objectExpressionsNotSupported\$expression$1")
++    }
++  }
++
++  @Ignore @Test fun manyProperties32() {
++    val moshi = Moshi.Builder().build()
++    val jsonAdapter = moshi.adapter(ManyProperties32::class.java)
++
++    val encoded = ManyProperties32(
++        101, 102, 103, 104, 105,
++        106, 107, 108, 109, 110,
++        111, 112, 113, 114, 115,
++        116, 117, 118, 119, 120,
++        121, 122, 123, 124, 125,
++        126, 127, 128, 129, 130,
++        131, 132)
++    val json = ("""
++        |{
++        |"v01":101,"v02":102,"v03":103,"v04":104,"v05":105,
++        |"v06":106,"v07":107,"v08":108,"v09":109,"v10":110,
++        |"v11":111,"v12":112,"v13":113,"v14":114,"v15":115,
++        |"v16":116,"v17":117,"v18":118,"v19":119,"v20":120,
++        |"v21":121,"v22":122,"v23":123,"v24":124,"v25":125,
++        |"v26":126,"v27":127,"v28":128,"v29":129,"v30":130,
++        |"v31":131,"v32":132
++        |}
++        |""").trimMargin().replace("\n", "")
++
++    assertThat(jsonAdapter.toJson(encoded)).isEqualTo(json)
++
++    val decoded = jsonAdapter.fromJson(json)!!
++    assertThat(decoded.v01).isEqualTo(101)
++    assertThat(decoded.v32).isEqualTo(132)
++  }
++
++  class ManyProperties32(
++      var v01: Int, var v02: Int, var v03: Int, var v04: Int, var v05: Int,
++      var v06: Int, var v07: Int, var v08: Int, var v09: Int, var v10: Int,
++      var v11: Int, var v12: Int, var v13: Int, var v14: Int, var v15: Int,
++      var v16: Int, var v17: Int, var v18: Int, var v19: Int, var v20: Int,
++      var v21: Int, var v22: Int, var v23: Int, var v24: Int, var v25: Int,
++      var v26: Int, var v27: Int, var v28: Int, var v29: Int, var v30: Int,
++      var v31: Int, var v32: Int)
++
++  @Ignore @Test fun manyProperties33() {
++    val moshi = Moshi.Builder().build()
++    val jsonAdapter = moshi.adapter(ManyProperties33::class.java)
++
++    val encoded = ManyProperties33(
++        101, 102, 103, 104, 105,
++        106, 107, 108, 109, 110,
++        111, 112, 113, 114, 115,
++        116, 117, 118, 119, 120,
++        121, 122, 123, 124, 125,
++        126, 127, 128, 129, 130,
++        131, 132, 133)
++    val json = ("""
++        |{
++        |"v01":101,"v02":102,"v03":103,"v04":104,"v05":105,
++        |"v06":106,"v07":107,"v08":108,"v09":109,"v10":110,
++        |"v11":111,"v12":112,"v13":113,"v14":114,"v15":115,
++        |"v16":116,"v17":117,"v18":118,"v19":119,"v20":120,
++        |"v21":121,"v22":122,"v23":123,"v24":124,"v25":125,
++        |"v26":126,"v27":127,"v28":128,"v29":129,"v30":130,
++        |"v31":131,"v32":132,"v33":133
++        |}
++        |""").trimMargin().replace("\n", "")
++
++    assertThat(jsonAdapter.toJson(encoded)).isEqualTo(json)
++
++    val decoded = jsonAdapter.fromJson(json)!!
++    assertThat(decoded.v01).isEqualTo(101)
++    assertThat(decoded.v32).isEqualTo(132)
++    assertThat(decoded.v33).isEqualTo(133)
++  }
++
++  class ManyProperties33(
++      var v01: Int, var v02: Int, var v03: Int, var v04: Int, var v05: Int,
++      var v06: Int, var v07: Int, var v08: Int, var v09: Int, var v10: Int,
++      var v11: Int, var v12: Int, var v13: Int, var v14: Int, var v15: Int,
++      var v16: Int, var v17: Int, var v18: Int, var v19: Int, var v20: Int,
++      var v21: Int, var v22: Int, var v23: Int, var v24: Int, var v25: Int,
++      var v26: Int, var v27: Int, var v28: Int, var v29: Int, var v30: Int,
++      var v31: Int, var v32: Int, var v33: Int)
++
+   // TODO(jwilson): resolve generic types?
+ 
+   @Retention(RUNTIME)

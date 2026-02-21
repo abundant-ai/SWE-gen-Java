@@ -1,0 +1,255 @@
+diff --git a/core/src/main/scala/cats/Eval.scala b/core/src/main/scala/cats/Eval.scala
+index 21b2025e7..58254bd09 100644
+--- a/core/src/main/scala/cats/Eval.scala
++++ b/core/src/main/scala/cats/Eval.scala
+@@ -116,7 +116,7 @@ sealed abstract class Eval[+A] extends Serializable { self =>
+  * This type should be used when an A value is already in hand, or
+  * when the computation to produce an A value is pure and very fast.
+  */
+-final case class Now[A](value: A) extends Eval.Leaf[A] {
++final case class Now[A](value: A) extends Eval[A] {
+   def memoize: Eval[A] = this
+ }
+ 
+@@ -134,7 +134,7 @@ final case class Now[A](value: A) extends Eval.Leaf[A] {
+  * by the closure) will not be retained, and will be available for
+  * garbage collection.
+  */
+-final class Later[A](f: () => A) extends Eval.Leaf[A] {
++final class Later[A](f: () => A) extends Eval[A] {
+   private[this] var thunk: () => A = f
+ 
+   // The idea here is that `f` may have captured very large
+@@ -167,7 +167,7 @@ object Later {
+  * required. It should be avoided except when laziness is required and
+  * caching must be avoided. Generally, prefer Later.
+  */
+-final class Always[A](f: () => A) extends Eval.Leaf[A] {
++final class Always[A](f: () => A) extends Eval[A] {
+   def value: A = f()
+   def memoize: Eval[A] = new Later(f)
+ }
+@@ -178,13 +178,6 @@ object Always {
+ 
+ object Eval extends EvalInstances {
+ 
+-  /**
+-   * A Leaf does not depend on any other Eval
+-   * so calling .value does not trigger
+-   * any flatMaps or defers
+-   */
+-  sealed abstract class Leaf[A] extends Eval[A]
+-
+   /**
+    * Construct an eager Eval[A] value (i.e. Now[A]).
+    */
+@@ -262,6 +255,34 @@ object Eval extends EvalInstances {
+     def value: A = evaluate(this)
+   }
+ 
++  /**
++   * Advance until we find a non-deferred Eval node.
++   *
++   * Often we may have deep chains of Defer nodes; the goal here is to
++   * advance through those to find the underlying "work" (in the case
++   * of FlatMap nodes) or "value" (in the case of Now, Later, or
++   * Always nodes).
++   */
++  @tailrec private def advance[A](fa: Eval[A]): Eval[A] =
++    fa match {
++      case call: Eval.Defer[A] =>
++        advance(call.thunk())
++      case compute: Eval.FlatMap[A] =>
++        new Eval.FlatMap[A] {
++          type Start = compute.Start
++          val start: () => Eval[Start] = () => compute.start()
++          val run: Start => Eval[A] = s => advance1(compute.run(s))
++        }
++      case other => other
++    }
++
++  /**
++   * Alias for advance that can be called in a non-tail position
++   * from an otherwise tailrec-optimized advance.
++   */
++  private def advance1[A](fa: Eval[A]): Eval[A] =
++    advance(fa)
++
+   /**
+    * FlatMap is a type of Eval[A] that is used to chain computations
+    * involving .map and .flatMap. Along with Eval#flatMap it
+@@ -297,70 +318,52 @@ object Eval extends EvalInstances {
+       }
+   }
+ 
+-  /*
+-   * This represents the stack of flatmap functions in a series
+-   * of Eval operations
+-   */
+-  sealed abstract private class FnStack[A, B]
+-  final private case class Ident[A, B](ev: A <:< B) extends FnStack[A, B]
+-  final private case class Many[A, B, C](first: A => Eval[B], rest: FnStack[B, C]) extends FnStack[A, C]
+-
+   private def evaluate[A](e: Eval[A]): A = {
+-    def addToMemo[A1](m: Memoize[A1]): A1 => Eval[A1] = { (a: A1) =>
++    type L = Eval[Any]
++    type M = Memoize[Any]
++    type C = Any => Eval[Any]
++
++    def addToMemo(m: M): C = { (a: Any) =>
+       m.result = Some(a)
+       Now(a)
+     }
+ 
+-    @tailrec def loop[A1](curr: Eval[A1], fs: FnStack[A1, A]): A =
++    @tailrec def loop(curr: L, fs: List[C]): Any =
+       curr match {
+-        case c: FlatMap[A1] =>
++        case c: FlatMap[_] =>
+           c.start() match {
+-            case cc: FlatMap[c.Start] =>
+-              val nextFs = Many(c.run, fs)
+-              loop(cc.start(), Many(cc.run, nextFs))
+-            case call: Defer[c.Start] =>
+-              // though the flatMap method handles defer(x).flatMap(f)
+-              // by removing the Defer, we can nest defers,
+-              // so defer(defer(x)).flatMap(f) could mean c.start()
+-              // returns a Defer. We have to handle it here
+-              loop(call.thunk(), Many(c.run, fs))
++            case cc: FlatMap[_] =>
++              loop(cc.start().asInstanceOf[L], cc.run.asInstanceOf[C] :: c.run.asInstanceOf[C] :: fs)
+             case mm @ Memoize(eval) =>
+               mm.result match {
+                 case Some(a) =>
+-                  loop(c.run(a), fs)
++                  loop(Now(a), c.run.asInstanceOf[C] :: fs)
+                 case None =>
+-                  val nextFs = Many(c.run, fs)
+-                  loop(eval, Many(addToMemo(mm), nextFs))
++                  loop(eval, addToMemo(mm.asInstanceOf[M]) :: c.run.asInstanceOf[C] :: fs)
+               }
+-            case xx: Leaf[c.Start] =>
+-              // xx must be Now, Later, Always, all of those
+-              // have safe .value:
++            case xx =>
+               loop(c.run(xx.value), fs)
+           }
+-        case call: Defer[A1] =>
+-          loop(call.thunk(), fs)
+-        case m: Memoize[a] =>
+-          // a <:< A1
++        case call: Defer[_] =>
++          loop(advance(call), fs)
++        case m @ Memoize(eval) =>
+           m.result match {
+             case Some(a) =>
+               fs match {
+-                case Many(f, fs) => loop(f(a), fs)
+-                case Ident(ev)   => ev(a)
++                case f :: fs => loop(f(a), fs)
++                case Nil     => a
+               }
+             case None =>
+-              loop[a](m.eval, Many[a, A1, A](addToMemo[a](m), fs))
++              loop(eval, addToMemo(m.asInstanceOf[M]) :: fs)
+           }
+-        case x: Leaf[A1] =>
+-          // Now, Later or Always don't have recursions
+-          // so they have safe .value:
+-          val a1 = x.value
++        case x =>
+           fs match {
+-            case Many(f, fs) => loop(f(a1), fs)
+-            case Ident(ev)   => ev(a1)
++            case f :: fs => loop(f(x.value), fs)
++            case Nil     => x.value
+           }
+       }
+ 
+-    loop(e, Ident(implicitly[A <:< A]))
++    loop(e.asInstanceOf[L], Nil).asInstanceOf[A]
+   }
+ }
+ 
+diff --git a/core/src/main/scala/cats/instances/list.scala b/core/src/main/scala/cats/instances/list.scala
+index 27f136226..a0b271920 100644
+--- a/core/src/main/scala/cats/instances/list.scala
++++ b/core/src/main/scala/cats/instances/list.scala
+@@ -30,10 +30,8 @@ trait ListInstances extends cats.kernel.instances.ListInstances {
+         if (fb.isEmpty) Nil // do O(1) work if fb is empty
+         else fa.flatMap(a => fb.map(b => f(a, b))) // already O(1) if fa is empty
+ 
+-      private[this] val evalNil: Eval[List[Nothing]] = Eval.now(Nil)
+-
+       override def map2Eval[A, B, Z](fa: List[A], fb: Eval[List[B]])(f: (A, B) => Z): Eval[List[Z]] =
+-        if (fa.isEmpty) evalNil // no need to evaluate fb
++        if (fa.isEmpty) Eval.now(Nil) // no need to evaluate fb
+         else fb.map(fb => map2(fa, fb)(f))
+ 
+       def tailRecM[A, B](a: A)(f: A => List[Either[A, B]]): List[B] = {
+diff --git a/core/src/main/scala/cats/instances/vector.scala b/core/src/main/scala/cats/instances/vector.scala
+index 0fb1bb404..e5828c9f7 100644
+--- a/core/src/main/scala/cats/instances/vector.scala
++++ b/core/src/main/scala/cats/instances/vector.scala
+@@ -30,10 +30,8 @@ trait VectorInstances extends cats.kernel.instances.VectorInstances {
+         if (fb.isEmpty) Vector.empty // do O(1) work if either is empty
+         else fa.flatMap(a => fb.map(b => f(a, b))) // already O(1) if fa is empty
+ 
+-      private[this] val evalEmpty: Eval[Vector[Nothing]] = Eval.now(Vector.empty)
+-
+       override def map2Eval[A, B, Z](fa: Vector[A], fb: Eval[Vector[B]])(f: (A, B) => Z): Eval[Vector[Z]] =
+-        if (fa.isEmpty) evalEmpty // no need to evaluate fb
++        if (fa.isEmpty) Eval.now(Vector.empty) // no need to evaluate fb
+         else fb.map(fb => map2(fa, fb)(f))
+ 
+       def coflatMap[A, B](fa: Vector[A])(f: Vector[A] => B): Vector[B] = {
+diff --git a/docs/src/main/tut/datatypes/eval.md b/docs/src/main/tut/datatypes/eval.md
+index d02549380..b22ea55ef 100644
+--- a/docs/src/main/tut/datatypes/eval.md
++++ b/docs/src/main/tut/datatypes/eval.md
+@@ -93,13 +93,13 @@ Another great example are mutual tail-recursive calls:
+ object MutualRecursion {
+   def even(n: Int): Eval[Boolean] =
+     Eval.always(n == 0).flatMap {
+-      case true => Eval.True
++      case true => Eval.now(true)
+       case false => odd(n - 1)
+     }
+ 
+   def odd(n: Int): Eval[Boolean] =
+     Eval.always(n == 0).flatMap {
+-      case true => Eval.False
++      case true => Eval.now(false)
+       case false => even(n - 1)
+     }
+ }
+diff --git a/docs/src/main/tut/typeclasses/foldable.md b/docs/src/main/tut/typeclasses/foldable.md
+index 479490413..53d18390b 100644
+--- a/docs/src/main/tut/typeclasses/foldable.md
++++ b/docs/src/main/tut/typeclasses/foldable.md
+@@ -133,5 +133,5 @@ With the lazy `foldRight` on `Foldable`, the calculation terminates
+ after looking at only one value:
+ 
+ ```tut:book
+-Foldable[Stream].foldRight(allFalse, Eval.True)((a,b) => if (a) b else Eval.False).value
++Foldable[Stream].foldRight(allFalse, Eval.True)((a,b) => if (a) b else Eval.now(false)).value
+ ```
+diff --git a/tests/src/test/scala/cats/tests/EvalSuite.scala b/tests/src/test/scala/cats/tests/EvalSuite.scala
+index 82426b143..e0a9479c1 100644
+--- a/tests/src/test/scala/cats/tests/EvalSuite.scala
++++ b/tests/src/test/scala/cats/tests/EvalSuite.scala
+@@ -96,14 +96,6 @@ class EvalSuite extends CatsSuite {
+     spooky.counter should ===(2)
+   }
+ 
+-  test("Defer and FlatMap compose without blowing the stack") {
+-    def inc(a: Eval[Int], count: Int): Eval[Int] =
+-      if (count <= 0) a
+-      else Eval.defer(Eval.defer(inc(a, count - 1))).flatMap { i => Eval.now(i + 1) }
+-
+-    assert(inc(Eval.now(0), 1000000).value == 1000000)
+-  }
+-
+   {
+     implicit val iso: SemigroupalTests.Isomorphisms[Eval] =
+       SemigroupalTests.Isomorphisms.invariant[Eval]

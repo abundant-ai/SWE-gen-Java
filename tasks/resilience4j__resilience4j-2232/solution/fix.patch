@@ -1,0 +1,267 @@
+diff --git a/resilience4j-bulkhead/src/main/java/io/github/resilience4j/bulkhead/internal/SemaphoreBulkhead.java b/resilience4j-bulkhead/src/main/java/io/github/resilience4j/bulkhead/internal/SemaphoreBulkhead.java
+index aeff3cc4..c5edbdf3 100644
+--- a/resilience4j-bulkhead/src/main/java/io/github/resilience4j/bulkhead/internal/SemaphoreBulkhead.java
++++ b/resilience4j-bulkhead/src/main/java/io/github/resilience4j/bulkhead/internal/SemaphoreBulkhead.java
+@@ -34,6 +34,7 @@ import io.github.resilience4j.core.lang.Nullable;
+ import java.util.Map;
+ import java.util.concurrent.Semaphore;
+ import java.util.concurrent.TimeUnit;
++import java.util.concurrent.locks.ReentrantLock;
+ import java.util.function.Supplier;
+ 
+ import static java.util.Collections.emptyMap;
+@@ -52,7 +53,7 @@ public class SemaphoreBulkhead implements Bulkhead {
+     private final BulkheadMetrics metrics;
+     private final BulkheadEventProcessor eventProcessor;
+ 
+-    private final Object configChangesLock = new Object();
++    private final ReentrantLock lock = new ReentrantLock();
+     private final Map<String, String> tags;
+     @SuppressWarnings("squid:S3077")
+     // this object is immutable and we replace ref entirely during config change.
+@@ -123,7 +124,9 @@ public class SemaphoreBulkhead implements Bulkhead {
+      */
+     @Override
+     public void changeConfig(final BulkheadConfig newConfig) {
+-        synchronized (configChangesLock) {
++        lock.lock();
++
++        try {
+             int delta = newConfig.getMaxConcurrentCalls() - config.getMaxConcurrentCalls();
+             if (delta < 0) {
+                 semaphore.acquireUninterruptibly(-delta);
+@@ -131,6 +134,8 @@ public class SemaphoreBulkhead implements Bulkhead {
+                 semaphore.release(delta);
+             }
+             config = newConfig;
++        } finally {
++            lock.unlock();
+         }
+     }
+ 
+diff --git a/resilience4j-circuitbreaker/src/main/java/io/github/resilience4j/circuitbreaker/internal/CircuitBreakerStateMachine.java b/resilience4j-circuitbreaker/src/main/java/io/github/resilience4j/circuitbreaker/internal/CircuitBreakerStateMachine.java
+index 3db53604..6ffd8bec 100644
+--- a/resilience4j-circuitbreaker/src/main/java/io/github/resilience4j/circuitbreaker/internal/CircuitBreakerStateMachine.java
++++ b/resilience4j-circuitbreaker/src/main/java/io/github/resilience4j/circuitbreaker/internal/CircuitBreakerStateMachine.java
+@@ -39,6 +39,7 @@ import java.util.concurrent.*;
+ import java.util.concurrent.atomic.AtomicBoolean;
+ import java.util.concurrent.atomic.AtomicInteger;
+ import java.util.concurrent.atomic.AtomicReference;
++import java.util.concurrent.locks.ReentrantLock;
+ import java.util.function.Function;
+ import java.util.function.Supplier;
+ import java.util.function.UnaryOperator;
+@@ -65,6 +66,7 @@ public final class CircuitBreakerStateMachine implements CircuitBreaker {
+     private final SchedulerFactory schedulerFactory;
+     private final Function<Clock, Long> currentTimestampFunction;
+     private final TimeUnit timestampUnit;
++    private final ReentrantLock lock = new ReentrantLock();
+ 
+     /**
+      * Creates a circuitBreaker.
+@@ -808,9 +810,15 @@ public final class CircuitBreakerStateMachine implements CircuitBreaker {
+             cancelAutomaticTransitionToHalfOpen();
+         }
+ 
+-        private synchronized void toHalfOpenState() {
+-            if (isOpen.compareAndSet(true, false)) {
+-                transitionToHalfOpenState();
++        private void toHalfOpenState() {
++            lock.lock();
++
++            try {
++                if (isOpen.compareAndSet(true, false)) {
++                    transitionToHalfOpenState();
++                }
++            } finally {
++                lock.unlock();
+             }
+         }
+ 
+diff --git a/resilience4j-core/src/main/java/io/github/resilience4j/core/EventProcessor.java b/resilience4j-core/src/main/java/io/github/resilience4j/core/EventProcessor.java
+index 325b00df..112e2719 100644
+--- a/resilience4j-core/src/main/java/io/github/resilience4j/core/EventProcessor.java
++++ b/resilience4j-core/src/main/java/io/github/resilience4j/core/EventProcessor.java
+@@ -20,11 +20,11 @@ package io.github.resilience4j.core;
+ 
+ import io.github.resilience4j.core.lang.Nullable;
+ 
+-import java.util.List;
+ import java.util.Set;
+ import java.util.concurrent.ConcurrentHashMap;
+ import java.util.concurrent.ConcurrentMap;
+ import java.util.concurrent.CopyOnWriteArraySet;
++import java.util.concurrent.locks.ReentrantLock;
+ 
+ public class EventProcessor<T> implements EventPublisher<T> {
+ 
+@@ -36,19 +36,27 @@ public class EventProcessor<T> implements EventPublisher<T> {
+         return consumerRegistered;
+     }
+ 
++    private final ReentrantLock lock = new ReentrantLock();
++
+     @SuppressWarnings("unchecked")
+-    public synchronized void registerConsumer(String className, EventConsumer<? extends T> eventConsumer) {
+-        this.eventConsumerMap.compute(className, (k, consumers) -> {
+-            if (consumers == null) {
+-                consumers = new CopyOnWriteArraySet<>();
+-                consumers.add((EventConsumer<T>) eventConsumer);
+-                return consumers;
+-            } else {
+-                consumers.add((EventConsumer<T>) eventConsumer);
+-                return consumers;
+-            }
+-        });
+-        this.consumerRegistered = true;
++    public void registerConsumer(String className, EventConsumer<? extends T> eventConsumer) {
++        lock.lock();
++
++        try {
++            this.eventConsumerMap.compute(className, (k, consumers) -> {
++                if (consumers == null) {
++                    consumers = new CopyOnWriteArraySet<>();
++                    consumers.add((EventConsumer<T>) eventConsumer);
++                    return consumers;
++                } else {
++                    consumers.add((EventConsumer<T>) eventConsumer);
++                    return consumers;
++                }
++            });
++            this.consumerRegistered = true;
++        } finally {
++            lock.unlock();
++        }
+     }
+ 
+     public <E extends T> boolean processEvent(E event) {
+@@ -73,8 +81,14 @@ public class EventProcessor<T> implements EventPublisher<T> {
+     }
+ 
+     @Override
+-    public synchronized void onEvent(@Nullable EventConsumer<T> onEventConsumer) {
+-        this.onEventConsumers.add(onEventConsumer);
+-        this.consumerRegistered = true;
++    public void onEvent(@Nullable EventConsumer<T> onEventConsumer) {
++        lock.lock();
++
++        try {
++            this.onEventConsumers.add(onEventConsumer);
++            this.consumerRegistered = true;
++        } finally {
++            lock.unlock();
++        }
+     }
+ }
+diff --git a/resilience4j-core/src/main/java/io/github/resilience4j/core/metrics/FixedSizeSlidingWindowMetrics.java b/resilience4j-core/src/main/java/io/github/resilience4j/core/metrics/FixedSizeSlidingWindowMetrics.java
+index 567d6376..17ed4a83 100644
+--- a/resilience4j-core/src/main/java/io/github/resilience4j/core/metrics/FixedSizeSlidingWindowMetrics.java
++++ b/resilience4j-core/src/main/java/io/github/resilience4j/core/metrics/FixedSizeSlidingWindowMetrics.java
+@@ -20,6 +20,7 @@ package io.github.resilience4j.core.metrics;
+ 
+ 
+ import java.util.concurrent.TimeUnit;
++import java.util.concurrent.locks.ReentrantLock;
+ 
+ /**
+  * A {@link Metrics} implementation is backed by a sliding window that aggregates only the last
+@@ -43,6 +44,8 @@ public class FixedSizeSlidingWindowMetrics implements Metrics {
+     private final Measurement[] measurements;
+     int headIndex;
+ 
++    private final ReentrantLock lock = new ReentrantLock();
++
+     /**
+      * Creates a new {@link FixedSizeSlidingWindowMetrics} with the given window size.
+      *
+@@ -59,14 +62,26 @@ public class FixedSizeSlidingWindowMetrics implements Metrics {
+     }
+ 
+     @Override
+-    public synchronized Snapshot record(long duration, TimeUnit durationUnit, Outcome outcome) {
+-        totalAggregation.record(duration, durationUnit, outcome);
+-        moveWindowByOne().record(duration, durationUnit, outcome);
+-        return new SnapshotImpl(totalAggregation);
++    public Snapshot record(long duration, TimeUnit durationUnit, Outcome outcome) {
++        lock.lock();
++
++        try {
++            totalAggregation.record(duration, durationUnit, outcome);
++            moveWindowByOne().record(duration, durationUnit, outcome);
++            return new SnapshotImpl(totalAggregation);
++        } finally {
++            lock.unlock();
++        }
+     }
+ 
+-    public synchronized Snapshot getSnapshot() {
+-        return new SnapshotImpl(totalAggregation);
++    public Snapshot getSnapshot() {
++        lock.lock();
++
++        try {
++            return new SnapshotImpl(totalAggregation);
++        } finally {
++            lock.unlock();
++        }
+     }
+ 
+     private Measurement moveWindowByOne() {
+diff --git a/resilience4j-core/src/main/java/io/github/resilience4j/core/metrics/SlidingTimeWindowMetrics.java b/resilience4j-core/src/main/java/io/github/resilience4j/core/metrics/SlidingTimeWindowMetrics.java
+index 46d40d0d..287da74a 100644
+--- a/resilience4j-core/src/main/java/io/github/resilience4j/core/metrics/SlidingTimeWindowMetrics.java
++++ b/resilience4j-core/src/main/java/io/github/resilience4j/core/metrics/SlidingTimeWindowMetrics.java
+@@ -21,6 +21,7 @@ package io.github.resilience4j.core.metrics;
+ 
+ import java.time.Clock;
+ import java.util.concurrent.TimeUnit;
++import java.util.concurrent.locks.ReentrantLock;
+ 
+ /**
+  * A {@link Metrics} implementation is backed by a sliding time window that aggregates only the
+@@ -51,6 +52,8 @@ public class SlidingTimeWindowMetrics implements Metrics {
+     private final Clock clock;
+     int headIndex;
+ 
++    private final ReentrantLock lock = new ReentrantLock();
++
+     /**
+      * Creates a new {@link SlidingTimeWindowMetrics} with the given clock and window of time.
+      *
+@@ -71,16 +74,28 @@ public class SlidingTimeWindowMetrics implements Metrics {
+     }
+ 
+     @Override
+-    public synchronized Snapshot record(long duration, TimeUnit durationUnit, Outcome outcome) {
+-        totalAggregation.record(duration, durationUnit, outcome);
+-        moveWindowToCurrentEpochSecond(getLatestPartialAggregation())
+-            .record(duration, durationUnit, outcome);
+-        return new SnapshotImpl(totalAggregation);
++    public Snapshot record(long duration, TimeUnit durationUnit, Outcome outcome) {
++        lock.lock();
++
++        try {
++            totalAggregation.record(duration, durationUnit, outcome);
++            moveWindowToCurrentEpochSecond(getLatestPartialAggregation())
++                    .record(duration, durationUnit, outcome);
++            return new SnapshotImpl(totalAggregation);
++        } finally {
++            lock.unlock();
++        }
+     }
+ 
+-    public synchronized Snapshot getSnapshot() {
+-        moveWindowToCurrentEpochSecond(getLatestPartialAggregation());
+-        return new SnapshotImpl(totalAggregation);
++    public Snapshot getSnapshot() {
++        lock.lock();
++
++        try {
++            moveWindowToCurrentEpochSecond(getLatestPartialAggregation());
++            return new SnapshotImpl(totalAggregation);
++        } finally {
++            lock.unlock();
++        }
+     }
+ 
+     /**

@@ -1,0 +1,246 @@
+diff --git a/release-notes/CREDITS b/release-notes/CREDITS
+index f053fc2bc..47740c76e 100644
+--- a/release-notes/CREDITS
++++ b/release-notes/CREDITS
+@@ -189,6 +189,8 @@ Kenneth Jorgensen (@kennethjor)
+   [3.1.0]
+ 
+ Lee Jiwon (@dlwldnjs1009)
++ * Fixed #3188: Skip unknown `Enum` keys in `Map` deserialization
++  [3.1.0]
+  * Implemented #3284: Backward compatibility for timezone formats of UTC Date
+    serialization
+   [3.1.0]
+diff --git a/release-notes/VERSION b/release-notes/VERSION
+index d738c9c02..f6672b523 100644
+--- a/release-notes/VERSION
++++ b/release-notes/VERSION
+@@ -55,6 +55,9 @@ Versions: 3.x (for earlier see VERSION-2.x)
+ #2686: `@JsonBackReference` does not work with a builder
+  (reported by @janrieke)
+  (fix by @JacksonJang)
++#3188: Skip unknown `Enum` keys in `Map` deserialization
++ (requested by @matthias-mueller)
++ (fixed by Lee Jiwon)
+ #3284: Backward compatibility for timezone formats of UTC Date
+   serialization
+  (requested by @arungitan)
+diff --git a/src/main/java/tools/jackson/databind/deser/jdk/JDKKeyDeserializer.java b/src/main/java/tools/jackson/databind/deser/jdk/JDKKeyDeserializer.java
+index e9c81be30..8c94ae4b8 100644
+--- a/src/main/java/tools/jackson/databind/deser/jdk/JDKKeyDeserializer.java
++++ b/src/main/java/tools/jackson/databind/deser/jdk/JDKKeyDeserializer.java
+@@ -349,6 +349,7 @@ public class JDKKeyDeserializer extends KeyDeserializer
+ 
+     @JacksonStdImpl
+     final static class EnumKD extends JDKKeyDeserializer
++        implements NullKeySkippable // [databind#3188]
+     {
+         protected final EnumResolver _byNameResolver;
+ 
+@@ -430,6 +431,12 @@ public class JDKKeyDeserializer extends KeyDeserializer
+             }
+             return  _byToStringResolver;
+         }
++
++        // [databind#3188]: signal to skip map entry when unknown enum id maps to null
++        @Override
++        public boolean skipNullKeys(DeserializationContext ctxt) {
++            return ctxt.isEnabled(EnumFeature.READ_UNKNOWN_ENUM_VALUES_AS_NULL);
++        }
+     }
+ 
+     /**
+@@ -472,4 +479,3 @@ public class JDKKeyDeserializer extends KeyDeserializer
+         }
+     }
+ }
+-
+diff --git a/src/main/java/tools/jackson/databind/deser/jdk/MapDeserializer.java b/src/main/java/tools/jackson/databind/deser/jdk/MapDeserializer.java
+index 1e64ed687..13d846f17 100644
+--- a/src/main/java/tools/jackson/databind/deser/jdk/MapDeserializer.java
++++ b/src/main/java/tools/jackson/databind/deser/jdk/MapDeserializer.java
+@@ -325,7 +325,7 @@ public class MapDeserializer
+                         if (ignored == null) {
+                             ignored = new HashSet<>(ignoresToAdd);
+                         } else {
+-                            ignored = new HashSet<String>(ignored);
++                            ignored = new HashSet<>(ignored);
+                             ignored.addAll(ignoresToAdd);
+                         }
+                     }
+@@ -502,18 +502,25 @@ public class MapDeserializer
+         } else {
+             JsonToken t = p.currentToken();
+             if (t != JsonToken.PROPERTY_NAME) {
+-                if (t == JsonToken.END_OBJECT) {
+-                    return result;
+-                }
+-                ctxt.reportWrongTokenException(this, JsonToken.PROPERTY_NAME, null);
++                _checkIsEndObject(ctxt, t);
++                return result;
+             }
+             keyStr = p.currentName();
+         }
+ 
++        // [databind#3188] Cache capability once outside the loop
++        final boolean skipNullKeys = (_keyDeserializer instanceof NullKeySkippable nks)
++                && nks.skipNullKeys(ctxt);
++
+         for (; keyStr != null; keyStr = p.nextName()) {
+             Object key = _keyDeserializer.deserializeKey(keyStr, ctxt);
+             // And then the value...
+             JsonToken t = p.nextToken();
++            // [databind#3188] Skip entry when key deserializer requests null-key skipping
++            if (skipNullKeys && key == null) {
++                p.skipChildren(); // no-op for scalar tokens; safe to call unconditionally
++                continue;
++            }
+             if ((_inclusionChecker != null) && _inclusionChecker.shouldIgnore(keyStr)) {
+                 p.skipChildren();
+                 continue;
+@@ -574,11 +581,9 @@ public class MapDeserializer
+             key = p.nextName();
+         } else {
+             JsonToken t = p.currentToken();
+-            if (t == JsonToken.END_OBJECT) {
+-                return result;
+-            }
+             if (t != JsonToken.PROPERTY_NAME) {
+-                ctxt.reportWrongTokenException(this, JsonToken.PROPERTY_NAME, null);
++                _checkIsEndObject(ctxt, t);
++                return result;
+             }
+             key = p.currentName();
+         }
+@@ -645,6 +650,10 @@ public class MapDeserializer
+             key = null;
+         }
+ 
++        // [databind#3188] Cache capability once outside the loop
++        final boolean skipNullKeys = (_keyDeserializer instanceof NullKeySkippable nks)
++                && nks.skipNullKeys(ctxt);
++
+         for (; key != null; key = p.nextName()) {
+             JsonToken t = p.nextToken(); // to get to value
+             if ((_inclusionChecker != null) && _inclusionChecker.shouldIgnore(key)) {
+@@ -669,6 +678,11 @@ public class MapDeserializer
+             }
+             // other property? needs buffering
+             Object actualKey = _keyDeserializer.deserializeKey(key, ctxt);
++            // [databind#3188] Skip entry when key deserializer requests null-key skipping
++            if (skipNullKeys && actualKey == null) {
++                p.skipChildren(); // no-op for scalar tokens; safe to call unconditionally
++                continue;
++            }
+             Object value;
+ 
+             try {
+@@ -724,19 +738,26 @@ public class MapDeserializer
+             keyStr = p.nextName();
+         } else {
+             JsonToken t = p.currentToken();
+-            if (t == JsonToken.END_OBJECT) {
+-                return;
+-            }
+             if (t != JsonToken.PROPERTY_NAME) {
+-                ctxt.reportWrongTokenException(this, JsonToken.PROPERTY_NAME, null);
++                _checkIsEndObject(ctxt, t);
++                return;
+             }
+             keyStr = p.currentName();
+         }
+ 
++        // [databind#3188] Cache capability once outside the loop
++        final boolean skipNullKeys = (_keyDeserializer instanceof NullKeySkippable nks)
++                && nks.skipNullKeys(ctxt);
++
+         for (; keyStr != null; keyStr = p.nextName()) {
+             Object key = _keyDeserializer.deserializeKey(keyStr, ctxt);
+             // And then the value...
+             JsonToken t = p.nextToken();
++            // [databind#3188] Skip entry when key deserializer requests null-key skipping
++            if (skipNullKeys && key == null) {
++                p.skipChildren(); // no-op for scalar tokens; safe to call unconditionally
++                continue;
++            }
+             if ((_inclusionChecker != null) && _inclusionChecker.shouldIgnore(keyStr)) {
+                 p.skipChildren();
+                 continue;
+@@ -798,11 +819,9 @@ public class MapDeserializer
+             key = p.nextName();
+         } else {
+             JsonToken t = p.currentToken();
+-            if (t == JsonToken.END_OBJECT) {
+-                return;
+-            }
+             if (t != JsonToken.PROPERTY_NAME) {
+-                ctxt.reportWrongTokenException(this, JsonToken.PROPERTY_NAME, null);
++                _checkIsEndObject(ctxt, t);
++                return;
+             }
+             key = p.currentName();
+         }
+@@ -856,7 +875,6 @@ public class MapDeserializer
+      * If _valueTypeDeserializer is null, use _valueDeserializer.deserialize; if non-null,
+      * use _valueDeserializer.deserializeWithType to deserialize value.
+      * This method only performs deserialization and does not consider _skipNullValues, _nullProvider, etc.
+-     * @since 2.19.2
+      */
+     protected Object _deserializeNoNullChecks(JsonParser p, DeserializationContext ctxt)
+         throws JacksonException
+@@ -867,9 +885,6 @@ public class MapDeserializer
+         return _valueDeserializer.deserializeWithType(p, ctxt, _valueTypeDeserializer);
+     }
+ 
+-    /**
+-     * @since 2.14
+-     */
+     @SuppressWarnings("unchecked")
+     protected void _squashDups(final DeserializationContext ctxt,
+             final Map<Object, Object> result,
+@@ -894,6 +909,13 @@ public class MapDeserializer
+     /**********************************************************************
+      */
+ 
++    // @since 3.1
++    protected void _checkIsEndObject(DeserializationContext ctxt, JsonToken t) {
++        if (t != JsonToken.END_OBJECT) {
++            ctxt.reportWrongTokenException(this, JsonToken.PROPERTY_NAME, null);
++        }
++    }
++
+     private void handleUnresolvedReference(DeserializationContext ctxt,
+             MapReferringAccumulator accumulator,
+             Object key, UnresolvedForwardReference reference)
+diff --git a/src/main/java/tools/jackson/databind/deser/jdk/NullKeySkippable.java b/src/main/java/tools/jackson/databind/deser/jdk/NullKeySkippable.java
+new file mode 100644
+index 000000000..d740de45a
+--- /dev/null
++++ b/src/main/java/tools/jackson/databind/deser/jdk/NullKeySkippable.java
+@@ -0,0 +1,25 @@
++package tools.jackson.databind.deser.jdk;
++
++import tools.jackson.databind.DeserializationContext;
++
++/**
++ * Internal capability interface for key deserializers that can signal
++ * null keys should be skipped during Map deserialization.
++ *<p>
++ * This abstraction exists so that
++ * {@link tools.jackson.databind.deser.jdk.MapDeserializer} does not need to know
++ * about specific key types (like enums) or their configuration options.
++ * The key deserializer itself decides whether null keys warrant skipping the entry.
++ *<p>
++ * Package-private: not part of public API.
++ *
++ * @since 3.1
++ */
++interface NullKeySkippable {
++    /**
++     * @param ctxt Deserialization context
++     * @return {@code true} if a null key (from an unrecognized value) should cause
++     *         the entire map entry to be skipped
++     */
++    boolean skipNullKeys(DeserializationContext ctxt);
++}
+\ No newline at end of file

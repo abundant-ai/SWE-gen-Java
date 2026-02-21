@@ -1,0 +1,283 @@
+diff --git a/src/main/java/com/fasterxml/jackson/databind/DeserializationContext.java b/src/main/java/com/fasterxml/jackson/databind/DeserializationContext.java
+index 39e359aaa..403e9a552 100644
+--- a/src/main/java/com/fasterxml/jackson/databind/DeserializationContext.java
++++ b/src/main/java/com/fasterxml/jackson/databind/DeserializationContext.java
+@@ -6,7 +6,6 @@ import java.text.ParseException;
+ import java.util.*;
+ import java.util.concurrent.atomic.AtomicReference;
+ 
+-import com.fasterxml.jackson.annotation.JacksonInject;
+ import com.fasterxml.jackson.annotation.JsonFormat;
+ import com.fasterxml.jackson.annotation.ObjectIdGenerator;
+ import com.fasterxml.jackson.annotation.ObjectIdResolver;
+@@ -468,20 +467,11 @@ public abstract class DeserializationContext
+             BeanProperty forProperty, Object beanInstance, Boolean optional, Boolean useInput)
+         throws JsonMappingException
+     {
+-        if (_injectableValues == null) {
+-            // `useInput` and `optional` come from property annotation (if any);
+-            // they have precedence over global setting.
+-            if (Boolean.TRUE.equals(useInput)
+-                    || Boolean.TRUE.equals(optional)
+-                    || ((useInput == null || optional == null)
+-                            && !isEnabled(DeserializationFeature.FAIL_ON_UNKNOWN_INJECT_VALUE))) {
+-                return JacksonInject.Value.empty();
+-            }
+-            throw missingInjectableValueException(String.format(
+-"No 'injectableValues' configured, cannot inject value with id '%s'", valueId),
+-                    valueId, forProperty, beanInstance);
++        InjectableValues injectables = _injectableValues;
++        if (injectables == null) {
++            injectables = InjectableValues.empty();
+         }
+-        return _injectableValues.findInjectableValue(this, valueId, forProperty, beanInstance,
++        return injectables.findInjectableValue(this, valueId, forProperty, beanInstance,
+                 optional, useInput);
+     }
+ 
+diff --git a/src/main/java/com/fasterxml/jackson/databind/InjectableValues.java b/src/main/java/com/fasterxml/jackson/databind/InjectableValues.java
+index 4fa5b4b26..9c371ae3e 100644
+--- a/src/main/java/com/fasterxml/jackson/databind/InjectableValues.java
++++ b/src/main/java/com/fasterxml/jackson/databind/InjectableValues.java
+@@ -10,6 +10,13 @@ import com.fasterxml.jackson.databind.util.ClassUtil;
+  */
+ public abstract class InjectableValues
+ {
++    /**
++     * @since 2.21
++     */
++    public static InjectableValues empty() {
++        return InjectableValues.Empty.INSTANCE;
++    }
++
+     /**
+      * Method called to find value identified by id <code>valueId</code> to
+      * inject as value of specified property during deserialization, passing
+@@ -46,17 +53,112 @@ public abstract class InjectableValues
+         throws JsonMappingException;
+ 
+     /*
+-    /**********************************************************
+-    /* Standard implementation
+-    /**********************************************************
++    /**********************************************************************
++    /* Standard implementations
++    /**********************************************************************
++     */
++
++    /**
++     * Shared intermediate base class for standard implementations.
++     *
++     * @since 2.21
++     */
++    public abstract static class Base
++        extends InjectableValues
++        implements java.io.Serializable
++    {
++        private static final long serialVersionUID = 1L;
++
++        protected String _validateKey(DeserializationContext ctxt, Object valueId,
++                BeanProperty forProperty, Object beanInstance)
++            throws JsonMappingException
++        {
++            if (!(valueId instanceof String)) {
++                throw ctxt.missingInjectableValueException(
++                        String.format(
++                        "Unsupported injectable value id type (%s), expecting String",
++                        ClassUtil.classNameOf(valueId)),
++                        valueId, forProperty, beanInstance);
++            }
++            return (String) valueId;
++        }
++
++        protected Object _handleMissingValue(DeserializationContext ctxt, String key,
++                BeanProperty forProperty, Object beanInstance,
++                Boolean optionalConfig, Boolean useInputConfig)
++            throws JsonMappingException
++        {
++            // Different defaulting fo "optional" (default to FALSE) and
++            // "useInput" (default to TRUE)
++
++            final boolean optional = Boolean.TRUE.equals(optionalConfig);
++            final boolean useInput = Boolean.TRUE.equals(useInputConfig);
++
++            // [databind#1381]: 14-Nov-2025, tatu: This is a mess: (1) and (2) make sense
++            //   but (3) is debatable. However, for backward compatibility this is what
++            //   passes tests we have.
++
++            // Missing ok if:
++            //
++            // 1. `optional` is TRUE
++            // 2. FAIL_ON_UNKNOWN_INJECT_VALUE is disabled
++            // 3. `useInput` is TRUE and injection is NOT via constructor (implied
++            //    by beanInstance being non-null)
++            if (optional
++                    || !ctxt.isEnabled(DeserializationFeature.FAIL_ON_UNKNOWN_INJECT_VALUE)
++                    || (useInput && beanInstance != null)
++                    ) {
++                return null;
++            }
++            throw ctxt.missingInjectableValueException(
++                    String.format("No injectable value with id '%s' found (for property '%s')",
++                    key, forProperty.getName()),
++                    key, forProperty, beanInstance);
++        }
++
++        /**
++         * @deprecated in 2.20
++         */
++        @Override
++        @Deprecated // since 2.20
++        public Object findInjectableValue(Object valueId, DeserializationContext ctxt,
++                BeanProperty forProperty, Object beanInstance)
++            throws JsonMappingException
++        {
++            return this.findInjectableValue(ctxt, valueId, forProperty, beanInstance,
++                    null, null);
++        }
++    }
++
++    /**
++     * @since 2.21
+      */
++    private static final class Empty
++        extends Base
++        implements java.io.Serializable
++    {
++        private static final long serialVersionUID = 1L;
++
++        final static Empty INSTANCE = new Empty();
++
++        @Override
++        public Object findInjectableValue(DeserializationContext ctxt, Object valueId,
++                BeanProperty forProperty, Object beanInstance,
++                Boolean optional, Boolean useInput)
++            throws JsonMappingException
++        {
++            final String key = _validateKey(ctxt, valueId, forProperty, beanInstance);
++            return _handleMissingValue(ctxt, key, forProperty, beanInstance,
++                    optional, useInput);
++        }
++    }
+ 
+     /**
+      * Simple standard implementation which uses a simple Map to
+      * store values to inject, identified by simple String keys.
+      */
+     public static class Std
+-        extends InjectableValues
++        extends Base
+         implements java.io.Serializable
+     {
+         private static final long serialVersionUID = 1L;
+@@ -64,7 +166,7 @@ public abstract class InjectableValues
+         protected final Map<String,Object> _values;
+ 
+         public Std() {
+-            this(new HashMap<String,Object>());
++            this(new HashMap<>());
+         }
+ 
+         public Std(Map<String,Object> values) {
+@@ -81,48 +183,19 @@ public abstract class InjectableValues
+             return this;
+         }
+ 
+-        /**
+-         * @since 2.20
+-         */
+         @Override
+         public Object findInjectableValue(DeserializationContext ctxt, Object valueId,
+                 BeanProperty forProperty, Object beanInstance,
+                 Boolean optional, Boolean useInput)
+             throws JsonMappingException
+         {
+-            if (!(valueId instanceof String)) {
+-                throw ctxt.missingInjectableValueException(
+-                        String.format(
+-                        "Unsupported injectable value id type (%s), expecting String",
+-                        ClassUtil.classNameOf(valueId)),
+-                        valueId, forProperty, beanInstance);
+-            }
+-            String key = (String) valueId;
++            String key = _validateKey(ctxt, valueId, forProperty, beanInstance);
+             Object ob = _values.get(key);
+             if (ob == null && !_values.containsKey(key)) {
+-                if (Boolean.FALSE.equals(optional)
+-                        || ((optional == null)
+-                                && ctxt.isEnabled(DeserializationFeature.FAIL_ON_UNKNOWN_INJECT_VALUE))) {
+-                    throw ctxt.missingInjectableValueException(
+-                            String.format("No injectable value with id '%s' found (for property '%s')",
+-                            key, forProperty.getName()),
+-                            valueId, forProperty, beanInstance);
+-                }
++                return _handleMissingValue(ctxt, key, forProperty, beanInstance,
++                        optional, useInput);
+             }
+             return ob;
+         }
+-
+-        /**
+-         * @deprecated in 2.20
+-         */
+-        @Override
+-        @Deprecated // since 2.20
+-        public Object findInjectableValue(Object valueId, DeserializationContext ctxt,
+-                BeanProperty forProperty, Object beanInstance)
+-            throws JsonMappingException
+-        {
+-            return this.findInjectableValue(ctxt, valueId, forProperty, beanInstance,
+-                    null, null);
+-        }
+     }
+ }
+diff --git a/src/main/java/com/fasterxml/jackson/databind/deser/impl/PropertyValueBuffer.java b/src/main/java/com/fasterxml/jackson/databind/deser/impl/PropertyValueBuffer.java
+index 0c020ad83..be9a7499f 100644
+--- a/src/main/java/com/fasterxml/jackson/databind/deser/impl/PropertyValueBuffer.java
++++ b/src/main/java/com/fasterxml/jackson/databind/deser/impl/PropertyValueBuffer.java
+@@ -291,12 +291,12 @@ public class PropertyValueBuffer
+         }
+ 
+         // First: do we have injectable value?
+-        Object injectableValueId = prop.getInjectableValueId();
+-        if (injectableValueId != null) {
++        final JacksonInject.Value injection = prop.getInjectionDefinition();
++        if (injection != null) {
+             // 10-Nov-2025: [databind#1381] Is this needed?
+             _injectablePropIndexes.clear(prop.getCreatorIndex());
+             return _context.findInjectableValue(prop.getInjectableValueId(),
+-                    prop, null, null, null);
++                    prop, null, injection.getOptional(), injection.getUseInput());
+         }
+         // Second: required?
+         if (prop.isRequired()) {
+@@ -345,7 +345,7 @@ public class PropertyValueBuffer
+                 final Object value = _context.findInjectableValue(injection.getId(),
+                         prop, prop.getMember(), injection.getOptional(), useInput);
+ 
+-                if (value != JacksonInject.Value.empty()) {
++                if (value != null) {
+                     int ix = prop.getCreatorIndex();
+                     _creatorParameters[ix] = value;
+                 }
+diff --git a/src/main/java/com/fasterxml/jackson/databind/deser/impl/ValueInjector.java b/src/main/java/com/fasterxml/jackson/databind/deser/impl/ValueInjector.java
+index 2a6b3bd7c..f813ddd08 100644
+--- a/src/main/java/com/fasterxml/jackson/databind/deser/impl/ValueInjector.java
++++ b/src/main/java/com/fasterxml/jackson/databind/deser/impl/ValueInjector.java
+@@ -2,7 +2,6 @@ package com.fasterxml.jackson.databind.deser.impl;
+ 
+ import java.io.IOException;
+ 
+-import com.fasterxml.jackson.annotation.JacksonInject;
+ import com.fasterxml.jackson.databind.*;
+ import com.fasterxml.jackson.databind.introspect.AnnotatedMember;
+ 
+@@ -70,7 +69,7 @@ public class ValueInjector
+     {
+         final Object value = findValue(context, beanInstance);
+ 
+-        if (value == JacksonInject.Value.empty()) {
++        if (value == null) {
+             if (Boolean.FALSE.equals(_optional)) {
+                 throw context.missingInjectableValueException(
+                         String.format("No injectable value with id '%s' found (for property '%s')",

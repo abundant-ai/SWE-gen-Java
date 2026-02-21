@@ -1,0 +1,195 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index fa0e703f8..24a9557a1 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -17,7 +17,6 @@ Currently the versioning policy of this project follows [Semantic Versioning v2.
+ - Ignore non-interpreted text when looking for `FS_BAD_DATE_FORMAT_FLAG_COMBO` ([#3387](https://github.com/spotbugs/spotbugs/issues/3387))
+ - Fix IllegalArgumentException thrown from `FindNoSideEffectMethods` detector ([#3320](https://github.com/spotbugs/spotbugs/issues/3320))
+ - Do not report `RV_RETURN_VALUE_IGNORED_NO_SIDE_EFFECT` when part of a Mockito `doAnswer()`, `doCallRealMethod()`, `doNothing()`, `doThrow()` or `doReturn()` call ([#3334](https://github.com/spotbugs/spotbugs/issues/3334))
+-- Fix `CT_CONSTRUCTOR_THROW` false positive with public and private constructors in specific order of methods ([#3417](https://github.com/spotbugs/spotbugs/issues/3417))
+ 
+ ### Added
+ - Added the unnecessary annotation to the `US_USELESS_SUPPRESSION_ON_*` messages ([#3395](https://github.com/spotbugs/spotbugs/issues/3395))
+diff --git a/spotbugs-tests/src/test/java/edu/umd/cs/findbugs/detect/ConstructorThrowTest.java b/spotbugs-tests/src/test/java/edu/umd/cs/findbugs/detect/ConstructorThrowTest.java
+index bf045f6f6..9a1747812 100644
+--- a/spotbugs-tests/src/test/java/edu/umd/cs/findbugs/detect/ConstructorThrowTest.java
++++ b/spotbugs-tests/src/test/java/edu/umd/cs/findbugs/detect/ConstructorThrowTest.java
+@@ -286,10 +286,4 @@ class ConstructorThrowTest extends AbstractIntegrationTest {
+         performAnalysis("constructorthrow/ConstructorThrowNegativeTest19.class");
+         assertNoBugType(CT_THROW);
+     }
+-
+-    @Test
+-    void testGoodConstructorThrowCheck20() {
+-        performAnalysis("constructorthrow/ConstructorThrowNegativeTest20.class");
+-        assertNoBugType(CT_THROW);
+-    }
+ }
+diff --git a/spotbugs/src/main/java/edu/umd/cs/findbugs/detect/ConstructorThrow.java b/spotbugs/src/main/java/edu/umd/cs/findbugs/detect/ConstructorThrow.java
+index 5ca88a672..935d43168 100644
+--- a/spotbugs/src/main/java/edu/umd/cs/findbugs/detect/ConstructorThrow.java
++++ b/spotbugs/src/main/java/edu/umd/cs/findbugs/detect/ConstructorThrow.java
+@@ -86,6 +86,7 @@ public class ConstructorThrow extends OpcodeStackDetector {
+         }
+ 
+         for (Method m : obj.getMethods()) {
++            hadObjectConstructor = false;
+             doVisitMethod(m);
+         }
+         isFirstPass = false;
+@@ -98,12 +99,6 @@ public class ConstructorThrow extends OpcodeStackDetector {
+                 .anyMatch(m -> "finalize".equals(m.getName()) && "()V".equals(m.getSignature()) && m.isFinal());
+     }
+ 
+-    @Override
+-    public void visit(Method obj) {
+-        hadObjectConstructor = false;
+-        super.visit(obj);
+-    }
+-
+     @Override
+     public void visitAfter(JavaClass obj) {
+         super.visit(obj);
+@@ -126,7 +121,7 @@ public class ConstructorThrow extends OpcodeStackDetector {
+         }
+         if (isFirstPass) {
+             collectExceptionsByMethods(seen);
+-        } else if (Const.CONSTRUCTOR_NAME.equals(getMethodName())) {
++        } else if (isConstructor()) {
+             reportConstructorThrow(seen);
+         }
+     }
+@@ -159,7 +154,7 @@ public class ConstructorThrow extends OpcodeStackDetector {
+                     AnalysisContext.reportMissingClass(e);
+                 }
+             }
+-        } else if (isMethodCall()) {
++        } else if (isMethodCall(seen)) {
+             if (Const.CONSTRUCTOR_NAME.equals(getNameConstantOperand())) {
+                 hadObjectConstructor = true;
+             }
+@@ -294,7 +289,7 @@ public class ConstructorThrow extends OpcodeStackDetector {
+                     AnalysisContext.reportMissingClass(e);
+                 }
+             }
+-        } else if (isMethodCall()) {
++        } else if (isMethodCall(seen)) {
+             String calledMethodName = getNameConstantOperand();
+             String calledMethodFullName = getCalledMethodFQN();
+             // not interested in call of the constructor or recursion
+@@ -326,20 +321,34 @@ public class ConstructorThrow extends OpcodeStackDetector {
+     }
+ 
+     private void addToExHandlesToMethodCallsByMethodsMap(String containerMethod, String calledMethod, Collection<String> caughtExes) {
+-        exHandlesToMethodCallsByMethodsMap
+-                .computeIfAbsent(containerMethod, k -> new HashMap<>())
+-                .computeIfAbsent(calledMethod, k -> new HashSet<>())
+-                .addAll(caughtExes);
++        if (exHandlesToMethodCallsByMethodsMap.containsKey(containerMethod)) {
++            Map<String, Set<String>> map = exHandlesToMethodCallsByMethodsMap.get(containerMethod);
++            if (!map.containsKey(calledMethod)) {
++                map.put(calledMethod, new HashSet<>(caughtExes));
++            } else {
++                map.get(calledMethod).addAll(caughtExes);
++            }
++        } else {
++            exHandlesToMethodCallsByMethodsMap.put(containerMethod,
++                    new HashMap<String, Set<String>>() {
++                        {
++                            put(calledMethod, new HashSet<>(caughtExes));
++                        }
++                    });
++        }
+     }
+ 
+     private void addToThrownExsByMethodMap(String containingMethod, JavaClass thrownExClass) {
+-        thrownExsByMethodMap.computeIfAbsent(containingMethod, k -> new HashSet<>()).add(thrownExClass);
++        if (thrownExsByMethodMap.containsKey(containingMethod)) {
++            thrownExsByMethodMap.get(containingMethod).add(thrownExClass);
++        } else {
++            thrownExsByMethodMap.put(containingMethod, new HashSet<>(Collections.singletonList(thrownExClass)));
++        }
+     }
+ 
+     /**
+      * Gives back the fully qualified name (DottedClassName) of the called method complete with the signature.
+      * Needs to be called from method call opcode.
+-     * This is in sync with {@link edu.umd.cs.findbugs.visitclass.PreorderVisitor#getFullyQualifiedMethodName} function.
+      *
+      * @return the fully qualified name of the method (dotted) with the signature.
+      */
+@@ -362,4 +371,15 @@ public class ConstructorThrow extends OpcodeStackDetector {
+                 .addSourceLine(this, getPC());
+         bugAccumulator.accumulateBug(bug, this);
+     }
++
++    private boolean isMethodCall(int seen) {
++        return seen == Const.INVOKESTATIC
++                || seen == Const.INVOKEVIRTUAL
++                || seen == Const.INVOKEINTERFACE
++                || seen == Const.INVOKESPECIAL;
++    }
++
++    private boolean isConstructor() {
++        return Const.CONSTRUCTOR_NAME.equals(getMethodName());
++    }
+ }
+diff --git a/spotbugsTestCases/src/java/constructorthrow/ConstructorThrowNegativeTest18.java b/spotbugsTestCases/src/java/constructorthrow/ConstructorThrowNegativeTest18.java
+index fb261eb6b..ad1465a15 100644
+--- a/spotbugsTestCases/src/java/constructorthrow/ConstructorThrowNegativeTest18.java
++++ b/spotbugsTestCases/src/java/constructorthrow/ConstructorThrowNegativeTest18.java
+@@ -8,12 +8,6 @@ import java.io.IOException;
+  * @see <a href="https://github.com/spotbugs/spotbugs/issues/2710">GitHub issue</a>
+  */
+ public class ConstructorThrowNegativeTest18 {
+-    private static boolean verify() throws IOException {
+-        // Returns true if data entered is valid, else throws an Exception
+-        // Assume that the attacker just enters invalid data, so this method always throws the exception
+-        throw new IOException("Invalid data!");
+-    }
+-
+     public ConstructorThrowNegativeTest18() throws IOException {
+         this(verify());
+     }
+@@ -22,4 +16,10 @@ public class ConstructorThrowNegativeTest18 {
+         // secure is always true
+         // Constructor without any checks
+     }
++
++    private static boolean verify() throws IOException {
++        // Returns true if data entered is valid, else throws an Exception
++        // Assume that the attacker just enters invalid data, so this method always throws the exception
++        throw new IOException("Invalid data!");
++    }
+ }
+diff --git a/spotbugsTestCases/src/java/constructorthrow/ConstructorThrowNegativeTest20.java b/spotbugsTestCases/src/java/constructorthrow/ConstructorThrowNegativeTest20.java
+deleted file mode 100644
+index 9bf196d62..000000000
+--- a/spotbugsTestCases/src/java/constructorthrow/ConstructorThrowNegativeTest20.java
++++ /dev/null
+@@ -1,25 +0,0 @@
+-package constructorthrow;
+-
+-import java.io.IOException;
+-
+-/**
+- * The Exception is thrown before the java.lang.Object constructor exits, so this is compliant, since in this case
+- * the JVM will not execute an object's finalizer.
+- * @see <a href="https://github.com/spotbugs/spotbugs/issues/3417">GitHub issue</a>
+- */
+-public class ConstructorThrowNegativeTest20 {
+-    private static boolean verify() throws IOException {
+-        // Returns true if data entered is valid, else throws an Exception
+-        // Assume that the attacker just enters invalid data, so this method always throws the exception
+-        throw new IOException("Invalid data!");
+-    }
+-
+-    private ConstructorThrowNegativeTest20(boolean secure) {
+-        // secure is always true
+-        // Constructor without any checks
+-    }
+-
+-    public ConstructorThrowNegativeTest20() throws IOException {
+-        this(verify());
+-    }
+-}

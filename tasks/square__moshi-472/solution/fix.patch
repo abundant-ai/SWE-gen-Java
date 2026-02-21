@@ -1,0 +1,372 @@
+diff --git a/kotlin-codegen/compiler/src/main/java/com/squareup/moshi/AdapterGenerator.kt b/kotlin-codegen/compiler/src/main/java/com/squareup/moshi/AdapterGenerator.kt
+index 78b74280..b0e9c66d 100644
+--- a/kotlin-codegen/compiler/src/main/java/com/squareup/moshi/AdapterGenerator.kt
++++ b/kotlin-codegen/compiler/src/main/java/com/squareup/moshi/AdapterGenerator.kt
+@@ -35,20 +35,17 @@ import javax.lang.model.util.Elements
+ 
+ /** Generates a JSON adapter for a target type. */
+ internal class AdapterGenerator(
+-  val fqClassName: String,
+-  val packageName: String,
++  val className: ClassName,
+   val propertyList: List<PropertyGenerator>,
+   val originalElement: Element,
+-  name: String = fqClassName.substringAfter(packageName)
+-      .replace('.', '_')
+-      .removePrefix("_"),
++  val isDataClass: Boolean,
+   val hasCompanionObject: Boolean,
+   val visibility: ProtoBuf.Visibility,
+   val elements: Elements,
+   val genericTypeNames: List<TypeVariableName>?
+ ) {
+   val nameAllocator = NameAllocator()
+-  val adapterName = "${name}JsonAdapter"
++  val adapterName = "${className.simpleNames().joinToString(separator = "_")}JsonAdapter"
+   val originalTypeName = originalElement.asType().asTypeName()
+ 
+   val moshiParam = ParameterSpec.builder(
+@@ -92,7 +89,7 @@ internal class AdapterGenerator(
+       property.allocateNames(nameAllocator)
+     }
+ 
+-    val result = FileSpec.builder(packageName, adapterName)
++    val result = FileSpec.builder(className.packageName(), adapterName)
+     if (hasCompanionObject) {
+       result.addFunction(generateJsonAdapterFun())
+     }
+@@ -148,6 +145,8 @@ internal class AdapterGenerator(
+   }
+ 
+   private fun generateFromJsonFun(): FunSpec {
++    val resultName = nameAllocator.newName("result")
++
+     val result = FunSpec.builder("fromJson")
+         .addModifiers(KModifier.OVERRIDE)
+         .addParameter(readerParam)
+@@ -187,36 +186,72 @@ internal class AdapterGenerator(
+     result.endControlFlow() // while
+     result.addStatement("%N.endObject()", readerParam)
+ 
+-    val propertiesWithoutDefaults = propertyList.filter { !it.hasDefault }
+-    result.addCode("%[return %T(\n", originalTypeName)
+-    propertiesWithoutDefaults.forEachIndexed { index, property ->
++    // Call the constructor providing only required parameters.
++    var hasOptionalParameters = false
++    result.addCode("%[var %N = %T(", resultName, originalTypeName)
++    var separator = "\n"
++    for (property in propertyList) {
++      if (!property.hasConstructorParameter) {
++        continue
++      }
++      if (property.hasDefault) {
++        hasOptionalParameters = true
++        continue
++      }
++      result.addCode(separator)
+       result.addCode("%N = %N", property.name, property.localName)
+       if (property.isRequired) {
+         result.addCode(" ?: throw %T(\"Required property '%L' missing at \${%N.path}\")",
+             JsonDataException::class, property.localName, readerParam)
+       }
+-      result.addCode(if (index + 1 < propertiesWithoutDefaults.size) ",\n" else "\n")
++      separator = ",\n"
+     }
+-    result.addCode("%])\n", originalTypeName)
++    result.addCode(")%]\n", originalTypeName)
++
++    // Call either the constructor again, or the copy() method, this time providing any optional
++    // parameters that we have.
++    if (hasOptionalParameters) {
++      if (isDataClass) {
++        result.addCode("%[%1N = %1N.copy(", resultName)
++      } else {
++        result.addCode("%[%1N = %2T(", resultName, originalTypeName)
++      }
++      separator = "\n"
++      for (property in propertyList) {
++        if (!property.hasConstructorParameter) {
++          continue // No constructor parameter for this property.
++        }
++        if (isDataClass && !property.hasDefault) {
++          continue // Property already assigned.
++        }
+ 
+-    val propertiesWithDefaults = propertyList.filter { it.hasDefault }
+-    if (!propertiesWithDefaults.isEmpty()) {
+-      result.addCode(".let {%>\n")
+-      result.addCode("%[it.copy(\n")
+-      propertiesWithDefaults.forEachIndexed { index, property ->
++        result.addCode(separator)
+         if (property.differentiateAbsentFromNull) {
+-          result.addCode("%1N = if (%2N) %3N else it.%1N",
+-              property.name, property.localIsPresentName, property.localName)
++          result.addCode("%2N = if (%3N) %4N else %1N.%2N",
++              resultName, property.name, property.localIsPresentName, property.localName)
+         } else {
+-          result.addCode("%1N = %2N ?: it.%1N",
+-              property.name, property.localName)
++          result.addCode("%2N = %3N ?: %1N.%2N", resultName, property.name, property.localName)
+         }
+-        result.addCode(if (index + 1 < propertiesWithDefaults.size) ",\n" else "\n")
++        separator = ",\n"
+       }
+       result.addCode("%])\n")
+-      result.addCode("%<}\n")
+     }
+ 
++    // Assign properties not present in the constructor.
++    for (property in propertyList) {
++      if (property.hasConstructorParameter) {
++        continue // Property already handled.
++      }
++      if (property.differentiateAbsentFromNull) {
++        result.addStatement("%1N.%2N = if (%3N) %4N else %1N.%2N",
++            resultName, property.name, property.localIsPresentName, property.localName)
++      } else {
++        result.addStatement("%1N.%2N = %3N ?: %1N.%2N",
++            resultName, property.name, property.localName)
++      }
++    }
++
++    result.addStatement("return %1N", resultName)
+     return result.build()
+   }
+ 
+@@ -244,8 +279,7 @@ internal class AdapterGenerator(
+ 
+   private fun generateJsonAdapterFun(): FunSpec {
+     val rawType = when (originalTypeName) {
+-      is TypeVariableName -> throw IllegalArgumentException(
+-          "Cannot get raw type of TypeVariable!")
++      is TypeVariableName -> throw IllegalArgumentException("Cannot get raw type of TypeVariable!")
+       is ParameterizedTypeName -> originalTypeName.rawType
+       else -> originalTypeName as ClassName
+     }
+diff --git a/kotlin-codegen/compiler/src/main/java/com/squareup/moshi/JsonClassCodeGenProcessor.kt b/kotlin-codegen/compiler/src/main/java/com/squareup/moshi/JsonClassCodeGenProcessor.kt
+index 345919eb..91a5c943 100644
+--- a/kotlin-codegen/compiler/src/main/java/com/squareup/moshi/JsonClassCodeGenProcessor.kt
++++ b/kotlin-codegen/compiler/src/main/java/com/squareup/moshi/JsonClassCodeGenProcessor.kt
+@@ -17,13 +17,16 @@ package com.squareup.moshi
+ 
+ import com.google.auto.common.AnnotationMirrors
+ import com.google.auto.service.AutoService
++import com.squareup.kotlinpoet.ClassName
+ import com.squareup.kotlinpoet.KModifier.OUT
++import com.squareup.kotlinpoet.ParameterizedTypeName
+ import com.squareup.kotlinpoet.TypeSpec
+ import com.squareup.kotlinpoet.TypeVariableName
++import com.squareup.kotlinpoet.asTypeName
+ import me.eugeniomarletti.kotlin.metadata.KotlinClassMetadata
+ import me.eugeniomarletti.kotlin.metadata.KotlinMetadataUtils
++import me.eugeniomarletti.kotlin.metadata.classKind
+ import me.eugeniomarletti.kotlin.metadata.declaresDefaultValue
+-import me.eugeniomarletti.kotlin.metadata.extractFullName
+ import me.eugeniomarletti.kotlin.metadata.isDataClass
+ import me.eugeniomarletti.kotlin.metadata.isPrimary
+ import me.eugeniomarletti.kotlin.metadata.jvm.getJvmConstructorSignature
+@@ -31,14 +34,17 @@ import me.eugeniomarletti.kotlin.metadata.kotlinMetadata
+ import me.eugeniomarletti.kotlin.metadata.visibility
+ import me.eugeniomarletti.kotlin.processing.KotlinAbstractProcessor
+ import org.jetbrains.kotlin.serialization.ProtoBuf
++import org.jetbrains.kotlin.serialization.ProtoBuf.ValueParameter
+ import java.io.File
+ import javax.annotation.processing.Processor
+ import javax.annotation.processing.RoundEnvironment
+ import javax.lang.model.SourceVersion
++import javax.lang.model.element.AnnotationMirror
+ import javax.lang.model.element.Element
+ import javax.lang.model.element.ElementKind
+ import javax.lang.model.element.ExecutableElement
+ import javax.lang.model.element.TypeElement
++import javax.lang.model.element.VariableElement
+ import javax.tools.Diagnostic.Kind.ERROR
+ 
+ /**
+@@ -77,24 +83,24 @@ class JsonClassCodeGenProcessor : KotlinAbstractProcessor(), KotlinMetadataUtils
+     val metadata = element.kotlinMetadata
+ 
+     if (metadata !is KotlinClassMetadata) {
+-      errorMustBeDataClass(element)
++      errorMustBeKotlinClass(element)
+       return null
+     }
+ 
+     val classData = metadata.data
+     val (nameResolver, classProto) = classData
+ 
+-    fun ProtoBuf.Type.extractFullName() = extractFullName(classData)
+-
+-    if (!classProto.isDataClass) {
+-      errorMustBeDataClass(element)
++    if (classProto.classKind != ProtoBuf.Class.Kind.CLASS) {
++      errorMustBeKotlinClass(element)
+       return null
+     }
+ 
+-    val fqClassName = nameResolver.getString(classProto.fqName).replace('/', '.')
+-
+-    val packageName = nameResolver.getString(classProto.fqName).substringBeforeLast('/').replace(
+-        '/', '.')
++    val typeName = element.asType().asTypeName()
++    val className = when (typeName) {
++      is ClassName -> typeName
++      is ParameterizedTypeName -> typeName.rawType
++      else -> throw IllegalStateException("unexpected TypeName: ${typeName::class}")
++    }
+ 
+     val hasCompanionObject = classProto.hasCompanionObjectName()
+     // todo allow custom constructor
+@@ -113,34 +119,49 @@ class JsonClassCodeGenProcessor : KotlinAbstractProcessor(), KotlinMetadataUtils
+         .first()
+     // TODO Temporary until jvm method signature matching is better
+     //  .single { it.jvmMethodSignature == constructorJvmSignature }
+-    val parameters = protoConstructor
+-        .valueParameterList
+-        .mapIndexed { index, valueParameter ->
+-          val paramName = nameResolver.getString(valueParameter.name)
+-
+-          val nullable = valueParameter.type.nullable
+-          val paramFqcn = valueParameter.type.extractFullName()
+-              .replace("`", "")
+-              .removeSuffix("?")
+-
+-          val actualElement = constructor.parameters[index]
+-
+-          val serializedName = actualElement.getAnnotation(Json::class.java)?.name
+-              ?: paramName
+-
+-          val jsonQualifiers = AnnotationMirrors.getAnnotatedAnnotations(actualElement,
+-              JsonQualifier::class.java)
+-
+-          PropertyGenerator(
+-              name = paramName,
+-              serializedName = serializedName,
+-              hasDefault = valueParameter.declaresDefaultValue,
+-              nullable = nullable,
+-              typeName = valueParameter.type.asTypeName(nameResolver, classProto::getTypeParameter),
+-              unaliasedName = valueParameter.type.asTypeName(nameResolver,
+-                  classProto::getTypeParameter, true),
+-              jsonQualifiers = jsonQualifiers)
+-        }
++    val parameters: Map<String, ValueParameter> = protoConstructor.valueParameterList.associateBy {
++      nameResolver.getString(it.name)
++    }
++
++    val properties = classData.classProto.propertyList.associateBy {
++      nameResolver.getString(it.name)
++    }
++
++    val propertyGenerators = mutableListOf<PropertyGenerator>()
++    for (enclosedElement in element.enclosedElements) {
++      if (enclosedElement !is VariableElement) continue
++
++      val name = enclosedElement.simpleName.toString()
++      val property = properties[name] ?: continue
++      val parameter = parameters[name]
++
++      val parameterElement = if (parameter != null) {
++        val parameterIndex = protoConstructor.valueParameterList.indexOf(parameter)
++        constructor.parameters[parameterIndex]
++      } else {
++        null
++      }
++
++      if (property.visibility != ProtoBuf.Visibility.INTERNAL
++          && property.visibility != ProtoBuf.Visibility.PROTECTED
++          && property.visibility != ProtoBuf.Visibility.PUBLIC) {
++        messager.printMessage(ERROR, "property $name is not visible", enclosedElement)
++        return null
++      }
++
++      propertyGenerators += PropertyGenerator(
++          name,
++          serializedName(name, enclosedElement, parameterElement),
++          parameter != null,
++          parameter?.declaresDefaultValue ?: true,
++          property.returnType.nullable,
++          property.returnType.asTypeName(nameResolver, classProto::getTypeParameter),
++          property.returnType.asTypeName(nameResolver, classProto::getTypeParameter, true),
++          jsonQualifiers(enclosedElement, parameterElement))
++    }
++
++    // Sort properties so that those with constructor parameters come first.
++    propertyGenerators.sortBy { if (it.hasConstructorParameter) -1 else 1 }
+ 
+     val genericTypeNames = classProto.typeParameterList
+         .map {
+@@ -168,19 +189,56 @@ class JsonClassCodeGenProcessor : KotlinAbstractProcessor(), KotlinMetadataUtils
+         }
+ 
+     return AdapterGenerator(
+-        fqClassName = fqClassName,
+-        packageName = packageName,
+-        propertyList = parameters,
++        className,
++        propertyList = propertyGenerators,
+         originalElement = element,
+         hasCompanionObject = hasCompanionObject,
+         visibility = classProto.visibility!!,
+         genericTypeNames = genericTypeNames,
+-        elements = elementUtils)
++        elements = elementUtils,
++        isDataClass = classProto.isDataClass)
++  }
++
++  /** Returns the JsonQualifiers on the field and parameter of a property. */
++  private fun jsonQualifiers(
++    field: VariableElement,
++    parameter: VariableElement?
++  ): Set<AnnotationMirror> {
++    val fieldJsonQualifiers = AnnotationMirrors.getAnnotatedAnnotations(
++        field, JsonQualifier::class.java)
++
++    val parameterJsonQualifiers: Set<AnnotationMirror> = if (parameter != null) {
++      AnnotationMirrors.getAnnotatedAnnotations(parameter, JsonQualifier::class.java)
++    } else {
++      setOf()
++    }
++
++    // TODO(jwilson): union the qualifiers somehow?
++    if (fieldJsonQualifiers.isNotEmpty()) {
++      return fieldJsonQualifiers
++    } else {
++      return parameterJsonQualifiers
++    }
++  }
++
++  /** Returns the @Json name of a property, or `propertyName` if none is provided. */
++  private fun serializedName(
++    propertyName: String,
++    field: VariableElement,
++    parameter: VariableElement?
++  ): String {
++    val fieldAnnotation = field.getAnnotation(Json::class.java)
++    if (fieldAnnotation != null) return fieldAnnotation.name
++
++    val parameterAnnotation = parameter?.getAnnotation(Json::class.java)
++    if (parameterAnnotation != null) return parameterAnnotation.name
++
++    return propertyName
+   }
+ 
+-  private fun errorMustBeDataClass(element: Element) {
++  private fun errorMustBeKotlinClass(element: Element) {
+     messager.printMessage(ERROR,
+-        "@${JsonClass::class.java.simpleName} can't be applied to $element: must be a Kotlin data class",
++        "@${JsonClass::class.java.simpleName} can't be applied to $element: must be a Kotlin class",
+         element)
+   }
+ 
+diff --git a/kotlin-codegen/compiler/src/main/java/com/squareup/moshi/PropertyGenerator.kt b/kotlin-codegen/compiler/src/main/java/com/squareup/moshi/PropertyGenerator.kt
+index 3d8319ca..68b61d77 100644
+--- a/kotlin-codegen/compiler/src/main/java/com/squareup/moshi/PropertyGenerator.kt
++++ b/kotlin-codegen/compiler/src/main/java/com/squareup/moshi/PropertyGenerator.kt
+@@ -32,6 +32,7 @@ import javax.lang.model.element.AnnotationMirror
+ internal class PropertyGenerator(
+   val name: String,
+   val serializedName: String,
++  val hasConstructorParameter: Boolean,
+   val hasDefault: Boolean,
+   val nullable: Boolean,
+   val typeName: TypeName,

@@ -1,0 +1,281 @@
+diff --git a/release-notes/CREDITS b/release-notes/CREDITS
+index 723d60cff..c599ed659 100644
+--- a/release-notes/CREDITS
++++ b/release-notes/CREDITS
+@@ -183,6 +183,11 @@ Kenneth Jorgensen (@kennethjor)
+   `@JsonDeserialize.builderPrefix` property
+   [3.1.0]
+ 
++Lee Jiwon (@dlwldnjs1009)
++ * Implemented #3284: Backward compatibility for timezone formats of UTC Date
++   serialization
++  [3.1.0]
++
+ Garret Wilson (@garretwilson)
+  * Suggested #4157: Add `MapperFeature.INFER_RECORD_GETTERS_FROM_COMPONENTS_ONLY` to ignore
+    getter method auto-detection for Records
+diff --git a/release-notes/VERSION b/release-notes/VERSION
+index c1a9a10d7..5c01e21b6 100644
+--- a/release-notes/VERSION
++++ b/release-notes/VERSION
+@@ -51,6 +51,10 @@ Versions: 3.x (for earlier see VERSION-2.x)
+ #2686: `@JsonBackReference` does not work with a builder
+  (reported by @janrieke)
+  (fix by @JacksonJang)
++#3284: Backward compatibility for timezone formats of UTC Date
++  serialization
++ (requested by @arungitan)
++ (implemented by Lee Jiwon)
+ #3964: Deserialization issue: MismatchedInputException, Bean not
+   yet resolved
+  (reported by @detomarco)
+diff --git a/src/main/java/tools/jackson/databind/SerializationContext.java b/src/main/java/tools/jackson/databind/SerializationContext.java
+index 5e1047633..2747e8d6a 100644
+--- a/src/main/java/tools/jackson/databind/SerializationContext.java
++++ b/src/main/java/tools/jackson/databind/SerializationContext.java
+@@ -35,6 +35,7 @@ import tools.jackson.databind.ser.impl.UnknownSerializer;
+ import tools.jackson.databind.ser.std.NullSerializer;
+ import tools.jackson.databind.type.TypeFactory;
+ import tools.jackson.databind.util.ClassUtil;
++import tools.jackson.databind.util.StdDateFormat;
+ import tools.jackson.databind.util.TokenBuffer;
+ 
+ /**
+@@ -1451,8 +1452,15 @@ public abstract class SerializationContext
+         // At this point, all timezone configuration should have occurred, with respect
+         // to default dateformat configuration. But we still better clone
+         // an instance as formatters are stateful, not thread-safe.
+-        DateFormat df = _config.getDateFormat();
+-        _dateFormat = df = (DateFormat) df.clone();
++        DateFormat df = (DateFormat) _config.getDateFormat().clone();
++
++        // [databind#3284]: Configure zero-offset format based on DateTimeFeature
++        if (df instanceof StdDateFormat sdf
++                && isEnabled(DateTimeFeature.WRITE_UTC_AS_OFFSET)) {
++            df = sdf.withZeroOffsetAsZ(false);
++        }
++
++        _dateFormat = df;
+         // [databind#939]: 26-Sep-2015, tatu: With 2.6, formatter has been (pre)configured
+         // with TimeZone, so we should NOT try overriding it unlike with earlier versions
+         /*
+diff --git a/src/main/java/tools/jackson/databind/cfg/DateTimeFeature.java b/src/main/java/tools/jackson/databind/cfg/DateTimeFeature.java
+index 7d314d668..083396f3f 100644
+--- a/src/main/java/tools/jackson/databind/cfg/DateTimeFeature.java
++++ b/src/main/java/tools/jackson/databind/cfg/DateTimeFeature.java
+@@ -264,6 +264,36 @@ public enum DateTimeFeature implements DatatypeFeature
+      */
+     WRITE_DURATIONS_AS_TIMESTAMPS(false),
+ 
++    /**
++     * Feature that controls how <b>zero timezone offset</b> ({@code offset == 0})
++     * is serialized: as "Z" (disabled) or as numeric offset
++     * "+00:00" or "+0000" (enabled).
++     *<p>
++     * NOTE: the name "UTC" is historical; this feature applies to <b>all timezones
++     * where the actual offset is zero</b> at serialization time (e.g., "UTC", "GMT",
++     * "Europe/London" in winter), regardless of the timezone ID.
++     *<p>
++     * This feature only controls zero-offset formatting when using "classic" JDK date
++     * types ({@link java.util.Date}, {@link java.util.Calendar}) and with
++     * {@link tools.jackson.databind.util.StdDateFormat} (the default).
++     * For Java 8 ({@code java.time.*}) and Joda date/time types, formatting is
++     * controlled by {@code DateTimeFormatter} configuration and this feature
++     * has no effect.
++     * Custom {@link java.text.DateFormat} instances are also not modified.
++     *<p>
++     * NOTE: when enabled, this feature overrides any {@code StdDateFormat}
++     * configuration set via
++     * {@link tools.jackson.databind.util.StdDateFormat#withZeroOffsetAsZ(boolean)}.
++     *<p>
++     * When enabled, the colon format ("+00:00" vs "+0000") is controlled by
++     * {@link tools.jackson.databind.util.StdDateFormat#withColonInTimeZone(boolean)}.
++     *<p>
++     * Feature is disabled by default to maintain Jackson 3.x standard behavior ("Z");
++     * it is usually enabled to achieve behavior similar to Jackson 2.x.
++     *
++     * @since 3.1
++     */
++    WRITE_UTC_AS_OFFSET(false),
+     ;
+ 
+     private final static int FEATURE_INDEX = DatatypeFeatures.FEATURE_INDEX_DATETIME;
+diff --git a/src/main/java/tools/jackson/databind/cfg/MapperBuilder.java b/src/main/java/tools/jackson/databind/cfg/MapperBuilder.java
+index dce990572..7531c4a54 100644
+--- a/src/main/java/tools/jackson/databind/cfg/MapperBuilder.java
++++ b/src/main/java/tools/jackson/databind/cfg/MapperBuilder.java
+@@ -833,6 +833,7 @@ public abstract class MapperBuilder<M extends ObjectMapper,
+         return disable(DateTimeFeature.ONE_BASED_MONTHS)
+                 .enable(DateTimeFeature.WRITE_DATES_AS_TIMESTAMPS)
+                 .enable(DateTimeFeature.WRITE_DURATIONS_AS_TIMESTAMPS)
++                .enable(DateTimeFeature.WRITE_UTC_AS_OFFSET) // [databind#3824]
+                 .disable(DeserializationFeature.FAIL_ON_NULL_FOR_PRIMITIVES)
+                 .disable(DeserializationFeature.FAIL_ON_TRAILING_TOKENS)
+                 .enable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES)
+diff --git a/src/main/java/tools/jackson/databind/util/StdDateFormat.java b/src/main/java/tools/jackson/databind/util/StdDateFormat.java
+index 8a2004809..843196e2b 100644
+--- a/src/main/java/tools/jackson/databind/util/StdDateFormat.java
++++ b/src/main/java/tools/jackson/databind/util/StdDateFormat.java
+@@ -150,6 +150,18 @@ public class StdDateFormat
+      */
+     protected boolean _tzSerializedWithColon = true;
+ 
++    /**
++     * Whether zero timezone offset should be serialized as "Z" (true, default in 3.x)
++     * or as numeric offset "+00:00"/"+0000" (false, legacy 2.x behavior).
++     *<p>
++     * NOTE: Applies to ALL timezones with zero offset, not just UTC TimeZone ID.
++     *<p>
++     * Default is {@code true} in Jackson 3.0; was effectively {@code false} in 2.x.
++     *
++     * @since 3.1
++     */
++    protected boolean _writeZeroOffsetAsZ = true;
++
+     /*
+     /**********************************************************************
+     /* Life cycle, accessing singleton "standard" formats
+@@ -157,15 +169,26 @@ public class StdDateFormat
+      */
+ 
+     public StdDateFormat() {
+-        _locale = DEFAULT_LOCALE;
++        // NOTE: _timezone intentionally left null (means "use default when needed")
++        // Default 3.x behavior: colon in offset ("+HH:mm") and "Z" for zero offset
++        this(null, DEFAULT_LOCALE, null, true, true);
+     }
+ 
+     protected StdDateFormat(TimeZone tz, Locale loc, Boolean lenient,
+             boolean formatTzOffsetWithColon) {
++        this(tz, loc, lenient, formatTzOffsetWithColon, true);
++    }
++
++    /**
++     * @since 3.1
++     */
++    protected StdDateFormat(TimeZone tz, Locale loc, Boolean lenient,
++            boolean formatTzOffsetWithColon, boolean writeZeroOffsetAsZ) {
+         _timezone = tz;
+         _locale = loc;
+         _lenient = lenient;
+         _tzSerializedWithColon = formatTzOffsetWithColon;
++        _writeZeroOffsetAsZ = writeZeroOffsetAsZ;
+     }
+ 
+     public static TimeZone getDefaultTimeZone() {
+@@ -183,7 +206,7 @@ public class StdDateFormat
+         if ((tz == _timezone) || tz.equals(_timezone)) {
+             return this;
+         }
+-        return new StdDateFormat(tz, _locale, _lenient, _tzSerializedWithColon);
++        return new StdDateFormat(tz, _locale, _lenient, _tzSerializedWithColon, _writeZeroOffsetAsZ);
+     }
+ 
+     /**
+@@ -196,7 +219,7 @@ public class StdDateFormat
+         if (loc.equals(_locale)) {
+             return this;
+         }
+-        return new StdDateFormat(_timezone, loc, _lenient, _tzSerializedWithColon);
++        return new StdDateFormat(_timezone, loc, _lenient, _tzSerializedWithColon, _writeZeroOffsetAsZ);
+     }
+ 
+     /**
+@@ -208,7 +231,7 @@ public class StdDateFormat
+         if (_equals(b, _lenient)) {
+             return this;
+         }
+-        return new StdDateFormat(_timezone, _locale, b, _tzSerializedWithColon);
++        return new StdDateFormat(_timezone, _locale, b, _tzSerializedWithColon, _writeZeroOffsetAsZ);
+     }
+ 
+     /**
+@@ -226,14 +249,34 @@ public class StdDateFormat
+         if (_tzSerializedWithColon == b) {
+             return this;
+         }
+-        return new StdDateFormat(_timezone, _locale, _lenient, b);
+-     }
++        return new StdDateFormat(_timezone, _locale, _lenient, b, _writeZeroOffsetAsZ);
++    }
++
++    /**
++     * "Mutant factory" method that returns an instance that controls whether
++     * zero timezone offset is serialized as "Z" ({@code true}) or as numeric
++     * offset "+00:00"/"+0000" ({@code false}).
++     *<p>
++     * NOTE: Applies to ALL timezones with zero offset, not just UTC TimeZone ID.
++     *<p>
++     * When writing numeric offset, the colon inclusion is controlled by
++     * {@link #withColonInTimeZone(boolean)}.
++     *
++     * @since 3.1
++     */
++    public StdDateFormat withZeroOffsetAsZ(boolean b) {
++        if (_writeZeroOffsetAsZ == b) {
++            return this;
++        }
++        return new StdDateFormat(_timezone, _locale, _lenient,
++                _tzSerializedWithColon, b);
++    }
+ 
+     @Override
+     public StdDateFormat clone() {
+         // Although there isn't that much state to share, we do need to
+         // orchestrate a bit, mostly since timezones may be changed
+-        return new StdDateFormat(_timezone, _locale, _lenient, _tzSerializedWithColon);
++        return new StdDateFormat(_timezone, _locale, _lenient, _tzSerializedWithColon, _writeZeroOffsetAsZ);
+     }
+ 
+     /*
+@@ -417,21 +460,39 @@ public class StdDateFormat
+ 
+         int offset = tz.getOffset(cal.getTimeInMillis());
+         if (offset != 0) {
+-            int hours = Math.abs((offset / (60 * 1000)) / 60);
+-            int minutes = Math.abs((offset / (60 * 1000)) % 60);
+-            buffer.append(offset < 0 ? '-' : '+');
+-            pad2(buffer, hours);
+-            if( _tzSerializedWithColon ) {
+-                buffer.append(':');
+-            }
+-            pad2(buffer, minutes);
++            _appendOffset(buffer, offset);
+         } else {
+-            // 06-Mar-2020, tatu: Jackson versions 2.x forced use of numeric offset even
+-            //    for Zulu; for 3.0 `Z` is used.
+-            buffer.append('Z');
++            // [databind#3284]: Allow legacy format via _writeZeroOffsetAsZ toggle
++            if (_writeZeroOffsetAsZ) {
++                // 06-Mar-2020, tatu: Jackson versions 2.x forced use of numeric offset even
++                //    for Zulu; for 3.0 `Z` is used.
++                buffer.append('Z');
++            } else {
++                _appendOffset(buffer, 0);
++            }
+         }
+     }
+ 
++    /**
++     * Helper to append timezone offset in +HH:mm or +HHmm format.
++     * Reused for both zero and non-zero offsets.
++     *
++     * @param buffer destination buffer
++     * @param offsetMillis offset in milliseconds; truncated to whole minutes (as per original logic)
++     */
++    private void _appendOffset(StringBuffer buffer, int offsetMillis) {
++        // Simplified calculation: divide once, then extract hours/minutes
++        int totalMinutes = offsetMillis / (60 * 1000);
++        int hours = Math.abs(totalMinutes / 60);
++        int minutes = Math.abs(totalMinutes % 60);
++        buffer.append(offsetMillis < 0 ? '-' : '+');
++        pad2(buffer, hours);
++        if (_tzSerializedWithColon) {
++            buffer.append(':');
++        }
++        pad2(buffer, minutes);
++    }
++
+     protected void _formatBCEYear(StringBuffer buffer, int bceYearNoSign) {
+         // Ok. First of all, BCE 1 output (given as value `1` in era BCE) needs to become
+         // "+0000", but rest (from `2` up, in that era) need minus sign.

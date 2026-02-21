@@ -1,0 +1,1840 @@
+diff --git a/README.md b/README.md
+index 7db070a57..0d81ec6ca 100644
+--- a/README.md
++++ b/README.md
+@@ -581,60 +581,7 @@ This will deserialize JSON fields with `known_as`, as well as `identifer` and `f
+ Note: to use the `@JsonAlias` annotation, a `@JsonProperty` annotation must also be used.
+ 
+ Overall, Jackson library is very powerful in deserializing objects using builder pattern.
+-
+-## Tutorial: Collecting multiple errors (3.1+)
+-
+-One recently introduced feature is the ability to collect multiple deserialization errors instead of failing fast on the first one. This can be really handy for validation use cases.
+-
+-By default, if Jackson encounters a problem during deserialization -- say, string `"xyz"` for an `int` property -- it will immediately throw an exception and stop. But sometimes you want to see ALL the problems in one go.
+-
+-Consider a case where you have a couple of fields with bad data:
+-
+-```java
+-class Order {
+-  public int orderId;
+-  public Date orderDate;
+-  public double amount;
+-}
+-
+-String json = "{\"orderId\":\"not-a-number\",\"orderDate\":\"bad-date\",\"amount\":\"xyz\"}";
+-```
+-
+-Normally you'd get an error about `orderId`, fix it, resubmit, then get error about `orderDate`, and so on. Not fun. So let's collect them all:
+-
+-```java
+-ObjectMapper mapper = new JsonMapper();
+-ObjectReader reader = mapper.readerFor(Order.class).problemCollectingReader();
+-
+-try {
+-    Order result = reader.readValueCollectingProblems(json);
+-    // worked fine
+-} catch (DeferredBindingException ex) {
+-    System.out.println("Found " + ex.getProblems().size() + " problems:");
+-    for (CollectedProblem problem : ex.getProblems()) {
+-        System.out.println(problem.getPath() + ": " + problem.getMessage());
+-        // Can also access problem.getRawValue() to see what the bad input was
+-    }
+-}
+-```
+-
+-This will report all 3 problems at once. Much better.
+-
+-By default, Jackson will collect up to 100 problems before giving up (to prevent DoS-style attacks with huge bad payloads). You can configure this:
+-
+-```java
+-ObjectReader reader = mapper.readerFor(Order.class).problemCollectingReader(10); // limit to 10
+-```
+-
+-Few things to keep in mind:
+-
+-1. This is best-effort: not all problems can be collected. Malformed JSON (like missing closing brace) or other structural problems will still fail immediately. But type conversion errors, unknown properties (if you enable that check), and such will be collected.
+-2. Error paths use JSON Pointer notation (RFC 6901): so `"/items/0/price"` means first item in `items` array, `price` field. Special characters get escaped (`~` becomes `~0`, `/` becomes `~1`).
+-3. Each call to `readValueCollectingProblems()` gets its own problem bucket, so it's thread-safe to reuse the same `ObjectReader`.
+-4. Fields that fail to deserialize get default values (0 for primitives, null for objects) during the attempt, but if any problems are collected, only the problems are reported in the `DeferredBindingException` - the partial result is not returned.
+-
+-This is particularly useful for things like REST API validation (return all validation errors to client), or batch processing (log errors but keep going), or development tooling.
+-
++ 
+ # Contribute!
+ 
+ We would love to get your contribution, whether it's in form of bug reports, Requests for Enhancement (RFE), documentation, or code patches.
+diff --git a/release-notes/CREDITS b/release-notes/CREDITS
+index 4cf5820c4..490d96d66 100644
+--- a/release-notes/CREDITS
++++ b/release-notes/CREDITS
+@@ -113,16 +113,6 @@ Fouad Almalki (@Eng-Fouad)
+    with Jackson 3
+   [3.0.3]
+ 
+-Oliver Drotbohm (@odrotbohm)
+- * Requested #1196: Add opt-in error collection for deserialization
+-  [3.1.0]
+-
+-@sri-adarsh-kumar
+- * Contributed #1196: Add opt-in error collection for deserialization
+-  [3.1.0]
+-
+ Hélios Gilles (@RoiSoleil)
+  * Contributed #5413: Add/support forward reference resolution for array values
+   [3.1.0]
+-
+-   
+\ No newline at end of file
+diff --git a/release-notes/VERSION b/release-notes/VERSION
+index d78d391c9..9a8b33f70 100644
+--- a/release-notes/VERSION
++++ b/release-notes/VERSION
+@@ -7,9 +7,6 @@ Versions: 3.x (for earlier see VERSION-2.x)
+ 
+ 3.1.0 (not yet released)
+ 
+-#1196: Add opt-in error collection for deserialization
+- (requested by @odrotbohm)
+- (contributed by @sri-adarsh-kumar)
+ #5350: Add `DeserializationFeature.USE_NULL_FOR_MISSING_REFERENCE_VALUES` for
+   selecting `null` vs "empty/absent" value when deserializing missing `Optional` value
+ #5361: Fix Maven SBOM publishing (worked in 3.0.0-rc4 but not in rc5 or later)
+diff --git a/src/main/java/tools/jackson/databind/ObjectReader.java b/src/main/java/tools/jackson/databind/ObjectReader.java
+index 16b470f98..1346bdf0d 100644
+--- a/src/main/java/tools/jackson/databind/ObjectReader.java
++++ b/src/main/java/tools/jackson/databind/ObjectReader.java
+@@ -17,11 +17,8 @@ import tools.jackson.core.type.TypeReference;
+ import tools.jackson.databind.cfg.ContextAttributes;
+ import tools.jackson.databind.cfg.DatatypeFeature;
+ import tools.jackson.databind.cfg.DeserializationContexts;
+-import tools.jackson.databind.deser.CollectingProblemHandler;
+ import tools.jackson.databind.deser.DeserializationContextExt;
+ import tools.jackson.databind.deser.DeserializationProblemHandler;
+-import tools.jackson.databind.exc.CollectedProblem;
+-import tools.jackson.databind.exc.DeferredBindingException;
+ import tools.jackson.databind.node.ArrayNode;
+ import tools.jackson.databind.node.JsonNodeFactory;
+ import tools.jackson.databind.node.ObjectNode;
+@@ -29,7 +26,6 @@ import tools.jackson.databind.node.TreeTraversingParser;
+ import tools.jackson.databind.type.SimpleType;
+ import tools.jackson.databind.type.TypeFactory;
+ import tools.jackson.databind.util.ClassUtil;
+-import tools.jackson.databind.util.LinkedNode;
+ import tools.jackson.databind.util.TokenBuffer;
+ 
+ /**
+@@ -696,73 +692,6 @@ public class ObjectReader
+         return _with(_config.withHandler(h));
+     }
+ 
+-    /**
+-     * Returns a new {@link ObjectReader} configured to collect deserialization problems
+-     * instead of failing on the first error. Uses default problem limit (100 problems).
+-     *
+-     * <p><b>IMPORTANT</b>: This method registers a {@link CollectingProblemHandler},
+-     * inserting it before possible other handlers.
+-     * If you need custom problem handling in addition to collection, you need to create
+-     * your own handler that delegates to {@code CollectingProblemHandler} (or sub-classes it)
+-     * and use {@link #problemCollectingReader(CollectingProblemHandler)} overload
+-     * instead of this method.
+-     *
+-     * <p>Future versions may support handler chaining; for now, only one handler is active.
+-     *
+-     * <p><b>Thread-safety</b>: The returned reader is immutable and thread-safe. Each call to
+-     * {@link #readValueCollectingProblems} allocates a fresh problem bucket, so concurrent
+-     * calls do not interfere.
+-     *
+-     * <p>Usage:
+-     * <pre>
+-     * ObjectReader reader = mapper.reader()
+-     *     .forType(MyBean.class)
+-     *     .problemCollectingReader();
+-     *
+-     * MyBean bean = reader.readValueCollectingProblems(json);
+-     * </pre>
+-     *
+-     * @return A new ObjectReader configured for problem collection
+-     * @since 3.1
+-     */
+-    public ObjectReader problemCollectingReader() {
+-        return problemCollectingReader(CollectingProblemHandler.DEFAULT_MAX_PROBLEMS);
+-    }
+-
+-    /**
+-     * Variant of {@link #problemCollectingReader()} that allows overriding maximum
+-     * number of problems to collect.
+-     *
+-     * @param maxProblems Maximum number of problems to collect (must be {@code >} 0)
+-     * @return A new ObjectReader configured for problem collection
+-     * @throws IllegalArgumentException if maxProblems is {@code <= 0}
+-     *
+-     * @since 3.1
+-     */
+-    public ObjectReader problemCollectingReader(int maxProblems) {
+-        if (maxProblems <= 0) {
+-            throw new IllegalArgumentException("maxProblems must be positive");
+-        }
+-        return problemCollectingReader(new CollectingProblemHandler(maxProblems));
+-    }
+-
+-    /**
+-     * Variant of {@link #problemCollectingReader()} that allows passing custom
+-     * {@link CollectingProblemHandler} (usually sub-class).
+-     *
+-     * @param problemHandler Custom handler instance to use
+-     *
+-     * @return A new ObjectReader configured for problem collection
+-     *
+-     * @since 3.1
+-     */
+-    public ObjectReader problemCollectingReader(CollectingProblemHandler problemHandler)
+-    {
+-        DeserializationConfig newConfig = _config.withHandler(problemHandler);
+-        return _new(this, newConfig, _valueType, _rootDeserializer, _valueToUpdate,
+-                _schema, _injectableValues);
+-    }
+-
+     public ObjectReader with(Base64Variant defaultBase64) {
+         return _with(_config.with(defaultBase64));
+     }
+@@ -1391,133 +1320,6 @@ public class ObjectReader
+                 _considerFilter(src.asParser(ctxt) , false));
+     }
+ 
+-    /*
+-    /**********************************************************************
+-    /* Deserialization methods with error collection
+-    /**********************************************************************
+-     */
+-
+-    /**
+-     * Deserializes JSON content into a Java object, collecting multiple
+-     * problems if encountered. If any problems were collected, throws
+-     * {@link DeferredBindingException} with all problems.
+-     *
+-     * <p><b>Usage</b>: This method should be called on an ObjectReader created via
+-     * {@link #problemCollectingReader()} or {@link #problemCollectingReader(int)}. If called on a regular
+-     * reader (without problem collection enabled), it behaves the same as
+-     * {@link #readValue(JsonParser)} since no handler is registered.
+-     *
+-     * <p><b>Error handling</b>:
+-     * <ul>
+-     * <li>Recoverable errors are accumulated and thrown as
+-     *     {@link DeferredBindingException} after parsing</li>
+-     * <li>Hard (non-recoverable) failures throw immediately, with collected problems
+-     *     attached as suppressed exceptions</li>
+-     * <li>When the configured limit is reached, collection stops</li>
+-     * </ul>
+-     *
+-     * <p><b>Exception Handling Strategy</b>:
+-     *
+-     * <p>This method catches only {@link DatabindException} subtypes (not all
+-     * {@link JacksonException}s) because:
+-     *
+-     * <ul>
+-     * <li>Core streaming errors ({@link tools.jackson.core.exc.StreamReadException},
+-     *     {@link tools.jackson.core.exc.StreamWriteException}) represent structural
+-     *     JSON problems that cannot be recovered from (malformed JSON, I/O errors)</li>
+-     *
+-     * <li>Only databind-level errors (type conversion, unknown properties, instantiation
+-     *     failures) are potentially recoverable and suitable for collection</li>
+-     *
+-     * <li>Catching all JacksonExceptions would hide critical parsing errors that should
+-     *     fail fast</li>
+-     * </ul>
+-     *
+-     * <p>If a hard failure occurs after some problems have been collected, those problems
+-     * are attached as suppressed exceptions to the thrown exception for debugging purposes.
+-     *
+-     * <p><b>Thread-safety</b>: Each call allocates a fresh problem bucket,
+-     * so multiple concurrent calls on the same reader instance are safe.
+-     *
+-     * <p><b>Parser filtering</b>: Unlike convenience overloads ({@link #readValueCollectingProblems(String)},
+-     * {@link #readValueCollectingProblems(byte[])}, etc.), this method does <i>not</i> apply
+-     * parser filtering. Callers are responsible for filter wrapping if needed.
+-     *
+-     * @param <T> Type to deserialize
+-     * @param p JsonParser to read from (will not be closed by this method)
+-     * @return Deserialized object
+-     * @throws DeferredBindingException if recoverable problems were collected
+-     * @throws DatabindException if a non-recoverable error occurred
+-     * @since 3.1
+-     */
+-    public <T> T readValueCollectingProblems(JsonParser p) throws JacksonException {
+-        _assertNotNull("p", p);
+-        DeserializationContextExt ctxt = _deserializationContext();
+-        return _collectingBind(ctxt, p);
+-    }
+-
+-    /**
+-     * Convenience overload for {@link #readValueCollectingProblems(JsonParser)}.
+-     */
+-    public <T> T readValueCollectingProblems(String content) throws JacksonException {
+-        _assertNotNull("content", content);
+-        DeserializationContextExt ctxt = _deserializationContext();
+-        return _collectingBindAndClose(ctxt,
+-                _considerFilter(_parserFactory.createParser(ctxt, content), false));
+-    }
+-
+-    /**
+-     * Convenience overload for {@link #readValueCollectingProblems(JsonParser)}.
+-     */
+-    public <T> T readValueCollectingProblems(byte[] content) throws JacksonException {
+-        _assertNotNull("content", content);
+-        DeserializationContextExt ctxt = _deserializationContext();
+-        return _collectingBindAndClose(ctxt,
+-                _considerFilter(_parserFactory.createParser(ctxt, content), false));
+-    }
+-
+-    /**
+-     * Convenience overload for {@link #readValueCollectingProblems(JsonParser)}.
+-     */
+-    public <T> T readValueCollectingProblems(File src) throws JacksonException {
+-        _assertNotNull("src", src);
+-        DeserializationContextExt ctxt = _deserializationContext();
+-        return _collectingBindAndClose(ctxt,
+-                _considerFilter(_parserFactory.createParser(ctxt, src), false));
+-    }
+-
+-    /**
+-     * Convenience overload for {@link #readValueCollectingProblems(JsonParser)}.
+-     */
+-    @SuppressWarnings("unchecked")
+-    public <T> T readValueCollectingProblems(Path path) throws JacksonException
+-    {
+-        _assertNotNull("path", path);
+-        DeserializationContextExt ctxt = _deserializationContext();
+-        return (T) _collectingBindAndClose(ctxt,
+-                _considerFilter(_parserFactory.createParser(ctxt, path), false));
+-    }
+-
+-    /**
+-     * Convenience overload for {@link #readValueCollectingProblems(JsonParser)}.
+-     */
+-    public <T> T readValueCollectingProblems(InputStream src) throws JacksonException {
+-        _assertNotNull("src", src);
+-        DeserializationContextExt ctxt = _deserializationContext();
+-        return _collectingBindAndClose(ctxt,
+-                _considerFilter(_parserFactory.createParser(ctxt, src), false));
+-    }
+-
+-    /**
+-     * Convenience overload for {@link #readValueCollectingProblems(JsonParser)}.
+-     */
+-    public <T> T readValueCollectingProblems(Reader src) throws JacksonException {
+-        _assertNotNull("src", src);
+-        DeserializationContextExt ctxt = _deserializationContext();
+-        return _collectingBindAndClose(ctxt,
+-                _considerFilter(_parserFactory.createParser(ctxt, src), false));
+-    }
+-
+     /*
+     /**********************************************************************
+     /* Deserialization methods; JsonNode ("tree")
+@@ -1851,78 +1653,6 @@ public class ObjectReader
+         }
+     }
+ 
+-    /**
+-     * Internal helper for problem-collecting deserialization that does NOT close the parser.
+-     * Caller is responsible for parser lifecycle management.
+-     *
+-     * @since 3.1
+-     */
+-    protected <T> T _collectingBind(DeserializationContextExt ctxt, JsonParser p)
+-            throws JacksonException {
+-        // CRITICAL: Allocate a FRESH bucket for THIS call (thread-safety)
+-        List<CollectedProblem> bucket = new ArrayList<>();
+-
+-        // Set bucket in context attributes (mutable per-call state)
+-        ctxt.setAttribute(CollectingProblemHandler.class, bucket);
+-
+-        // Find the CollectingProblemHandler to get maxProblems limit
+-        int maxProblems = CollectingProblemHandler.DEFAULT_MAX_PROBLEMS;
+-        LinkedNode<DeserializationProblemHandler> handlers = _config.getProblemHandlers();
+-        while (handlers != null) {
+-            if (handlers.value() instanceof CollectingProblemHandler cph) {
+-                maxProblems = cph.getMaxProblems();
+-                break;
+-            }
+-            handlers = handlers.next();
+-        }
+-
+-        try {
+-            // Directly invoke _bind with the prepared context
+-            @SuppressWarnings("unchecked")
+-            T result = (T) _bind(ctxt, p, _valueToUpdate);
+-
+-            // Check if any problems were collected
+-            if (!bucket.isEmpty()) {
+-                boolean limitReached = (bucket.size() >= maxProblems);
+-                throw new DeferredBindingException(p, bucket, limitReached);
+-            }
+-
+-            return result;
+-
+-        } catch (DeferredBindingException e) {
+-            throw e; // Already properly formatted
+-
+-        } catch (DatabindException e) {
+-            // Hard failure occurred; attach collected problems as suppressed
+-            if (!bucket.isEmpty()) {
+-                boolean limitReached = (bucket.size() >= maxProblems);
+-                if (limitReached) {
+-                    // Limit was hit - throw DeferredBindingException as primary exception
+-                    DeferredBindingException dbe = new DeferredBindingException(p, bucket, true);
+-                    dbe.addSuppressed(e); // Original error as suppressed for debugging
+-                    throw dbe;
+-                } else {
+-                    // Hard failure unrelated to limit - keep original as primary
+-                    e.addSuppressed(new DeferredBindingException(p, bucket, false));
+-                }
+-            }
+-            throw e;
+-        }
+-    }
+-
+-    /**
+-     * Internal helper for problem-collecting deserialization that DOES close the parser.
+-     * Mirrors {@link #_bindAndClose} but with problem collection enabled.
+-     *
+-     * @since 3.1
+-     */
+-    protected <T> T _collectingBindAndClose(DeserializationContextExt ctxt, JsonParser p0)
+-            throws JacksonException {
+-        try (JsonParser p = p0) {
+-            return _collectingBind(ctxt, p);
+-        }
+-    }
+-
+     protected final JsonNode _bindAndCloseAsTree(DeserializationContextExt ctxt,
+             JsonParser p0) throws JacksonException {
+         try (JsonParser p = ctxt.assignAndReturnParser(p0)) {
+@@ -2013,7 +1743,7 @@ public class ObjectReader
+      */
+     protected JsonParser _considerFilter(final JsonParser p, boolean multiValue) {
+         // 26-Mar-2016, tatu: Need to allow multiple-matches at least if we have
+-        //    a multiple-value read (that is, "readValues()").
++        //    have a multiple-value read (that is, "readValues()").
+         return ((_filter == null) || FilteringParserDelegate.class.isInstance(p))
+                 ? p : new FilteringParserDelegate(p, _filter, Inclusion.ONLY_INCLUDE_ALL, multiValue);
+     }
+diff --git a/src/main/java/tools/jackson/databind/deser/CollectingProblemHandler.java b/src/main/java/tools/jackson/databind/deser/CollectingProblemHandler.java
+deleted file mode 100644
+index 5dac787ae..000000000
+--- a/src/main/java/tools/jackson/databind/deser/CollectingProblemHandler.java
++++ /dev/null
+@@ -1,316 +0,0 @@
+-package tools.jackson.databind.deser;
+-
+-import java.util.List;
+-
+-import tools.jackson.core.JacksonException;
+-import tools.jackson.core.JsonParser;
+-import tools.jackson.core.JsonPointer;
+-import tools.jackson.core.JsonToken;
+-import tools.jackson.core.TokenStreamContext;
+-import tools.jackson.core.TokenStreamLocation;
+-import tools.jackson.databind.DeserializationContext;
+-import tools.jackson.databind.JavaType;
+-import tools.jackson.databind.ValueDeserializer;
+-import tools.jackson.databind.exc.CollectedProblem;
+-import tools.jackson.databind.util.ClassUtil;
+-
+-/**
+- * Stateless {@link DeserializationProblemHandler} that collects recoverable
+- * problems into a per-call bucket stored in {@link DeserializationContext}
+- * attributes.
+- *
+- * <p><b>Design</b>: This handler is completely stateless. The problem collection
+- * bucket is allocated per-call by {@code ObjectReader.readValueCollectingProblems(...)}
+- * and stored in per-call context attributes, ensuring thread-safety and call isolation.
+- *
+- * <p><b>Usage</b>: This class is internal infrastructure, registered automatically by
+- * {@code ObjectReader.problemCollectingReader()}. Users should not instantiate or
+- * register this handler manually.
+- *
+- * <p><b>Design rationale - Context Attributes vs Handler State</b>:
+- *
+- * <p>Problem collection state is stored in {@link DeserializationContext} attributes
+- * rather than within this handler for several reasons:
+- *
+- * <ol>
+- * <li><b>Thread-safety</b>: The handler instance is shared across all calls to the
+- *     same ObjectReader. Storing mutable state in the handler would require
+- *     synchronization and complicate the implementation.</li>
+- *
+- * <li><b>Call isolation</b>: Each call to {@code readValueCollectingProblems()} needs
+- *     its own problem bucket. Context attributes are perfect for this - they're created
+- *     per-call and automatically cleaned up after deserialization.</li>
+- *
+- * <li><b>Immutability</b>: Jackson's config objects (including handlers) are designed
+- *     to be immutable and reusable. Storing per-call state violates this principle.</li>
+- *
+- * <li><b>Configuration vs State</b>: The handler stores configuration (max problems
+- *     limit) while attributes store runtime state (the actual problem list). This
+- *     separation follows Jackson's design patterns.</li>
+- * </ol>
+- *
+- * <p>The handler itself is stateless - it's just a strategy for handling problems.
+- * The actual collection happens in a bucket passed through context attributes.
+- *
+- * <p><b>Recoverable errors handled</b>:
+- * <ul>
+- * <li>Unknown properties ({@link #handleUnknownProperty handleUnknownProperty}) - skips children</li>
+- * <li>Type coercion failures ({@link #handleWeirdStringValue handleWeirdStringValue},
+- *     {@link #handleWeirdNumberValue handleWeirdNumberValue}) - returns defaults</li>
+- * <li>Map key coercion ({@link #handleWeirdKey handleWeirdKey}) - returns {@code NOT_HANDLED}</li>
+- * <li>Instantiation failures ({@link #handleInstantiationProblem handleInstantiationProblem}) -
+- *     returns null when safe</li>
+- * </ul>
+- *
+- * <p><b>Default values</b>: Primitives receive zero/false defaults; reference types
+- * (including boxed primitives) receive {@code null} to avoid masking nullability issues.
+- *
+- * <p><b>DoS protection</b>: Collection stops when the configured limit (default 100)
+- * is reached, preventing memory/CPU exhaustion attacks.
+- *
+- * <p><b>JSON Pointer</b>: Paths are built from parser context following RFC 6901,
+- * with proper escaping of {@code ~} and {@code /} characters via jackson-core's
+- * {@link JsonPointer} class.
+- *
+- * @since 3.1
+- */
+-public class CollectingProblemHandler extends DeserializationProblemHandler
+-{
+-    /**
+-     * Default maximum number of problems to collect before stopping.
+-     * Prevents memory exhaustion attacks.
+-     */
+-    public static final int DEFAULT_MAX_PROBLEMS = 100;
+-
+-    /**
+-     * Attribute key for the problem collection bucket.
+-     * Using class object as key (not a string) for type safety.
+-     */
+-    private static final Object ATTR_KEY = CollectingProblemHandler.class;
+-
+-    /**
+-     * Maximum number of problems to collect before stopping.
+-     */
+-    private final int _maxProblems;
+-
+-    /**
+-     * Constructs a handler with the default maximum problem limit.
+-     */
+-    public CollectingProblemHandler() {
+-        this(DEFAULT_MAX_PROBLEMS);
+-    }
+-
+-    /**
+-     * Constructs a handler with a specific maximum problem limit.
+-     *
+-     * @param maxProblems Maximum number of problems to collect (must be positive)
+-     */
+-    public CollectingProblemHandler(int maxProblems) {
+-        if (maxProblems <= 0) {
+-            throw new IllegalArgumentException("maxProblems must be positive, was: " + maxProblems);
+-        }
+-        _maxProblems = maxProblems;
+-    }
+-
+-    /**
+-     * Gets the maximum number of problems this handler will collect.
+-     */
+-    public int getMaxProblems() {
+-        return _maxProblems;
+-    }
+-
+-    /**
+-     * Retrieves the problem collection bucket from context attributes.
+-     *
+-     * @return Problem bucket, or null if not in collecting mode
+-     */
+-    @SuppressWarnings("unchecked")
+-    public static List<CollectedProblem> getBucket(DeserializationContext ctxt) {
+-        Object attr = ctxt.getAttribute(ATTR_KEY);
+-        return (attr instanceof List) ? (List<CollectedProblem>) attr : null;
+-    }
+-
+-    /**
+-     * Records a problem in the collection bucket.
+-     *
+-     * @return true if problem was recorded, false if limit reached
+-     */
+-    private boolean recordProblem(DeserializationContext ctxt,
+-            String message, JavaType targetType, Object rawValue)
+-    {
+-        List<CollectedProblem> bucket = getBucket(ctxt);
+-        if (bucket == null) {
+-            return false; // Not in collecting mode
+-        }
+-
+-        if (bucket.size() >= _maxProblems) {
+-            return false; // Limit reached
+-        }
+-
+-        JsonParser p = ctxt.getParser();
+-        JsonPointer path = buildJsonPointer(p);
+-        TokenStreamLocation location = safeGetLocation(p);
+-        JsonToken token = safeGetToken(p);
+-
+-        bucket.add(new CollectedProblem(
+-            path, message, targetType, location, rawValue, token
+-        ));
+-
+-        return true;
+-    }
+-
+-    /**
+-     * Safely retrieves the current token location, handling null parser.
+-     */
+-    private TokenStreamLocation safeGetLocation(JsonParser p) {
+-        return (p != null) ? p.currentTokenLocation() : null;
+-    }
+-
+-    /**
+-     * Safely retrieves the current token, handling null parser.
+-     */
+-    private JsonToken safeGetToken(JsonParser p) {
+-        return (p != null) ? p.currentToken() : null;
+-    }
+-
+-    /**
+-     * Builds a JsonPointer from the parser's current context.
+-     * Uses the built-in {@link TokenStreamContext#pathAsPointer()} method
+-     * which handles RFC 6901 escaping ('~' becomes '~0', '/' becomes '~1').
+-     */
+-    private JsonPointer buildJsonPointer(JsonParser p) {
+-        if (p == null) {
+-            return JsonPointer.empty();
+-        }
+-        return p.streamReadContext().pathAsPointer();
+-    }
+-
+-    @Override
+-    public boolean handleUnknownProperty(DeserializationContext ctxt,
+-            JsonParser p, ValueDeserializer<?> deserializer,
+-            Object beanOrClass, String propertyName)
+-        throws JacksonException
+-    {
+-        String message = String.format(
+-            "Unknown property '%s' for type %s",
+-            propertyName,
+-            ClassUtil.getClassDescription(beanOrClass)
+-        );
+-
+-        // Store null as rawValue for unknown properties
+-        // (property name is in the path, no need to duplicate)
+-        if (recordProblem(ctxt, message, null, null)) {
+-            p.skipChildren(); // Skip the unknown property value
+-            return true; // Problem handled
+-        }
+-
+-        return false; // Limit reached or not collecting, let default handling throw
+-    }
+-
+-    @Override
+-    public Object handleWeirdKey(DeserializationContext ctxt,
+-            Class<?> rawKeyType, String keyValue, String failureMsg)
+-        throws JacksonException
+-    {
+-        String message = String.format(
+-            "Cannot deserialize Map key '%s' to %s: %s",
+-            keyValue,
+-            ClassUtil.getClassDescription(rawKeyType),
+-            failureMsg
+-        );
+-
+-        if (recordProblem(ctxt, message,
+-                ctxt.constructType(rawKeyType), keyValue)) {
+-            // Return NOT_HANDLED instead of null
+-            // Rationale: Some Map implementations (Hashtable, ConcurrentHashMap)
+-            // reject null keys. Safer to let Jackson handle it than risk NPE.
+-            // If null keys are needed, users can provide custom handler.
+-            return NOT_HANDLED;
+-        }
+-
+-        return NOT_HANDLED; // Limit reached or not collecting
+-    }
+-
+-    @Override
+-    public Object handleWeirdStringValue(DeserializationContext ctxt,
+-            Class<?> targetType, String valueToConvert, String failureMsg)
+-        throws JacksonException
+-    {
+-        String message = String.format(
+-            "Cannot deserialize value '%s' to %s: %s",
+-            valueToConvert,
+-            ClassUtil.getClassDescription(targetType),
+-            failureMsg
+-        );
+-
+-        if (recordProblem(ctxt, message,
+-                ctxt.constructType(targetType), valueToConvert)) {
+-            // Return sensible default based on target type
+-            return getDefaultValue(targetType);
+-        }
+-
+-        return NOT_HANDLED; // Limit reached or not collecting
+-    }
+-
+-    @Override
+-    public Object handleWeirdNumberValue(DeserializationContext ctxt,
+-            Class<?> targetType, Number valueToConvert, String failureMsg)
+-        throws JacksonException
+-    {
+-        String message = String.format(
+-            "Cannot deserialize number %s to %s: %s",
+-            valueToConvert,
+-            ClassUtil.getClassDescription(targetType),
+-            failureMsg
+-        );
+-
+-        if (recordProblem(ctxt, message,
+-                ctxt.constructType(targetType), valueToConvert)) {
+-            return getDefaultValue(targetType);
+-        }
+-
+-        return NOT_HANDLED; // Limit reached or not collecting
+-    }
+-
+-    @Override
+-    public Object handleInstantiationProblem(DeserializationContext ctxt,
+-            Class<?> instClass, Object argument, Throwable t)
+-        throws JacksonException
+-    {
+-        String message = String.format(
+-            "Cannot instantiate %s: %s",
+-            ClassUtil.getClassDescription(instClass),
+-            t.getMessage()
+-        );
+-
+-        if (recordProblem(ctxt, message,
+-                ctxt.constructType(instClass), argument)) {
+-            // Cannot return null for primitives; safe for all reference types
+-            if (!instClass.isPrimitive()) {
+-                return null;
+-            }
+-            // fall through
+-        }
+-
+-        return NOT_HANDLED; // Cannot recover
+-    }
+-
+-    /**
+-     * Returns a sensible default value for the given type to allow
+-     * deserialization to continue.
+-     *
+-     * <p>IMPORTANT: Only primitives get non-null defaults. Reference types
+-     * (including boxed primitives) get null to avoid masking nullability issues.
+-     */
+-    private Object getDefaultValue(Class<?> type) {
+-        // Primitives MUST have non-null defaults (cannot be null)
+-        // Use ClassUtil for consistent primitive default handling
+-        if (type.isPrimitive()) {
+-            return ClassUtil.defaultValue(type);
+-        }
+-
+-        // Reference types (including Integer, Long, etc.) get null
+-        // This avoids masking nullability issues in the domain model
+-        return null;
+-    }
+-}
+diff --git a/src/main/java/tools/jackson/databind/exc/CollectedProblem.java b/src/main/java/tools/jackson/databind/exc/CollectedProblem.java
+deleted file mode 100644
+index 7e66051ea..000000000
+--- a/src/main/java/tools/jackson/databind/exc/CollectedProblem.java
++++ /dev/null
+@@ -1,108 +0,0 @@
+-package tools.jackson.databind.exc;
+-
+-import java.util.Objects;
+-
+-import tools.jackson.core.JsonPointer;
+-import tools.jackson.core.JsonToken;
+-import tools.jackson.core.TokenStreamLocation;
+-import tools.jackson.databind.JavaType;
+-
+-/**
+- * Immutable value object capturing details about a single deserialization
+- * problem encountered during error-collecting mode.
+- *
+- * <p><b>Contents</b>: Each problem records:
+- * <ul>
+- * <li>{@link #getPath() path} - RFC 6901 JSON Pointer to the problematic field
+- *     (e.g., {@code "/items/2/price"})</li>
+- * <li>{@link #getMessage() message} - Human-readable error description</li>
+- * <li>{@link #getTargetType() targetType} - Expected Java type (may be null)</li>
+- * <li>{@link #getLocation() location} - Source location in JSON (line/column)</li>
+- * <li>{@link #getRawValue() rawValue} - Original value from JSON that caused the error
+- *     (truncated if > 200 chars)</li>
+- * <li>{@link #getToken() token} - JSON token type at error location</li>
+- * </ul>
+- *
+- * <p><b>Truncation</b>: String values longer than {@value #MAX_RAW_VALUE_LENGTH}
+- * characters are truncated with "..." suffix to prevent memory issues.
+- *
+- * <p><b>Unknown properties</b>: For unknown property errors, {@code rawValue}
+- * is {@code null} since the property name is already in the path.
+- *
+- * <p><b>Immutability</b>: All instances are immutable and thread-safe.
+- *
+- * @since 3.1
+- * @see DeferredBindingException#getProblems()
+- */
+-public final class CollectedProblem {
+-    /**
+-     * Maximum length for raw value strings before truncation.
+-     */
+-    private static final int MAX_RAW_VALUE_LENGTH = 200;
+-
+-    private final JsonPointer path;
+-    private final String message;
+-    private final JavaType targetType;
+-    private final TokenStreamLocation location;
+-    private final Object rawValue;      // @Nullable
+-    private final JsonToken token;      // @Nullable
+-
+-    public CollectedProblem(JsonPointer path, String message,
+-            JavaType targetType, TokenStreamLocation location,
+-            Object rawValue, JsonToken token) {
+-        this.path = Objects.requireNonNull(path, "path");
+-        this.message = Objects.requireNonNull(message, "message");
+-        this.targetType = targetType;
+-        this.location = location;
+-        this.rawValue = truncateIfNeeded(rawValue);
+-        this.token = token;
+-    }
+-
+-    /**
+-     * @return JSON Pointer path to the problematic field (e.g., "/items/1/date").
+-     *         Empty string ("") for root-level problems.
+-     */
+-    public JsonPointer getPath() { return path; }
+-
+-    /**
+-     * @return Human-readable error message
+-     */
+-    public String getMessage() { return message; }
+-
+-    /**
+-     * @return Expected Java type for the field (may be null)
+-     */
+-    public JavaType getTargetType() { return targetType; }
+-
+-    /**
+-     * @return Location in source JSON where problem occurred (may be null)
+-     */
+-    public TokenStreamLocation getLocation() { return location; }
+-
+-    /**
+-     * @return Raw value from JSON that caused the problem (may be null or truncated).
+-     *         For unknown properties, this is null; use the path to identify the property name.
+-     */
+-    public Object getRawValue() { return rawValue; }
+-
+-    /**
+-     * @return JSON token type at the error location (may be null)
+-     */
+-    public JsonToken getToken() { return token; }
+-
+-    private static Object truncateIfNeeded(Object value) {
+-        if (value instanceof String) {
+-            String s = (String) value;
+-            if (s.length() > MAX_RAW_VALUE_LENGTH) {
+-                return s.substring(0, MAX_RAW_VALUE_LENGTH - 3) + "...";
+-            }
+-        }
+-        return value;
+-    }
+-
+-    @Override
+-    public String toString() {
+-        return String.format("CollectedProblem[path=%s, message=%s, targetType=%s]",
+-            path, message, targetType);
+-    }
+-}
+diff --git a/src/main/java/tools/jackson/databind/exc/DeferredBindingException.java b/src/main/java/tools/jackson/databind/exc/DeferredBindingException.java
+deleted file mode 100644
+index 7847506ac..000000000
+--- a/src/main/java/tools/jackson/databind/exc/DeferredBindingException.java
++++ /dev/null
+@@ -1,110 +0,0 @@
+-package tools.jackson.databind.exc;
+-
+-import java.util.Collections;
+-import java.util.List;
+-
+-import tools.jackson.core.JsonParser;
+-import tools.jackson.databind.DatabindException;
+-
+-/**
+- * Exception that aggregates multiple recoverable deserialization problems
+- * encountered during problem-collecting mode.
+- *
+- * <p><b>Usage</b>: This exception is thrown by
+- * {@link tools.jackson.databind.ObjectReader#readValueCollectingProblems ObjectReader.readValueCollectingProblems(...)}
+- * when one or more recoverable problems were collected during deserialization.
+- * Enable problem collection via {@link tools.jackson.databind.ObjectReader#problemCollectingReader()}.
+- *
+- * <p><b>Problem access</b>: Each problem is captured as a {@link CollectedProblem}
+- * containing the JSON Pointer path, error message, location, target type, raw value, and token.
+- * Access problems via {@link #getProblems()}.
+- *
+- * <p><b>Limit handling</b>: When the configured problem limit is reached, collection
+- * stops and {@link #isLimitReached()} returns {@code true}. This indicates additional
+- * problems may exist beyond those collected.
+- *
+- * <p><b>Message formatting</b>: The exception message shows:
+- * <ul>
+- * <li>For 1 problem: the single error message</li>
+- * <li>For multiple: count + first 5 problems + "...and N more" suffix</li>
+- * <li>A "limit reached" note if applicable</li>
+- * </ul>
+- *
+- * <p><b>Example</b>:
+- * <pre>{@code
+- * try {
+- *     MyBean bean = reader.problemCollectingReader()
+- *                         .readValueCollectingProblems(json);
+- * } catch (DeferredBindingException e) {
+- *     for (CollectedProblem p : e.getProblems()) {
+- *         System.err.println("Error at " + p.getPath() + ": " + p.getMessage());
+- *     }
+- * }
+- * }</pre>
+- *
+- * @since 3.1
+- */
+-public class DeferredBindingException extends DatabindException {
+-    private static final long serialVersionUID = 1L;
+-
+-    private final List<CollectedProblem> problems;
+-    private final boolean limitReached;
+-
+-    public DeferredBindingException(JsonParser p,
+-            List<CollectedProblem> problems,
+-            boolean limitReached) {
+-        super(p, formatMessage(problems, limitReached));
+-        this.problems = Collections.unmodifiableList(problems);
+-        this.limitReached = limitReached;
+-    }
+-
+-    /**
+-     * @return Unmodifiable list of all collected problems
+-     */
+-    public List<CollectedProblem> getProblems() {
+-        return problems;
+-    }
+-
+-    /**
+-     * @return Number of problems collected
+-     */
+-    public int getProblemCount() {
+-        return problems.size();
+-    }
+-
+-    /**
+-     * @return true if error collection stopped due to reaching the configured limit
+-     */
+-    public boolean isLimitReached() {
+-        return limitReached;
+-    }
+-
+-    private static String formatMessage(List<CollectedProblem> problems, boolean limitReached) {
+-        int count = problems.size();
+-        if (count == 1) {
+-            return "1 deserialization problem: " + problems.get(0).getMessage();
+-        }
+-
+-        String limitNote = limitReached ? " (limit reached; more errors may exist)" : "";
+-        return String.format(
+-            "%d deserialization problems%s (showing first 5):%n%s",
+-            count,
+-            limitNote,
+-            formatProblems(problems)
+-        );
+-    }
+-
+-    private static String formatProblems(List<CollectedProblem> problems) {
+-        StringBuilder sb = new StringBuilder();
+-        int limit = Math.min(5, problems.size());
+-        for (int i = 0; i < limit; i++) {
+-            CollectedProblem p = problems.get(i);
+-            sb.append(String.format("  [%d] at %s: %s%n",
+-                i + 1, p.getPath(), p.getMessage()));
+-        }
+-        if (problems.size() > 5) {
+-            sb.append(String.format("  ... and %d more", problems.size() - 5));
+-        }
+-        return sb.toString();
+-    }
+-}
+diff --git a/src/test/java/tools/jackson/databind/deser/CollectingErrorsTest.java b/src/test/java/tools/jackson/databind/deser/CollectingErrorsTest.java
+deleted file mode 100644
+index 34137a385..000000000
+--- a/src/test/java/tools/jackson/databind/deser/CollectingErrorsTest.java
++++ /dev/null
+@@ -1,860 +0,0 @@
+-package tools.jackson.databind.deser;
+-
+-import java.io.File;
+-import java.io.InputStream;
+-import java.io.Reader;
+-import java.nio.charset.StandardCharsets;
+-import java.util.ArrayList;
+-import java.util.Collections;
+-import java.util.List;
+-import java.util.concurrent.CountDownLatch;
+-import java.util.concurrent.ExecutorService;
+-import java.util.concurrent.Executors;
+-import java.util.concurrent.TimeUnit;
+-import java.util.concurrent.atomic.AtomicInteger;
+-
+-import org.junit.jupiter.api.DisplayName;
+-import org.junit.jupiter.api.Nested;
+-import org.junit.jupiter.api.Test;
+-
+-import tools.jackson.databind.*;
+-import tools.jackson.databind.exc.DeferredBindingException;
+-import tools.jackson.databind.testutil.DatabindTestUtil;
+-
+-import static org.assertj.core.api.Assertions.*;
+-
+-/**
+- * Tests for error-collecting deserialization feature (issue #1196).
+- * Verifies opt-in per-call error collection via ObjectReader.problemCollectingReader().
+- */
+-public class CollectingErrorsTest extends DatabindTestUtil
+-{
+-    private final ObjectMapper MAPPER = newJsonMapper();
+-
+-    /*
+-    /**********************************************************************
+-    /* Test POJOs
+-    /**********************************************************************
+-     */
+-
+-    static class Person {
+-        public String name;
+-        public int age;
+-        public boolean active;
+-    }
+-
+-    static class Order {
+-        public int orderId;
+-        public List<Item> items;
+-    }
+-
+-    static class Item {
+-        public String sku;
+-        public double price;
+-        public int quantity;
+-    }
+-
+-    static class TypedData {
+-        public int intValue;
+-        public long longValue;
+-        public double doubleValue;
+-        public float floatValue;
+-        public boolean boolValue;
+-        public Integer boxedInt;
+-        public String stringValue;
+-    }
+-
+-    static class JsonPointerTestBean {
+-        public String normalField;
+-        public String fieldWithSlash;
+-        public String fieldWithTilde;
+-        public String fieldWithBoth;
+-    }
+-
+-    /*
+-    /**********************************************************************
+-    /* Helper methods
+-    /**********************************************************************
+-     */
+-
+-    /**
+-     * Helper to reduce boilerplate: captures DeferredBindingException and returns it.
+-     * Use with AssertJ for cleaner assertions.
+-     */
+-    private DeferredBindingException expectDeferredBinding(ObjectReader reader, String json) {
+-        return catchThrowableOfType(
+-            DeferredBindingException.class,
+-            () -> reader.readValueCollectingProblems(json)
+-        );
+-    }
+-
+-    /**
+-     * Overload for byte[] input
+-     */
+-    private DeferredBindingException expectDeferredBinding(ObjectReader reader, byte[] json) {
+-        return catchThrowableOfType(
+-            DeferredBindingException.class,
+-            () -> reader.readValueCollectingProblems(json)
+-        );
+-    }
+-
+-    /**
+-     * Overload for File input
+-     */
+-    private DeferredBindingException expectDeferredBinding(ObjectReader reader, File json) {
+-        return catchThrowableOfType(
+-            DeferredBindingException.class,
+-            () -> reader.readValueCollectingProblems(json)
+-        );
+-    }
+-
+-    /**
+-     * Overload for InputStream input
+-     */
+-    private DeferredBindingException expectDeferredBinding(ObjectReader reader, InputStream json) {
+-        return catchThrowableOfType(
+-            DeferredBindingException.class,
+-            () -> reader.readValueCollectingProblems(json)
+-        );
+-    }
+-
+-    /**
+-     * Overload for Reader input
+-     */
+-    private DeferredBindingException expectDeferredBinding(ObjectReader reader, Reader json) {
+-        return catchThrowableOfType(
+-            DeferredBindingException.class,
+-            () -> reader.readValueCollectingProblems(json)
+-        );
+-    }
+-
+-    /**
+-     * Helper to build JSON with specified number of invalid order items.
+-     * Used for testing limit behavior and hard failures.
+-     */
+-    private String buildInvalidOrderJson(int itemCount) {
+-        StringBuilder json = new StringBuilder("{\"items\":[");
+-        for (int i = 0; i < itemCount; i++) {
+-            if (i > 0) json.append(",");
+-            json.append("{\"price\":\"invalid").append(i).append("\"}");
+-        }
+-        json.append("]}");
+-        return json.toString();
+-    }
+-
+-    /*
+-    /**********************************************************************
+-    /* Test: Default behavior (fail-fast unchanged)
+-    /**********************************************************************
+-     */
+-
+-    @Nested
+-    @DisplayName("Default fail-fast behavior")
+-    class DefaultBehaviorTests {
+-
+-        @Test
+-        @DisplayName("should fail fast by default when error encountered")
+-        void failFastDefault() {
+-            // setup
+-            String json = "{\"name\":\"John\",\"age\":\"not-a-number\"}";
+-
+-            // when/then
+-            assertThatThrownBy(() -> MAPPER.readValue(json, Person.class))
+-                .isInstanceOf(DatabindException.class)
+-                .hasMessageContaining("not-a-number");
+-        }
+-
+-        @Test
+-        @DisplayName("should fail fast when using regular readValue even after problemCollectingReader")
+-        void failFastAfterCollectErrors() {
+-            // setup
+-            String json = "{\"name\":\"John\",\"age\":\"invalid\"}";
+-            ObjectReader reader = MAPPER.readerFor(Person.class).problemCollectingReader();
+-
+-            // when/then - using regular readValue, not readValueCollectingProblems
+-            assertThatThrownBy(() -> reader.readValue(json))
+-                .isInstanceOf(DatabindException.class);
+-        }
+-    }
+-
+-    /*
+-    /**********************************************************************
+-    /* Test: Per-call bucket isolation
+-    /**********************************************************************
+-     */
+-
+-    @Nested
+-    @DisplayName("Per-call bucket isolation")
+-    class BucketIsolationTests {
+-
+-        @Test
+-        @DisplayName("should isolate errors between successive calls")
+-        void successiveCalls() {
+-            // setup
+-            ObjectReader reader = MAPPER.readerFor(Person.class).problemCollectingReader();
+-            String json1 = "{\"name\":\"Alice\",\"age\":\"invalid1\"}";
+-            String json2 = "{\"name\":\"Bob\",\"age\":\"invalid2\"}";
+-
+-            // when
+-            DeferredBindingException ex1 = expectDeferredBinding(reader, json1);
+-            DeferredBindingException ex2 = expectDeferredBinding(reader, json2);
+-
+-            // then
+-            assertThat(ex1).isNotNull();
+-            assertThat(ex2).isNotNull();
+-            assertThat(ex1.getProblems()).hasSize(1);
+-            assertThat(ex2.getProblems()).hasSize(1);
+-            assertThat(ex1.getProblems().get(0).getRawValue()).isEqualTo("invalid1");
+-            assertThat(ex2.getProblems().get(0).getRawValue()).isEqualTo("invalid2");
+-        }
+-
+-        @Test
+-        @DisplayName("should isolate errors in concurrent calls")
+-        void concurrentCalls() throws Exception {
+-            // setup
+-            ObjectReader reader = MAPPER.readerFor(Person.class).problemCollectingReader();
+-            int threadCount = 10;
+-            ExecutorService executor = Executors.newFixedThreadPool(threadCount);
+-            CountDownLatch latch = new CountDownLatch(threadCount);
+-            AtomicInteger successCount = new AtomicInteger(0);
+-            List<DeferredBindingException> exceptions =
+-                Collections.synchronizedList(new ArrayList<>());
+-            List<Throwable> unexpectedErrors =
+-                Collections.synchronizedList(new ArrayList<>());
+-
+-            // when
+-            try {
+-                for (int i = 0; i < threadCount; i++) {
+-                    final int index = i;
+-                    executor.submit(() -> {
+-                        try {
+-                            String json = String.format("{\"name\":\"User%d\",\"age\":\"invalid%d\"}",
+-                                index, index);
+-                            reader.readValueCollectingProblems(json);
+-                            unexpectedErrors.add(new AssertionError("Should have thrown DeferredBindingException"));
+-                        } catch (DeferredBindingException e) {
+-                            exceptions.add(e);
+-                            successCount.incrementAndGet();
+-                        } catch (Throwable t) {
+-                            unexpectedErrors.add(t);
+-                        } finally {
+-                            latch.countDown();
+-                        }
+-                    });
+-                }
+-
+-                // Wait for all threads with assertion
+-                assertThat(latch.await(5, TimeUnit.SECONDS))
+-                    .as("All threads should complete within timeout")
+-                    .isTrue();
+-
+-            } finally {
+-                executor.shutdown();
+-                try {
+-                    assertThat(executor.awaitTermination(2, TimeUnit.SECONDS))
+-                        .as("Executor should terminate within timeout")
+-                        .isTrue();
+-                } catch (InterruptedException e) {
+-                    executor.shutdownNow();
+-                    Thread.currentThread().interrupt();
+-                }
+-            }
+-
+-            // then
+-            assertThat(unexpectedErrors)
+-                .as("No unexpected exceptions should occur")
+-                .isEmpty();
+-            assertThat(successCount.get()).isEqualTo(threadCount);
+-
+-            // Synchronize iteration per JDK contract for Collections.synchronizedList()
+-            synchronized (exceptions) {
+-                assertThat(exceptions).hasSize(threadCount);
+-
+-                // Verify each exception has exactly 1 problem and collect all raw values
+-                List<String> rawValues = new ArrayList<>();
+-                for (DeferredBindingException ex : exceptions) {
+-                    assertThat(ex.getProblems()).hasSize(1);
+-                    String rawValue = (String) ex.getProblems().get(0).getRawValue();
+-                    rawValues.add(rawValue);
+-                }
+-
+-                // Verify we have exactly the unique values from each thread (no bucket sharing)
+-                assertThat(rawValues)
+-                    .as("Each thread should have its own isolated error bucket")
+-                    .containsExactlyInAnyOrder(
+-                        "invalid0", "invalid1", "invalid2", "invalid3", "invalid4",
+-                        "invalid5", "invalid6", "invalid7", "invalid8", "invalid9"
+-                    );
+-            }
+-        }
+-    }
+-
+-    /*
+-    /**********************************************************************
+-    /* Test: JSON Pointer escaping (RFC 6901)
+-    /**********************************************************************
+-     */
+-
+-    @Nested
+-    @DisplayName("JSON Pointer escaping (RFC 6901)")
+-    class JsonPointerEscapingTests {
+-
+-        @Test
+-        @DisplayName("should escape tilde in property names")
+-        void escapeTilde() {
+-            // setup
+-            String json = "{\"field~name\":\"invalid\"}";
+-            ObjectReader reader = MAPPER.readerFor(JsonPointerTestBean.class)
+-                .problemCollectingReader();
+-
+-            // when
+-            DeferredBindingException ex = expectDeferredBinding(reader, json);
+-
+-            // then
+-            assertThat(ex).isNotNull();
+-            assertThat(ex.getProblems()).hasSize(1);
+-            // Tilde should be escaped as ~0
+-            assertThat(ex.getProblems().get(0).getPath().toString())
+-                .isEqualTo("/field~0name");
+-        }
+-
+-        @Test
+-        @DisplayName("should escape slash in property names")
+-        void escapeSlash() {
+-            // setup
+-            String json = "{\"field/name\":\"invalid\"}";
+-            ObjectReader reader = MAPPER.readerFor(JsonPointerTestBean.class)
+-                .problemCollectingReader();
+-
+-            // when
+-            DeferredBindingException ex = expectDeferredBinding(reader, json);
+-
+-            // then
+-            assertThat(ex).isNotNull();
+-            assertThat(ex.getProblems()).hasSize(1);
+-            // Slash should be escaped as ~1
+-            assertThat(ex.getProblems().get(0).getPath().toString())
+-                .isEqualTo("/field~1name");
+-        }
+-
+-        @Test
+-        @DisplayName("should escape both tilde and slash correctly")
+-        void escapeBoth() {
+-            // setup
+-            String json = "{\"field~/name\":\"invalid\"}";
+-            ObjectReader reader = MAPPER.readerFor(JsonPointerTestBean.class)
+-                .problemCollectingReader();
+-
+-            // when
+-            DeferredBindingException ex = expectDeferredBinding(reader, json);
+-
+-            // then
+-            assertThat(ex).isNotNull();
+-            assertThat(ex.getProblems()).hasSize(1);
+-            // Must escape ~ first (to ~0), then / (to ~1)
+-            assertThat(ex.getProblems().get(0).getPath().toString())
+-                .isEqualTo("/field~0~1name");
+-        }
+-
+-        @Test
+-        @DisplayName("should handle array indices in pointer")
+-        void arrayIndices() {
+-            // setup
+-            String json = "{\"orderId\":123,\"items\":[" +
+-                "{\"sku\":\"ABC\",\"price\":\"invalid\",\"quantity\":5}," +
+-                "{\"sku\":\"DEF\",\"price\":99.99,\"quantity\":\"bad\"}" +
+-                "]}";
+-            ObjectReader reader = MAPPER.readerFor(Order.class).problemCollectingReader();
+-
+-            // when
+-            DeferredBindingException ex = expectDeferredBinding(reader, json);
+-
+-            // then
+-            assertThat(ex).isNotNull();
+-            assertThat(ex.getProblems()).hasSize(2);
+-            assertThat(ex.getProblems().get(0).getPath().toString())
+-                .contains("/items/0/price");
+-            assertThat(ex.getProblems().get(1).getPath().toString())
+-                .contains("/items/1/quantity");
+-        }
+-    }
+-
+-    /*
+-    /**********************************************************************
+-    /* Test: Limit reached behavior
+-    /**********************************************************************
+-     */
+-
+-    @Nested
+-    @DisplayName("Limit reached behavior")
+-    class LimitReachedTests {
+-
+-        @Test
+-        @DisplayName("should stop collecting when default limit reached")
+-        void defaultLimit() {
+-            // setup - create JSON with 101 errors (default limit is 100)
+-            String json = buildInvalidOrderJson(101);
+-            ObjectReader reader = MAPPER.readerFor(Order.class).problemCollectingReader();
+-
+-            // when
+-            DeferredBindingException ex = expectDeferredBinding(reader, json);
+-
+-            // then - should get DeferredBindingException as primary when limit reached
+-            assertThat(ex).isNotNull();
+-            assertThat(ex.getProblems()).hasSize(100); // Stopped at limit
+-            assertThat(ex.isLimitReached()).isTrue();
+-            assertThat(ex.getMessage()).contains("limit reached");
+-
+-            // Original DatabindException should be in suppressed for debugging
+-            Throwable[] suppressed = ex.getSuppressed();
+-            assertThat(suppressed).hasSizeGreaterThanOrEqualTo(1);
+-            assertThat(suppressed[0]).isInstanceOf(DatabindException.class);
+-        }
+-
+-        @Test
+-        @DisplayName("should respect custom limit")
+-        void customLimit() {
+-            // setup
+-            String json = buildInvalidOrderJson(20);
+-            ObjectReader reader = MAPPER.readerFor(Order.class).problemCollectingReader(10);
+-
+-            // when
+-            DeferredBindingException ex = expectDeferredBinding(reader, json);
+-
+-            // then - should get DeferredBindingException as primary when limit reached
+-            assertThat(ex).isNotNull();
+-            assertThat(ex.getProblems()).hasSize(10); // Custom limit
+-            assertThat(ex.isLimitReached()).isTrue();
+-
+-            // Original DatabindException should be in suppressed for debugging
+-            Throwable[] suppressed = ex.getSuppressed();
+-            assertThat(suppressed).hasSizeGreaterThanOrEqualTo(1);
+-            assertThat(suppressed[0]).isInstanceOf(DatabindException.class);
+-        }
+-
+-        @Test
+-        @DisplayName("should not set limit reached when under limit")
+-        void underLimit() {
+-            // setup
+-            String json = "{\"name\":\"John\",\"age\":\"invalid\"}";
+-            ObjectReader reader = MAPPER.readerFor(Person.class).problemCollectingReader(100);
+-
+-            // when
+-            DeferredBindingException ex = expectDeferredBinding(reader, json);
+-
+-            // then
+-            assertThat(ex).isNotNull();
+-            assertThat(ex.getProblems()).hasSize(1);
+-            assertThat(ex.isLimitReached()).isFalse();
+-            assertThat(ex.getMessage()).doesNotContain("limit reached");
+-        }
+-    }
+-
+-    /*
+-    /**********************************************************************
+-    /* Test: Unknown property handling
+-    /**********************************************************************
+-     */
+-
+-    @Nested
+-    @DisplayName("Unknown property handling")
+-    class UnknownPropertyTests {
+-
+-        @Test
+-        @DisplayName("should collect unknown property errors when FAIL_ON_UNKNOWN_PROPERTIES enabled")
+-        void unknownProperty() {
+-            // setup
+-            String json = "{\"name\":\"Alice\",\"unknownField\":\"value\",\"age\":30}";
+-            ObjectReader reader = MAPPER.readerFor(Person.class)
+-                .with(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES)
+-                .problemCollectingReader();
+-
+-            // when
+-            DeferredBindingException ex = expectDeferredBinding(reader, json);
+-
+-            // then - unknown property error is collected
+-            assertThat(ex).isNotNull();
+-            assertThat(ex.getProblems()).hasSize(1);
+-            assertThat(ex.getProblems().get(0).getMessage())
+-                .contains("Unknown property 'unknownField'");
+-        }
+-
+-        @Test
+-        @DisplayName("should skip unknown property children")
+-        void skipUnknownChildren() {
+-            // setup
+-            String json = "{\"name\":\"Bob\",\"unknownObject\":{\"nested\":\"value\"},\"age\":25}";
+-            ObjectReader reader = MAPPER.readerFor(Person.class)
+-                .with(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES)
+-                .problemCollectingReader();
+-
+-            // when
+-            DeferredBindingException ex = expectDeferredBinding(reader, json);
+-
+-            // then
+-            assertThat(ex).isNotNull();
+-            assertThat(ex.getProblems()).hasSize(1);
+-            assertThat(ex.getProblems().get(0).getMessage())
+-                .contains("Unknown property 'unknownObject'");
+-        }
+-    }
+-
+-    /*
+-    /**********************************************************************
+-    /* Test: Default value policy (primitives vs references)
+-    /**********************************************************************
+-     */
+-
+-    @Nested
+-    @DisplayName("Default value policy")
+-    class DefaultValuePolicyTests {
+-
+-        @Test
+-        @DisplayName("should collect error for primitive int coercion")
+-        void primitiveInt() {
+-            // setup
+-            String json = "{\"intValue\":\"invalid\"}";
+-            ObjectReader reader = MAPPER.readerFor(TypedData.class).problemCollectingReader();
+-
+-            // when
+-            DeferredBindingException ex = expectDeferredBinding(reader, json);
+-
+-            // then - error collected with default value used
+-            assertThat(ex).isNotNull();
+-            assertThat(ex.getProblems()).hasSize(1);
+-            assertThat(ex.getProblems().get(0).getRawValue()).isEqualTo("invalid");
+-        }
+-
+-        @Test
+-        @DisplayName("should collect error for primitive long coercion")
+-        void primitiveLong() {
+-            // setup
+-            String json = "{\"longValue\":\"invalid\"}";
+-            ObjectReader reader = MAPPER.readerFor(TypedData.class).problemCollectingReader();
+-
+-            // when
+-            DeferredBindingException ex = expectDeferredBinding(reader, json);
+-
+-            // then
+-            assertThat(ex).isNotNull();
+-            assertThat(ex.getProblems()).hasSize(1);
+-        }
+-
+-        @Test
+-        @DisplayName("should collect error for primitive double coercion")
+-        void primitiveDouble() {
+-            // setup
+-            String json = "{\"doubleValue\":\"invalid\"}";
+-            ObjectReader reader = MAPPER.readerFor(TypedData.class).problemCollectingReader();
+-
+-            // when
+-            DeferredBindingException ex = expectDeferredBinding(reader, json);
+-
+-            // then
+-            assertThat(ex).isNotNull();
+-            assertThat(ex.getProblems()).hasSize(1);
+-        }
+-
+-        @Test
+-        @DisplayName("should collect error for primitive boolean coercion")
+-        void primitiveBoolean() {
+-            // setup
+-            String json = "{\"boolValue\":\"invalid\"}";
+-            ObjectReader reader = MAPPER.readerFor(TypedData.class).problemCollectingReader();
+-
+-            // when
+-            DeferredBindingException ex = expectDeferredBinding(reader, json);
+-
+-            // then
+-            assertThat(ex).isNotNull();
+-            assertThat(ex.getProblems()).hasSize(1);
+-        }
+-
+-        @Test
+-        @DisplayName("should collect error for boxed Integer coercion")
+-        void boxedInteger() {
+-            // setup
+-            String json = "{\"boxedInt\":\"invalid\"}";
+-            ObjectReader reader = MAPPER.readerFor(TypedData.class).problemCollectingReader();
+-
+-            // when
+-            DeferredBindingException ex = expectDeferredBinding(reader, json);
+-
+-            // then - error collected for reference type
+-            assertThat(ex).isNotNull();
+-            assertThat(ex.getProblems()).hasSize(1);
+-        }
+-
+-        @Test
+-        @DisplayName("should handle multiple type coercion errors")
+-        void multipleTypeErrors() {
+-            // setup
+-            String json = "{\"intValue\":\"bad1\",\"longValue\":\"bad2\",\"doubleValue\":\"bad3\"}";
+-            ObjectReader reader = MAPPER.readerFor(TypedData.class).problemCollectingReader();
+-
+-            // when
+-            DeferredBindingException ex = expectDeferredBinding(reader, json);
+-
+-            // then
+-            assertThat(ex).isNotNull();
+-            assertThat(ex.getProblems()).hasSize(3);
+-            assertThat(ex.getProblems())
+-                .extracting(p -> p.getPath().toString())
+-                .containsExactlyInAnyOrder("/intValue", "/longValue", "/doubleValue");
+-        }
+-    }
+-
+-    /*
+-    /**********************************************************************
+-    /* Test: Root-level problems
+-    /**********************************************************************
+-     */
+-
+-    @Nested
+-    @DisplayName("Root-level problems")
+-    class RootLevelTests {
+-
+-        @Test
+-        @DisplayName("should not collect root-level type mismatches")
+-        void rootLevelTypeMismatch() {
+-            // setup - root value is invalid for Person (non-recoverable)
+-            String json = "\"not-an-object\"";
+-            ObjectReader reader = MAPPER.readerFor(Person.class).problemCollectingReader();
+-
+-            // when/then - root-level type mismatches are non-recoverable
+-            // They occur before property deserialization, so handler is never invoked
+-            assertThatThrownBy(() -> reader.readValueCollectingProblems(json))
+-                .isInstanceOf(DatabindException.class)
+-                .hasMessageContaining("Cannot construct instance")
+-                .satisfies(ex -> {
+-                    // Verify no problems were collected (root errors are non-recoverable)
+-                    assertThat(ex.getSuppressed()).isEmpty();
+-                });
+-        }
+-
+-        @Test
+-        @DisplayName("should format property paths correctly without double slashes")
+-        void propertyPathFormatting() {
+-            // setup
+-            String json = "{\"age\":\"invalid\"}";
+-            ObjectReader reader = MAPPER.readerFor(Person.class).problemCollectingReader();
+-
+-            // when
+-            DeferredBindingException ex = expectDeferredBinding(reader, json);
+-
+-            // then
+-            assertThat(ex).isNotNull();
+-            String pointer = ex.getProblems().get(0).getPath().toString();
+-            assertThat(pointer).isEqualTo("/age");
+-            assertThat(pointer).doesNotContain("//"); // No double slashes
+-        }
+-    }
+-
+-    /*
+-    /**********************************************************************
+-    /* Test: Hard failure with suppressed exceptions
+-    /**********************************************************************
+-     */
+-
+-    @Nested
+-    @DisplayName("Hard failure with suppressed exceptions")
+-    class HardFailureTests {
+-
+-        @Test
+-        @DisplayName("should attach collected problems as suppressed on hard failure")
+-        void suppressedProblems() {
+-            // setup - create JSON with 101 errors to trigger limit
+-            // When limit is reached, DeferredBindingException is thrown as primary,
+-            // with original DatabindException as suppressed
+-            String json = buildInvalidOrderJson(101);
+-            ObjectReader reader = MAPPER.readerFor(Order.class).problemCollectingReader();
+-
+-            // when
+-            DeferredBindingException ex = expectDeferredBinding(reader, json);
+-
+-            // then - verify suppressed exception attachment mechanism
+-            assertThat(ex).isNotNull();
+-            assertThat(ex.getProblems()).hasSize(100);
+-            assertThat(ex.isLimitReached()).isTrue();
+-
+-            // Original DatabindException should be in suppressed for debugging
+-            assertThat(ex.getSuppressed())
+-                .as("Original DatabindException should be attached as suppressed")
+-                .hasSizeGreaterThanOrEqualTo(1);
+-            assertThat(ex.getSuppressed()[0]).isInstanceOf(DatabindException.class);
+-        }
+-    }
+-
+-    /*
+-    /**********************************************************************
+-    /* Test: Message formatting
+-    /**********************************************************************
+-     */
+-
+-    @Nested
+-    @DisplayName("Message formatting")
+-    class MessageFormattingTests {
+-
+-        @Test
+-        @DisplayName("should format single error message")
+-        void singleError() {
+-            // setup
+-            String json = "{\"age\":\"invalid\"}";
+-            ObjectReader reader = MAPPER.readerFor(Person.class).problemCollectingReader();
+-
+-            // when
+-            DeferredBindingException ex = expectDeferredBinding(reader, json);
+-
+-            // then
+-            assertThat(ex).isNotNull();
+-            assertThat(ex.getMessage()).contains("1 deserialization problem");
+-        }
+-
+-        @Test
+-        @DisplayName("should format multiple errors with first 5 shown")
+-        void multipleErrors() {
+-            // setup
+-            String json = buildInvalidOrderJson(10);
+-            ObjectReader reader = MAPPER.readerFor(Order.class).problemCollectingReader();
+-
+-            // when
+-            DeferredBindingException ex = expectDeferredBinding(reader, json);
+-
+-            // then
+-            assertThat(ex).isNotNull();
+-            assertThat(ex.getMessage())
+-                .contains("10 deserialization problems")
+-                .contains("showing first 5")
+-                .contains("... and 5 more");
+-        }
+-    }
+-
+-    /*
+-    /**********************************************************************
+-    /* Test: Edge cases
+-    /**********************************************************************
+-     */
+-
+-    @Nested
+-    @DisplayName("Edge cases")
+-    class EdgeCaseTests {
+-
+-        @Test
+-        @DisplayName("should validate positive maxProblems")
+-        void validateMaxProblems() {
+-            // when/then
+-            assertThatThrownBy(() -> MAPPER.readerFor(Person.class).problemCollectingReader(0))
+-                .isInstanceOf(IllegalArgumentException.class)
+-                .hasMessageContaining("maxProblems must be positive");
+-
+-            assertThatThrownBy(() -> MAPPER.readerFor(Person.class).problemCollectingReader(-1))
+-                .isInstanceOf(IllegalArgumentException.class);
+-        }
+-
+-        @Test
+-        @DisplayName("should handle empty JSON")
+-        void emptyJson() {
+-            // setup
+-            String json = "{}";
+-            ObjectReader reader = MAPPER.readerFor(Person.class).problemCollectingReader();
+-
+-            // when
+-            Person result = reader.readValueCollectingProblems(json);
+-
+-            // then
+-            assertThat(result).isNotNull();
+-            assertThat(result.name).isNull();
+-            assertThat(result.age).isEqualTo(0);
+-        }
+-
+-        @Test
+-        @DisplayName("should handle null parser gracefully")
+-        void nullParser() {
+-            // setup
+-            ObjectReader reader = MAPPER.readerFor(Person.class).problemCollectingReader();
+-
+-            // when/then
+-            assertThatThrownBy(() -> reader.readValueCollectingProblems((String) null))
+-                .isInstanceOf(IllegalArgumentException.class);
+-        }
+-
+-        @Test
+-        @DisplayName("should collect errors via byte[] overload")
+-        void collectFromByteArray() {
+-            // setup
+-            String jsonString = "{\"name\":\"Alice\",\"age\":\"invalid\"}";
+-            byte[] jsonBytes = jsonString.getBytes(StandardCharsets.UTF_8);
+-            ObjectReader reader = MAPPER.readerFor(Person.class).problemCollectingReader();
+-
+-            // when
+-            DeferredBindingException ex = expectDeferredBinding(reader, jsonBytes);
+-
+-            // then
+-            assertThat(ex).isNotNull();
+-            assertThat(ex.getProblems()).hasSize(1);
+-            assertThat(ex.getProblems().get(0).getPath().toString()).isEqualTo("/age");
+-        }
+-
+-        @Test
+-        @DisplayName("should collect errors via File overload")
+-        void collectFromFile() throws Exception {
+-            // setup
+-            File tempFile = File.createTempFile("test", ".json");
+-            try {
+-                java.nio.file.Files.writeString(tempFile.toPath(),
+-                    "{\"name\":\"Bob\",\"age\":\"notANumber\"}");
+-                ObjectReader reader = MAPPER.readerFor(Person.class).problemCollectingReader();
+-
+-                // when
+-                DeferredBindingException ex = expectDeferredBinding(reader, tempFile);
+-
+-                // then
+-                assertThat(ex).isNotNull();
+-                assertThat(ex.getProblems()).hasSize(1);
+-                assertThat(ex.getProblems().get(0).getMessage())
+-                    .contains("notANumber");
+-            } finally {
+-                java.nio.file.Files.deleteIfExists(tempFile.toPath());
+-            }
+-        }
+-
+-        @Test
+-        @DisplayName("should collect errors via InputStream overload")
+-        void collectFromInputStream() throws Exception {
+-            // setup
+-            String json = "{\"name\":\"Charlie\",\"age\":\"bad\"}";
+-            ObjectReader reader = MAPPER.readerFor(Person.class).problemCollectingReader();
+-
+-            // when
+-            DeferredBindingException ex;
+-            try (InputStream input = new java.io.ByteArrayInputStream(
+-                    json.getBytes(StandardCharsets.UTF_8))) {
+-                ex = expectDeferredBinding(reader, input);
+-            }
+-
+-            // then
+-            assertThat(ex).isNotNull();
+-            assertThat(ex.getProblems()).hasSize(1);
+-            assertThat(ex.getProblems().get(0).getPath().toString()).isEqualTo("/age");
+-        }
+-
+-        @Test
+-        @DisplayName("should collect errors via Reader overload")
+-        void collectFromReader() throws Exception {
+-            // setup
+-            String json = "{\"name\":\"Diana\",\"age\":\"invalid\"}";
+-            ObjectReader objectReader = MAPPER.readerFor(Person.class).problemCollectingReader();
+-
+-            // when
+-            DeferredBindingException ex;
+-            try (Reader reader = new java.io.StringReader(json)) {
+-                ex = expectDeferredBinding(objectReader, reader);
+-            }
+-
+-            // then
+-            assertThat(ex).isNotNull();
+-            assertThat(ex.getProblems()).hasSize(1);
+-            assertThat(ex.getProblems().get(0).getPath().toString()).isEqualTo("/age");
+-        }
+-    }
+-}

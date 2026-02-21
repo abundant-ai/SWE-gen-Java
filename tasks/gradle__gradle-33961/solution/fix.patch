@@ -1,0 +1,241 @@
+diff --git a/platforms/core-configuration/base-diagnostics/src/testFixtures/groovy/org/gradle/api/reporting/model/ModelReportParser.groovy b/platforms/core-configuration/base-diagnostics/src/testFixtures/groovy/org/gradle/api/reporting/model/ModelReportParser.groovy
+index 359a1bc760c..6fed895ebe6 100644
+--- a/platforms/core-configuration/base-diagnostics/src/testFixtures/groovy/org/gradle/api/reporting/model/ModelReportParser.groovy
++++ b/platforms/core-configuration/base-diagnostics/src/testFixtures/groovy/org/gradle/api/reporting/model/ModelReportParser.groovy
+@@ -28,7 +28,7 @@ class ModelReportParser {
+     public static final String NODE_LEFT_PADDING = '    '
+     public static final String NODE_SYMBOL = '+'
+     public static final LinkedHashMap<String, String> NODE_ATTRIBUTES = ['Value': 'nodeValue', 'Type': 'type', 'Creator': 'creator']
+-    private static final Pattern END_OF_REPORT_MARKER = ~/BUILD SUCCESSFUL|Some tasks in this build are not compatible with the configuration cache/
++    private static final Pattern END_OF_REPORT_MARKER = ~/BUILD SUCCESSFUL|Some tasks or features in this build are not compatible with the configuration cache/
+ 
+     static ParsedModelReport parse(String text) {
+         validate(text)
+diff --git a/platforms/core-configuration/configuration-cache/src/integTest/groovy/org/gradle/internal/cc/impl/ConfigurationCacheGracefulDegradationIntegrationTest.groovy b/platforms/core-configuration/configuration-cache/src/integTest/groovy/org/gradle/internal/cc/impl/ConfigurationCacheGracefulDegradationIntegrationTest.groovy
+index 5a6e271046d..e92eb4c2a63 100644
+--- a/platforms/core-configuration/configuration-cache/src/integTest/groovy/org/gradle/internal/cc/impl/ConfigurationCacheGracefulDegradationIntegrationTest.groovy
++++ b/platforms/core-configuration/configuration-cache/src/integTest/groovy/org/gradle/internal/cc/impl/ConfigurationCacheGracefulDegradationIntegrationTest.groovy
+@@ -21,8 +21,8 @@ import org.gradle.api.internal.ConfigurationCacheDegradationController
+ import javax.inject.Inject
+ 
+ class ConfigurationCacheGracefulDegradationIntegrationTest extends AbstractConfigurationCacheIntegrationTest {
+-    public static final String CONFIGURATION_CACHE_INCOMPATIBLE_TASKS_FOOTER = "Some tasks in this build are not compatible with the configuration cache."
+-    public static final String CONFIGURATION_CACHE_DISABLED_REASON = "Configuration cache disabled because incompatible task"
++    public static final String CONFIGURATION_CACHE_INCOMPATIBLE_TASKS_OR_FEATURES_FOOTER = "Some tasks or features in this build are not compatible with the configuration cache."
++    public static final String CONFIGURATION_CACHE_DISABLED_REASON = "Configuration cache disabled because incompatible"
+ 
+     def "a compatible build does not print degradation reasons"() {
+         buildFile """
+@@ -126,6 +126,36 @@ class ConfigurationCacheGracefulDegradationIntegrationTest extends AbstractConfi
+         ["-DaccessTaskProject=true", "-DaccessTaskDependencies=true"] | ["Task's project accessed!", "Task's dependencies accessed!"] | "Project access, TaskDependencies access."
+     }
+ 
++    def "features may cause CC degradation"() {
++        settingsFile """
++            sourceControl {
++                vcsMappings {
++                    withModule("org.test:sourceModule") {
++                        from(GitVersionControlSpec) {
++                            url = "some-repo"
++                        }
++                    }
++                }
++            }
++        """
++
++        when:
++        configurationCacheRun("help")
++
++        then:
++        configurationCache.assertNoConfigurationCache()
++
++        and:
++        problems.assertResultConsoleSummaryHasNoProblems(result)
++        problems.assertResultHtmlReportHasProblems(result) {
++            totalProblemsCount = 1
++            withProblem("Feature 'source dependencies' is incompatible with the configuration cache.")
++        }
++
++        and:
++        assertConfigurationCacheDegradation()
++    }
++
+     def "CC problems in warning mode are not hidden by CC degradation"() {
+         buildFile """
+             ${taskWithInjectedDegradationController()}
+@@ -541,15 +571,15 @@ class ConfigurationCacheGracefulDegradationIntegrationTest extends AbstractConfi
+ 
+     private void assertConfigurationCacheDegradation(boolean hasOtherProblems = false) {
+         if (hasOtherProblems) {
+-            outputDoesNotContain(CONFIGURATION_CACHE_INCOMPATIBLE_TASKS_FOOTER)
++            outputDoesNotContain(CONFIGURATION_CACHE_INCOMPATIBLE_TASKS_OR_FEATURES_FOOTER)
+         } else {
+-            outputContains(CONFIGURATION_CACHE_INCOMPATIBLE_TASKS_FOOTER)
++            outputContains(CONFIGURATION_CACHE_INCOMPATIBLE_TASKS_OR_FEATURES_FOOTER)
+         }
+         postBuildOutputContains(CONFIGURATION_CACHE_DISABLED_REASON)
+     }
+ 
+     private void assertNoConfigurationCacheDegradation() {
+-        outputDoesNotContain(CONFIGURATION_CACHE_INCOMPATIBLE_TASKS_FOOTER)
++        outputDoesNotContain(CONFIGURATION_CACHE_INCOMPATIBLE_TASKS_OR_FEATURES_FOOTER)
+         postBuildOutputDoesNotContain(CONFIGURATION_CACHE_DISABLED_REASON)
+     }
+ }
+diff --git a/platforms/core-configuration/configuration-cache/src/main/kotlin/org/gradle/internal/cc/impl/problems/ConfigurationCacheProblems.kt b/platforms/core-configuration/configuration-cache/src/main/kotlin/org/gradle/internal/cc/impl/problems/ConfigurationCacheProblems.kt
+index 3e1bb7073a6..28ea7a7ff32 100644
+--- a/platforms/core-configuration/configuration-cache/src/main/kotlin/org/gradle/internal/cc/impl/problems/ConfigurationCacheProblems.kt
++++ b/platforms/core-configuration/configuration-cache/src/main/kotlin/org/gradle/internal/cc/impl/problems/ConfigurationCacheProblems.kt
+@@ -222,6 +222,18 @@ class ConfigurationCacheProblems(
+         summarizer.onIncompatibleTask()
+     }
+ 
++    private
++    fun reportDegradingFeature(feature: String) {
++        val problem = problemFactory
++            .problem {
++                // for now, we don't expect interesting information from degrading features, so only the feature name is displayed
++                text("Feature '$feature' is incompatible with the configuration cache.")
++            }
++            .build()
++        report.onProblem(problem)
++        summarizer.onIncompatibleFeature()
++    }
++
+     override fun onProblem(problem: PropertyProblem) {
+         onProblem(problem, ProblemSeverity.Deferred)
+     }
+@@ -315,6 +327,7 @@ class ConfigurationCacheProblems(
+      */
+     override fun report(reportDir: File, validationFailures: ProblemConsumer) {
+         addNotReportedDegradingTasks()
++        addDegradingFeatures()
+         val summary = summarizer.get()
+         val hasNoProblemsForConsole = summary.reportableProblemCount == 0
+         val outputDirectory = outputDirectoryFor(reportDir)
+@@ -342,7 +355,8 @@ class ConfigurationCacheProblems(
+         }
+     }
+ 
+-    private fun addNotReportedDegradingTasks() {
++    private
++    fun addNotReportedDegradingTasks() {
+         degradationDecision.onDegradedTask { task, reasons ->
+             val trace = locationForTask(task)
+             if (!incompatibleTasks.contains(trace)) {
+@@ -351,6 +365,14 @@ class ConfigurationCacheProblems(
+         }
+     }
+ 
++    private
++    fun addDegradingFeatures() {
++        degradationDecision.onDegradedFeature { feature, _ ->
++            // TODO:configuration-cache consider collecting location information (trace)
++            reportDegradingFeature(feature)
++        }
++    }
++
+     private
+     fun detailsFor(summary: Summary): ProblemReportDetails {
+         val cacheActionText = cacheAction.summaryText()
+@@ -472,8 +494,10 @@ class ConfigurationCacheProblems(
+         }
+     }
+ 
+-    private inner class ErrorsAreProblemsProblemsListener(
+-        private val problemSeverity: ProblemSeverity
++    private
++    inner class ErrorsAreProblemsProblemsListener(
++        private
++        val problemSeverity: ProblemSeverity
+     ) : AbstractProblemsListener() {
+ 
+         override fun onProblem(problem: PropertyProblem) {
+diff --git a/platforms/core-configuration/configuration-cache/src/main/kotlin/org/gradle/internal/cc/impl/problems/ConfigurationCacheProblemsSummary.kt b/platforms/core-configuration/configuration-cache/src/main/kotlin/org/gradle/internal/cc/impl/problems/ConfigurationCacheProblemsSummary.kt
+index 66362035f0b..43820cbd514 100644
+--- a/platforms/core-configuration/configuration-cache/src/main/kotlin/org/gradle/internal/cc/impl/problems/ConfigurationCacheProblemsSummary.kt
++++ b/platforms/core-configuration/configuration-cache/src/main/kotlin/org/gradle/internal/cc/impl/problems/ConfigurationCacheProblemsSummary.kt
+@@ -68,6 +68,9 @@ class ConfigurationCacheProblemsSummary(
+     private
+     var incompatibleTasksCount: Int = 0
+ 
++    private
++    var incompatibleFeatureCount: Int = 0
++
+     /**
+      * Unique problem causes observed among all reported problems.
+      *
+@@ -98,7 +101,8 @@ class ConfigurationCacheProblemsSummary(
+             ImmutableList.copyOf(originalProblemExceptions),
+             overflowed,
+             maxCollectedProblems,
+-            incompatibleTasksCount
++            incompatibleTasksCount,
++            incompatibleFeatureCount
+         )
+     }
+ 
+@@ -137,6 +141,12 @@ class ConfigurationCacheProblemsSummary(
+         }
+     }
+ 
++    fun onIncompatibleFeature() {
++        lock.withLock {
++            incompatibleFeatureCount += 1
++        }
++    }
++
+     private
+     fun collectOriginalException(problem: PropertyProblem) {
+         if (originalProblemExceptions.size < MAX_PROBLEM_EXCEPTIONS) {
+@@ -194,7 +204,12 @@ class Summary(
+      * Total number of tasks in the current work graph that are not CC-compatible.
+      */
+     private
+-    val incompatibleTasksCount: Int
++    val incompatibleTasksCount: Int,
++    /**
++     * Total number of features that are not CC-compatible.
++     */
++    private
++    val incompatibleFeatureCount: Int
+ ) {
+     val reportableProblemCount: Int
+         get() = totalProblemCount - suppressedSilentlyProblemCount
+@@ -225,11 +240,12 @@ class Summary(
+                 }
+             }
+             val hasIncompatibleTasks = incompatibleTasksCount > 0
++            val hasIncompatibleFeatures = incompatibleFeatureCount > 0
+             htmlReportFile?.let {
+                 appendLine()
+-                if (hasIncompatibleTasks && !hasReportableProblems) {
++                if ((hasIncompatibleTasks || hasIncompatibleFeatures) && !hasReportableProblems) {
+                     // Some tests parse this line, you may need to change them if you change the message.
+-                    append("Some tasks in this build are not compatible with the configuration cache.")
++                    append("Some tasks or features in this build are not compatible with the configuration cache.")
+                     appendLine()
+                 }
+                 append(buildSummaryReportLink(it))
+diff --git a/testing/internal-integ-testing/src/main/groovy/org/gradle/integtests/fixtures/logging/GroupedOutputFixture.java b/testing/internal-integ-testing/src/main/groovy/org/gradle/integtests/fixtures/logging/GroupedOutputFixture.java
+index 42e4f213cf9..5c713bf70df 100644
+--- a/testing/internal-integ-testing/src/main/groovy/org/gradle/integtests/fixtures/logging/GroupedOutputFixture.java
++++ b/testing/internal-integ-testing/src/main/groovy/org/gradle/integtests/fixtures/logging/GroupedOutputFixture.java
+@@ -51,7 +51,7 @@ public class GroupedOutputFixture {
+     private final static String BUILD_STATUS_FOOTER = "BUILD SUCCESSFUL";
+     private final static String BUILD_FAILED_FOOTER = "BUILD FAILED";
+     private final static String CONFIGURATION_CACHE_PROBLEMS_FOOTER = "\\d+ (problem was|problems were) found storing the configuration cache";
+-    private final static String CONFIGURATION_CACHE_INCOMPATIBLE_TASKS_FOOTER = "Some tasks in this build are not compatible with the configuration cache.";
++    private final static String CONFIGURATION_CACHE_INCOMPATIBLE_TASKS_OR_FEATURES_FOOTER = "Some tasks or features in this build are not compatible with the configuration cache.";
+     private final static String ACTIONABLE_TASKS = "[0-9]+ actionable tasks?:";
+ 
+     /**
+@@ -65,7 +65,7 @@ public class GroupedOutputFixture {
+         EMBEDDED_BUILD_START,
+         ACTIONABLE_TASKS,
+         CONFIGURATION_CACHE_PROBLEMS_FOOTER,
+-        CONFIGURATION_CACHE_INCOMPATIBLE_TASKS_FOOTER,
++        CONFIGURATION_CACHE_INCOMPATIBLE_TASKS_OR_FEATURES_FOOTER,
+         "\\z"
+     );
+ 

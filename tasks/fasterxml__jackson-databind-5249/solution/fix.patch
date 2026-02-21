@@ -1,0 +1,487 @@
+diff --git a/release-notes/VERSION-2.x b/release-notes/VERSION-2.x
+index f2b492e05..196b734cb 100644
+--- a/release-notes/VERSION-2.x
++++ b/release-notes/VERSION-2.x
+@@ -4,6 +4,11 @@ Project: jackson-databind
+ === Releases === 
+ ------------------------------------------------------------------------
+ 
++Not yet released
++
++#5242: Support "binary vectors": `@JsonFormat(shape = Shape.BINARY)` for
++  `float[]`, `double[]`
++
+ 2.20.0-rc1 (04-Aug-2025)
+ 
+ #3072: Allow specifying `@JacksonInject` does not fail when there's no
+diff --git a/src/main/java/com/fasterxml/jackson/databind/deser/std/PrimitiveArrayDeserializers.java b/src/main/java/com/fasterxml/jackson/databind/deser/std/PrimitiveArrayDeserializers.java
+index d058c5d38..08a62c777 100644
+--- a/src/main/java/com/fasterxml/jackson/databind/deser/std/PrimitiveArrayDeserializers.java
++++ b/src/main/java/com/fasterxml/jackson/databind/deser/std/PrimitiveArrayDeserializers.java
+@@ -213,7 +213,6 @@ public abstract class PrimitiveArrayDeserializers<T> extends StdDeserializer<T>
+     @SuppressWarnings("unchecked")
+     protected T handleNonArray(JsonParser p, DeserializationContext ctxt) throws IOException
+     {
+-
+         final boolean canWrap = (_unwrapSingle == Boolean.TRUE) ||
+                 ((_unwrapSingle == null) &&
+                         ctxt.isEnabled(DeserializationFeature.ACCEPT_SINGLE_VALUE_AS_ARRAY));
+@@ -269,10 +268,8 @@ public abstract class PrimitiveArrayDeserializers<T> extends StdDeserializer<T>
+         @Override
+         public char[] deserialize(JsonParser p, DeserializationContext ctxt) throws IOException
+         {
+-            /* Won't take arrays, must get a String (could also
+-             * convert other tokens to Strings... but let's not bother
+-             * yet, doesn't seem to make sense)
+-             */
++            // Won't take arrays, must get a String (could also convert other tokens to Strings...
++            // but let's not bother yet, doesn't seem to make sense)
+             if (p.hasToken(JsonToken.VALUE_STRING)) {
+                 // note: can NOT return shared internal buffer, must copy:
+                 char[] buffer = p.getTextCharacters();
+@@ -483,6 +480,7 @@ public abstract class PrimitiveArrayDeserializers<T> extends StdDeserializer<T>
+                         return (byte[]) ctxt.handleWeirdStringValue(byte[].class,
+                                 p.getText(), msg);
+                     }
++                    throw e;
+                 }
+             }
+             // 31-Dec-2009, tatu: Also may be hidden as embedded Object
+@@ -821,6 +819,10 @@ public abstract class PrimitiveArrayDeserializers<T> extends StdDeserializer<T>
+         public float[] deserialize(JsonParser p, DeserializationContext ctxt) throws IOException
+         {
+             if (!p.isExpectedStartArrayToken()) {
++                float[] decoded = _deserializeBinaryVector(p, ctxt);
++                if (decoded != null) {
++                    return decoded;
++                }
+                 return handleNonArray(p, ctxt);
+             }
+             ArrayBuilders.FloatBuilder builder = ctxt.getArrayBuilders().getFloatBuilder();
+@@ -864,6 +866,61 @@ public abstract class PrimitiveArrayDeserializers<T> extends StdDeserializer<T>
+             System.arraycopy(newValue, 0, result, len1, len2);
+             return result;
+         }
++
++        private float[] _deserializeBinaryVector(JsonParser p, DeserializationContext ctxt)
++            throws IOException
++        {
++            JsonToken t = p.currentToken();
++            byte[] packed = null;
++
++            // Typical textual format case: base64 encoded String (for Packed Binary Vector)
++            if (t == JsonToken.VALUE_STRING) {
++                try {
++                    packed = p.getBinaryValue(ctxt.getBase64Variant());
++                } catch (StreamReadException | DatabindException e) {
++                    // [databind#1425], try to convert to a more usable one, as it's not really
++                    // a JSON-level parse exception, but rather binding from JSON String into
++                    // base64 decoded  binary data
++                    String msg = e.getOriginalMessage();
++                    if (msg.contains("base64")) {
++                        return (float[]) ctxt.handleWeirdStringValue(float[].class,
++                                p.getText(), msg);
++                    }
++                    throw e;
++                }
++            } else if (t == JsonToken.VALUE_EMBEDDED_OBJECT) {
++                // Typical for binary formats
++                Object ob = p.getEmbeddedObject();
++                if (ob instanceof byte[]) {
++                    packed = (byte[]) ob;
++                } else if (ob == null || (ob instanceof float[])) {
++                    return (float[]) ob;
++                }
++            }
++            // Packed Binary Vector case
++            if (packed != null) {
++                return _unpack(ctxt, packed);
++            }
++            return null;
++        }
++
++        private float[] _unpack(DeserializationContext ctxt, byte[] bytes) throws IOException {
++            final int bytesLen = bytes.length;
++            if ((bytesLen & 3) != 0) {
++                return (float[]) ctxt.reportInputMismatch(handledType(),
++                        "Vector length for Packed Binary Float Vector (%d) not a multiple of 4 bytes", bytesLen);
++            }
++            final int vectorLen = bytesLen >> 2;
++            final float[] floats = new float[vectorLen];
++            for (int in = 0, out = 0; in < bytesLen; ) {
++                int packed = (bytes[in++] << 24)
++                        | ((bytes[in++] & 0xFF) << 16)
++                        | ((bytes[in++] & 0xFF) << 8)
++                        | (bytes[in++] & 0xFF);
++                floats[out++] = Float.intBitsToFloat(packed);
++            }
++            return floats;
++        }
+     }
+ 
+     @JacksonStdImpl
+@@ -892,6 +949,10 @@ public abstract class PrimitiveArrayDeserializers<T> extends StdDeserializer<T>
+         public double[] deserialize(JsonParser p, DeserializationContext ctxt) throws IOException
+         {
+             if (!p.isExpectedStartArrayToken()) {
++                double[] decoded = _deserializeBinaryVector(p, ctxt);
++                if (decoded != null) {
++                    return decoded;
++                }
+                 return handleNonArray(p, ctxt);
+             }
+             ArrayBuilders.DoubleBuilder builder = ctxt.getArrayBuilders().getDoubleBuilder();
+@@ -934,5 +995,65 @@ public abstract class PrimitiveArrayDeserializers<T> extends StdDeserializer<T>
+             System.arraycopy(newValue, 0, result, len1, len2);
+             return result;
+         }
++
++        private double[] _deserializeBinaryVector(JsonParser p, DeserializationContext ctxt)
++            throws IOException
++        {
++            JsonToken t = p.currentToken();
++            byte[] packed = null;
++
++            // Typical textual format case: base64 encoded String (for Packed Binary Vector)
++            if (t == JsonToken.VALUE_STRING) {
++                try {
++                    packed = p.getBinaryValue(ctxt.getBase64Variant());
++                } catch (StreamReadException | DatabindException e) {
++                    // [databind#1425], try to convert to a more usable one, as it's not really
++                    // a JSON-level parse exception, but rather binding from JSON String into
++                    // base64 decoded  binary data
++                    String msg = e.getOriginalMessage();
++                    if (msg.contains("base64")) {
++                        return (double[]) ctxt.handleWeirdStringValue(double[].class,
++                                p.getText(), msg);
++                    }
++                    throw e;
++                }
++            } else if (t == JsonToken.VALUE_EMBEDDED_OBJECT) {
++                // Typical for binary formats
++                Object ob = p.getEmbeddedObject();
++                if (ob instanceof byte[]) {
++                    packed = (byte[]) ob;
++                } else if (ob == null || (ob instanceof double[])) {
++                    return (double[]) ob;
++                }
++            }
++            // Packed Binary Vector case
++            if (packed != null) {
++                return _unpack(ctxt, packed);
++            }
++            return null;
++        }
++
++        private double[] _unpack(DeserializationContext ctxt, byte[] bytes) throws IOException {
++            final int bytesLen = bytes.length;
++            if ((bytesLen & 7) != 0) {
++                return (double[]) ctxt.reportInputMismatch(handledType(),
++                        "Vector length for Packed Binary Double Vector (%d) not a multiple of 8 bytes", bytesLen);
++            }
++            final int vectorLen = bytesLen >> 3;
++            final double[] doubles = new double[vectorLen];
++            for (int in = 0, out = 0; in < bytesLen; ) {
++                int packed1 = (bytes[in++] << 24)
++                        | ((bytes[in++] & 0xFF) << 16)
++                        | ((bytes[in++] & 0xFF) << 8)
++                        | (bytes[in++] & 0xFF);
++                int packed2 = (bytes[in++] << 24)
++                        | ((bytes[in++] & 0xFF) << 16)
++                        | ((bytes[in++] & 0xFF) << 8)
++                        | (bytes[in++] & 0xFF);
++                long packed = ((long) packed1 << 32) | (packed2 & 0xFFFFFFFFL);
++                doubles[out++] = Double.longBitsToDouble(packed);
++            }
++            return doubles;
++        }
+     }
+ }
+diff --git a/src/main/java/com/fasterxml/jackson/databind/ser/std/StdArraySerializers.java b/src/main/java/com/fasterxml/jackson/databind/ser/std/StdArraySerializers.java
+index 9d2231cf3..fbf05de4c 100644
+--- a/src/main/java/com/fasterxml/jackson/databind/ser/std/StdArraySerializers.java
++++ b/src/main/java/com/fasterxml/jackson/databind/ser/std/StdArraySerializers.java
+@@ -4,6 +4,7 @@ import java.io.IOException;
+ import java.lang.reflect.Type;
+ import java.util.HashMap;
+ 
++import com.fasterxml.jackson.annotation.JsonFormat;
+ import com.fasterxml.jackson.core.*;
+ import com.fasterxml.jackson.core.type.WritableTypeId;
+ import com.fasterxml.jackson.databind.*;
+@@ -13,6 +14,7 @@ import com.fasterxml.jackson.databind.jsonFormatVisitors.JsonFormatVisitorWrappe
+ import com.fasterxml.jackson.databind.jsontype.TypeSerializer;
+ import com.fasterxml.jackson.databind.node.ObjectNode;
+ import com.fasterxml.jackson.databind.ser.ContainerSerializer;
++import com.fasterxml.jackson.databind.ser.ContextualSerializer;
+ import com.fasterxml.jackson.databind.type.TypeFactory;
+ 
+ /**
+@@ -512,16 +514,20 @@ public class StdArraySerializers
+         // as above, assuming no one re-defines primitive/wrapper types
+         private final static JavaType VALUE_TYPE = simpleElementType(Float.TYPE);
+ 
++        // @since 2.20
++        final static FloatArraySerializer instance = new FloatArraySerializer();
++
+         public FloatArraySerializer() {
+             super(float[].class);
+         }
++
+         public FloatArraySerializer(FloatArraySerializer src, BeanProperty prop,
+                 Boolean unwrapSingle) {
+             super(src, prop, unwrapSingle);
+         }
+ 
+         @Override
+-        public JsonSerializer<?> _withResolved(BeanProperty prop,Boolean unwrapSingle) {
++        public JsonSerializer<?> _withResolved(BeanProperty prop, Boolean unwrapSingle) {
+             return new FloatArraySerializer(this, prop, unwrapSingle);
+         }
+ 
+@@ -546,6 +552,20 @@ public class StdArraySerializers
+             return (value.length == 1);
+         }
+ 
++        @Override
++        public JsonSerializer<?> createContextual(SerializerProvider ctxt, BeanProperty property)
++            throws JsonMappingException
++        {
++            JsonFormat.Value format = findFormatOverrides(ctxt, property,
++                    handledType());
++            if (format != null) {
++                if (format.getShape() == JsonFormat.Shape.BINARY) {
++                    return BinaryFloatArraySerializer.instance;
++                }
++            }
++            return super.createContextual(ctxt, property);
++        }
++
+         @Override
+         public final void serialize(float[] value, JsonGenerator g, SerializerProvider provider) throws IOException
+         {
+@@ -590,6 +610,9 @@ public class StdArraySerializers
+         // as above, assuming no one re-defines primitive/wrapper types
+         private final static JavaType VALUE_TYPE = simpleElementType(Double.TYPE);
+ 
++        // @since 2.20
++        final static DoubleArraySerializer instance = new DoubleArraySerializer();
++        
+         public DoubleArraySerializer() { super(double[].class); }
+ 
+         /**
+@@ -635,6 +658,20 @@ public class StdArraySerializers
+             return (value.length == 1);
+         }
+ 
++        @Override
++        public JsonSerializer<?> createContextual(SerializerProvider ctxt, BeanProperty property)
++            throws JsonMappingException
++        {
++            JsonFormat.Value format = findFormatOverrides(ctxt, property,
++                    handledType());
++            if (format != null) {
++                if (format.getShape() == JsonFormat.Shape.BINARY) {
++                    return BinaryDoubleArraySerializer.instance;
++                }
++            }
++            return super.createContextual(ctxt, property);
++        }
++        
+         @Override
+         public final void serialize(double[] value, JsonGenerator g, SerializerProvider provider) throws IOException
+         {
+@@ -671,4 +708,193 @@ public class StdArraySerializers
+             visitArrayFormat(visitor, typeHint, JsonFormatTypes.NUMBER);
+         }
+     }
++
++    /*
++    /**********************************************************************
++    /* Concrete serializers, alternative "binary Vector" representations
++    /**********************************************************************
++     */
++
++    /**
++     * Alternative serializer for arrays of primitive floats, using "packed binary"
++     * representation ("binary vector") instead of JSON array.
++     *
++     * @since 2.20
++     */
++    @JacksonStdImpl
++    public static class BinaryFloatArraySerializer extends StdSerializer<float[]>
++        implements ContextualSerializer
++    {
++        private static final long serialVersionUID = 1L;
++
++        final static BinaryFloatArraySerializer instance = new BinaryFloatArraySerializer();
++        
++        public BinaryFloatArraySerializer() {
++            super(float[].class);
++        }
++
++        @Override
++        public boolean isEmpty(SerializerProvider prov, float[] value) {
++            return value.length == 0;
++        }
++
++        @Override
++        public JsonSerializer<?> createContextual(SerializerProvider ctxt, BeanProperty property)
++                throws JsonMappingException
++        {
++            JsonFormat.Value format = findFormatOverrides(ctxt, property,
++                    handledType());
++            if (format != null) {
++                switch (format.getShape()) {
++                case ARRAY:
++                case NATURAL:
++                    return FloatArraySerializer.instance;
++                default:
++                }
++            }
++            return this;
++        }
++
++        @Override
++        public void serialize(float[] value, JsonGenerator g, SerializerProvider ctxt)
++            throws IOException
++        {
++            // First: "pack" the floats into bytes
++            final int vectorLen = value.length;
++            final byte[] b = new byte[vectorLen << 2];
++            for (int i = 0, out = 0; i < vectorLen; i++) {
++                final int floatBits = Float.floatToIntBits(value[i]);
++                b[out++] = (byte) (floatBits >> 24);
++                b[out++] = (byte) (floatBits >> 16);
++                b[out++] = (byte) (floatBits >> 8);
++                b[out++] = (byte) (floatBits);
++            }
++            // Second: write packed bytes (for JSON, Base64 encoded)
++            g.writeBinary(ctxt.getConfig().getBase64Variant(),
++                    b, 0, b.length);
++        }
++
++        @Override
++        public void serializeWithType(float[] value, JsonGenerator g, SerializerProvider ctxt,
++                TypeSerializer typeSer)
++            throws IOException
++        {
++            // most likely scalar
++            WritableTypeId typeIdDef = typeSer.writeTypePrefix(g,
++                    typeSer.typeId(value, JsonToken.VALUE_EMBEDDED_OBJECT));
++            serialize(value, g, ctxt);
++            typeSer.writeTypeSuffix(g, typeIdDef);
++        }
++
++        @Deprecated
++        @Override
++        public JsonNode getSchema(SerializerProvider provider, Type typeHint) {
++            return createSchemaNode("array", true).set("items", createSchemaNode("number"));
++        }
++
++        @Override
++        public void acceptJsonFormatVisitor(JsonFormatVisitorWrapper visitor, JavaType typeHint)
++            throws JsonMappingException
++        {
++            // 06-Aug-2025, tatu: while logically (and within JVM) binary, gets encoded as Base64 String,
++            // let's try to indicate it is array of Float... difficult, thanks to JSON Schema's
++            // lackluster listing of types
++            visitArrayFormat(visitor, typeHint, JsonFormatTypes.NUMBER);
++        }
++    }
++
++    /**
++     * Alternative serializer for arrays of primitive doubles, using "packed binary"
++     * representation ("binary vector") instead of JSON array.
++     *
++     * @since 2.20
++     */
++    @JacksonStdImpl
++    public static class BinaryDoubleArraySerializer extends StdSerializer<double[]>
++        implements ContextualSerializer
++    {
++        private static final long serialVersionUID = 1L;
++
++        final static BinaryDoubleArraySerializer instance = new BinaryDoubleArraySerializer();
++        
++        public BinaryDoubleArraySerializer() {
++            super(double[].class);
++        }
++
++        @Override
++        public boolean isEmpty(SerializerProvider prov, double[] value) {
++            return value.length == 0;
++        }
++
++        @Override
++        public JsonSerializer<?> createContextual(SerializerProvider ctxt, BeanProperty property)
++                throws JsonMappingException
++        {
++            JsonFormat.Value format = findFormatOverrides(ctxt, property,
++                    handledType());
++            if (format != null) {
++                switch (format.getShape()) {
++                case ARRAY:
++                case NATURAL:
++                    return DoubleArraySerializer.instance;
++                default:
++                }
++            }
++            return this;
++        }
++
++        @Override
++        public void serialize(double[] value, JsonGenerator g, SerializerProvider ctxt)
++            throws IOException
++        {
++            // First: "pack" the floats into bytes
++            final int vectorLen = value.length;
++            final byte[] b = new byte[vectorLen << 3];
++            for (int i = 0, out = 0; i < vectorLen; i++) {
++                long bits = Double.doubleToLongBits(value[i]);
++                final int hi = (int) (bits >> 32);
++                b[out] = (byte) (hi >> 24);
++                b[out+1] = (byte) (hi >> 16);
++                b[out+2] = (byte) (hi >> 8);
++                b[out+3] = (byte) (hi);
++                final int lo = (int) bits;
++                b[out+4] = (byte) (lo >> 24);
++                b[out+5] = (byte) (lo >> 16);
++                b[out+6] = (byte) (lo >> 8);
++                b[out+7] = (byte) (lo);
++                out += 8;
++            }
++            // Second: write packed bytes (for JSON, Base64 encoded)
++            g.writeBinary(ctxt.getConfig().getBase64Variant(),
++                    b, 0, b.length);
++        }
++
++        @Override
++        public void serializeWithType(double[] value, JsonGenerator g, SerializerProvider ctxt,
++                TypeSerializer typeSer)
++            throws IOException
++        {
++            // most likely scalar
++            WritableTypeId typeIdDef = typeSer.writeTypePrefix(g,
++                    typeSer.typeId(value, JsonToken.VALUE_EMBEDDED_OBJECT));
++            serialize(value, g, ctxt);
++            typeSer.writeTypeSuffix(g, typeIdDef);
++        }
++
++        @Deprecated
++        @Override
++        public JsonNode getSchema(SerializerProvider provider, Type typeHint) {
++            return createSchemaNode("array", true).set("items", createSchemaNode("number"));
++        }
++
++        @Override
++        public void acceptJsonFormatVisitor(JsonFormatVisitorWrapper visitor, JavaType typeHint)
++            throws JsonMappingException
++        {
++            // 14-Mar-2016, tatu: while logically (and within JVM) binary, gets encoded as Base64 String,
++            // let's try to indicate it is array of Float... difficult, thanks to JSON Schema's
++            // lackluster listing of types
++            visitArrayFormat(visitor, typeHint, JsonFormatTypes.NUMBER);
++        }
++    }
+ }

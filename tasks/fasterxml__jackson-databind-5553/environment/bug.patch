@@ -1,0 +1,245 @@
+diff --git a/release-notes/VERSION b/release-notes/VERSION
+index ee2a8a729..308b90f14 100644
+--- a/release-notes/VERSION
++++ b/release-notes/VERSION
+@@ -27,9 +27,6 @@ Versions: 3.x (for earlier see VERSION-2.x)
+ #1516: Problem with multi-argument Creator with `@JsonBackReference` property
+  (reported by @sarahlikesglitter)
+  (fix by @JacksonJang)
+-#1649: `@JsonInclude(content=)` not working for `Map`-valued properties via
+-  POJO class annotation
+- (fix by @cowtowncoder, w/ Claude code)
+ #1654: @JsonDeserialize(contentUsing=...) is ignored if content
+   type is determined by @JsonTypeInfo
+  (reported by @pdegoeje)
+diff --git a/src/main/java/tools/jackson/databind/introspect/POJOPropertyBuilder.java b/src/main/java/tools/jackson/databind/introspect/POJOPropertyBuilder.java
+index 578f79be8..8ea6bcf0d 100644
+--- a/src/main/java/tools/jackson/databind/introspect/POJOPropertyBuilder.java
++++ b/src/main/java/tools/jackson/databind/introspect/POJOPropertyBuilder.java
+@@ -850,7 +850,7 @@ public class POJOPropertyBuilder
+     @Override
+     public JsonInclude.Value findInclusion() {
+         AnnotatedMember a = getAccessor();
+-        // 16-Apr-2016, tatu: Let's include per-type default inclusion too
++        // 16-Apr-2106, tatu: Let's include per-type default inclusion too
+         // 17-Aug-2016, tatu: Do NOT include global, or per-type defaults, because
+         //    not all of this information (specifically, enclosing type's settings)
+         //    is available here
+diff --git a/src/main/java/tools/jackson/databind/ser/BeanPropertyWriter.java b/src/main/java/tools/jackson/databind/ser/BeanPropertyWriter.java
+index bddd5d7a4..b75833d02 100644
+--- a/src/main/java/tools/jackson/databind/ser/BeanPropertyWriter.java
++++ b/src/main/java/tools/jackson/databind/ser/BeanPropertyWriter.java
+@@ -177,17 +177,6 @@ public class BeanPropertyWriter
+      */
+     protected final Class<?>[] _includeInViews;
+ 
+-    /**
+-     * Inclusion settings for this property, pre-computed in PropertyBuilder
+-     * by merging global defaults, type defaults, and property-level annotations,
+-     * including contextual annotations from the enclosing class.
+-     * If non-null, will be returned by {@link #findPropertyInclusion} instead
+-     * of dynamically re-computing inclusion settings.
+-     *
+-     * @since 3.1
+-     */
+-    protected final JsonInclude.Value _inclusion;
+-
+     /*
+     /**********************************************************************
+     /* Opaqueinternal data that bean serializer factory and
+@@ -203,34 +192,13 @@ public class BeanPropertyWriter
+     /**********************************************************************
+      */
+ 
+-    /**
+-     * @deprecated Since 3.1
+-     */
+-    @Deprecated // @since 3.1
+-    public BeanPropertyWriter(BeanPropertyDefinition propDef,
+-            AnnotatedMember member, Annotations contextAnnotations,
+-            JavaType declaredType,
+-            ValueSerializer<?> ser, TypeSerializer typeSer, JavaType serType,
+-            boolean suppressNulls, Object suppressableValue,
+-            Class<?>[] includeInViews)
+-    {
+-        this(propDef, member, contextAnnotations, declaredType,
+-                ser, typeSer, serType, suppressNulls, suppressableValue,
+-                includeInViews, null);
+-    }
+-
+-    /**
+-     * Constructor with additional inclusion parameter.
+-     *
+-     * @since 3.1
+-     */
+     @SuppressWarnings("unchecked")
+     public BeanPropertyWriter(BeanPropertyDefinition propDef,
+             AnnotatedMember member, Annotations contextAnnotations,
+             JavaType declaredType,
+             ValueSerializer<?> ser, TypeSerializer typeSer, JavaType serType,
+             boolean suppressNulls, Object suppressableValue,
+-            Class<?>[] includeInViews, JsonInclude.Value inclusion)
++            Class<?>[] includeInViews)
+     {
+         super(propDef);
+         _member = member;
+@@ -251,7 +219,6 @@ public class BeanPropertyWriter
+         // this will be resolved later on, unless nulls are to be suppressed
+         _nullSerializer = null;
+         _includeInViews = includeInViews;
+-        _inclusion = inclusion;
+     }
+ 
+     /**
+@@ -278,7 +245,6 @@ public class BeanPropertyWriter
+         _suppressableValue = null;
+ 
+         _nullSerializer = null;
+-        _inclusion = null;
+     }
+ 
+     /**
+@@ -316,7 +282,6 @@ public class BeanPropertyWriter
+         _includeInViews = base._includeInViews;
+         _typeSerializer = base._typeSerializer;
+         _nonTrivialBaseType = base._nonTrivialBaseType;
+-        _inclusion = base._inclusion;
+     }
+ 
+     protected BeanPropertyWriter(BeanPropertyWriter base, SerializedString name) {
+@@ -340,7 +305,6 @@ public class BeanPropertyWriter
+         _includeInViews = base._includeInViews;
+         _typeSerializer = base._typeSerializer;
+         _nonTrivialBaseType = base._nonTrivialBaseType;
+-        _inclusion = base._inclusion;
+     }
+ 
+     public BeanPropertyWriter rename(NameTransformer transformer) {
+@@ -470,7 +434,20 @@ public class BeanPropertyWriter
+     @Override
+     public JsonInclude.Value findPropertyInclusion(MapperConfig<?> config, Class<?> baseType)
+     {
+-        return _inclusion;
++        AnnotatedMember member = getMember();
++        if (member == null) {
++            return config.getDefaultPropertyInclusion(baseType);
++        }
++        JsonInclude.Value v0 = config.getDefaultInclusion(baseType, member.getRawType());
++        AnnotationIntrospector intr = config.getAnnotationIntrospector();
++        if (intr == null) {
++            return v0;
++        }
++        JsonInclude.Value v = intr.findPropertyInclusion(config, member);
++        if (v0 == null) {
++            return v;
++        }
++        return v0.withOverrides(v);
+     }
+ 
+     protected void _depositSchemaProperty(ObjectNode propertiesNode,
+@@ -501,7 +478,7 @@ public class BeanPropertyWriter
+      */
+     public Object setInternalSetting(Object key, Object value) {
+         if (_internalSettings == null) {
+-            _internalSettings = new HashMap<>();
++            _internalSettings = new HashMap<Object, Object>();
+         }
+         return _internalSettings.put(key, value);
+     }
+diff --git a/src/main/java/tools/jackson/databind/ser/PropertyBuilder.java b/src/main/java/tools/jackson/databind/ser/PropertyBuilder.java
+index 85b30103a..ff02bf326 100644
+--- a/src/main/java/tools/jackson/databind/ser/PropertyBuilder.java
++++ b/src/main/java/tools/jackson/databind/ser/PropertyBuilder.java
+@@ -224,13 +224,9 @@ public class PropertyBuilder
+         if (views == null) {
+             views = _beanDesc.findDefaultViews();
+         }
+-        // [databind#1649]: Pass the computed inclusion value (which includes
+-        // contextual annotations) so BeanPropertyWriter can use it directly
+-        // instead of re-computing in findPropertyInclusion()
+         BeanPropertyWriter bpw = _constructPropertyWriter(propDef,
+                 am, _beanDesc.getClassAnnotations(), declaredType,
+-                ser, typeSer, serializationType, suppressNulls, valueToSuppress, views,
+-                inclV);
++                ser, typeSer, serializationType, suppressNulls, valueToSuppress, views);
+ 
+         // How about custom null serializer?
+         Object serDef = _annotationIntrospector.findNullSerializer(_config, am);
+@@ -248,20 +244,17 @@ public class PropertyBuilder
+     /**
+      * Overridable factory method for actual construction of {@link BeanPropertyWriter};
+      * often needed if subclassing {@link #buildWriter} method.
+-     *
+-     * @since 3.1 Added {@code inclusion} parameter
+      */
+     protected BeanPropertyWriter _constructPropertyWriter(BeanPropertyDefinition propDef,
+             AnnotatedMember member, Annotations contextAnnotations,
+             JavaType declaredType,
+             ValueSerializer<?> ser, TypeSerializer typeSer, JavaType serType,
+             boolean suppressNulls, Object suppressableValue,
+-            Class<?>[] includeInViews, JsonInclude.Value inclusion)
++            Class<?>[] includeInViews)
+     {
+         return new BeanPropertyWriter(propDef,
+                 member, contextAnnotations, declaredType,
+-                ser, typeSer, serType, suppressNulls, suppressableValue, includeInViews,
+-                inclusion);
++                ser, typeSer, serType, suppressNulls, suppressableValue, includeInViews);
+     }
+ 
+     /*
+diff --git a/src/main/java/tools/jackson/databind/ser/VirtualBeanPropertyWriter.java b/src/main/java/tools/jackson/databind/ser/VirtualBeanPropertyWriter.java
+index 6b55133db..1db8cf6db 100644
+--- a/src/main/java/tools/jackson/databind/ser/VirtualBeanPropertyWriter.java
++++ b/src/main/java/tools/jackson/databind/ser/VirtualBeanPropertyWriter.java
+@@ -51,7 +51,7 @@ public abstract class VirtualBeanPropertyWriter
+         super(propDef, propDef.getPrimaryMember(), contextAnnotations, declaredType,
+                 ser, typeSer, serType,
+                 _suppressNulls(inclusion), _suppressableValue(inclusion),
+-                includeInViews, inclusion);
++                includeInViews);
+     }
+ 
+     protected VirtualBeanPropertyWriter(VirtualBeanPropertyWriter base) {
+diff --git a/src/test/java/tools/jackson/databind/ser/ValueSerializerModifierTest.java b/src/test/java/tools/jackson/databind/ser/ValueSerializerModifierTest.java
+index 6543f8ecb..0f30e3a91 100644
+--- a/src/test/java/tools/jackson/databind/ser/ValueSerializerModifierTest.java
++++ b/src/test/java/tools/jackson/databind/ser/ValueSerializerModifierTest.java
+@@ -169,7 +169,7 @@ public class ValueSerializerModifierTest extends DatabindTestUtil
+                         strType,
+                         null, null, strType,
+                         false, null,
+-                        null, null));
++                        null));
+             } catch (NoSuchFieldException e) {
+                 throw new IllegalStateException(e.getMessage());
+             }
+diff --git a/src/test/java/tools/jackson/databind/ser/filter/MapInclusion1649Test.java b/src/test/java/tools/jackson/databind/tofix/MapInclusion1649Test.java
+similarity index 89%
+rename from src/test/java/tools/jackson/databind/ser/filter/MapInclusion1649Test.java
+rename to src/test/java/tools/jackson/databind/tofix/MapInclusion1649Test.java
+index 0a6987e53..41d61d857 100644
+--- a/src/test/java/tools/jackson/databind/ser/filter/MapInclusion1649Test.java
++++ b/src/test/java/tools/jackson/databind/tofix/MapInclusion1649Test.java
+@@ -1,4 +1,4 @@
+-package tools.jackson.databind.ser.filter;
++package tools.jackson.databind.tofix;
+ 
+ import java.io.IOException;
+ import java.util.LinkedHashMap;
+@@ -10,6 +10,7 @@ import com.fasterxml.jackson.annotation.JsonInclude;
+ 
+ import tools.jackson.databind.*;
+ import tools.jackson.databind.testutil.DatabindTestUtil;
++import tools.jackson.databind.testutil.failure.JacksonTestFailureExpected;
+ 
+ import static org.junit.jupiter.api.Assertions.assertEquals;
+ 
+@@ -27,6 +28,7 @@ class MapInclusion1649Test extends DatabindTestUtil {
+     final private ObjectMapper MAPPER = objectMapper();
+ 
+     // [databind#1649]
++    @JacksonTestFailureExpected
+     @Test
+     void nonEmptyViaClass() throws IOException {
+         // non-empty/null, include

@@ -1,0 +1,213 @@
+diff --git a/release-notes/CREDITS-2.x b/release-notes/CREDITS-2.x
+index fbe2b55b1..bddb93f1e 100644
+--- a/release-notes/CREDITS-2.x
++++ b/release-notes/CREDITS-2.x
+@@ -1982,3 +1982,7 @@ Michael Reiche (@mikereiche)
+ Johnny Lim (@izeye)
+  * Reported #5293: Fix minor typo in `PropertyBindingException.getMessageSuffix()`
+   (2.21.0)
++
++Hélios Gilles (@RoiSoleil)
++ * Contributed #5413: Add/support forward reference resolution for array values
++  [2.21.0]
+diff --git a/release-notes/VERSION-2.x b/release-notes/VERSION-2.x
+index b37271dcf..573d73675 100644
+--- a/release-notes/VERSION-2.x
++++ b/release-notes/VERSION-2.x
+@@ -23,6 +23,8 @@ Project: jackson-databind
+   anymore since 2.18.4
+  (reported by @victor-noel-pfx)
+  (fix by @cowtowncoder, w/ Claude code)
++#5413: Add/support forward reference resolution for array values
++ (contributed by Hélios G)
+ 
+ 2.20.2 (not yet released)
+ 
+diff --git a/src/main/java/com/fasterxml/jackson/databind/deser/std/CollectionDeserializer.java b/src/main/java/com/fasterxml/jackson/databind/deser/std/CollectionDeserializer.java
+index 882d2d90a..54e1dfd4e 100644
+--- a/src/main/java/com/fasterxml/jackson/databind/deser/std/CollectionDeserializer.java
++++ b/src/main/java/com/fasterxml/jackson/databind/deser/std/CollectionDeserializer.java
+@@ -537,7 +537,7 @@ _containerType,
+         /**
+          * A list of {@link CollectionReferring} to maintain ordering.
+          */
+-        private List<CollectionReferring> _accumulator = new ArrayList<CollectionReferring>();
++        private List<CollectionReferring> _accumulator = new ArrayList<>();
+ 
+         public CollectionReferringAccumulator(Class<?> elementType, Collection<Object> result) {
+             _elementType = elementType;
+@@ -591,7 +591,7 @@ _containerType,
+      */
+     private final static class CollectionReferring extends Referring {
+         private final CollectionReferringAccumulator _parent;
+-        public final List<Object> next = new ArrayList<Object>();
++        public final List<Object> next = new ArrayList<>();
+ 
+         CollectionReferring(CollectionReferringAccumulator parent,
+                 UnresolvedForwardReference reference, Class<?> contentType)
+diff --git a/src/main/java/com/fasterxml/jackson/databind/deser/std/ObjectArrayDeserializer.java b/src/main/java/com/fasterxml/jackson/databind/deser/std/ObjectArrayDeserializer.java
+index d6e194c63..ef4fe4c0f 100644
+--- a/src/main/java/com/fasterxml/jackson/databind/deser/std/ObjectArrayDeserializer.java
++++ b/src/main/java/com/fasterxml/jackson/databind/deser/std/ObjectArrayDeserializer.java
+@@ -2,22 +2,25 @@ package com.fasterxml.jackson.databind.deser.std;
+ 
+ import java.io.IOException;
+ import java.lang.reflect.Array;
+-import java.util.Arrays;
+-import java.util.Objects;
++import java.util.*;
+ 
+ import com.fasterxml.jackson.annotation.JsonFormat;
+ 
+ import com.fasterxml.jackson.core.*;
++
+ import com.fasterxml.jackson.databind.*;
+ import com.fasterxml.jackson.databind.annotation.JacksonStdImpl;
+ import com.fasterxml.jackson.databind.cfg.CoercionAction;
+ import com.fasterxml.jackson.databind.cfg.CoercionInputShape;
+ import com.fasterxml.jackson.databind.deser.ContextualDeserializer;
+ import com.fasterxml.jackson.databind.deser.NullValueProvider;
++import com.fasterxml.jackson.databind.deser.UnresolvedForwardReference;
++import com.fasterxml.jackson.databind.deser.impl.ReadableObjectId.Referring;
+ import com.fasterxml.jackson.databind.jsontype.TypeDeserializer;
+ import com.fasterxml.jackson.databind.type.ArrayType;
+ import com.fasterxml.jackson.databind.type.LogicalType;
+ import com.fasterxml.jackson.databind.util.AccessPattern;
++import com.fasterxml.jackson.databind.util.ClassUtil;
+ import com.fasterxml.jackson.databind.util.ObjectBuffer;
+ 
+ /**
+@@ -196,10 +199,17 @@ public class ObjectArrayDeserializer
+         if (!p.isExpectedStartArrayToken()) {
+             return handleNonArray(p, ctxt);
+         }
+-
++        if (_elementDeserializer.getObjectIdReader() != null) {
++            return _deserializeWithObjectId(p, ctxt);
++        }
+         final ObjectBuffer buffer = ctxt.leaseObjectBuffer();
+         Object[] chunk = buffer.resetAndStart();
+         int ix = 0;
++        return _deserialize(p, ctxt, buffer, ix, chunk);
++    }
++
++    protected Object[] _deserialize(JsonParser p, DeserializationContext ctxt,
++            final ObjectBuffer buffer, int ix, Object[] chunk) throws JsonMappingException {
+         JsonToken t;
+ 
+         try {
+@@ -245,6 +255,54 @@ public class ObjectArrayDeserializer
+         return result;
+     }
+ 
++    protected Object[] _deserializeWithObjectId(JsonParser p, DeserializationContext ctxt) throws JsonMappingException {
++        final ObjectArrayReferringAccumulator acc = new ObjectArrayReferringAccumulator(_untyped, _elementClass);
++
++        JsonToken t;
++
++        int ix = 0;
++        try {
++            while ((t = p.nextToken()) != JsonToken.END_ARRAY) {
++                try {
++                    Object value;
++
++                    if (t == JsonToken.VALUE_NULL) {
++                        if (_skipNullValues) {
++                            continue;
++                        }
++                        value = null;
++                    } else {
++                        value = _deserializeNoNullChecks(p, ctxt);
++                    }
++
++                    if (value == null) {
++                        value = _nullProvider.getNullValue(ctxt);
++
++                        if (value == null && _skipNullValues) {
++                            continue;
++                        }
++                    }
++                    acc.add(value);
++                } catch (UnresolvedForwardReference reference) {
++                    if (acc == null) {
++                        throw reference;
++                    }
++                    ArrayReferring referring = new ArrayReferring(reference, _elementClass, acc);
++                    reference.getRoid().appendReferring(referring);
++                }
++                ++ix;
++            }
++        } catch (Exception e) {
++            boolean wrap = (ctxt == null) || ctxt.isEnabled(DeserializationFeature.WRAP_EXCEPTIONS);
++            if (!wrap) {
++                ClassUtil.throwIfRTE(e);
++            }
++            throw JsonMappingException.wrapWithPath(e, acc.buildArray(), ix);
++        }
++
++        return acc.buildArray();
++    }
++
+     @Override
+     public Object deserializeWithType(JsonParser p, DeserializationContext ctxt,
+             TypeDeserializer typeDeserializer)
+@@ -425,4 +483,59 @@ public class ObjectArrayDeserializer
+         }
+         return _elementDeserializer.deserializeWithType(p, ctxt, _elementTypeDeserializer);
+     }
++
++    // @since 2.21
++    private static class ObjectArrayReferringAccumulator {
++        private final boolean _untyped;
++        private final Class<?> _elementType;
++        private final List<Object> _accumulator = new ArrayList<>();
++
++        private Object[] _array;
++
++        ObjectArrayReferringAccumulator(boolean untyped, Class<?> elementType) {
++            _untyped = untyped;
++            _elementType = elementType;
++        }
++
++        void add(Object value) {
++            _accumulator.add(value);
++        }
++
++        Object[] buildArray() {
++            if (_untyped) {
++                _array = new Object[_accumulator.size()];
++            } else {
++                _array = (Object[]) Array.newInstance(_elementType, _accumulator.size());
++            }
++            for (int i = 0; i < _accumulator.size(); i++) {
++                if (!(_accumulator.get(i) instanceof ArrayReferring)) {
++                    _array[i] = _accumulator.get(i);
++                }
++            }
++            return _array;
++        }
++    }
++
++    private static class ArrayReferring extends Referring {
++        private final ObjectArrayReferringAccumulator _parent;
++
++        ArrayReferring(UnresolvedForwardReference ref,
++                Class<?> type,
++                ObjectArrayReferringAccumulator acc) {
++            super(ref, type);
++            _parent = acc;
++            _parent._accumulator.add(this);
++        }
++
++        @Override
++        public void handleResolvedForwardReference(Object id, Object value) throws JacksonException {
++            for (int i = 0; i < _parent._accumulator.size(); i++) {
++                if (_parent._accumulator.get(i) == this) {
++                    _parent._array[i] = value;
++                    return;
++                }
++            }
++            throw new IllegalArgumentException("Trying to resolve unknown reference: " + id);
++        }
++    }
+ }
