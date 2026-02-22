@@ -9,11 +9,9 @@
 > 1000 JVM tasks generated from 16 open-source GitHub repos using [SWE-gen](https://github.com/abundant-ai/SWE-gen).
 
 ## Each task
-- is a merged GitHub PR
-- has 1-10 source files edited
+- is a merged GitHub PR with 1-10 source files edited
 - has Fail-to-Pass unit tests
 - passes NOP (baseline fails) and Oracle (fix succeeds) validation
-- follows the Harbor format
 
 ## Getting Started
 
@@ -22,16 +20,6 @@ Install [**Harbor**](https://github.com/laude-institute/harbor):
 ```shell
 uv tool install harbor
 ```
-
-Run the dataset oracle solutions to verify setup:
-
-```shell
-harbor run --dataset swe-gen-java \
-   --agent oracle \
-   --n-concurrent 4 
-```
-
-This command automatically downloads the tasks for the benchmark.
 
 Run with Codex:
 
@@ -42,6 +30,8 @@ harbor run --dataset swe-gen-java \
    --model openai/gpt-5.2-codex \
    --n-concurrent 4
 ```
+
+This command automatically downloads the tasks.
 
 <p align="center">
   <img src="assets/pie_chart.png" style="height: 20em" alt="SWE-gen Java pie chart" />
