@@ -1,16 +1,16 @@
 # SWE-gen-Java
 
 <p align="center">
-  <a href="https://github.com/abundant-ai/SWE-gen-Java">
-    <img src="assets/swegen-java-banner.jpg" style="height: 10em" alt="SWE-gen Java banner" />
+  <a href="https://github.com/abundant-ai/SWE-gen-JS">
+    <img src="assets/swegen-java-banner.jpg" style="height: 25em" alt="SWE-gen Java banner" />
   </a>
 </p>
 
-> 1000 Java tasks generated from 30 open-source GitHub repos using [SWE-gen](https://github.com/abundant-ai/SWE-gen).
+> 1000 JVM tasks generated from 16 open-source GitHub repos using [SWE-gen](https://github.com/abundant-ai/SWE-gen).
 
 ## Each task
 - is a merged GitHub PR
-- has 2-10 source files edited
+- has 1-10 source files edited
 - has Fail-to-Pass unit tests
 - passes NOP (baseline fails) and Oracle (fix succeeds) validation
 - follows the Harbor format
