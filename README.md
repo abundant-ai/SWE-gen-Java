@@ -2,7 +2,7 @@
 
 <p align="center">
   <a href="https://github.com/abundant-ai/SWE-gen-JS">
-    <img src="assets/swegen-java-banner.jpg" style="height: 25em" alt="SWE-gen Java banner" />
+    <img src="assets/swegen-java-banner.jpg" style="height: 20em" alt="SWE-gen Java banner" />
   </a>
 </p>
 
